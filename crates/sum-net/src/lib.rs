@@ -16,13 +16,16 @@ pub mod transport;   // deferred — TCP/Noise fallback transport
 pub use events::SumNetEvent;
 pub use gossip::{TOPIC_CAPABILITY, TOPIC_STORAGE, TOPIC_TEST};
 pub use codec::{ShardCodec, ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL};
-pub use identity::{keypair_from_seed, l1_address_from_keypair, peer_id_from_keypair};
+pub use identity::{
+    keypair_from_seed, l1_address_from_keypair, l1_address_base58,
+    l1_address_from_base58, l1_address_from_peer_public_key, peer_id_from_keypair,
+};
 pub use libp2p::identity::Keypair;
+pub use libp2p::PeerId;
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
 use anyhow::Result;
-use libp2p::PeerId;
 use tokio::sync::mpsc;
 
 use sum_types::config::NetConfig;

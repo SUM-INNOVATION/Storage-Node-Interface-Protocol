@@ -22,4 +22,13 @@ pub enum SumError {
 
     #[error("identity error: {0}")]
     Identity(String),
+
+    #[error("RPC error: {0}")]
+    Rpc(String),
+
+    #[error("ACL denied: {0}")]
+    AclDenied(String),
+
+    #[error("transaction error: {0}")]
+    Transaction(String),
 }

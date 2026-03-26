@@ -15,6 +15,9 @@ pub enum StoreError {
     #[error("merkle error: {0}")]
     Merkle(String),
 
+    #[error("manifest not found for merkle root: {0}")]
+    ManifestNotFound(String),
+
     #[error("{0}")]
     Other(String),
 }

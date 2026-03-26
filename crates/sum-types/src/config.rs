@@ -45,6 +45,26 @@ impl Default for StoreConfig {
     }
 }
 
+// ── L1 RPC ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct RpcConfig {
+    /// URL of the SUM Chain L1 JSON-RPC endpoint.
+    pub rpc_url: String,
+
+    /// How often (seconds) the PoR worker polls for active challenges.
+    pub por_poll_interval_secs: u64,
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self {
+            rpc_url: "http://127.0.0.1:9944".to_string(),
+            por_poll_interval_secs: 10,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

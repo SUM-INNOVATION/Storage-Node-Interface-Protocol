@@ -19,4 +19,12 @@ clap               = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
+serde              = { workspace = true }
 serde_json         = { workspace = true }
+blake3             = { workspace = true }
+reqwest            = { workspace = true }
+bs58               = { workspace = true }
+ed25519-dalek      = { workspace = true }
+bincode1           = { workspace = true }
+hex                = { workspace = true }
+serde-big-array    = { workspace = true }

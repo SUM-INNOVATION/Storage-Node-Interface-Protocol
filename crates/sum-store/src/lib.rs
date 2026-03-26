@@ -4,6 +4,7 @@ pub mod content_id;
 pub mod error;
 pub mod fetch;
 pub mod manifest;
+pub mod manifest_index;
 pub mod merkle;
 pub mod mmap;
 pub mod serve;
@@ -16,6 +17,7 @@ pub use error::StoreError;
 pub use fetch::{FetchManager, FetchOutcome};
 pub use store::ChunkStore;
 pub use chunker::BinaryChunker;
+pub use manifest_index::ManifestIndex;
 pub use merkle::MerkleTree;
 
 use std::path::Path;
@@ -32,6 +34,7 @@ pub struct SumStore {
     pub config: StoreConfig,
     pub local: ChunkStore,
     pub fetcher: FetchManager,
+    pub manifest_idx: ManifestIndex,
 }
 
 impl SumStore {
@@ -39,11 +42,12 @@ impl SumStore {
     pub fn new(config: StoreConfig) -> Result<Self> {
         let local = ChunkStore::new(config.store_dir.clone())?;
         let fetcher = FetchManager::new(config.max_chunk_msg_bytes);
-        Ok(Self { config, local, fetcher })
+        let manifest_idx = ManifestIndex::load(&config.store_dir)?;
+        Ok(Self { config, local, fetcher, manifest_idx })
     }
 
     /// Ingest any file: chunk, compute Merkle tree, store chunks, build manifest.
-    pub fn ingest_file(&self, path: &Path) -> Result<DataManifest> {
+    pub fn ingest_file(&mut self, path: &Path) -> Result<DataManifest> {
         let (mapped, manifest) = BinaryChunker::chunk_file(path)?;
 
         info!(
@@ -68,10 +72,12 @@ impl SumStore {
             );
         }
 
-        // Write manifest to disk.
-        let manifest_path = self.config.store_dir.join("manifest.cbor");
-        manifest::write_manifest(&manifest, &manifest_path)?;
-        info!(path = %manifest_path.display(), "manifest written");
+        // Write manifest to the index (persistent + in-memory).
+        self.manifest_idx.insert(&manifest)?;
+        info!(
+            merkle_root = %manifest.merkle_root.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "manifest indexed"
+        );
 
         Ok(manifest)
     }

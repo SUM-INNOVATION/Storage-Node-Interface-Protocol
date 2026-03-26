@@ -51,4 +51,11 @@ pub enum SumNetEvent {
         peer_id: PeerId,
         error: String,
     },
+
+    /// A peer's L1 address was identified via the libp2p identify protocol.
+    /// Used by the ACL checker to map PeerId -> L1 Address.
+    PeerIdentified {
+        peer_id: PeerId,
+        l1_address: [u8; 20],
+    },
 }

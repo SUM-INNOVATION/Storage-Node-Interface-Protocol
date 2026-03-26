@@ -228,6 +228,21 @@ impl SumSwarm {
             }
 
             // ── Identify ──────────────────────────────────────────────────────
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Identify(
+                identify::Event::Received { peer_id, info, .. }
+            )) => {
+                debug!(%peer_id, "identify received");
+                if let Some(l1_addr) =
+                    crate::identity::l1_address_from_peer_public_key(&info.public_key)
+                {
+                    if let Err(e) = event_tx.try_send(SumNetEvent::PeerIdentified {
+                        peer_id,
+                        l1_address: l1_addr,
+                    }) {
+                        warn!(%e, "event channel full — dropping PeerIdentified");
+                    }
+                }
+            }
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Identify(e)) => {
                 debug!(?e, "identify event");
             }

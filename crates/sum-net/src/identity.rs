@@ -53,6 +53,65 @@ pub fn l1_address_hex(addr: &[u8; 20]) -> String {
     addr.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Encode an L1 address as a base58 string with a 4-byte blake3 double-hash checksum.
+///
+/// Matches `Address::to_base58()` in `sum-chain/crates/primitives/src/address.rs:78-87`:
+/// `base58(addr_20_bytes ++ blake3(blake3(addr))[0..4])`
+pub fn l1_address_base58(addr: &[u8; 20]) -> String {
+    let hash1 = blake3::hash(addr);
+    let hash2 = blake3::hash(hash1.as_bytes());
+
+    let mut with_checksum = Vec::with_capacity(24);
+    with_checksum.extend_from_slice(addr);
+    with_checksum.extend_from_slice(&hash2.as_bytes()[0..4]);
+
+    bs58::encode(with_checksum).into_string()
+}
+
+/// Decode a base58-encoded L1 address, verifying the 4-byte checksum.
+///
+/// Matches `Address::from_base58()` in `sum-chain/crates/primitives/src/address.rs:52-75`.
+pub fn l1_address_from_base58(s: &str) -> anyhow::Result<[u8; 20]> {
+    let decoded = bs58::decode(s)
+        .into_vec()
+        .map_err(|e| anyhow::anyhow!("invalid base58: {e}"))?;
+
+    if decoded.len() != 24 {
+        anyhow::bail!(
+            "invalid address length: expected 24 bytes (20 + 4 checksum), got {}",
+            decoded.len()
+        );
+    }
+
+    let (addr_bytes, checksum) = decoded.split_at(20);
+
+    let hash1 = blake3::hash(addr_bytes);
+    let hash2 = blake3::hash(hash1.as_bytes());
+
+    if &hash2.as_bytes()[0..4] != checksum {
+        anyhow::bail!("address checksum mismatch");
+    }
+
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(addr_bytes);
+    Ok(addr)
+}
+
+/// Derive an L1 address from a libp2p public key.
+///
+/// Extracts the Ed25519 bytes and computes `blake3(pubkey)[12..32]`.
+/// Returns `None` if the public key is not Ed25519.
+pub fn l1_address_from_peer_public_key(
+    public_key: &libp2p::identity::PublicKey,
+) -> Option<[u8; 20]> {
+    let ed_pubkey = public_key.clone().try_into_ed25519().ok()?;
+    let pubkey_bytes = ed_pubkey.to_bytes();
+    let hash = blake3::hash(&pubkey_bytes);
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&hash.as_bytes()[12..32]);
+    Some(addr)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -88,7 +147,6 @@ mod tests {
         let kp = keypair_from_seed(&seed).unwrap();
         let addr = l1_address_from_keypair(&kp);
 
-        // Verify: blake3(pubkey)[12..32]
         let ed_pubkey = kp.public().try_into_ed25519().unwrap();
         let hash = blake3::hash(&ed_pubkey.to_bytes());
         assert_eq!(&addr[..], &hash.as_bytes()[12..32]);
@@ -108,5 +166,41 @@ mod tests {
         let hex = l1_address_hex(&addr);
         assert_eq!(hex.len(), 40);
         assert_eq!(hex, "ab".repeat(20));
+    }
+
+    #[test]
+    fn base58_round_trip() {
+        let seed = [55u8; 32];
+        let kp = keypair_from_seed(&seed).unwrap();
+        let addr = l1_address_from_keypair(&kp);
+        let encoded = l1_address_base58(&addr);
+        let decoded = l1_address_from_base58(&encoded).unwrap();
+        assert_eq!(addr, decoded);
+    }
+
+    #[test]
+    fn base58_bad_checksum_fails() {
+        let seed = [55u8; 32];
+        let kp = keypair_from_seed(&seed).unwrap();
+        let addr = l1_address_from_keypair(&kp);
+        let mut encoded = l1_address_base58(&addr);
+        // Corrupt the last character
+        let last = encoded.pop().unwrap();
+        encoded.push(if last == '1' { '2' } else { '1' });
+        assert!(l1_address_from_base58(&encoded).is_err());
+    }
+
+    #[test]
+    fn base58_wrong_length_fails() {
+        assert!(l1_address_from_base58("abc").is_err());
+    }
+
+    #[test]
+    fn l1_address_from_peer_pubkey() {
+        let seed = [77u8; 32];
+        let kp = keypair_from_seed(&seed).unwrap();
+        let addr_direct = l1_address_from_keypair(&kp);
+        let addr_from_pubkey = l1_address_from_peer_public_key(&kp.public()).unwrap();
+        assert_eq!(addr_direct, addr_from_pubkey);
     }
 }

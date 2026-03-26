@@ -10,6 +10,7 @@ rust-version.workspace = true
 sum-types  = { workspace = true }
 libp2p     = { workspace = true }
 blake3     = { workspace = true }
+bs58       = { workspace = true }
 futures    = { workspace = true }
 tokio      = { workspace = true }
 tracing    = { workspace = true }
