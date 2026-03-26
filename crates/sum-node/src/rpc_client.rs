@@ -25,6 +25,11 @@ impl L1RpcClient {
         }
     }
 
+    /// Low-level JSON-RPC 2.0 call (public for e2e-helper).
+    pub async fn call_public<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        self.call(method, params).await
+    }
+
     /// Low-level JSON-RPC 2.0 call.
     async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
         let body = json!({

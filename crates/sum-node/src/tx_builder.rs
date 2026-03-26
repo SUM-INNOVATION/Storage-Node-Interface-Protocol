@@ -1,4 +1,4 @@
-//! Transaction builder for submitting PoR proofs to the SUM Chain L1.
+//! Transaction builder for submitting storage operations to the SUM Chain L1.
 //!
 //! Constructs `SignedTransaction` bytes that the L1 can deserialize via
 //! `SignedTransaction::from_hex()` (bincode v1).
@@ -12,9 +12,9 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
+// ── Public Builder Functions ──────────────────────────────────────────────────
+
 /// Build a hex-encoded `SignedTransaction` for `SubmitStorageProof`.
-///
-/// The returned hex string can be submitted directly to `send_raw_transaction`.
 pub fn build_submit_proof_tx(
     ed25519_seed: &[u8; 32],
     chain_id: u64,
@@ -26,7 +26,66 @@ pub fn build_submit_proof_tx(
     chunk_hash: [u8; 32],
     merkle_path: Vec<[u8; 32]>,
 ) -> Result<String> {
-    // Derive keypair from seed.
+    let payload = TxPayloadMirror::StorageMetadata(StorageMetadataTxDataMirror {
+        operation: StorageMetadataOperationMirror::SubmitStorageProof {
+            challenge_id,
+            merkle_root,
+            chunk_index,
+            chunk_hash,
+            merkle_path,
+        },
+    });
+    sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
+}
+
+/// Build a hex-encoded `SignedTransaction` for `NodeRegistry::Register(ArchiveNode)`.
+pub fn build_register_archive_node_tx(
+    ed25519_seed: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+    fee: u128,
+    stake: u64,
+) -> Result<String> {
+    let payload = TxPayloadMirror::NodeRegistry(NodeRegistryTxDataMirror {
+        operation: NodeRegistryOperationMirror::Register {
+            role: NodeRoleMirror::ArchiveNode,
+            stake,
+        },
+    });
+    sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
+}
+
+/// Build a hex-encoded `SignedTransaction` for `StorageMetadata::RegisterFile`.
+pub fn build_register_file_tx(
+    ed25519_seed: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+    fee: u128,
+    merkle_root: [u8; 32],
+    total_size_bytes: u64,
+    access_list: Vec<[u8; 20]>,
+    fee_deposit: u64,
+) -> Result<String> {
+    let payload = TxPayloadMirror::StorageMetadata(StorageMetadataTxDataMirror {
+        operation: StorageMetadataOperationMirror::RegisterFile {
+            merkle_root,
+            total_size_bytes,
+            access_list,
+            fee_deposit,
+        },
+    });
+    sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
+}
+
+// ── Shared Signing Logic ──────────────────────────────────────────────────────
+
+fn sign_and_encode(
+    ed25519_seed: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+    fee: u128,
+    payload: TxPayloadMirror,
+) -> Result<String> {
     let signing_key = SigningKey::from_bytes(ed25519_seed);
     let pubkey_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
 
@@ -35,21 +94,12 @@ pub fn build_submit_proof_tx(
     let mut from_addr = [0u8; 20];
     from_addr.copy_from_slice(&pubkey_hash.as_bytes()[12..32]);
 
-    // Build the unsigned transaction.
     let tx = TransactionV2Mirror {
         chain_id,
         from: from_addr,
         fee,
         nonce,
-        payload: TxPayloadMirror::StorageMetadata(StorageMetadataTxDataMirror {
-            operation: StorageMetadataOperationMirror::SubmitStorageProof {
-                challenge_id,
-                merkle_root,
-                chunk_index,
-                chunk_hash,
-                merkle_path,
-            },
-        }),
+        payload,
     };
 
     // Serialize with bincode v1 to get signing hash.
@@ -58,16 +108,13 @@ pub fn build_submit_proof_tx(
 
     // Sign with Ed25519.
     let signature = signing_key.sign(signing_hash.as_bytes());
-    let sig_bytes: [u8; 64] = signature.to_bytes();
 
-    // Wrap in SignedTransaction.
     let signed = SignedTransactionMirror {
         inner: TxInnerMirror::V2(tx),
-        signature: sig_bytes,
+        signature: signature.to_bytes(),
         public_key: pubkey_bytes,
     };
 
-    // Serialize the full signed transaction with bincode v1 and hex-encode.
     let raw_bytes =
         bincode1::serialize(&signed).context("bincode v1 serialization of signed tx failed")?;
     Ok(hex::encode(&raw_bytes))
@@ -76,10 +123,53 @@ pub fn build_submit_proof_tx(
 // ── Mirror Types ─────────────────────────────────────────────────────────────
 //
 // These must match the L1's types exactly in field order and variant indices.
-// Source: sum-chain/crates/primitives/src/transaction.rs and storage_metadata.rs
+// Source: sum-chain/crates/primitives/src/transaction.rs,
+//         sum-chain/crates/primitives/src/storage_metadata.rs,
+//         sum-chain/crates/primitives/src/node_registry.rs
+
+// ── Node Registry mirrors ────────────────────────────────────────────────────
+
+/// Mirror of `NodeRole`. Variant indices must match L1.
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
+enum NodeRoleMirror {
+    Validator,   // 0
+    ArchiveNode, // 1
+}
+
+/// Mirror of `NodeStatus`.
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
+enum NodeStatusMirror {
+    Active,  // 0
+    Slashed, // 1
+}
+
+/// Mirror of `NodeRegistryOperation`.
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
+enum NodeRegistryOperationMirror {
+    Register {
+        role: NodeRoleMirror,
+        stake: u64,
+    },              // 0
+    UpdateStatus {
+        target: [u8; 20],
+        new_status: NodeStatusMirror,
+    },              // 1
+}
+
+/// Mirror of `NodeRegistryTxData`.
+#[derive(Debug, Serialize, Deserialize)]
+struct NodeRegistryTxDataMirror {
+    operation: NodeRegistryOperationMirror,
+}
+
+// ── Storage Metadata mirrors ─────────────────────────────────────────────────
 
 /// Mirror of `StorageMetadataOperation` (variant indices must match L1).
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 enum StorageMetadataOperationMirror {
     RegisterFile {
         merkle_root: [u8; 32],
@@ -118,11 +208,10 @@ struct StorageMetadataTxDataMirror {
     operation: StorageMetadataOperationMirror,
 }
 
-/// Mirror of `TxPayload` — 19 variants, StorageMetadata at index 18.
-///
-/// We only construct the `StorageMetadata` variant. The other 18 are
-/// placeholders that keep the variant indices aligned. Since bincode v1
-/// only serializes the active variant, their internal types are irrelevant.
+// ── Transaction envelope mirrors ─────────────────────────────────────────────
+
+/// Mirror of `TxPayload` — 19 variants.
+/// `NodeRegistry` at index 17, `StorageMetadata` at index 18.
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 enum TxPayloadMirror {
@@ -143,17 +232,16 @@ enum TxPayloadMirror {
     Employment(Vec<u8>),                       // 14
     Finance(Vec<u8>),                          // 15
     PolicyAccount(Vec<u8>),                    // 16
-    NodeRegistry(Vec<u8>),                     // 17
-    StorageMetadata(StorageMetadataTxDataMirror), // 18 — the only variant we use
+    NodeRegistry(NodeRegistryTxDataMirror),    // 17
+    StorageMetadata(StorageMetadataTxDataMirror), // 18
 }
 
 /// Mirror of `TransactionV2`.
-/// Fields must be in the same order as the L1's struct.
 #[derive(Debug, Serialize, Deserialize)]
 struct TransactionV2Mirror {
     chain_id: u64,
-    from: [u8; 20],   // Address newtype is transparent under bincode v1
-    fee: u128,         // Balance = u128
+    from: [u8; 20],
+    fee: u128,
     nonce: u64,
     payload: TxPayloadMirror,
 }
@@ -162,8 +250,8 @@ struct TransactionV2Mirror {
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 enum TxInnerMirror {
-    Legacy(Vec<u8>),           // index 0 — placeholder, never constructed
-    V2(TransactionV2Mirror),   // index 1
+    Legacy(Vec<u8>),           // 0
+    V2(TransactionV2Mirror),   // 1
 }
 
 /// Mirror of `SignedTransaction`.
@@ -185,61 +273,44 @@ mod tests {
     fn build_and_verify_proof_tx() {
         let seed = [42u8; 32];
         let hex = build_submit_proof_tx(
-            &seed,
-            1,                  // chain_id
-            0,                  // nonce
-            1_000_000,          // fee
-            [0xAA; 32],         // challenge_id
-            [0xBB; 32],         // merkle_root
-            5,                  // chunk_index
-            [0xCC; 32],         // chunk_hash
-            vec![[0xDD; 32], [0xEE; 32]], // merkle_path (2 siblings)
+            &seed, 1, 0, 1_000_000,
+            [0xAA; 32], [0xBB; 32], 5, [0xCC; 32],
+            vec![[0xDD; 32], [0xEE; 32]],
         )
         .unwrap();
 
-        // Should be a valid hex string.
         assert!(!hex.is_empty());
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
 
-        // Should be deserializable back (proves bincode v1 round-trip).
         let bytes = hex::decode(&hex).unwrap();
         let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
 
-        // Verify the transaction contents survived.
         match signed.inner {
             TxInnerMirror::V2(tx) => {
                 assert_eq!(tx.chain_id, 1);
                 assert_eq!(tx.nonce, 0);
                 assert_eq!(tx.fee, 1_000_000);
                 match tx.payload {
-                    TxPayloadMirror::StorageMetadata(data) => {
-                        match data.operation {
-                            StorageMetadataOperationMirror::SubmitStorageProof {
-                                challenge_id,
-                                merkle_root,
-                                chunk_index,
-                                chunk_hash,
-                                merkle_path,
-                            } => {
-                                assert_eq!(challenge_id, [0xAA; 32]);
-                                assert_eq!(merkle_root, [0xBB; 32]);
-                                assert_eq!(chunk_index, 5);
-                                assert_eq!(chunk_hash, [0xCC; 32]);
-                                assert_eq!(merkle_path.len(), 2);
-                            }
-                            _ => panic!("wrong operation variant"),
+                    TxPayloadMirror::StorageMetadata(data) => match data.operation {
+                        StorageMetadataOperationMirror::SubmitStorageProof {
+                            challenge_id, merkle_root, chunk_index, chunk_hash, merkle_path,
+                        } => {
+                            assert_eq!(challenge_id, [0xAA; 32]);
+                            assert_eq!(merkle_root, [0xBB; 32]);
+                            assert_eq!(chunk_index, 5);
+                            assert_eq!(chunk_hash, [0xCC; 32]);
+                            assert_eq!(merkle_path.len(), 2);
                         }
-                    }
+                        _ => panic!("wrong operation variant"),
+                    },
                     _ => panic!("wrong payload variant"),
                 }
             }
             _ => panic!("wrong TxInner variant"),
         }
 
-        // Verify Ed25519 signature.
         let signing_key = SigningKey::from_bytes(&seed);
-        let verifying_key = signing_key.verifying_key();
-        assert_eq!(signed.public_key, verifying_key.to_bytes());
+        assert_eq!(signed.public_key, signing_key.verifying_key().to_bytes());
     }
 
     #[test]
@@ -247,12 +318,75 @@ mod tests {
         let seed = [1u8; 32];
         let hex1 = build_submit_proof_tx(
             &seed, 1, 0, 100, [0; 32], [1; 32], 0, [2; 32], vec![],
-        )
-        .unwrap();
+        ).unwrap();
         let hex2 = build_submit_proof_tx(
             &seed, 1, 0, 100, [0; 32], [1; 32], 0, [2; 32], vec![],
-        )
-        .unwrap();
+        ).unwrap();
         assert_eq!(hex1, hex2, "same inputs must produce same tx hex");
+    }
+
+    #[test]
+    fn build_and_verify_register_node_tx() {
+        let seed = [10u8; 32];
+        let hex = build_register_archive_node_tx(
+            &seed, 1337, 0, 1_000_000, 1_000_000_000,
+        ).unwrap();
+
+        let bytes = hex::decode(&hex).unwrap();
+        let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
+
+        match signed.inner {
+            TxInnerMirror::V2(tx) => {
+                assert_eq!(tx.chain_id, 1337);
+                match tx.payload {
+                    TxPayloadMirror::NodeRegistry(data) => match data.operation {
+                        NodeRegistryOperationMirror::Register { role, stake } => {
+                            assert!(matches!(role, NodeRoleMirror::ArchiveNode));
+                            assert_eq!(stake, 1_000_000_000);
+                        }
+                        _ => panic!("wrong NodeRegistry operation"),
+                    },
+                    _ => panic!("wrong payload variant — expected NodeRegistry"),
+                }
+            }
+            _ => panic!("wrong TxInner variant"),
+        }
+    }
+
+    #[test]
+    fn build_and_verify_register_file_tx() {
+        let seed = [20u8; 32];
+        let hex = build_register_file_tx(
+            &seed, 1337, 1, 1_000_000,
+            [0xFF; 32],     // merkle_root
+            2_097_152,      // total_size_bytes (2 MB)
+            vec![],         // empty access_list (public)
+            100_000_000,    // fee_deposit
+        ).unwrap();
+
+        let bytes = hex::decode(&hex).unwrap();
+        let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
+
+        match signed.inner {
+            TxInnerMirror::V2(tx) => {
+                assert_eq!(tx.chain_id, 1337);
+                assert_eq!(tx.nonce, 1);
+                match tx.payload {
+                    TxPayloadMirror::StorageMetadata(data) => match data.operation {
+                        StorageMetadataOperationMirror::RegisterFile {
+                            merkle_root, total_size_bytes, access_list, fee_deposit,
+                        } => {
+                            assert_eq!(merkle_root, [0xFF; 32]);
+                            assert_eq!(total_size_bytes, 2_097_152);
+                            assert!(access_list.is_empty());
+                            assert_eq!(fee_deposit, 100_000_000);
+                        }
+                        _ => panic!("wrong StorageMetadata operation"),
+                    },
+                    _ => panic!("wrong payload variant — expected StorageMetadata"),
+                }
+            }
+            _ => panic!("wrong TxInner variant"),
+        }
     }
 }

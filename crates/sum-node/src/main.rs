@@ -14,11 +14,6 @@
 //! RUST_LOG=info cargo run --bin sum-node -- send "Hello from SUM Node"
 //! ```
 
-pub mod acl;
-pub mod por_worker;
-pub mod rpc_client;
-pub mod tx_builder;
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,9 +30,9 @@ use sum_net::identity;
 use sum_store::{SumStore, FetchOutcome, decode_announcement};
 use sum_types::config::{NetConfig, StoreConfig};
 
-use crate::acl::AclChecker;
-use crate::por_worker::PorWorker;
-use crate::rpc_client::L1RpcClient;
+use sum_node::acl::AclChecker;
+use sum_node::por_worker::PorWorker;
+use sum_node::rpc_client::L1RpcClient;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -363,11 +358,18 @@ async fn run_fetch(keypair: Keypair, cid: String) -> Result<()> {
         }
     }
 
+    // Wait briefly for connections to establish before sending the request.
+    // mDNS discovery can find a peer before the QUIC connection is ready.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     let peer = target_peer.unwrap();
+    info!(%peer, "sending chunk request");
     store.fetcher.start_fetch(&net, peer, cid.clone())
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    let fetch_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut retries = 0;
     loop {
         tokio::select! {
             Some(event) = net.next_event() => {
@@ -385,11 +387,29 @@ async fn run_fetch(keypair: Keypair, cid: String) -> Result<()> {
                             }
                         }
                     }
-                    SumNetEvent::ShardRequestFailed { error, .. } => {
-                        anyhow::bail!("chunk request failed: {error}");
+                    SumNetEvent::ShardRequestFailed { peer_id, error } => {
+                        retries += 1;
+                        warn!(%error, retries, "chunk request failed — will retry");
+                        if retries > 5 {
+                            anyhow::bail!("chunk request failed after {retries} retries: {error}");
+                        }
+                        // Wait and retry with the same peer (connection may now be ready).
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        info!(%peer_id, "retrying fetch");
+                        let _ = store.fetcher.start_fetch(&net, peer_id, cid.clone()).await;
+                    }
+                    SumNetEvent::PeerConnected { peer_id } => {
+                        if !store.fetcher.is_active(&cid) {
+                            info!(%peer_id, "retrying fetch with connected peer");
+                            let _ = store.fetcher.start_fetch(&net, peer_id, cid.clone()).await;
+                        }
+                        print_event(&SumNetEvent::PeerConnected { peer_id });
                     }
                     _ => print_event(&event),
                 }
+            }
+            _ = tokio::time::sleep_until(fetch_deadline) => {
+                anyhow::bail!("timed out fetching chunk {cid}");
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C — aborting fetch");
