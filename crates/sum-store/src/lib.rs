@@ -1,4 +1,5 @@
 pub mod announce;
+pub mod assignment;
 pub mod chunker;
 pub mod content_id;
 pub mod error;
@@ -19,6 +20,7 @@ pub use store::ChunkStore;
 pub use chunker::BinaryChunker;
 pub use manifest_index::ManifestIndex;
 pub use merkle::MerkleTree;
+pub use assignment::{compute_chunk_assignment, compute_default_assignment, chunks_for_node, nodes_for_chunk};
 
 use std::path::Path;
 

@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 /// Every file is sliced into uniform 1 MB chunks (last chunk may be smaller).
 pub const CHUNK_SIZE: u64 = 1_048_576;
 
+/// Replication factor: each chunk is stored on this many nodes.
+/// Must match the L1 constant in sum-chain/crates/primitives/src/storage_metadata.rs.
+pub const REPLICATION_FACTOR: u32 = 3;
+
 // ── Chunk Descriptor ─────────────────────────────────────────────────────────
 
 /// Descriptor for a single chunk of a chunked file.

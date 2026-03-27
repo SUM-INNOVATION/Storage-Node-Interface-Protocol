@@ -43,7 +43,7 @@ const CHANNEL_CAPACITY: usize = 256;
 /// running the [`swarm::SumSwarm`] event loop.
 pub struct SumNet {
     cmd_tx:   mpsc::Sender<SwarmCommand>,
-    event_rx: mpsc::Receiver<SumNetEvent>,
+    event_rx: tokio::sync::Mutex<mpsc::Receiver<SumNetEvent>>,
 }
 
 impl SumNet {
@@ -65,7 +65,7 @@ impl SumNet {
             }
         });
 
-        Ok(Self { cmd_tx, event_rx })
+        Ok(Self { cmd_tx, event_rx: tokio::sync::Mutex::new(event_rx) })
     }
 
     // ── Gossipsub ──────────────────────────────────────────────────────
@@ -100,6 +100,25 @@ impl SumNet {
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot request chunk"))
     }
 
+    /// Request a file's DataManifest from a peer.
+    ///
+    /// Uses the `"manifest:<hex_root>"` convention within the existing
+    /// `/sum/storage/v1` protocol.
+    pub async fn request_manifest(
+        &self,
+        peer_id: PeerId,
+        merkle_root_hex: String,
+    ) -> Result<()> {
+        let cid = format!("manifest:{merkle_root_hex}");
+        self.cmd_tx
+            .send(SwarmCommand::RequestShard {
+                peer_id,
+                request: ShardRequest { cid, offset: None, max_bytes: None },
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot request manifest"))
+    }
+
     /// Send a chunk response on a pending response channel.
     pub async fn respond_shard(
         &self,
@@ -115,8 +134,8 @@ impl SumNet {
     // ── Lifecycle ───────────────────────────────────────────────────────
 
     /// Receive the next event from the mesh.
-    pub async fn next_event(&mut self) -> Option<SumNetEvent> {
-        self.event_rx.recv().await
+    pub async fn next_event(&self) -> Option<SumNetEvent> {
+        self.event_rx.lock().await.recv().await
     }
 
     /// Signal the swarm loop to shut down gracefully.

@@ -31,6 +31,7 @@ use sum_store::{SumStore, FetchOutcome, decode_announcement};
 use sum_types::config::{NetConfig, StoreConfig};
 
 use sum_node::acl::AclChecker;
+use sum_node::market_sync::MarketSyncWorker;
 use sum_node::por_worker::PorWorker;
 use sum_node::rpc_client::L1RpcClient;
 
@@ -55,6 +56,10 @@ struct Cli {
     /// PoR challenge poll interval in seconds.
     #[arg(long, env = "SUM_POR_INTERVAL", default_value = "10")]
     por_poll_secs: u64,
+
+    /// Market sync poll interval in seconds.
+    #[arg(long, env = "SUM_MARKET_SYNC_INTERVAL", default_value = "30")]
+    market_sync_secs: u64,
 
     #[command(subcommand)]
     command: Command,
@@ -146,7 +151,7 @@ fn hex_to_bytes_32(hex: &str) -> Result<[u8; 32]> {
 // ── Listen mode ───────────────────────────────────────────────────────────────
 
 async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli) -> Result<()> {
-    let mut net = SumNet::new(NetConfig::default(), keypair.clone()).await?;
+    let net = Arc::new(SumNet::new(NetConfig::default(), keypair.clone()).await?);
     let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
 
     // Shared PeerId -> L1 Address map (populated by PeerIdentified events).
@@ -167,13 +172,26 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli) -> Resu
         let por = PorWorker::new(
             rpc.clone(),
             seed,
-            l1_base58,
+            l1_base58.clone(),
             Duration::from_secs(cli.por_poll_secs),
         );
         let store_clone = store.clone();
         tokio::spawn(async move { por.run(store_clone).await });
+        // Spawn MarketSync worker
+        let market_sync = MarketSyncWorker::new(
+            rpc.clone(),
+            l1_addr,
+            l1_base58.clone(),
+            Duration::from_secs(cli.market_sync_secs),
+        );
+        let store_clone2 = store.clone();
+        let net_clone = net.clone();
+        let peer_addrs_clone = peer_addresses.clone();
+        tokio::spawn(async move {
+            market_sync.run(store_clone2, net_clone, peer_addrs_clone).await;
+        });
     } else {
-        warn!("PoR worker not started — no L1 keypair available");
+        warn!("PoR/MarketSync workers not started — no L1 keypair available");
     }
 
     info!("SUM Node listening — serving chunks, enforcing ACLs, press Ctrl-C to stop");
@@ -195,7 +213,8 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli) -> Resu
 
                         if allowed {
                             sum_store::serve::handle_request(
-                                &net, &store_read.local, request, *channel_id,
+                                &net, &store_read.local, &store_read.manifest_idx,
+                                request, *channel_id,
                             ).await;
                         } else {
                             info!(
@@ -252,7 +271,7 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli) -> Resu
 // ── Ingest mode ──────────────────────────────────────────────────────────────
 
 async fn run_ingest(keypair: Keypair, path: PathBuf) -> Result<()> {
-    let mut net = SumNet::new(NetConfig::default(), keypair).await?;
+    let net = SumNet::new(NetConfig::default(), keypair).await?;
     let mut store = SumStore::new(StoreConfig::default())?;
 
     info!(path = %path.display(), "ingesting file");
@@ -275,14 +294,14 @@ async fn run_ingest(keypair: Keypair, path: PathBuf) -> Result<()> {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     store.announce_chunks(&net, &manifest).await?;
                     info!("all chunks announced — listening for requests");
-                    simple_serve_loop(&mut net, &store).await?;
+                    simple_serve_loop(&net, &store).await?;
                     return Ok(());
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
                 warn!("timed out waiting for peer — announcing anyway");
                 store.announce_chunks(&net, &manifest).await?;
-                simple_serve_loop(&mut net, &store).await?;
+                simple_serve_loop(&net, &store).await?;
                 return Ok(());
             }
         }
@@ -290,14 +309,15 @@ async fn run_ingest(keypair: Keypair, path: PathBuf) -> Result<()> {
 }
 
 /// Simple serve loop without ACL (used by ingest after announcing).
-async fn simple_serve_loop(net: &mut SumNet, store: &SumStore) -> Result<()> {
+async fn simple_serve_loop(net: &SumNet, store: &SumStore) -> Result<()> {
     loop {
         tokio::select! {
             Some(event) = net.next_event() => {
                 match &event {
                     SumNetEvent::ShardRequested { request, channel_id, .. } => {
                         sum_store::serve::handle_request(
-                            net, &store.local, request, *channel_id,
+                            net, &store.local, &store.manifest_idx,
+                            request, *channel_id,
                         ).await;
                     }
                     _ => print_event(&event),
@@ -316,7 +336,7 @@ async fn simple_serve_loop(net: &mut SumNet, store: &SumStore) -> Result<()> {
 // ── Fetch mode ───────────────────────────────────────────────────────────────
 
 async fn run_fetch(keypair: Keypair, cid: String) -> Result<()> {
-    let mut net = SumNet::new(NetConfig::default(), keypair).await?;
+    let net = SumNet::new(NetConfig::default(), keypair).await?;
     let mut store = SumStore::new(StoreConfig::default())?;
 
     if store.has_chunk(&cid) {
@@ -423,13 +443,13 @@ async fn run_fetch(keypair: Keypair, cid: String) -> Result<()> {
 // ── Send mode ─────────────────────────────────────────────────────────────────
 
 async fn run_send(keypair: Keypair, message: String) -> Result<()> {
-    let mut node = SumNet::new(NetConfig::default(), keypair).await?;
+    let node = SumNet::new(NetConfig::default(), keypair).await?;
 
     const TIMEOUT: Duration = Duration::from_secs(30);
     info!("waiting for a peer on the LAN (timeout: {TIMEOUT:?})");
 
     let result =
-        tokio::time::timeout(TIMEOUT, discover_and_send(&mut node, &message)).await;
+        tokio::time::timeout(TIMEOUT, discover_and_send(&node, &message)).await;
 
     match result {
         Ok(inner)     => inner,
@@ -440,7 +460,7 @@ async fn run_send(keypair: Keypair, message: String) -> Result<()> {
     }
 }
 
-async fn discover_and_send(node: &mut SumNet, message: &str) -> Result<()> {
+async fn discover_and_send(node: &SumNet, message: &str) -> Result<()> {
     while let Some(event) = node.next_event().await {
         print_event(&event);
 

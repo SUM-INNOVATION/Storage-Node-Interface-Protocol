@@ -48,10 +48,15 @@ Goal: Connect the storage node to the L1 blockchain, enforce access control, and
     5. ACL Interceptor: Before serving a chunk to a peer, query storage_getAccessList on the L1. If access_list is non-empty and requester's L1 address is not in it, deny the request. Map PeerId -> L1 Address via libp2p identify protocol's exchanged public keys.
     6. PeerId-to-Address Mapping: Use libp2p identify (already in the behaviour) to learn peers' Ed25519 public keys, then derive their L1 addresses via blake3(pubkey)[12..32]. Emit PeerIdentified events for the ACL checker.
 
-Phase 3: The Combinatorial P2P Mesh (Weeks 9-12)
-Goal: Nodes can deterministically route and distribute file chunks across the network.
-    1. Combinatorial Assignment Logic: Write the algorithm that maps a file's Merkle Root and chunk count to a specific subset of active Storage Nodes, enforcing the rule that configuration states must be unique (e.g., calculating C(C,m)).
-    2. Market Sync: Use storage_getFundedFiles to discover files the node should be storing based on its assignment, and automatically fetch assigned chunks from peers.
+Phase 3: The Combinatorial P2P Mesh (Weeks 9-12) [COMPLETED]
+Goal: Nodes can deterministically route and distribute file chunks across the network with 3x replication.
+    1. REPLICATION_FACTOR = 3: Added to both L1 (primitives) and off-chain (sum-types). Each chunk is stored on exactly min(3, N) nodes.
+    2. Deterministic Assignment Algorithm: blake3(merkle_root ++ chunk_index ++ replica) maps each chunk replica to a position in the sorted active node list, with linear probing on collision. Identical implementation in both L1 (state/storage_metadata.rs) and off-chain (sum-store/assignment.rs).
+    3. L1 generate_challenge() Update: Now only challenges nodes that are assigned to the selected file, instead of any random active node. Uses the assignment algorithm to compute eligible targets.
+    4. storage_getActiveNodes() RPC: New L1 endpoint returning all active ArchiveNodes sorted by address bytes. Used by off-chain nodes to compute the same assignment.
+    5. Manifest Exchange Protocol: serve.rs handles "manifest:" prefixed requests, serving CBOR-serialized DataManifest data. SumNet.request_manifest() convenience method added.
+    6. MarketSyncWorker: Background task polling L1 for funded files, computing assignments, fetching missing manifests and chunks from peers. Runs alongside PorWorker.
+    7. CLI: --market-sync-secs flag (default 30s, env SUM_MARKET_SYNC_INTERVAL).
 
 Phase 4: The "Scale-Out" Upgrade (Future)
 Goal: Transition from pure replication to Erasure Coding.

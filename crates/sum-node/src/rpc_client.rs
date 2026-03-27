@@ -101,6 +101,12 @@ impl L1RpcClient {
             .await
     }
 
+    /// Get all active ArchiveNodes, sorted deterministically by address bytes.
+    /// Used to compute the deterministic chunk assignment.
+    pub async fn get_active_nodes(&self) -> Result<Vec<NodeRecordInfo>> {
+        self.call("storage_getActiveNodes", json!([])).await
+    }
+
     /// Get the node registry record for an address.
     pub async fn get_node_record(
         &self,
