@@ -25,6 +25,50 @@ A native decentralized storage protocol for the SUM Chain blockchain. The L1 act
 
 ### Step 0 — Node Registration (one-time setup, each node does this independently)
 
+```mermaid
+flowchart TB
+    subgraph SUMChain["SUMChain"]
+        direction LR
+        Val1([Val 1])
+        Val2([Val 2])
+    end
+
+    subgraph P2P["P2P Mesh"]
+        direction LR
+        N1[N1] & N2[N2] & N3[N3] & N4[N4] & N5[N5]
+        N6[N6] & N7[N7] & N8[N8] & N9[N9] & N10[N10]
+    end
+
+    Alice[/Alice\]
+    Bob[/Bob\]
+    File[(file.pdf)]
+
+    N1 ==>|"Register ArchiveNode + Stake 1 Koppa"| SUMChain
+    N2 ==>|"Register"| SUMChain
+    N3 ==>|"Register"| SUMChain
+    N4 ==>|"Register"| SUMChain
+    N5 ==>|"Register"| SUMChain
+    N6 ==>|"Register"| SUMChain
+    N7 ==>|"Register"| SUMChain
+    N8 ==>|"Register"| SUMChain
+    N9 ==>|"Register"| SUMChain
+    N10 ==>|"Register"| SUMChain
+
+    classDef validator fill:#7B2D8E,stroke:#7B2D8E,color:#fff,font-weight:bold
+    classDef node fill:#fff,stroke:#CC0000,color:#CC0000,font-weight:bold
+    classDef user fill:#fff,stroke:#0066CC,color:#0066CC,font-weight:bold
+    classDef fileStyle fill:#f5f5f5,stroke:#666,color:#333
+    classDef chainBox fill:none,stroke:#7B2D8E,stroke-dasharray:5 5,color:#7B2D8E,font-weight:bold
+    classDef p2pBox fill:none,stroke:#CC0000,stroke-dasharray:5 5,color:#CC0000,font-weight:bold
+
+    class Val1,Val2 validator
+    class N1,N2,N3,N4,N5,N6,N7,N8,N9,N10 node
+    class Alice,Bob user
+    class File fileStyle
+    class SUMChain chainBox
+    class P2P p2pBox
+```
+
 Before any file storage can happen, each storage node must register itself on the blockchain. This is like applying for a license to participate in the storage market.
 
 **What N1 does:**
@@ -60,6 +104,46 @@ Before any file storage can happen, each storage node must register itself on th
 ---
 
 ### Step 1 — Alice ingests file.pdf (local processing)
+
+```mermaid
+flowchart TB
+    subgraph SUMChain["SUMChain"]
+        direction LR
+        Val1([Val 1])
+        Val2([Val 2])
+    end
+
+    subgraph P2P["P2P Mesh"]
+        direction LR
+        N1[N1] & N2[N2] & N3[N3] & N4[N4] & N5[N5]
+        N6[N6] & N7[N7] & N8[N8] & N9[N9] & N10[N10]
+    end
+
+    Alice[/Alice\]
+    Bob[/Bob\]
+    File[(file.pdf)]
+
+    File -->|"read"| Alice
+    Alice -->|"1. mmap + chunk into C=10 pieces"| Alice
+    Alice -->|"2. blake3 hash each chunk"| Alice
+    Alice -->|"3. build Merkle tree -> merkle_root"| Alice
+
+    classDef validator fill:#7B2D8E,stroke:#7B2D8E,color:#fff,font-weight:bold
+    classDef node fill:#fff,stroke:#CC0000,color:#CC0000,font-weight:bold
+    classDef user fill:#fff,stroke:#0066CC,color:#0066CC,font-weight:bold
+    classDef activeUser fill:#0066CC,stroke:#0066CC,color:#fff,font-weight:bold
+    classDef fileStyle fill:#f5f5f5,stroke:#666,color:#333
+    classDef chainBox fill:none,stroke:#7B2D8E,stroke-dasharray:5 5,color:#7B2D8E,font-weight:bold
+    classDef p2pBox fill:none,stroke:#CC0000,stroke-dasharray:5 5,color:#CC0000,font-weight:bold
+
+    class Val1,Val2 validator
+    class N1,N2,N3,N4,N5,N6,N7,N8,N9,N10 node
+    class Alice activeUser
+    class Bob user
+    class File fileStyle
+    class SUMChain chainBox
+    class P2P p2pBox
+```
 
 Alice wants to store `file.pdf` (10 MB) on the decentralized network. She runs a client tool (or uses a client library) that performs the following operations locally on her machine. No network activity happens yet.
 
@@ -147,6 +231,44 @@ This manifest is serialized to disk as a CBOR file (a compact binary format, lik
 
 ### Step 2 — Alice registers the file on the blockchain
 
+```mermaid
+flowchart TB
+    subgraph SUMChain["SUMChain"]
+        direction LR
+        Val1([Val 1])
+        Val2([Val 2])
+    end
+
+    subgraph P2P["P2P Mesh"]
+        direction LR
+        N1[N1] & N2[N2] & N3[N3] & N4[N4] & N5[N5]
+        N6[N6] & N7[N7] & N8[N8] & N9[N9] & N10[N10]
+    end
+
+    Alice[/Alice\]
+    Bob[/Bob\]
+    File[(file.pdf)]
+
+    Alice ==>|"AllocateStorage tx: merkle_root + access_list + 100 Koppa"| SUMChain
+    SUMChain -.->|"Writes StorageMetadata to state trie"| SUMChain
+
+    classDef validator fill:#7B2D8E,stroke:#7B2D8E,color:#fff,font-weight:bold
+    classDef node fill:#fff,stroke:#CC0000,color:#CC0000,font-weight:bold
+    classDef activeUser fill:#0066CC,stroke:#0066CC,color:#fff,font-weight:bold
+    classDef user fill:#fff,stroke:#0066CC,color:#0066CC,font-weight:bold
+    classDef fileStyle fill:#f5f5f5,stroke:#666,color:#333
+    classDef chainBox fill:none,stroke:#7B2D8E,stroke-dasharray:5 5,color:#7B2D8E,font-weight:bold
+    classDef p2pBox fill:none,stroke:#CC0000,stroke-dasharray:5 5,color:#CC0000,font-weight:bold
+
+    class Val1,Val2 validator
+    class N1,N2,N3,N4,N5,N6,N7,N8,N9,N10 node
+    class Alice activeUser
+    class Bob user
+    class File fileStyle
+    class SUMChain chainBox
+    class P2P p2pBox
+```
+
 Alice now needs the blockchain to officially recognize this file. She creates and signs a `TxPayload::AllocateStorage` transaction containing:
 
 - `merkle_root`: `34a749...` — the file's unique identity (32 bytes)
@@ -177,6 +299,54 @@ The validators execute the transaction:
 
 ### Step 3 — Alice pushes chunks to the P2P mesh
 
+```mermaid
+flowchart TB
+    subgraph SUMChain["SUMChain"]
+        direction LR
+        Val1([Val 1])
+        Val2([Val 2])
+    end
+
+    subgraph P2P["P2P Mesh"]
+        N1[N1]
+        N2[N2] & N3[N3] & N4[N4] & N5[N5]
+        N6[N6] & N7[N7] & N8[N8] & N9[N9] & N10[N10]
+    end
+
+    Alice[/Alice\]
+    Bob[/Bob\]
+    File[(file.pdf)]
+
+    Alice ==>|"Push C=10 chunks + DataManifest via /sum/storage/v1"| N1
+    N1 ==>|"gossipsub: ChunkAnnouncement x10"| N2
+    N1 ==>|"gossipsub: ChunkAnnouncement x10"| N3
+    N1 ==>|"gossipsub: ChunkAnnouncement x10"| N5
+    N1 ==>|"gossipsub: ChunkAnnouncement x10"| N8
+    N1 -.->|"announces to all nodes"| N4
+    N1 -.->|"announces to all nodes"| N6
+    N1 -.->|"announces to all nodes"| N7
+    N1 -.->|"announces to all nodes"| N9
+    N1 -.->|"announces to all nodes"| N10
+
+    classDef validator fill:#7B2D8E,stroke:#7B2D8E,color:#fff,font-weight:bold
+    classDef node fill:#fff,stroke:#CC0000,color:#CC0000,font-weight:bold
+    classDef activeNode fill:#CC0000,stroke:#CC0000,color:#fff,font-weight:bold
+    classDef activeUser fill:#0066CC,stroke:#0066CC,color:#fff,font-weight:bold
+    classDef user fill:#fff,stroke:#0066CC,color:#0066CC,font-weight:bold
+    classDef fileStyle fill:#f5f5f5,stroke:#666,color:#333
+    classDef chainBox fill:none,stroke:#7B2D8E,stroke-dasharray:5 5,color:#7B2D8E,font-weight:bold
+    classDef p2pBox fill:none,stroke:#CC0000,stroke-dasharray:5 5,color:#CC0000,font-weight:bold
+
+    class Val1,Val2 validator
+    class N1 activeNode
+    class N2,N3,N4,N5,N6,N7,N8,N9,N10 node
+    class Alice activeUser
+    class Bob user
+    class File fileStyle
+    class SUMChain chainBox
+    class P2P p2pBox
+```
+
 Alice connects to the P2P mesh and discovers nearby storage nodes via mDNS (multicast DNS — nodes broadcast "I'm here" on the local network). She finds N1.
 
 Alice pushes all `C` = 10 chunks to N1 using the `/sum/storage/v1` request-response protocol over QUIC (a fast, encrypted transport protocol). N1 receives each chunk, verifies its CID (hashes the received bytes with blake3 and checks the result matches), and writes it to its local disk as `<cid>.chunk`.
@@ -198,6 +368,47 @@ Alice can now disconnect. Her job is done — the file is on N1 and registered o
 ---
 
 ### Step 4 — Storage nodes determine their assignments and fetch chunks
+
+```mermaid
+flowchart TB
+    subgraph SUMChain["SUMChain"]
+        direction LR
+        Val1([Val 1])
+        Val2([Val 2])
+    end
+
+    subgraph P2P["P2P Mesh"]
+        N1[N1]
+        N2[N2] & N3[N3] & N4[N4] & N5[N5]
+        N6[N6] & N7[N7] & N8[N8] & N9[N9] & N10[N10]
+    end
+
+    Alice[/Alice\]
+    Bob[/Bob\]
+
+    N5 -.->|"1. RPC: getFundedFiles + getActiveNodes"| SUMChain
+    N2 -.->|"1. RPC: getFundedFiles + getActiveNodes"| SUMChain
+    N8 -.->|"1. RPC: getFundedFiles + getActiveNodes"| SUMChain
+
+    N5 -->|"2. Compute assignment locally"| N5
+    N5 ==>|"3. Fetch assigned chunks 1,5,7"| N1
+    N3 ==>|"3. Fetch assigned chunks 0,3,8"| N1
+    N7 ==>|"3. Fetch assigned chunks 0,5,9"| N1
+
+    classDef validator fill:#7B2D8E,stroke:#7B2D8E,color:#fff,font-weight:bold
+    classDef node fill:#fff,stroke:#CC0000,color:#CC0000,font-weight:bold
+    classDef activeNode fill:#CC0000,stroke:#CC0000,color:#fff,font-weight:bold
+    classDef user fill:#fff,stroke:#0066CC,color:#0066CC,font-weight:bold
+    classDef chainBox fill:none,stroke:#7B2D8E,stroke-dasharray:5 5,color:#7B2D8E,font-weight:bold
+    classDef p2pBox fill:none,stroke:#CC0000,stroke-dasharray:5 5,color:#CC0000,font-weight:bold
+
+    class Val1,Val2 validator
+    class N1 activeNode
+    class N2,N3,N4,N5,N6,N7,N8,N9,N10 node
+    class Alice,Bob user
+    class SUMChain chainBox
+    class P2P p2pBox
+```
 
 Each storage node runs a background task called the **MarketSyncWorker**. Every 30 seconds (configurable), it asks the blockchain two questions via RPC:
 
@@ -262,6 +473,46 @@ In this example, each node stores approximately 3 chunks (30 total assignments a
 
 ### Step 5 — Validators issue Proof of Retrievability (PoR) challenges
 
+```mermaid
+flowchart TB
+    subgraph SUMChain["SUMChain"]
+        Val1([Val 1])
+        Val2([Val 2])
+    end
+
+    subgraph P2P["P2P Mesh"]
+        N1[N1] & N2[N2] & N3[N3] & N4[N4] & N5[N5]
+        N6[N6] & N7[N7] & N8[N8] & N9[N9] & N10[N10]
+    end
+
+    Alice[/Alice\]
+    Bob[/Bob\]
+
+    Val1 -->|"1. seed = blake3(prev_block_hash)"| Val1
+    Val1 -->|"2. Pick random file: 34a749..."| Val1
+    Val1 -->|"3. Pick random chunk: 7"| Val1
+    Val1 -->|"4. Compute assignment for chunk 7"| Val1
+    Val1 ==>|"5. Write StorageChallenge targeting N5 for chunk 7"| SUMChain
+
+    SUMChain -.->|"Challenge: prove chunk 7 within 50 blocks or get slashed"| N5
+
+    classDef validator fill:#7B2D8E,stroke:#7B2D8E,color:#fff,font-weight:bold
+    classDef activeValidator fill:#5E1D70,stroke:#FFD700,color:#fff,font-weight:bold,stroke-width:3px
+    classDef node fill:#fff,stroke:#CC0000,color:#CC0000,font-weight:bold
+    classDef targetNode fill:#FF6600,stroke:#FF6600,color:#fff,font-weight:bold
+    classDef user fill:#fff,stroke:#0066CC,color:#0066CC,font-weight:bold
+    classDef chainBox fill:none,stroke:#7B2D8E,stroke-dasharray:5 5,color:#7B2D8E,font-weight:bold
+    classDef p2pBox fill:none,stroke:#CC0000,stroke-dasharray:5 5,color:#CC0000,font-weight:bold
+
+    class Val1 activeValidator
+    class Val2 validator
+    class N5 targetNode
+    class N1,N2,N3,N4,N6,N7,N8,N9,N10 node
+    class Alice,Bob user
+    class SUMChain chainBox
+    class P2P p2pBox
+```
+
 Every `CHALLENGE_INTERVAL_BLOCKS` = 100 blocks (roughly 100 seconds), the validators automatically generate a storage challenge. This is built into the block execution logic — no human triggers it. It is the mechanism by which the blockchain verifies that storage nodes are actually holding the data they were assigned.
 
 **How a challenge is generated (inside Val 1's block execution at block 5100):**
@@ -310,6 +561,47 @@ Note: The validators only challenge nodes that the assignment algorithm says sho
 
 ### Step 6 — N5 responds with a cryptographic proof
 
+```mermaid
+flowchart TB
+    subgraph SUMChain["SUMChain"]
+        direction LR
+        Val1([Val 1])
+        Val2([Val 2])
+    end
+
+    subgraph P2P["P2P Mesh"]
+        N1[N1] & N2[N2] & N3[N3] & N4[N4] & N5[N5]
+        N6[N6] & N7[N7] & N8[N8] & N9[N9] & N10[N10]
+    end
+
+    Alice[/Alice\]
+    Bob[/Bob\]
+    Disk[(N5 local disk)]
+
+    N5 -.->|"1. Poll: getActiveChallenges(my_address)"| SUMChain
+    SUMChain -.->|"Challenge: chunk 7 of 34a749..."| N5
+    Disk -->|"2. Read chunk 7 from disk"| N5
+    N5 -->|"3. blake3(chunk_7) -> chunk_hash"| N5
+    N5 -->|"4. generate_proof(7) -> merkle_path"| N5
+    N5 ==>|"5. SubmitStorageProof tx: chunk_hash + merkle_path"| SUMChain
+
+    classDef validator fill:#7B2D8E,stroke:#7B2D8E,color:#fff,font-weight:bold
+    classDef node fill:#fff,stroke:#CC0000,color:#CC0000,font-weight:bold
+    classDef activeNode fill:#CC0000,stroke:#CC0000,color:#fff,font-weight:bold
+    classDef user fill:#fff,stroke:#0066CC,color:#0066CC,font-weight:bold
+    classDef fileStyle fill:#f5f5f5,stroke:#666,color:#333
+    classDef chainBox fill:none,stroke:#7B2D8E,stroke-dasharray:5 5,color:#7B2D8E,font-weight:bold
+    classDef p2pBox fill:none,stroke:#CC0000,stroke-dasharray:5 5,color:#CC0000,font-weight:bold
+
+    class Val1,Val2 validator
+    class N5 activeNode
+    class N1,N2,N3,N4,N6,N7,N8,N9,N10 node
+    class Alice,Bob user
+    class Disk fileStyle
+    class SUMChain chainBox
+    class P2P p2pBox
+```
+
 N5's **PorWorker** (a background async task) polls the blockchain every few seconds: `storage_getActiveChallenges(my_address)`. It sees the challenge targeting it for chunk 7 of file `34a749...`.
 
 N5 must now prove it holds chunk 7 without sending the entire 1 MB chunk on-chain (that would be far too expensive — blockchains are for small data, not megabytes). Instead, it constructs a **Merkle proof**: a compact set of sibling hashes that lets the validator mathematically verify that chunk 7 belongs to this file.
@@ -354,6 +646,43 @@ N5 must now prove it holds chunk 7 without sending the entire 1 MB chunk on-chai
 ---
 
 ### Step 7 — Validators verify the proof and settle payment
+
+```mermaid
+flowchart TB
+    subgraph SUMChain["SUMChain"]
+        Val1([Val 1])
+        Val2([Val 2])
+    end
+
+    subgraph P2P["P2P Mesh"]
+        N1[N1] & N2[N2] & N3[N3] & N4[N4] & N5[N5]
+        N6[N6] & N7[N7] & N8[N8] & N9[N9] & N10[N10]
+    end
+
+    Alice[/Alice\]
+    Bob[/Bob\]
+
+    Val1 -->|"1. Verify Merkle proof: walk chunk_hash to root"| Val1
+    Val1 -->|"2. Reconstructed root == on-chain merkle_root?"| Val1
+    Val1 ==>|"3. YES: Transfer 10 Koppa from fee_pool to N5"| N5
+    Val1 -.->|"Delete challenge from state"| SUMChain
+
+    classDef validator fill:#7B2D8E,stroke:#7B2D8E,color:#fff,font-weight:bold
+    classDef activeValidator fill:#5E1D70,stroke:#FFD700,color:#fff,font-weight:bold,stroke-width:3px
+    classDef node fill:#fff,stroke:#CC0000,color:#CC0000,font-weight:bold
+    classDef rewardedNode fill:#009900,stroke:#009900,color:#fff,font-weight:bold
+    classDef user fill:#fff,stroke:#0066CC,color:#0066CC,font-weight:bold
+    classDef chainBox fill:none,stroke:#7B2D8E,stroke-dasharray:5 5,color:#7B2D8E,font-weight:bold
+    classDef p2pBox fill:none,stroke:#CC0000,stroke-dasharray:5 5,color:#CC0000,font-weight:bold
+
+    class Val1 activeValidator
+    class Val2 validator
+    class N5 rewardedNode
+    class N1,N2,N3,N4,N6,N7,N8,N9,N10 node
+    class Alice,Bob user
+    class SUMChain chainBox
+    class P2P p2pBox
+```
 
 Val 1 receives N5's proof transaction in the mempool and includes it in the next block. During block execution:
 
@@ -403,6 +732,48 @@ This cycle repeats continuously — every 100 blocks, a new random challenge tar
 ---
 
 ### Step 8 — Bob downloads file.pdf
+
+```mermaid
+flowchart TB
+    subgraph SUMChain["SUMChain"]
+        direction LR
+        Val1([Val 1])
+        Val2([Val 2])
+    end
+
+    subgraph P2P["P2P Mesh"]
+        N1[N1] & N2[N2] & N3[N3] & N4[N4] & N5[N5]
+        N6[N6] & N7[N7] & N8[N8] & N9[N9] & N10[N10]
+    end
+
+    Alice[/Alice\]
+    Bob[/Bob\]
+
+    Bob ==>|"8a. Request DataManifest for 34a749..."| N3
+    N3 -.->|"8b. ACL check: getAccessList(34a749...)"| SUMChain
+    SUMChain -.->|"access_list contains Bob? YES"| N3
+    N3 ==>|"Return manifest: C=10 chunks, all CIDs"| Bob
+    Bob ==>|"8c. ShardRequest chunk 0"| N3
+    Bob ==>|"8c. ShardRequest chunk 1"| N7
+    Bob ==>|"8c. ShardRequest chunk 5"| N1
+    Bob -->|"8d. Verify CIDs + reassemble file.pdf"| Bob
+
+    classDef validator fill:#7B2D8E,stroke:#7B2D8E,color:#fff,font-weight:bold
+    classDef node fill:#fff,stroke:#CC0000,color:#CC0000,font-weight:bold
+    classDef servingNode fill:#CC0000,stroke:#CC0000,color:#fff,font-weight:bold
+    classDef user fill:#fff,stroke:#0066CC,color:#0066CC,font-weight:bold
+    classDef activeUser fill:#0066CC,stroke:#0066CC,color:#fff,font-weight:bold
+    classDef chainBox fill:none,stroke:#7B2D8E,stroke-dasharray:5 5,color:#7B2D8E,font-weight:bold
+    classDef p2pBox fill:none,stroke:#CC0000,stroke-dasharray:5 5,color:#CC0000,font-weight:bold
+
+    class Val1,Val2 validator
+    class N1,N3,N7 servingNode
+    class N2,N4,N5,N6,N8,N9,N10 node
+    class Alice user
+    class Bob activeUser
+    class SUMChain chainBox
+    class P2P p2pBox
+```
 
 Bob knows the file's `merkle_root` (`34a749...`) — Alice shared it with him. The merkle_root is the file's permanent address on the SUM network. Bob wants to reconstruct the original file.pdf.
 
