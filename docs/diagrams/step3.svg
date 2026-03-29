@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 700" font-family="'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="ah-b" viewBox="0 0 10 6" refX="9" refY="3" markerWidth="8" markerHeight="6" orient="auto"><path d="M0,0 L10,3 L0,6Z" fill="#0066CC"/></marker>
+    <marker id="ah-r" viewBox="0 0 10 6" refX="9" refY="3" markerWidth="8" markerHeight="6" orient="auto"><path d="M0,0 L10,3 L0,6Z" fill="#CC0000"/></marker>
+  </defs>
+
+  <!-- SUMChain box -->
+  <rect x="30" y="15" width="420" height="175" rx="8" fill="none" stroke="#7B2D8E" stroke-width="2.5" stroke-dasharray="8,4"/>
+  <text x="240" y="48" text-anchor="middle" fill="#7B2D8E" font-weight="bold" font-size="22">SUMChain</text>
+  <ellipse cx="155" cy="115" rx="62" ry="28" fill="#7B2D8E"/>
+  <text x="155" y="121" text-anchor="middle" fill="#fff" font-size="15" font-weight="bold">Val 1</text>
+  <ellipse cx="335" cy="115" rx="62" ry="28" fill="#7B2D8E"/>
+  <text x="335" y="121" text-anchor="middle" fill="#fff" font-size="15" font-weight="bold">Val 2</text>
+
+  <!-- P2P Mesh box -->
+  <rect x="520" y="280" width="520" height="380" rx="8" fill="none" stroke="#CC0000" stroke-width="2.5" stroke-dasharray="8,4"/>
+  <text x="780" y="310" text-anchor="middle" fill="#CC0000" font-weight="bold" font-size="20">P2P Mesh</text>
+
+  <!-- N1 highlighted (receives chunks) -->
+  <rect x="560" y="335" width="58" height="38" rx="4" fill="#CC0000" stroke="#CC0000" stroke-width="2"/><text x="589" y="360" text-anchor="middle" fill="#fff" font-size="14" font-weight="bold">N1</text>
+  <!-- Other nodes -->
+  <rect x="660" y="335" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="689" y="360" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N2</text>
+  <rect x="760" y="335" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="789" y="360" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N3</text>
+  <rect x="560" y="415" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="589" y="440" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N4</text>
+  <rect x="660" y="415" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="689" y="440" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N5</text>
+  <rect x="760" y="415" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="789" y="440" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N6</text>
+  <rect x="860" y="415" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="889" y="440" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N7</text>
+  <rect x="560" y="495" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="589" y="520" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N8</text>
+  <rect x="660" y="495" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="689" y="520" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N9</text>
+  <rect x="760" y="495" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="789" y="520" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N10</text>
+
+  <!-- Alice (active) -->
+  <polygon points="120,515 82,572 158,572" fill="#0066CC" stroke="#0066CC" stroke-width="2"/>
+  <text x="120" y="558" text-anchor="middle" fill="#fff" font-size="14" font-weight="bold">Alice</text>
+
+  <!-- Bob -->
+  <polygon points="330,515 292,572 368,572" fill="#fff" stroke="#0066CC" stroke-width="2"/>
+  <text x="330" y="558" text-anchor="middle" fill="#0066CC" font-size="14" font-weight="bold">Bob</text>
+
+  <!-- file.pdf -->
+  <rect x="175" y="590" width="42" height="52" rx="2" fill="#f5f5f5" stroke="#666" stroke-width="1.5"/>
+  <path d="M183,603 Q196,600 209,603 M183,611 Q196,608 209,611 M183,619 Q196,616 209,619 M183,627 Q196,624 205,627" fill="none" stroke="#999" stroke-width="1"/>
+  <text x="196" y="656" text-anchor="middle" fill="#555" font-size="11">file.pdf</text>
+
+  <!-- STEP 3 ARROWS -->
+  <!-- Alice -> N1: push chunks -->
+  <path d="M158,535 C350,450 470,380 560,354" fill="none" stroke="#0066CC" stroke-width="2.5" marker-end="url(#ah-b)"/>
+  <rect x="270" y="430" width="210" height="22" rx="3" fill="#fff" fill-opacity="0.9"/>
+  <text x="375" y="446" text-anchor="middle" fill="#0066CC" font-size="12" font-weight="bold">Push C=10 chunks + manifest</text>
+
+  <!-- N1 -> other nodes: gossipsub -->
+  <line x1="618" y1="354" x2="660" y2="354" stroke="#CC0000" stroke-width="1.5" marker-end="url(#ah-r)"/>
+  <line x1="618" y1="354" x2="760" y2="354" stroke="#CC0000" stroke-width="1.5" marker-end="url(#ah-r)"/>
+  <line x1="589" y1="373" x2="589" y2="415" stroke="#CC0000" stroke-width="1.5" marker-end="url(#ah-r)" stroke-dasharray="4,3"/>
+  <line x1="589" y1="373" x2="660" y2="415" stroke="#CC0000" stroke-width="1.5" marker-end="url(#ah-r)" stroke-dasharray="4,3"/>
+  <line x1="589" y1="373" x2="760" y2="430" stroke="#CC0000" stroke-width="1.5" marker-end="url(#ah-r)" stroke-dasharray="4,3"/>
+  <line x1="589" y1="373" x2="860" y2="430" stroke="#CC0000" stroke-width="1.5" marker-end="url(#ah-r)" stroke-dasharray="4,3"/>
+  <line x1="589" y1="373" x2="589" y2="495" stroke="#CC0000" stroke-width="1.5" marker-end="url(#ah-r)" stroke-dasharray="4,3"/>
+  <line x1="589" y1="373" x2="660" y2="495" stroke="#CC0000" stroke-width="1.5" marker-end="url(#ah-r)" stroke-dasharray="4,3"/>
+  <line x1="589" y1="373" x2="760" y2="495" stroke="#CC0000" stroke-width="1.5" marker-end="url(#ah-r)" stroke-dasharray="4,3"/>
+
+  <!-- Gossipsub label -->
+  <rect x="625" y="468" width="185" height="20" rx="3" fill="#fff" fill-opacity="0.9"/>
+  <text x="717" y="483" text-anchor="middle" fill="#CC0000" font-size="11" font-weight="bold">gossipsub: ChunkAnnouncement x10</text>
+
+  <!-- Step label -->
+  <text x="30" y="695" fill="#333" font-size="13" font-style="italic">Step 3: Alice pushes chunks to N1. N1 announces all chunks to the mesh via gossipsub. Alice can disconnect.</text>
+</svg>

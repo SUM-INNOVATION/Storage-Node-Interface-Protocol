@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 700" font-family="'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="ah-p" viewBox="0 0 10 6" refX="9" refY="3" markerWidth="8" markerHeight="6" orient="auto"><path d="M0,0 L10,3 L0,6Z" fill="#7B2D8E"/></marker>
+    <marker id="ah-o" viewBox="0 0 10 6" refX="9" refY="3" markerWidth="8" markerHeight="6" orient="auto"><path d="M0,0 L10,3 L0,6Z" fill="#FF6600"/></marker>
+  </defs>
+
+  <!-- SUMChain box -->
+  <rect x="30" y="15" width="420" height="175" rx="8" fill="none" stroke="#7B2D8E" stroke-width="2.5" stroke-dasharray="8,4"/>
+  <text x="240" y="48" text-anchor="middle" fill="#7B2D8E" font-weight="bold" font-size="22">SUMChain</text>
+  <!-- Val 1 highlighted (generating challenge) -->
+  <ellipse cx="155" cy="115" rx="62" ry="28" fill="#5E1D70" stroke="#FFD700" stroke-width="3"/>
+  <text x="155" y="121" text-anchor="middle" fill="#fff" font-size="15" font-weight="bold">Val 1</text>
+  <ellipse cx="335" cy="115" rx="62" ry="28" fill="#7B2D8E"/>
+  <text x="335" y="121" text-anchor="middle" fill="#fff" font-size="15" font-weight="bold">Val 2</text>
+
+  <!-- P2P Mesh box -->
+  <rect x="520" y="280" width="520" height="380" rx="8" fill="none" stroke="#CC0000" stroke-width="2.5" stroke-dasharray="8,4"/>
+  <text x="780" y="310" text-anchor="middle" fill="#CC0000" font-weight="bold" font-size="20">P2P Mesh</text>
+
+  <!-- Nodes -->
+  <rect x="560" y="335" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="589" y="360" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N1</text>
+  <rect x="660" y="335" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="689" y="360" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N2</text>
+  <rect x="760" y="335" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="789" y="360" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N3</text>
+  <rect x="560" y="415" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="589" y="440" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N4</text>
+  <!-- N5 targeted (orange) -->
+  <rect x="660" y="415" width="58" height="38" rx="4" fill="#FF6600" stroke="#FF6600" stroke-width="2"/><text x="689" y="440" text-anchor="middle" fill="#fff" font-size="14" font-weight="bold">N5</text>
+  <rect x="760" y="415" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="789" y="440" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N6</text>
+  <rect x="860" y="415" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="889" y="440" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N7</text>
+  <rect x="560" y="495" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="589" y="520" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N8</text>
+  <rect x="660" y="495" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="689" y="520" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N9</text>
+  <rect x="760" y="495" width="58" height="38" rx="4" fill="#fff" stroke="#CC0000" stroke-width="2"/><text x="789" y="520" text-anchor="middle" fill="#CC0000" font-size="14" font-weight="bold">N10</text>
+
+  <!-- Alice -->
+  <polygon points="120,515 82,572 158,572" fill="#fff" stroke="#0066CC" stroke-width="2"/>
+  <text x="120" y="558" text-anchor="middle" fill="#0066CC" font-size="14" font-weight="bold">Alice</text>
+
+  <!-- Bob -->
+  <polygon points="330,515 292,572 368,572" fill="#fff" stroke="#0066CC" stroke-width="2"/>
+  <text x="330" y="558" text-anchor="middle" fill="#0066CC" font-size="14" font-weight="bold">Bob</text>
+
+  <!-- file.pdf -->
+  <rect x="175" y="590" width="42" height="52" rx="2" fill="#f5f5f5" stroke="#666" stroke-width="1.5"/>
+  <path d="M183,603 Q196,600 209,603 M183,611 Q196,608 209,611 M183,619 Q196,616 209,619 M183,627 Q196,624 205,627" fill="none" stroke="#999" stroke-width="1"/>
+  <text x="196" y="656" text-anchor="middle" fill="#555" font-size="11">file.pdf</text>
+
+  <!-- STEP 5 ARROWS -->
+  <!-- Val1 self-loop (compute) -->
+  <path d="M95,105 C60,60 100,50 130,88" fill="none" stroke="#7B2D8E" stroke-width="2" marker-end="url(#ah-p)"/>
+
+  <!-- Val1 computation steps -->
+  <rect x="30" y="220" width="230" height="90" rx="5" fill="#f0e6f6" stroke="#7B2D8E" stroke-width="1"/>
+  <text x="145" y="240" text-anchor="middle" fill="#7B2D8E" font-size="12" font-weight="bold">Challenge Generation:</text>
+  <text x="145" y="258" text-anchor="middle" fill="#333" font-size="11">1. seed = blake3(prev_block_hash)</text>
+  <text x="145" y="274" text-anchor="middle" fill="#333" font-size="11">2. Pick file: 34a749...</text>
+  <text x="145" y="290" text-anchor="middle" fill="#333" font-size="11">3. Pick chunk 7, target: N5</text>
+
+  <!-- Challenge arrow: SUMChain -> N5 -->
+  <path d="M450,150 C530,200 600,300 680,415" fill="none" stroke="#FF6600" stroke-width="2.5" marker-end="url(#ah-o)"/>
+
+  <!-- Challenge label -->
+  <rect x="470" y="250" width="200" height="38" rx="4" fill="#fff3e6" stroke="#FF6600" stroke-width="1"/>
+  <text x="570" y="266" text-anchor="middle" fill="#FF6600" font-size="11" font-weight="bold">StorageChallenge:</text>
+  <text x="570" y="280" text-anchor="middle" fill="#FF6600" font-size="11">Prove chunk 7 within 50 blocks</text>
+
+  <!-- Step label -->
+  <text x="30" y="695" fill="#333" font-size="13" font-style="italic">Step 5: Val 1 generates a PoR challenge. N5 is randomly selected and must prove it holds chunk 7.</text>
+</svg>
