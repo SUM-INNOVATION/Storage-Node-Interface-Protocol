@@ -47,11 +47,12 @@
   <!-- Self-loop on Alice for local processing -->
   <path d="M158,540 C200,510 200,570 158,555" fill="none" stroke="#0066CC" stroke-width="2" marker-end="url(#ah-b)"/>
 
-  <!-- Processing labels -->
-  <text x="215" y="520" fill="#0066CC" font-size="12" font-weight="bold">1. mmap + chunk (C=10)</text>
-  <text x="215" y="538" fill="#0066CC" font-size="12" font-weight="bold">2. blake3 hash each chunk</text>
-  <text x="215" y="556" fill="#0066CC" font-size="12" font-weight="bold">3. build Merkle tree</text>
-  <text x="215" y="574" fill="#0066CC" font-size="12" font-weight="bold">4. generate merkle_root</text>
+  <!-- Processing labels (with white background, above self-loop arrow) -->
+  <rect x="135" y="395" width="215" height="80" rx="5" fill="#fff" fill-opacity="0.92" stroke="#0066CC" stroke-width="1"/>
+  <text x="145" y="413" fill="#0066CC" font-size="12" font-weight="bold">1. mmap + chunk (C=10)</text>
+  <text x="145" y="431" fill="#0066CC" font-size="12" font-weight="bold">2. blake3 hash each chunk</text>
+  <text x="145" y="449" fill="#0066CC" font-size="12" font-weight="bold">3. build Merkle tree</text>
+  <text x="145" y="467" fill="#0066CC" font-size="12" font-weight="bold">4. generate merkle_root</text>
 
   <!-- Step label -->
   <text x="30" y="695" fill="#333" font-size="13" font-style="italic">Step 1: Alice ingests file.pdf locally. No network activity — chunking, hashing, and Merkle tree are all computed on her machine.</text>

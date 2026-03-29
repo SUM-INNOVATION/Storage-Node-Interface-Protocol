@@ -2,14 +2,64 @@
 
 ## Overview
 
-Phase 4 has three objectives:
-1. **Reed-Solomon Erasure Coding** — replace 3x full replication with coded redundancy (3x -> ~1.5x overhead)
-2. **WAN Discovery** — Kademlia DHT + NAT traversal so nodes work beyond LAN
-3. **Production Hardening** — metrics, graceful shutdown, logging, full E2E test against live validators
+Phase 4 has four objectives:
+1. **Resilient Upload — Multi-Node Push + Confirmation** — eliminate the single-point-of-failure window between upload and replication
+2. **Reed-Solomon Erasure Coding** — replace 3x full replication with coded redundancy (3x -> ~1.5x overhead)
+3. **WAN Discovery** — Kademlia DHT + NAT traversal so nodes work beyond LAN
+4. **Production Hardening** — metrics, graceful shutdown, logging, full E2E test against live validators
 
 ---
 
-## Objective 1: Reed-Solomon Erasure Coding
+## Objective 1: Resilient Upload — Multi-Node Push + Confirmation
+
+**The problem:** Between Step 3 (Alice pushes chunks to N1) and Step 4 (other nodes fetch from N1), N1 is the sole holder of the file. If N1 discards or corrupts the data during this window, the file is permanently lost. No amount of PoR challenges or slashing can recover data that never existed on a second node.
+
+**The solution:** Alice pushes to R=3 nodes directly (not just N1), and retains her local copy until she has confirmed all 3 nodes hold the data via gossipsub ChunkAnnouncements.
+
+**Current flow (vulnerable):**
+```
+Alice -> N1 (single copy)
+   ⚠️ WINDOW: N1 is sole holder, file can be lost
+N1 announces via gossipsub
+Other nodes eventually fetch from N1
+```
+
+**Proposed flow (resilient):**
+```
+Alice computes assignment: chunks 0-9 assigned to [N1,N3,N7], [N5,N2,N9], etc.
+Alice pushes each chunk directly to its R=3 assigned nodes in parallel
+Alice waits for R ChunkAnnouncements per chunk (confirmation)
+Alice disconnects only after all C*R confirmations received (or timeout)
+```
+
+**Files to create/modify:**
+
+| File | Action | What |
+|------|--------|------|
+| `sum-node/src/upload.rs` | **New** | `UploadOrchestrator` — takes a DataManifest, computes the assignment (requires L1 RPC to get active nodes), pushes each chunk to its R assigned nodes in parallel. Tracks confirmations via gossipsub. Returns `UploadResult { confirmed: u32, total: u32, timeout: bool }` |
+| `sum-store/src/lib.rs` | **Modify** | `SumStore::ingest_file()` returns the assignment alongside the manifest, so the upload orchestrator knows where to push |
+| `sum-node/src/main.rs` | **Modify** | The `ingest` subcommand uses `UploadOrchestrator` instead of pushing to the first discovered peer. New `--upload-timeout` flag (default 120s). Exits with error if fewer than R confirmations received per chunk |
+| `sum-net/src/lib.rs` | **Modify** | Add `push_chunk(peer_id, cid, data)` method — inverse of `request_shard_chunk`. Sends chunk data to a specific peer proactively |
+
+**Design details:**
+- Alice must call `storage_getActiveNodes()` via RPC to compute the assignment before uploading. This means Alice needs `--rpc-url` to know which nodes are assigned.
+- If an assigned node is unreachable, Alice falls back to pushing to the next node in the sorted list (same linear probing as the assignment algorithm).
+- Confirmation is via gossipsub: Alice subscribes to `sum/storage/v1` and waits for `ChunkAnnouncement` messages matching her merkle_root from the expected PeerIds.
+- Timeout behavior: if after `--upload-timeout` seconds fewer than R confirmations are received for any chunk, Alice logs a warning with the specific chunks/nodes that didn't confirm. She does NOT disconnect silently — the user sees exactly what failed.
+
+**Tests (target: 8+ new tests):**
+- Upload to 3 nodes in parallel, all confirm -> success
+- Upload with 1 unreachable node -> falls back to next node, still R confirmations
+- Upload timeout with 0 confirmations -> returns error with details
+- Upload with 2 of 3 confirmations + timeout -> returns partial success warning
+- Confirmation matching: announcements from wrong PeerId or wrong merkle_root are ignored
+- Assignment computation matches what nodes would independently compute
+- Push + announce round-trip: Alice pushes chunk, node announces it, Alice sees the announcement
+- Integration: full ingest with 3 nodes, verify all 3 hold the chunks on disk
+
+---
+
+## Objective 2: Reed-Solomon Erasure Coding
 
 **What changes:** Instead of storing 3 identical copies of each chunk, we encode each chunk into `k` data shards + `m` parity shards using Reed-Solomon. Any `k` of the `k+m` shards can reconstruct the original chunk.
 
@@ -49,7 +99,7 @@ Phase 4 has three objectives:
 
 ---
 
-## Objective 2: WAN Discovery (Kademlia DHT + NAT Traversal)
+## Objective 3: WAN Discovery (Kademlia DHT + NAT Traversal)
 
 **What changes:** Currently nodes only find each other via mDNS (same LAN). We add Kademlia DHT for internet-wide peer discovery, AutoNAT for detecting NAT type, and DCUtR (Direct Connection Upgrade through Relay) for hole-punching behind NATs.
 
@@ -82,7 +132,7 @@ Phase 4 has three objectives:
 
 ---
 
-## Objective 3: Production Hardening
+## Objective 4: Production Hardening
 
 **Files to create/modify:**
 
@@ -106,32 +156,39 @@ Phase 4 has three objectives:
 ## Execution Order
 
 ```
-Step 1: Objective 1 (Reed-Solomon)
-  |-- 1a. sum-types: Add erasure constants + ShardDescriptor
-  |-- 1b. sum-store/erasure.rs: RS encoder/decoder
-  |-- 1c. sum-store/chunker.rs: Integrate RS into chunking pipeline
-  |-- 1d. sum-store/assignment.rs: Shard-level assignment
-  |-- 1e. sum-node/por_worker.rs + market_sync.rs: Shard-aware
-  |-- 1f. L1 changes (sum-chain): Shard-aware challenges + verification
-  +-- 1g. Tests: 15+ unit tests for erasure + assignment + PoR
+Step 1: Objective 1 (Resilient Upload) — HIGHEST PRIORITY
+  |-- 1a. sum-net: push_chunk() method (proactive send)
+  |-- 1b. sum-node/upload.rs: UploadOrchestrator
+  |-- 1c. sum-store: ingest returns assignment alongside manifest
+  |-- 1d. sum-node/main.rs: ingest uses UploadOrchestrator
+  +-- 1e. Tests: 8+ unit tests + multi-node integration test
 
-Step 2: Objective 2 (WAN Discovery)
-  |-- 2a. sum-net/transport.rs: TCP/Noise fallback
-  |-- 2b. sum-net/nat.rs: AutoNAT + DCUtR
-  |-- 2c. sum-net/capability.rs: Gossipsub capability ads
-  |-- 2d. sum-net/behaviour.rs + swarm.rs: Wire in Kademlia + NAT
-  |-- 2e. sum-net/discovery.rs: Kademlia event handling
-  |-- 2f. sum-node/main.rs: CLI flags + bootstrap
-  +-- 2g. Tests: 10+ unit tests + WAN integration script
+Step 2: Objective 2 (Reed-Solomon)
+  |-- 2a. sum-types: Add erasure constants + ShardDescriptor
+  |-- 2b. sum-store/erasure.rs: RS encoder/decoder
+  |-- 2c. sum-store/chunker.rs: Integrate RS into chunking pipeline
+  |-- 2d. sum-store/assignment.rs: Shard-level assignment
+  |-- 2e. sum-node/por_worker.rs + market_sync.rs: Shard-aware
+  |-- 2f. L1 changes (sum-chain): Shard-aware challenges + verification
+  +-- 2g. Tests: 15+ unit tests for erasure + assignment + PoR
 
-Step 3: Objective 3 (Production Hardening)
-  |-- 3a. sum-node/metrics.rs: Prometheus metrics
-  |-- 3b. Graceful shutdown + health checks
-  |-- 3c. E2E L1 integration test against live validators
-  +-- 3d. Tests: 8+ unit tests + integration scripts
+Step 3: Objective 3 (WAN Discovery)
+  |-- 3a. sum-net/transport.rs: TCP/Noise fallback
+  |-- 3b. sum-net/nat.rs: AutoNAT + DCUtR
+  |-- 3c. sum-net/capability.rs: Gossipsub capability ads
+  |-- 3d. sum-net/behaviour.rs + swarm.rs: Wire in Kademlia + NAT
+  |-- 3e. sum-net/discovery.rs: Kademlia event handling
+  |-- 3f. sum-node/main.rs: CLI flags + bootstrap
+  +-- 3g. Tests: 10+ unit tests + WAN integration script
+
+Step 4: Objective 4 (Production Hardening)
+  |-- 4a. sum-node/metrics.rs: Prometheus metrics
+  |-- 4b. Graceful shutdown + health checks
+  |-- 4c. E2E L1 integration test against live validators
+  +-- 4d. Tests: 8+ unit tests + integration scripts
 ```
 
 ---
 
-## Total New Tests: ~33+
-## Total Expected Tests After Phase 4: ~110+
+## Total New Tests: ~41+
+## Total Expected Tests After Phase 4: ~118+
