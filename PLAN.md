@@ -39,7 +39,7 @@ Goal: Define the native state and build the client-side file chunker.
     3. Transaction Payloads: Define TxPayload::AllocateStorage and TxPayload::RegisterStorageNode.
     4. L1 Identity Bridge: Derive libp2p PeerId from the same Ed25519 seed used for the L1 wallet, ensuring network identity matches on-chain identity.
 
-Phase 2: L1 RPC Bridge, ACL Enforcement & PoR Responder (Weeks 4-8) [CURRENT]
+Phase 2: L1 RPC Bridge, ACL Enforcement & PoR Responder (Weeks 4-8) [COMPLETED]
 Goal: Connect the storage node to the L1 blockchain, enforce access control, and automate proof-of-retrievability responses so nodes earn Koppa. This phase merges the original Phases 2 and 4 because the RPC client and PoR responder are tightly coupled -- you can't test the RPC client without something consuming it, and the PoR responder is its primary consumer.
     1. RPC Client: Build a JSON-RPC client (reqwest) connecting to a local/remote SUM Chain L1 node. Bind endpoints: storage_getFundedFiles, storage_getActiveChallenges, storage_getAccessList, storage_getNodeRecord, send_raw_transaction, get_nonce, chain_id.
     2. Manifest Index: Build a persistent merkle_root -> DataManifest index so the node can locate chunks when challenged by the L1.
@@ -58,60 +58,129 @@ Goal: Nodes can deterministically route and distribute file chunks across the ne
     6. MarketSyncWorker: Background task polling L1 for funded files, computing assignments, fetching missing manifests and chunks from peers. Runs alongside PorWorker.
     7. CLI: --market-sync-secs flag (default 30s, env SUM_MARKET_SYNC_INTERVAL).
 
-Phase 4: The "Scale-Out" Upgrade (Future)
-Goal: Transition from pure replication to Erasure Coding.
-    1. Reed-Solomon Integration: Replace the pure 3x chunk replication with a Reed-Solomon encoding library.
-    2. Protocol Upgrade: Update the Merkle Builder to hash shards (data + parity) instead of raw chunks. The rest of the on-chain metadata, ACL, and PoR systems remain completely unchanged, but the network storage overhead drops by 60-80%.
+Phase 4: Scale-Out & Production Readiness [IN PROGRESS — see docs/PHASE4-EXECUTION-PLAN.md]
+Goal: Close remaining gaps, improve storage efficiency, enable WAN connectivity, and harden for production.
+    1. Resilient Upload: Push protocol (push_data on ShardRequest) + UploadOrchestrator that pushes to R=3 assigned nodes with ACK confirmation. [CODE COMPLETE — not yet wired into ingest CLI]
+    2. File Download Command: sum-node download <merkle_root> --output <path> — manifest fetch, parallel chunk download (max 10 concurrent), CID verification, merkle root verification, file reassembly. [DONE]
+    3. Garbage Collection: GarbageCollector with mark-and-sweep, configurable grace period (--gc-grace-secs, default 1 hour), L1-reachability safety guard (pauses if last poll > 5 min). Integrated into MarketSyncWorker. Entry nodes (the R=3 nodes Alice initially pushes to) are NOT treated specially — if the assignment recomputes and an entry node is no longer assigned to a chunk, GC deletes it after the grace period. This is safe because the MarketSync cycle (30s) fetches data to new assignees well before the GC grace period (1 hour) expires. No chunk provenance metadata is stored. [DONE]
+    4. Reed-Solomon Erasure Coding: Replace pure 3x chunk replication with coded redundancy (k=4 data + m=2 parity shards). Storage overhead drops from 3x to 1.5x. Requires L1 changes to challenge on shard indices. [NOT STARTED]
+    5. WAN Discovery: Kademlia DHT + AutoNAT + DCUtR for internet-wide peer discovery and NAT traversal. Currently only mDNS (LAN-only). [NOT STARTED]
+    6. Production Hardening: Prometheus metrics, graceful shutdown, health checks, full E2E integration test against live validators. [NOT STARTED]
+
+Phase 5: Client-Side Encryption for Private Files [NOT STARTED — see docs/SECURITY-ANALYSIS.md]
+Goal: Make data confidentiality independent of node honesty. Nodes store ciphertext, never plaintext.
+    The current ACL (access_list on StorageMetadata) is enforced off-chain by node code. A malicious node
+    operator can bypass the check and read/serve plaintext data. Client-side encryption (XChaCha20-Poly1305)
+    before chunking eliminates this — nodes hold ciphertext that is useless without the decryption key.
+    The ACL becomes a bandwidth optimization, not the security boundary.
+    See docs/SECURITY-ANALYSIS.md for full analysis of three approaches (deterministic+ACL, opt-in, encryption)
+    and justification for why encryption is the correct layer.
+
+What Can Be Tested Right Now
+    1. cargo test --workspace — 90 unit tests, no setup needed
+    2. bash tests/integration/test_p2p.sh — automated 2-node chunk transfer on localhost
+    3. Two-terminal ingest + download — ingest on Terminal A, download <merkle_root> --output on Terminal B, diff to verify byte-identical output
+    4. LAN test — same as above across two computers on the same WiFi (mDNS discovers peers automatically)
+    5. VPN/Tailscale LAN test — mDNS may work over Tailscale mesh networks, enabling testing across different physical networks without WAN support
+
+What Cannot Be Tested Without a Running L1
+    1. PoR challenge/response loop (Steps 5-7) — needs validators generating challenges every 100 blocks
+    2. Market sync auto-fetch of assigned chunks (Step 4) — needs storage_getFundedFiles + storage_getActiveNodes RPC
+    3. ACL enforcement on private files (Step 8b) — needs storage_getAccessList RPC
+    4. GC in production conditions — needs assignment from live on-chain state
+    5. Upload orchestrator with real R=3 assignment — needs storage_getActiveNodes from L1
+
+What Cannot Be Tested Without WAN Support (Phase 4, Objective 5)
+    - Two computers on different networks (different WiFi, different cities, over the internet)
+    - The only peer discovery mechanism is mDNS, which broadcasts on the local network only
+    - WAN requires Kademlia DHT bootstrap nodes — not implemented
+    - Workaround: Tailscale or similar VPN creates a virtual LAN where mDNS works across physical networks
+
+Known Gaps (Current State)
+The following items are described in the README but are not yet fully implemented:
+    1. No separate client role: The README describes Alice as a non-node user (external client) uploading a file. In practice, Alice must run sum-node ingest which starts a full libp2p swarm (gossipsub, mDNS, chunk serving). A true lightweight client binary that only connects, pushes chunks to R=3 nodes, waits for confirmation, and exits — without running background workers or serving chunks — does not yet exist. This is a critical goal: external users (non-node operators) must be able to store and retrieve files without running storage infrastructure. See Phase 4 Objective 7.
+    2. Single-node upload: The ingest command still pushes chunks to 1 discovered peer only. The UploadOrchestrator (which pushes to R=3) is built but not yet integrated into run_ingest().
+    3. Steps 4-7 untested against live L1: The PoR loop (market sync, challenge polling, proof generation, settlement) is implemented but has never been tested end-to-end against running sum-chain validators.
+
+    Phase 4 Objective 7 — Lightweight Client Mode [NOT STARTED]:
+    Build a separate binary or --client flag for sum-node that enables Alice and Bob to interact with the network without being storage nodes:
+        - Upload mode: chunk file locally, compute assignment from L1, push to R=3 nodes, wait for R confirmations, exit. No gossipsub subscriptions, no PorWorker, no MarketSync, no chunk serving.
+        - Download mode: request manifest, fetch chunks from assigned nodes, verify CIDs, reassemble file, exit. (The download command already supports this flow but still starts a full swarm.)
+        - No stake required. No ArchiveNode registration. Just a wallet with Koppa for AllocateStorage fees.
+        - This is the architecture described in the README: Alice and Bob are external users, not infrastructure operators.
 
 sum-storage-node/
 |
 +-- Cargo.toml                          # Workspace manifest
 +-- rust-toolchain.toml                 # Rust 2024 edition, MSRV 1.85+
-+-- README.md                           # Protocol spec for SUM Chain native storage
++-- README.md                           # Full protocol walkthrough with diagrams
++-- PLAN.md                             # This file
++-- docs/
+    +-- PHASE4-EXECUTION-PLAN.md        # Detailed Phase 4 test specs & objectives
+    +-- PHASE4-IMPLEMENTATION-PLAN.md   # Phase 4 implementation plan (approved)
+    +-- diagrams/                       # SVG diagrams for README (step0-step8)
 |
 +-- crates/
     +-- sum-types/                      # Crate 1: Core Definitions
     |   +-- src/
     |       +-- lib.rs
-    |       +-- storage.rs              # ChunkDescriptor, DataManifest, CHUNK_SIZE
-    |       +-- rpc_types.rs            # NEW (Phase 2): RPC response types
-    |       +-- config.rs              # NetConfig, StoreConfig, RpcConfig
+    |       +-- storage.rs              # ChunkDescriptor, DataManifest, CHUNK_SIZE, REPLICATION_FACTOR
+    |       +-- rpc_types.rs            # RPC response types (StorageFileInfo, ChallengeInfo, NodeRecordInfo)
+    |       +-- config.rs               # NetConfig, StoreConfig, RpcConfig
     |       +-- node.rs                 # NodeCapability types
     |       +-- error.rs                # SumError
     |
     +-- sum-net/                        # Crate 2: The P2P Mesh (libp2p)
     |   +-- src/
     |       +-- lib.rs                  # SumNet API handle
-    |       +-- behaviour.rs            # mDNS, Gossipsub, Request-Response
-    |       +-- identity.rs             # Ed25519 SUM Chain Wallet Integration + Base58
+    |       +-- behaviour.rs            # mDNS, Gossipsub, Identify, Request-Response
+    |       +-- identity.rs             # Ed25519 SUM Chain Wallet Integration + Base58 + L1 Address
     |       +-- codec.rs                # Custom /sum/storage/v1 transfer protocol
-    |       +-- gossip.rs               # Chunk availability announcements
+    |       +-- gossip.rs               # Chunk availability announcements (sum/storage/v1 topic)
     |       +-- swarm.rs                # Swarm event loop + PeerIdentified events
     |       +-- events.rs               # SumNetEvent enum
     |       +-- discovery.rs            # mDNS peer discovery
+    |       +-- capability.rs           # [DEFERRED] WAN capability advertisement
+    |       +-- nat.rs                  # [DEFERRED] AutoNAT / DCUtR / Relay
+    |       +-- transport.rs            # [DEFERRED] TCP/Noise fallback transport
     |
     +-- sum-store/                      # Crate 3: File I/O & Merkle Math
     |   +-- src/
-    |       +-- lib.rs
-    |       +-- chunker.rs              # Generic binary file slicer
+    |       +-- lib.rs                  # SumStore top-level API (ingest_file, announce_chunks)
+    |       +-- chunker.rs              # Generic BinaryChunker (any file -> 1 MB chunks)
     |       +-- merkle.rs               # BLAKE3 Merkle DAG builder & proof generator
-    |       +-- manifest_index.rs       # NEW (Phase 2): merkle_root -> manifest lookup
-    |       +-- store.rs                # On-disk content-addressed chunk store
+    |       +-- assignment.rs           # Deterministic chunk-to-node assignment (3x replication)
+    |       +-- manifest_index.rs       # Persistent merkle_root -> DataManifest lookup
+    |       +-- store.rs                # On-disk content-addressed chunk store (<cid>.chunk)
     |       +-- fetch.rs                # Windowed chunk download orchestration
-    |       +-- serve.rs                # Inbound chunk request handler
+    |       +-- serve.rs                # Inbound chunk, manifest, and push request handler
     |       +-- verify.rs               # BLAKE3, CID, and Merkle proof verification
-    |       +-- manifest.rs             # CBOR manifest serialization
-    |       +-- content_id.rs           # BLAKE3 -> CIDv1
+    |       +-- manifest.rs             # CBOR manifest serialization + deserialization
+    |       +-- content_id.rs           # BLAKE3 -> CIDv1 conversion
     |       +-- mmap.rs                 # Zero-copy memory-mapped file I/O
     |       +-- announce.rs             # ChunkAnnouncement gossipsub messages
+    |       +-- gc.rs                   # Garbage collection of unassigned chunks (mark-and-sweep)
     |
     +-- sum-node/                       # Crate 4: CLI Entry Point
         +-- src/
-            +-- main.rs                 # CLI: listen, ingest, fetch, send
-            +-- rpc_client.rs           # NEW (Phase 2): JSON-RPC client to L1
-            +-- tx_builder.rs           # NEW (Phase 2): Transaction construction + signing
-            +-- por_worker.rs           # NEW (Phase 2): Background PoR challenge responder
-            +-- acl.rs                  # NEW (Phase 2): ACL check before serving chunks
+            +-- main.rs                 # CLI: listen, ingest, fetch, download, send
+            +-- lib.rs                  # Library exports for e2e_helper
+            +-- rpc_client.rs           # JSON-RPC client to L1
+            +-- tx_builder.rs           # Transaction construction + signing (bincode v1 mirror types)
+            +-- por_worker.rs           # Background PoR challenge responder
+            +-- market_sync.rs          # Background market sync + auto-fetch + GC integration
+            +-- acl.rs                  # ACL check before serving chunks
+            +-- download.rs             # DownloadOrchestrator — full file retrieval by merkle_root
+            +-- upload.rs               # UploadOrchestrator — multi-node push with confirmation
+            +-- bin/e2e_helper.rs       # E2E test helper CLI
+
+Tests: 90 unit tests + P2P integration test passing
+    - sum-types: 8 tests (storage types, RPC types, config)
+    - sum-net: 14 tests (codec, identity, base58, L1 address, push round-trip)
+    - sum-store: 63 tests (chunker, merkle, verify, content_id, store, manifest, manifest_index, assignment, announce, mmap, gc)
+    - sum-node: 4 tests (tx_builder)
+    - Integration: test_p2p.sh (2-node chunk transfer on localhost)
+    - Integration: test_e2e_l1.sh (full PoR loop, requires live validators)
 
 What We Deleted (The "Anti-Features")
 To make this pure storage, we dropped several heavy components from the OmniNode repo:
@@ -122,6 +191,11 @@ To make this pure storage, we dropped several heavy components from the OmniNode
 The Core Engineering Focuses for Team B
     1. The merkle.rs Engine (in sum-store): Builds the Merkle DAG constructor. Takes raw files, chunks them, hashes leaves with BLAKE3, outputs the MerkleRoot (sent to L1) and individual chunk proofs (for PoR audits). [DONE]
     2. The identity.rs Bridge (in sum-net): Custom identity provider taking a SUM Chain Ed25519 private key seed and deriving the PeerId. Every storage node's network identity is tied to its on-chain financial identity. [DONE]
-    3. The rpc_client.rs (in sum-node): Lightweight JSON-RPC client to talk to the SUM Chain Validator node. Enables ACL checks, challenge polling, and proof submission. [Phase 2]
-    4. The por_worker.rs (in sum-node): Background loop that polls for PoR challenges, generates Merkle proofs, and submits signed transactions back to the L1 to earn Koppa. [Phase 2]
-    5. The tx_builder.rs (in sum-node): Constructs transactions with bincode v1 mirror types matching the L1's exact byte layout, signs with Ed25519, and hex-encodes for RPC submission. [Phase 2]
+    3. The rpc_client.rs (in sum-node): Lightweight JSON-RPC client to talk to the SUM Chain Validator node. Enables ACL checks, challenge polling, and proof submission. [DONE]
+    4. The por_worker.rs (in sum-node): Background loop that polls for PoR challenges, generates Merkle proofs, and submits signed transactions back to the L1 to earn Koppa. [DONE]
+    5. The tx_builder.rs (in sum-node): Constructs transactions with bincode v1 mirror types matching the L1's exact byte layout, signs with Ed25519, and hex-encodes for RPC submission. [DONE]
+    6. The assignment.rs (in sum-store): Deterministic chunk-to-node mapping using blake3(merkle_root ++ chunk_index ++ replica). Same algorithm on L1 and off-chain. [DONE]
+    7. The market_sync.rs (in sum-node): Polls L1 for funded files, computes assignments, auto-fetches missing chunks from peers. [DONE]
+    8. The download command (in sum-node): DownloadOrchestrator — manifest fetch, parallel chunk download (max 10 concurrent), CID verification, merkle root verification, file reassembly. [DONE]
+    9. The upload orchestrator (in sum-node): UploadOrchestrator — push protocol (push_data on ShardRequest), push to R=3 assigned nodes, ACK confirmation tracking. [CODE COMPLETE — not yet wired into ingest CLI]
+    10. The garbage collector (in sum-store): GarbageCollector with mark-and-sweep, configurable grace period, L1-reachability guard. Integrated into MarketSyncWorker. [DONE]

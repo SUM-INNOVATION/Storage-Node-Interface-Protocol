@@ -24,6 +24,10 @@ const MAX_MSG_BYTES: usize = 256 * 1024 * 1024;
 // ── Message Types ─────────────────────────────────────────────────────────────
 
 /// Request for a shard (or sub-chunk thereof), identified by CID.
+///
+/// When `push_data` is `Some(...)`, this is a **push request**: the sender
+/// is proactively delivering chunk data for the receiver to store. The
+/// receiver verifies the CID, writes to disk, and responds with an ACK.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardRequest {
     /// CIDv1 string identifying the desired shard.
@@ -34,6 +38,10 @@ pub struct ShardRequest {
     /// Maximum bytes to return. `None` means the entire shard.
     /// Used for windowed streaming of large shards.
     pub max_bytes: Option<u64>,
+    /// When present, this is a push (store) request carrying chunk data.
+    /// The receiver must verify the CID before storing.
+    #[serde(default)]
+    pub push_data: Option<Vec<u8>>,
 }
 
 /// Response carrying shard data (or an error).
@@ -187,6 +195,7 @@ mod tests {
             cid: "bafkr4itest".into(),
             offset: Some(1024),
             max_bytes: Some(65536),
+            push_data: None,
         };
 
         let mut buf = Vec::new();
@@ -203,6 +212,34 @@ mod tests {
         assert_eq!(decoded.cid, req.cid);
         assert_eq!(decoded.offset, req.offset);
         assert_eq!(decoded.max_bytes, req.max_bytes);
+        assert!(decoded.push_data.is_none());
+    }
+
+    #[tokio::test]
+    async fn push_request_round_trip() {
+        let mut codec = ShardCodec::default();
+        let push_payload = vec![0xDE; 8192];
+        let req = ShardRequest {
+            cid: "bafkr4ipush".into(),
+            offset: None,
+            max_bytes: None,
+            push_data: Some(push_payload.clone()),
+        };
+
+        let mut buf = Vec::new();
+        codec
+            .write_request(&String::new(), &mut Cursor::new(&mut buf), req.clone())
+            .await
+            .unwrap();
+
+        let decoded = codec
+            .read_request(&String::new(), &mut Cursor::new(&buf))
+            .await
+            .unwrap();
+
+        assert_eq!(decoded.cid, "bafkr4ipush");
+        assert!(decoded.push_data.is_some());
+        assert_eq!(decoded.push_data.unwrap(), push_payload);
     }
 
     #[tokio::test]

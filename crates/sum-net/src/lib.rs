@@ -94,7 +94,7 @@ impl SumNet {
         self.cmd_tx
             .send(SwarmCommand::RequestShard {
                 peer_id,
-                request: ShardRequest { cid, offset, max_bytes },
+                request: ShardRequest { cid, offset, max_bytes, push_data: None },
             })
             .await
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot request chunk"))
@@ -113,10 +113,33 @@ impl SumNet {
         self.cmd_tx
             .send(SwarmCommand::RequestShard {
                 peer_id,
-                request: ShardRequest { cid, offset: None, max_bytes: None },
+                request: ShardRequest { cid, offset: None, max_bytes: None, push_data: None },
             })
             .await
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot request manifest"))
+    }
+
+    /// Push a chunk to a remote peer for storage.
+    ///
+    /// The peer will verify the CID, store the chunk, and respond with an ACK.
+    pub async fn push_chunk(
+        &self,
+        peer_id: PeerId,
+        cid: String,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(SwarmCommand::RequestShard {
+                peer_id,
+                request: ShardRequest {
+                    cid,
+                    offset: None,
+                    max_bytes: None,
+                    push_data: Some(data),
+                },
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot push chunk"))
     }
 
     /// Send a chunk response on a pending response channel.

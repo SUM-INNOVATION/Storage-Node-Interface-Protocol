@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::RwLock;
@@ -14,13 +14,15 @@ use tracing::{debug, info, warn};
 use sum_net::{SumNet, PeerId};
 use sum_net::identity;
 use sum_store::{SumStore, compute_chunk_assignment, chunks_for_node, nodes_for_chunk};
+use sum_store::gc::GarbageCollector;
 use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_types::rpc_types::StorageFileInfo;
-use sum_types::storage::CHUNK_SIZE;
+use sum_types::storage::{CHUNK_SIZE, REPLICATION_FACTOR};
 
 use crate::rpc_client::L1RpcClient;
 
-/// Background worker that syncs this node's assigned chunks from the network.
+/// Background worker that syncs this node's assigned chunks from the network,
+/// and garbage-collects unassigned chunks after a grace period.
 pub struct MarketSyncWorker {
     rpc: Arc<L1RpcClient>,
     /// This node's L1 address (20 bytes).
@@ -31,6 +33,10 @@ pub struct MarketSyncWorker {
     poll_interval: Duration,
     /// CIDs with in-flight fetch requests (avoid duplicates).
     pending_fetches: HashSet<String>,
+    /// Garbage collector for unassigned chunks.
+    gc: GarbageCollector,
+    /// When the L1 was last successfully polled (for GC safety).
+    last_l1_poll: Instant,
 }
 
 impl MarketSyncWorker {
@@ -39,6 +45,7 @@ impl MarketSyncWorker {
         l1_address: [u8; 20],
         l1_address_base58: String,
         poll_interval: Duration,
+        gc_grace_period: Duration,
     ) -> Self {
         Self {
             rpc,
@@ -46,6 +53,8 @@ impl MarketSyncWorker {
             l1_address_base58,
             poll_interval,
             pending_fetches: HashSet::new(),
+            gc: GarbageCollector::new(gc_grace_period),
+            last_l1_poll: Instant::now(),
         }
     }
 
@@ -119,12 +128,22 @@ impl MarketSyncWorker {
             }
         }
 
-        if missing_count > 0 || fetched_count > 0 {
-            info!(
-                missing = missing_count,
-                fetched = fetched_count,
-                "MarketSync cycle complete"
-            );
+        // 4. Run garbage collection
+        self.last_l1_poll = Instant::now();
+        let assigned_cids = self.compute_assigned_cids(&files, &node_addrs, store).await;
+        {
+            let store_read = store.read().await;
+            match self.gc.mark_and_sweep(&store_read.local, &assigned_cids, self.last_l1_poll) {
+                Ok(result) if result.chunks_deleted > 0 => {
+                    info!(
+                        deleted = result.chunks_deleted,
+                        freed_bytes = result.bytes_freed,
+                        "GC completed after sync cycle"
+                    );
+                }
+                Err(e) => warn!(%e, "GC failed"),
+                _ => {}
+            }
         }
 
         Ok(())
@@ -151,7 +170,7 @@ impl MarketSyncWorker {
 
         // Compute assignment
         let assignment = compute_chunk_assignment(
-            &root_bytes, chunk_count, node_addrs, sum_types::storage::REPLICATION_FACTOR,
+            &root_bytes, chunk_count, node_addrs, REPLICATION_FACTOR,
         );
 
         // Which chunks is THIS node assigned?
@@ -228,6 +247,42 @@ impl MarketSyncWorker {
         }
 
         Ok(())
+    }
+
+    /// Compute the complete set of CIDs this node is assigned to across all files.
+    async fn compute_assigned_cids(
+        &self,
+        files: &[StorageFileInfo],
+        node_addrs: &[[u8; 20]],
+        store: &Arc<RwLock<SumStore>>,
+    ) -> HashSet<String> {
+        let mut assigned_cids = HashSet::new();
+        let store_read = store.read().await;
+
+        for file in files {
+            let root_hex = file.merkle_root.strip_prefix("0x").unwrap_or(&file.merkle_root);
+            let Some(root_bytes) = hex_to_32(root_hex) else { continue };
+
+            let chunk_count = (file.total_size_bytes + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            if chunk_count == 0 { continue; }
+
+            let assignment = compute_chunk_assignment(
+                &root_bytes, chunk_count, node_addrs, REPLICATION_FACTOR,
+            );
+
+            let my_chunks = chunks_for_node(&assignment, &self.l1_address);
+
+            // Look up CIDs from the manifest if we have it
+            if let Some(manifest) = store_read.manifest_idx.get_by_merkle_root(&root_bytes) {
+                for chunk_index in &my_chunks {
+                    if let Some(chunk) = manifest.chunks.get(*chunk_index as usize) {
+                        assigned_cids.insert(chunk.cid.clone());
+                    }
+                }
+            }
+        }
+
+        assigned_cids
     }
 
     /// Called by the main event loop when a chunk fetch completes.
