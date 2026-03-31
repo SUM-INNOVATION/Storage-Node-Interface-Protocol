@@ -70,6 +70,38 @@ impl ChunkStore {
     pub fn root(&self) -> &Path {
         &self.chunk_dir
     }
+
+    /// List all CIDs stored on disk.
+    ///
+    /// Reads the chunk directory, filters for `.chunk` files, and returns
+    /// the CID (filename without extension) for each.
+    pub fn list_all_cids(&self) -> Result<Vec<String>> {
+        let mut cids = Vec::new();
+        for entry in fs::read_dir(&self.chunk_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("chunk") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    cids.push(stem.to_string());
+                }
+            }
+        }
+        Ok(cids)
+    }
+
+    /// Delete a chunk from disk.
+    ///
+    /// Returns `Ok(true)` if the file existed and was deleted,
+    /// `Ok(false)` if it did not exist.
+    pub fn delete(&self, cid: &str) -> Result<bool> {
+        let path = self.chunk_path(cid);
+        if path.exists() {
+            fs::remove_file(&path)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -99,6 +131,50 @@ mod tests {
 
         let err = store.get("nonexistent").unwrap_err();
         assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    #[test]
+    fn list_all_cids_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::new(dir.path().join("chunks")).unwrap();
+        let cids = store.list_all_cids().unwrap();
+        assert!(cids.is_empty());
+    }
+
+    #[test]
+    fn list_all_cids_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::new(dir.path().join("chunks")).unwrap();
+
+        store.put("bafaaa", b"chunk a").unwrap();
+        store.put("bafbbb", b"chunk b").unwrap();
+        store.put("bafccc", b"chunk c").unwrap();
+
+        let mut cids = store.list_all_cids().unwrap();
+        cids.sort();
+        assert_eq!(cids, vec!["bafaaa", "bafbbb", "bafccc"]);
+    }
+
+    #[test]
+    fn delete_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::new(dir.path().join("chunks")).unwrap();
+
+        store.put("bafdelete", b"to be deleted").unwrap();
+        assert!(store.has("bafdelete"));
+
+        let deleted = store.delete("bafdelete").unwrap();
+        assert!(deleted);
+        assert!(!store.has("bafdelete"));
+    }
+
+    #[test]
+    fn delete_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::new(dir.path().join("chunks")).unwrap();
+
+        let deleted = store.delete("bafnope").unwrap();
+        assert!(!deleted);
     }
 
     #[test]

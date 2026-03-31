@@ -4,6 +4,7 @@ pub mod chunker;
 pub mod content_id;
 pub mod error;
 pub mod fetch;
+pub mod gc;
 pub mod manifest;
 pub mod manifest_index;
 pub mod merkle;
@@ -118,5 +119,60 @@ impl SumStore {
     /// Memory-map a local chunk for zero-copy read access.
     pub fn mmap_chunk(&self, cid: &str) -> Result<memmap2::Mmap> {
         self.local.mmap(cid)
+    }
+
+    /// Delete all locally stored chunks and manifests.
+    ///
+    /// Used in client mode after a successful upload — Alice doesn't need
+    /// to keep chunks on her disk after they've been pushed to R=3 nodes.
+    pub fn cleanup(&self) -> Result<()> {
+        let cids = self.local.list_all_cids()?;
+        for cid in &cids {
+            self.local.delete(cid)?;
+        }
+        // Also clean up manifests directory.
+        let manifests_dir = self.config.store_dir.join("manifests");
+        if manifests_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&manifests_dir) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        info!("store cleanup complete — {} chunks removed", cids.len());
+        Ok(())
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sum_types::config::StoreConfig;
+
+    #[test]
+    fn cleanup_removes_all_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig {
+            store_dir: dir.path().join("store"),
+            max_chunk_msg_bytes: 64 * 1024 * 1024,
+        };
+        let store = SumStore::new(config).unwrap();
+
+        // Put some chunks
+        store.local.put("cid_a", b"chunk a").unwrap();
+        store.local.put("cid_b", b"chunk b").unwrap();
+        store.local.put("cid_c", b"chunk c").unwrap();
+        assert_eq!(store.local.list_all_cids().unwrap().len(), 3);
+
+        // Cleanup
+        store.cleanup().unwrap();
+
+        // Verify empty
+        assert_eq!(store.local.list_all_cids().unwrap().len(), 0);
+        assert!(!store.local.has("cid_a"));
+        assert!(!store.local.has("cid_b"));
+        assert!(!store.local.has("cid_c"));
     }
 }

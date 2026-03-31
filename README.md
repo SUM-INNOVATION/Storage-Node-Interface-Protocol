@@ -185,23 +185,27 @@ The validators execute the transaction:
 
 ![Step 3](docs/diagrams/step3.svg)
 
-Alice connects to the P2P mesh and discovers nearby storage nodes via mDNS (multicast DNS — nodes broadcast "I'm here" on the local network). She finds N1.
+Alice connects to the P2P mesh and discovers nearby storage nodes via mDNS (multicast DNS — nodes broadcast "I'm here" on the local network).
 
-Alice pushes all `C` = 10 chunks to N1 using the `/sum/storage/v1` request-response protocol over QUIC (a fast, encrypted transport protocol). N1 receives each chunk, verifies its CID (hashes the received bytes with blake3 and checks the result matches), and writes it to its local disk as `<cid>.chunk`.
+Alice does **not** push to a single node. Instead, she computes the same deterministic assignment algorithm described in Step 4 — she queries the L1 for the active node list (`storage_getActiveNodes()`), sorts them, and calculates which `R` = 3 nodes are assigned to each chunk. She then pushes each chunk directly to its 3 assigned nodes in parallel using the `/sum/storage/v1` push protocol over QUIC (a fast, encrypted transport protocol).
 
-Alice also sends the `DataManifest` to N1, which N1 stores in its manifest index (a persistent lookup table mapping merkle_root -> manifest).
+For each pushed chunk, the receiving node:
+1. Verifies the CID (blake3-hashes the received bytes, checks the hash matches the claimed CID)
+2. If valid: writes the chunk to its local disk as `<cid>.chunk` and responds with an ACK
+3. If invalid: rejects the push with an error — the data is NOT stored
+4. Announces the chunk via gossipsub on `sum/storage/v1`
 
-N1 then publishes `C` = 10 `ChunkAnnouncement` messages via **gossipsub** — a pub/sub protocol where messages published to a named "topic" are forwarded to all nodes subscribed to that topic. The topic is `sum/storage/v1`.
-
-Each of the 10 announcements contains:
+Each of the `C` x `R` = 30 announcements contains:
 - `merkle_root`: `34a749...` — which file this chunk belongs to
 - `chunk_index`: 0 through 9 — which piece
 - `cid`: the content address for requesting this specific chunk
 - `size`: 1,048,576 bytes (or less for a final partial chunk)
 
-N2 through N10 all receive all 10 announcements. Every node on the mesh now knows: "N1 holds chunks 0-9 of file `34a749...`"
+Alice also sends the `DataManifest` to at least one node, which stores it in its manifest index (a persistent lookup table mapping merkle_root -> manifest).
 
-Alice can now disconnect. Her job is done — the file is on N1 and registered on-chain. The network takes over from here.
+**Alice waits for confirmation before disconnecting.** She tracks ACK responses from each target node. Only after receiving `R` = 3 confirmations per chunk (or reaching a timeout) does she disconnect. If any chunk has fewer than `R` confirmations, Alice receives an explicit warning listing the unconfirmed chunks and nodes — she knows the upload is incomplete and should NOT delete her local copy.
+
+After all chunks are confirmed across 3 nodes each, Alice can safely disconnect. Her file exists in 3 independent copies from the moment she leaves — there is no single-point-of-failure window.
 
 ---
 
@@ -257,16 +261,17 @@ In this example, each node stores approximately 3 chunks (30 total assignments a
 
 1. N5 computes the assignment table above
 2. N5 filters: "which chunks have my address?" -> chunks 1, 5, 7
-3. N5 checks its local disk: it has none of them
-4. N5 knows from Step 3's gossipsub announcements that N1 holds all 10 chunks
-5. N5 requests the `DataManifest` from N1 by sending a special request: `"manifest:34a749..."` over the `/sum/storage/v1` protocol. N1 responds with the CBOR-encoded manifest containing all 10 chunk CIDs, sizes, and offsets.
-6. N5 sends `ShardRequest` messages to N1 for chunks 1, 5, and 7 (identified by their CIDs from the manifest)
-7. For each received chunk, N5:
-   - BLAKE3-hashes the received bytes
-   - Compares the computed hash to the expected CID — if they don't match, the data was corrupted or tampered with in transit; reject it
-   - Writes the verified chunk to disk as `<cid>.chunk`
+3. N5 checks its local disk: it already has chunks 1, 5, 7 — Alice pushed them directly in Step 3
+4. N5 has nothing to fetch. It is already fully synchronized for this file.
 
-**All 10 nodes perform this process simultaneously and independently.** After Step 4 completes, every chunk of file.pdf exists on exactly 3 nodes across the network. The file is fully distributed.
+In the case where Alice's push failed for some chunks (e.g., N5 was temporarily unreachable during Step 3), N5 would:
+- Request the `DataManifest` from any peer by sending `"manifest:34a749..."` over the `/sum/storage/v1` protocol
+- Fetch missing chunks from other nodes that hold them (identified via the assignment table)
+- Verify each received chunk's CID before writing to disk
+
+**All 10 nodes perform this process simultaneously and independently.** The MarketSyncWorker acts as a self-healing mechanism — if any chunk replica is missing (due to failed pushes, node restarts, or node departures), it is automatically detected and re-fetched within one sync cycle (default 30 seconds).
+
+After Step 4 completes, every chunk of file.pdf exists on exactly 3 nodes across the network. The file is fully distributed.
 
 ---
 
@@ -424,6 +429,13 @@ This cycle repeats continuously — every 100 blocks, a new random challenge tar
 
 Bob knows the file's `merkle_root` (`34a749...`) — Alice shared it with him. The merkle_root is the file's permanent address on the SUM network. Bob wants to reconstruct the original file.pdf.
 
+Bob runs:
+```bash
+sum-node download 34a749797e853c5f3c6a678b881adee2103c66611f999082efff71bb75701b66 --output ./file.pdf
+```
+
+The download command handles the entire retrieval pipeline automatically:
+
 **Step 8a — Get the manifest:**
 
 Bob connects to the P2P mesh and discovers nearby storage nodes via mDNS. He finds N3. Bob sends a manifest request: `"manifest:34a749797e853c5f3c6a678b881adee2103c66611f999082efff71bb75701b66"` to N3 over the `/sum/storage/v1` protocol.
@@ -450,6 +462,7 @@ ShardRequest {
   cid: "bafkr4iblchqzqis3tr73bre2atjte5bzbifrleynael4j4vvoyreohcfge",  // which chunk
   offset: None,      // start from the beginning
   max_bytes: None,   // send the whole thing
+  push_data: None,   // None = pull request (fetch), Some(data) = push request (store)
 }
 ```
 
@@ -478,7 +491,7 @@ For each received chunk, Bob:
 
 Once all `C` = 10 chunks are downloaded and verified, Bob concatenates them in order (chunk 0 + chunk 1 + ... + chunk 9) to reconstruct the original `file.pdf`. The file is byte-for-byte identical to what Alice uploaded — guaranteed by the cryptographic hashes.
 
-Bob can optionally verify the entire file by building the Merkle tree from his 10 chunk hashes and checking that the computed merkle_root matches `34a749...`. If it does, he has cryptographic proof that his reconstructed file is exactly what Alice registered on the blockchain.
+The download command automatically verifies the entire file by building the Merkle tree from the 10 chunk hashes and checking that the computed merkle_root matches `34a749...`. If it matches, Bob has cryptographic proof that his reconstructed file is exactly what Alice registered on the blockchain. If it doesn't match, the download reports an error.
 
 ---
 
@@ -488,8 +501,8 @@ Bob can optionally verify the entire file by building the Merkle tree from his 1
 |-------|--------------|----------------|
 | **Blockchain (Val 1, Val 2)** | File identities (merkle_root), ownership, access rules, fee pools, node registrations, challenge/proof history | Metadata only — never file data. ~100 bytes per file. |
 | **Storage nodes (N1-N10)** | Which chunks they hold, which peers have what, their assignment | Actual file chunks on disk. ~3 MB per node for a 10 MB file with 10 nodes. |
-| **Uploader (Alice)** | The merkle_root of her file | Nothing after upload — she can delete her local copy. |
-| **Downloader (Bob)** | The merkle_root (shared by Alice) | The reconstructed file after download. |
+| **Uploader (Alice)** | The merkle_root of her file | Nothing after upload — she can delete her local copy once R=3 confirmations are received per chunk. Alice is NOT a storage node. |
+| **Downloader (Bob)** | The merkle_root (shared by Alice) | The reconstructed file after download. Bob is NOT a storage node. |
 
 **No central server.** Files are spread across independent nodes that don't trust each other.
 
@@ -500,3 +513,65 @@ Bob can optionally verify the entire file by building the Merkle tree from his 1
 **Deterministic coordination.** No central coordinator assigns work. Every participant independently computes the same assignment from public on-chain data using the same hash function with the same inputs.
 
 **Cryptographic integrity.** Every chunk is content-addressed (CID = hash of contents). Every Merkle proof is mathematically verifiable. You cannot fake a proof without possessing the actual data.
+
+---
+
+## CLI Reference
+
+| Command | What it does |
+|---------|-------------|
+| `sum-node listen` | Serve chunks, enforce ACLs, respond to PoR challenges, run MarketSync + GC |
+| `sum-node ingest <path>` | Chunk a file, store, announce on mesh |
+| `sum-node download <merkle_root> --output <path>` | Download a complete file by merkle root — manifest fetch, parallel chunk download, CID verification, merkle root verification, file reassembly |
+| `sum-node fetch <cid>` | Download a single chunk by CID from a LAN peer |
+| `sum-node send <message>` | Broadcast a test gossipsub message |
+
+**Key flags:**
+- `--key-file <path>` — Ed25519 private key seed (hex-encoded). Without it, generates a random keypair (dev mode, PoR disabled).
+- `--rpc-url <url>` — SUM Chain L1 JSON-RPC endpoint (default `http://127.0.0.1:9944`)
+- `--gc-grace-secs <seconds>` — how long to keep unassigned chunks before garbage collection deletes them (default 3600 = 1 hour)
+- `--max-concurrent <n>` — maximum parallel chunk fetches during download (default 10)
+
+---
+
+## Garbage Collection
+
+When nodes join or leave the network, the deterministic assignment recomputes (because the sorted node list changes). A node that was assigned to a chunk may no longer be assigned after a new node registers. Without garbage collection, that node holds the unassigned chunk indefinitely, wasting disk space.
+
+The `GarbageCollector` runs automatically after each MarketSync cycle (every 30 seconds). It:
+1. Enumerates all chunks on disk
+2. Compares against the current assignment (computed from on-chain state)
+3. Marks unassigned chunks with a timestamp
+4. Deletes chunks that have been unassigned longer than the grace period (`--gc-grace-secs`, default 1 hour)
+
+**Safety guarantees:**
+- Never deletes a chunk that is currently assigned
+- Respects the grace period to avoid thrashing from transient node list changes (e.g., a node briefly going offline and coming back)
+- Pauses entirely if the L1 has not been polled within 5 minutes (avoids deleting based on stale assignment state)
+- Logs every deletion with the CID and how long the chunk was unassigned
+
+**What happens to the nodes Alice initially pushed to?**
+
+In Step 3, Alice pushes each chunk to R=3 assigned nodes. These "entry nodes" are the first holders of the data. Over time, the network may change — new nodes join, old nodes leave, and the deterministic assignment recomputes. An entry node may no longer be assigned to the chunks it originally received from Alice.
+
+When this happens, the GC treats entry nodes the same as any other node. There is no special retention for being the "first" to hold a chunk. The lifecycle is:
+
+1. Alice pushes chunk 0 to N1, N3, N7 (all three are currently assigned)
+2. N11 joins the network. Assignment recomputes. Chunk 0 is now assigned to N3, N7, N11.
+3. N11's MarketSyncWorker detects it should hold chunk 0, fetches it from N3 or N7.
+4. N1's GC marks chunk 0 as unassigned (N1 is no longer in the assignment for chunk 0).
+5. After the grace period (default 1 hour), N1's GC deletes chunk 0 from its disk.
+
+This is safe because N11 has already fetched the chunk within the 30-second MarketSync cycle — well before N1's 1-hour grace period expires. The grace period exists precisely to ensure this ordering: new assignment holders fetch the data before old holders delete it.
+
+The GC does not track how a chunk was acquired (push from Alice, fetch from MarketSync, or local ingest). All chunks are stored identically on disk as `<cid>.chunk` files with no provenance metadata. The only thing that determines whether a chunk stays or goes is the current on-chain assignment.
+
+---
+
+## Network Limitations
+
+**LAN only (current).** Peer discovery uses mDNS, which broadcasts on the local network. Two computers on the same WiFi or LAN will discover each other automatically. Two computers on different networks (different WiFi, different cities, over the internet) will NOT find each other.
+
+**Workaround:** If both machines are on the same Tailscale (or similar VPN) network, mDNS may work over the Tailscale interface, enabling cross-network testing without WAN support.
+
+**WAN support (planned).** Kademlia DHT + bootstrap nodes for internet-wide peer discovery, AutoNAT for detecting NAT type, and DCUtR for hole-punching behind NATs. See `docs/PHASE4-EXECUTION-PLAN.md`, Objective 4.

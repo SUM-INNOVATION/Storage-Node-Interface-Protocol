@@ -31,9 +31,11 @@ use sum_store::{SumStore, FetchOutcome, decode_announcement};
 use sum_types::config::{NetConfig, StoreConfig};
 
 use sum_node::acl::AclChecker;
+use sum_node::download::DownloadOrchestrator;
 use sum_node::market_sync::MarketSyncWorker;
 use sum_node::por_worker::PorWorker;
 use sum_node::rpc_client::L1RpcClient;
+use sum_node::upload::UploadOrchestrator;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -61,6 +63,18 @@ struct Cli {
     #[arg(long, env = "SUM_MARKET_SYNC_INTERVAL", default_value = "30")]
     market_sync_secs: u64,
 
+    /// Garbage collection grace period in seconds.
+    /// Unassigned chunks are kept for this long before deletion.
+    #[arg(long, env = "SUM_GC_GRACE", default_value = "3600")]
+    gc_grace_secs: u64,
+
+    /// Run in client mode (upload/download only, no storage node services).
+    /// In client mode: no PorWorker, no MarketSync, no GC, no chunk serving.
+    /// The ingest command pushes to R=3 nodes and exits after confirmation.
+    /// The listen command is not available in client mode.
+    #[arg(long, env = "SUM_CLIENT_MODE")]
+    client: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -71,16 +85,34 @@ enum Command {
     /// and responding to PoR challenges.
     Listen,
 
-    /// Ingest a file: chunk, build Merkle tree, store, announce on mesh.
+    /// Ingest a file: chunk, push to R=3 assigned nodes, announce on mesh.
     Ingest {
         /// Path to the file to ingest.
         path: PathBuf,
+        /// Upload timeout in seconds (time to wait for R=3 push confirmations).
+        #[arg(long, default_value = "120")]
+        upload_timeout_secs: u64,
     },
 
     /// Fetch a chunk by CID from a LAN peer.
     Fetch {
         /// CIDv1 string of the chunk to fetch.
         cid: String,
+    },
+
+    /// Download a complete file by merkle root from the network.
+    Download {
+        /// Hex-encoded merkle root of the file to download.
+        merkle_root: String,
+        /// Path to write the reassembled file.
+        #[arg(long)]
+        output: PathBuf,
+        /// Maximum concurrent chunk fetches.
+        #[arg(long, default_value = "10")]
+        max_concurrent: usize,
+        /// Download timeout in seconds.
+        #[arg(long, default_value = "300")]
+        download_timeout_secs: u64,
     },
 
     /// Discover a peer on the LAN, publish a test message, then exit.
@@ -125,9 +157,19 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
+        Command::Listen if cli.client => {
+            anyhow::bail!("listen command requires node mode — remove --client flag")
+        }
         Command::Listen => run_listen(keypair, seed, &cli).await,
-        Command::Ingest { path } => run_ingest(keypair, path).await,
+        Command::Ingest { path, upload_timeout_secs } => {
+            let rpc_url = cli.rpc_url.clone();
+            let client_mode = cli.client;
+            run_ingest(keypair, rpc_url, client_mode, path, upload_timeout_secs).await
+        }
         Command::Fetch { cid } => run_fetch(keypair, cid).await,
+        Command::Download { merkle_root, output, max_concurrent, download_timeout_secs } => {
+            run_download(keypair, cli.rpc_url.clone(), merkle_root, output, max_concurrent, download_timeout_secs).await
+        }
         Command::Send { message } => run_send(keypair, message).await,
     }
 }
@@ -183,6 +225,7 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli) -> Resu
             l1_addr,
             l1_base58.clone(),
             Duration::from_secs(cli.market_sync_secs),
+            Duration::from_secs(cli.gc_grace_secs),
         );
         let store_clone2 = store.clone();
         let net_clone = net.clone();
@@ -270,7 +313,13 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli) -> Resu
 
 // ── Ingest mode ──────────────────────────────────────────────────────────────
 
-async fn run_ingest(keypair: Keypair, path: PathBuf) -> Result<()> {
+async fn run_ingest(
+    keypair: Keypair,
+    rpc_url: String,
+    client_mode: bool,
+    path: PathBuf,
+    upload_timeout_secs: u64,
+) -> Result<()> {
     let net = SumNet::new(NetConfig::default(), keypair).await?;
     let mut store = SumStore::new(StoreConfig::default())?;
 
@@ -280,32 +329,111 @@ async fn run_ingest(keypair: Keypair, path: PathBuf) -> Result<()> {
     let json = serde_json::to_string_pretty(&manifest)?;
     info!("manifest:\n{json}");
 
-    // Wait for a peer before announcing.
-    info!("waiting for a peer on the LAN to announce chunks...");
-    let timeout = Duration::from_secs(30);
-    let deadline = tokio::time::Instant::now() + timeout;
+    // Wait for peer discovery + collect peer identities for the upload orchestrator.
+    info!("waiting for peers on the LAN...");
+    let discover_timeout = Duration::from_secs(30);
+    let discover_deadline = tokio::time::Instant::now() + discover_timeout;
+    let mut peer_addresses: HashMap<sum_net::PeerId, [u8; 20]> = HashMap::new();
+    let mut found_peer = false;
 
     loop {
         tokio::select! {
             Some(event) = net.next_event() => {
                 print_event(&event);
-                if let SumNetEvent::PeerDiscovered { peer_id, .. } = &event {
-                    info!(%peer_id, "peer found — announcing chunks");
+                match &event {
+                    SumNetEvent::PeerDiscovered { .. } => {
+                        found_peer = true;
+                    }
+                    SumNetEvent::PeerIdentified { peer_id, l1_address } => {
+                        peer_addresses.insert(*peer_id, *l1_address);
+                    }
+                    _ => {}
+                }
+                // Wait a bit after first peer to collect more identities
+                if found_peer && peer_addresses.is_empty() {
+                    continue; // Keep waiting for PeerIdentified
+                }
+                if found_peer && !peer_addresses.is_empty() {
+                    // Give a brief window for more peers to identify
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    store.announce_chunks(&net, &manifest).await?;
-                    info!("all chunks announced — listening for requests");
-                    simple_serve_loop(&net, &store).await?;
-                    return Ok(());
+                    // Drain any remaining events
+                    while let Ok(event) = tokio::time::timeout(
+                        Duration::from_millis(200), net.next_event()
+                    ).await {
+                        if let Some(SumNetEvent::PeerIdentified { peer_id, l1_address }) = event {
+                            peer_addresses.insert(peer_id, l1_address);
+                        }
+                    }
+                    break;
                 }
             }
-            _ = tokio::time::sleep_until(deadline) => {
-                warn!("timed out waiting for peer — announcing anyway");
-                store.announce_chunks(&net, &manifest).await?;
-                simple_serve_loop(&net, &store).await?;
-                return Ok(());
+            _ = tokio::time::sleep_until(discover_deadline) => {
+                if !found_peer {
+                    warn!("timed out waiting for peers");
+                }
+                break;
             }
         }
     }
+
+    // Push to R=3 assigned nodes via UploadOrchestrator.
+    let rpc = Arc::new(L1RpcClient::new(rpc_url));
+    let orchestrator = UploadOrchestrator::new(
+        rpc,
+        Duration::from_secs(upload_timeout_secs),
+    );
+
+    info!(
+        peers = peer_addresses.len(),
+        "pushing chunks to assigned nodes"
+    );
+
+    let upload_result = orchestrator.run(
+        &net, &store, &manifest, &peer_addresses,
+    ).await;
+
+    match &upload_result {
+        Ok(result) => {
+            info!(
+                confirmed = result.confirmed,
+                total = result.total,
+                timeout = result.timeout,
+                failed = result.failed.len(),
+                "upload complete"
+            );
+            if result.timeout || !result.failed.is_empty() {
+                warn!("some pushes failed or timed out — do NOT delete your local copy");
+                for f in &result.failed {
+                    warn!(cid = %f.cid, error = %f.error, "push failed");
+                }
+            }
+        }
+        Err(e) => {
+            warn!(%e, "upload orchestrator failed — falling back to gossipsub announce");
+        }
+    }
+
+    // Announce via gossipsub (so other nodes learn about the file even if push failed).
+    store.announce_chunks(&net, &manifest).await?;
+    info!("all chunks announced via gossipsub");
+
+    if client_mode {
+        // Client mode: clean up local chunks and exit.
+        if upload_result.as_ref().map(|r| r.confirmed > 0 && r.failed.is_empty()).unwrap_or(false) {
+            info!("client mode — cleaning up local chunks");
+            store.cleanup()?;
+        } else {
+            warn!("client mode — skipping cleanup (upload incomplete)");
+        }
+        net.shutdown().await?;
+        info!("client mode — exiting");
+    } else {
+        // Node mode: enter serve loop (backward compat for node operators).
+        info!("node mode — listening for requests (Ctrl-C to stop)");
+        simple_serve_loop(&net, &store).await?;
+    }
+
+    Ok(())
 }
 
 /// Simple serve loop without ACL (used by ingest after announcing).
@@ -438,6 +566,47 @@ async fn run_fetch(keypair: Keypair, cid: String) -> Result<()> {
             }
         }
     }
+}
+
+// ── Download mode ────────────────────────────────────────────────────────────
+
+async fn run_download(
+    keypair: Keypair,
+    rpc_url: String,
+    merkle_root: String,
+    output: PathBuf,
+    max_concurrent: usize,
+    timeout_secs: u64,
+) -> Result<()> {
+    info!(%merkle_root, output = %output.display(), "starting download");
+
+    let net = Arc::new(SumNet::new(NetConfig::default(), keypair.clone()).await?);
+    let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
+    let rpc = Arc::new(L1RpcClient::new(rpc_url));
+    let peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
+    let orchestrator = DownloadOrchestrator::new(
+        merkle_root,
+        output.clone(),
+        rpc,
+        max_concurrent,
+        Duration::from_secs(timeout_secs),
+    );
+
+    let result = orchestrator.run(net.clone(), store, peer_addresses).await?;
+
+    info!(
+        chunks_fetched = result.chunks_fetched,
+        chunks_skipped = result.chunks_skipped,
+        total_bytes = result.total_bytes,
+        merkle_verified = result.merkle_verified,
+        output = %output.display(),
+        "download complete"
+    );
+
+    net.shutdown().await?;
+    Ok(())
 }
 
 // ── Send mode ─────────────────────────────────────────────────────────────────

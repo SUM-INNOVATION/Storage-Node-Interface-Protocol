@@ -11,9 +11,9 @@
 use sum_net::{SumNet, ShardRequest, ShardResponse};
 use tracing::{info, warn};
 
-use crate::manifest;
 use crate::manifest_index::ManifestIndex;
 use crate::store::ChunkStore;
+use crate::verify;
 
 /// The prefix that distinguishes manifest requests from chunk requests.
 pub const MANIFEST_REQUEST_PREFIX: &str = "manifest:";
@@ -28,6 +28,8 @@ pub async fn handle_request(
 ) {
     if request.cid.starts_with(MANIFEST_REQUEST_PREFIX) {
         handle_manifest_request(net, manifest_idx, request, channel_id).await;
+    } else if request.push_data.is_some() {
+        handle_push_request(net, store, request, channel_id).await;
     } else {
         handle_chunk_request(net, store, request, channel_id).await;
     }
@@ -102,6 +104,65 @@ async fn handle_manifest_request(
 
     if let Err(e) = net.respond_shard(channel_id, resp).await {
         warn!(root = root_hex, %e, "failed to send manifest response");
+    }
+}
+
+/// Handle a push (store) request: verify CID, write to disk, ACK.
+///
+/// The sender is proactively delivering chunk data. We verify the CID
+/// matches the data (blake3 hash), store it (idempotent), and respond
+/// with an empty-data ACK.
+async fn handle_push_request(
+    net: &SumNet,
+    store: &ChunkStore,
+    request: &ShardRequest,
+    channel_id: u64,
+) {
+    let cid = &request.cid;
+    let data = request.push_data.as_ref().unwrap();
+
+    // Verify CID matches data
+    if let Err(e) = verify::verify_cid(data, cid) {
+        warn!(%cid, %e, "push rejected: CID verification failed");
+        let resp = ShardResponse {
+            cid: cid.clone(),
+            offset: 0,
+            total_bytes: 0,
+            data: Vec::new(),
+            error: Some(format!("CID verification failed: {e}")),
+        };
+        let _ = net.respond_shard(channel_id, resp).await;
+        return;
+    }
+
+    // Write to disk (idempotent — skip if already exists)
+    if !store.has(cid) {
+        if let Err(e) = store.put(cid, data) {
+            warn!(%cid, %e, "push rejected: store write failed");
+            let resp = ShardResponse {
+                cid: cid.clone(),
+                offset: 0,
+                total_bytes: 0,
+                data: Vec::new(),
+                error: Some(format!("store write failed: {e}")),
+            };
+            let _ = net.respond_shard(channel_id, resp).await;
+            return;
+        }
+    }
+
+    info!(%cid, bytes = data.len(), "push accepted — chunk stored");
+
+    // ACK: empty data, no error
+    let resp = ShardResponse {
+        cid: cid.clone(),
+        offset: 0,
+        total_bytes: data.len() as u64,
+        data: Vec::new(),
+        error: None,
+    };
+    if let Err(e) = net.respond_shard(channel_id, resp).await {
+        warn!(%cid, %e, "failed to send push ACK");
     }
 }
 

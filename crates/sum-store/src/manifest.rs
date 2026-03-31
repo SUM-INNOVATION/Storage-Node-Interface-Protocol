@@ -24,7 +24,12 @@ pub fn write_manifest(manifest: &DataManifest, path: &Path) -> Result<()> {
 /// Read a manifest from a CBOR file.
 pub fn read_manifest(path: &Path) -> Result<DataManifest> {
     let data = std::fs::read(path)?;
-    ciborium::de::from_reader(&data[..])
+    deserialize_manifest_cbor(&data)
+}
+
+/// Deserialize a manifest from CBOR bytes.
+pub fn deserialize_manifest_cbor(data: &[u8]) -> Result<DataManifest> {
+    ciborium::de::from_reader(data)
         .map_err(|e| StoreError::Other(format!("CBOR deserialization: {e}")))
 }
 
