@@ -1,4 +1,4 @@
-use libp2p::{gossipsub, identify, mdns, request_response, swarm::NetworkBehaviour};
+use libp2p::{gossipsub, identify, kad, mdns, request_response, swarm::NetworkBehaviour};
 
 use crate::codec::ShardCodec;
 
@@ -10,10 +10,12 @@ use crate::codec::ShardCodec;
 /// - `Gossipsub(gossipsub::Event)`
 /// - `Identify(identify::Event)`
 /// - `ShardXfer(request_response::Event<ShardRequest, ShardResponse>)`
+/// - `Kademlia(kad::Event)`
 #[derive(NetworkBehaviour)]
 pub struct LocalMeshBehaviour {
     pub mdns:       mdns::tokio::Behaviour,
     pub gossipsub:  gossipsub::Behaviour,
     pub identify:   identify::Behaviour,
     pub shard_xfer: request_response::Behaviour<ShardCodec>,
+    pub kademlia:   kad::Behaviour<kad::store::MemoryStore>,
 }

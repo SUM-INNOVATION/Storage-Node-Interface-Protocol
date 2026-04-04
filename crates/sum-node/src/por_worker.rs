@@ -4,7 +4,6 @@
 //! challenged chunk from disk, generates the Merkle proof, builds and
 //! signs a `SubmitStorageProof` transaction, and submits it to the L1.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +17,9 @@ use sum_types::rpc_types::ChallengeInfo;
 use crate::rpc_client::L1RpcClient;
 use crate::tx_builder;
 
+/// Maximum number of responded challenge IDs to track (FIFO eviction).
+const MAX_RESPONDED: usize = 500;
+
 /// Background worker that responds to L1 PoR challenges.
 pub struct PorWorker {
     rpc: Arc<L1RpcClient>,
@@ -27,8 +29,10 @@ pub struct PorWorker {
     l1_address_base58: String,
     /// How often to poll for challenges.
     poll_interval: Duration,
-    /// Challenge IDs we have already responded to (avoids double-submission).
-    responded: HashSet<String>,
+    /// Challenge IDs we have already responded to (bounded FIFO, avoids double-submission).
+    responded: Vec<String>,
+    /// Consecutive RPC failures (for exponential backoff).
+    consecutive_failures: u32,
 }
 
 impl PorWorker {
@@ -43,12 +47,17 @@ impl PorWorker {
             ed25519_seed,
             l1_address_base58,
             poll_interval,
-            responded: HashSet::new(),
+            responded: Vec::new(),
+            consecutive_failures: 0,
         }
     }
 
     /// Run the PoR worker loop indefinitely.
-    pub async fn run(mut self, store: Arc<RwLock<SumStore>>) {
+    pub async fn run(
+        mut self,
+        store: Arc<RwLock<SumStore>>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
         info!(
             address = %self.l1_address_base58,
             interval_secs = self.poll_interval.as_secs(),
@@ -57,9 +66,31 @@ impl PorWorker {
 
         let mut interval = tokio::time::interval(self.poll_interval);
         loop {
-            interval.tick().await;
-            if let Err(e) = self.poll_and_respond(&store).await {
-                warn!(%e, "PoR poll cycle failed");
+            tokio::select! {
+                _ = interval.tick() => {
+                    match self.poll_and_respond(&store).await {
+                        Ok(()) => { self.consecutive_failures = 0; }
+                        Err(e) => {
+                            self.consecutive_failures += 1;
+                            let backoff_secs = self.poll_interval.as_secs()
+                                * 2u64.pow(self.consecutive_failures.min(5));
+                            warn!(
+                                %e,
+                                backoff_secs,
+                                failures = self.consecutive_failures,
+                                "PoR poll failed — backing off"
+                            );
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        }
+                    }
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("PoR worker shutting down — one final poll");
+                        let _ = self.poll_and_respond(&store).await;
+                        return;
+                    }
+                }
             }
         }
     }
@@ -82,7 +113,11 @@ impl PorWorker {
             }
             match self.respond_to_challenge(store, challenge).await {
                 Ok(()) => {
-                    self.responded.insert(challenge.challenge_id.clone());
+                    // Bounded FIFO: evict oldest when full.
+                    if self.responded.len() >= MAX_RESPONDED {
+                        self.responded.remove(0);
+                    }
+                    self.responded.push(challenge.challenge_id.clone());
                 }
                 Err(e) => {
                     warn!(
@@ -92,11 +127,6 @@ impl PorWorker {
                     );
                 }
             }
-        }
-
-        // Clean up old responded entries (keep set bounded).
-        if self.responded.len() > 1000 {
-            self.responded.clear();
         }
 
         Ok(())

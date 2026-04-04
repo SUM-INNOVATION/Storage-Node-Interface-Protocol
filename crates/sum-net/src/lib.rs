@@ -56,6 +56,11 @@ impl SumNet {
         let mut sum_swarm = SumSwarm::build(&config, keypair)?;
         sum_swarm.subscribe_all_topics()?;
 
+        // Bootstrap Kademlia DHT when WAN mode is enabled.
+        if config.enable_wan {
+            sum_swarm.bootstrap_kademlia(&config.bootstrap_peers)?;
+        }
+
         let (event_tx, event_rx) = mpsc::channel::<SumNetEvent>(CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx)     = mpsc::channel::<SwarmCommand>(CHANNEL_CAPACITY);
 

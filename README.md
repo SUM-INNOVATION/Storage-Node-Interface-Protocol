@@ -546,6 +546,9 @@ The download command automatically verifies the entire file by building the Merk
 - `--upload-timeout <seconds>` — time to wait for R=3 push confirmations during ingest (default 120)
 - `--gc-grace-secs <seconds>` — how long to keep unassigned chunks before garbage collection deletes them (default 3600 = 1 hour)
 - `--max-concurrent <n>` — maximum parallel chunk fetches during download (default 10)
+- `--enable-wan` — enable Kademlia DHT + TCP transport for internet-wide peer discovery
+- `--bootstrap-peer <multiaddr>` — bootstrap peer for Kademlia (repeatable or comma-separated)
+- `--tcp-port <port>` — TCP listen port for WAN connections (default 0 = OS-assigned)
 
 ---
 
@@ -583,10 +586,19 @@ The GC does not track how a chunk was acquired (push from Alice, fetch from Mark
 
 ---
 
-## Network Limitations
+## Network Modes
 
-**LAN only (current).** Peer discovery uses mDNS, which broadcasts on the local network. Two computers on the same WiFi or LAN will discover each other automatically. Two computers on different networks (different WiFi, different cities, over the internet) will NOT find each other.
+**LAN mode (default).** Without `--enable-wan`, peer discovery uses mDNS only. Two computers on the same WiFi or LAN will discover each other automatically. No bootstrap peers needed.
 
-**Workaround:** If both machines are on the same Tailscale (or similar VPN) network, mDNS may work over the Tailscale interface, enabling cross-network testing without WAN support.
+**WAN mode.** With `--enable-wan` and at least one `--bootstrap-peer`, nodes use Kademlia DHT for internet-wide peer discovery. TCP/Noise/Yamux transport is added alongside QUIC for NAT/firewall compatibility. Both mDNS (LAN) and Kademlia (WAN) run simultaneously — LAN peers are discovered instantly, WAN peers via DHT propagation.
 
-**WAN support (planned).** Kademlia DHT + bootstrap nodes for internet-wide peer discovery, AutoNAT for detecting NAT type, and DCUtR for hole-punching behind NATs. See `docs/PHASE4-EXECUTION-PLAN.md`, Objective 4.
+```bash
+# WAN example — Node B bootstraps off Node A across the internet:
+sum-node --enable-wan --tcp-port 4001 \
+  --bootstrap-peer /ip4/<node_a_public_ip>/tcp/4001/p2p/<node_a_peer_id> \
+  listen
+```
+
+**Firewall requirements:** TCP port (default OS-assigned, or set via `--tcp-port`) must be reachable for inbound WAN connections. QUIC/UDP port should also be open for optimal performance.
+
+**Future:** AutoNAT for detecting NAT type and DCUtR for hole-punching behind symmetric NATs. See `docs/WAN-DISCOVERY-AND-HARDENING.md`.
