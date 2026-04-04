@@ -4,7 +4,7 @@
 
 Phase 4 foundation changes add chunk enumeration/deletion to ChunkStore, push_data support to the wire protocol, and push request handling in serve.rs.
 
-**Test count:** 12 new tests (4 ChunkStore + 1 codec + 7 GC)
+**Test count:** 19 new tests (4 ChunkStore + 1 codec + 7 GC + 1 cleanup + 2 health_check + 4 metrics)
 
 ---
 
@@ -80,12 +80,51 @@ Phase 4 foundation changes add chunk enumeration/deletion to ChunkStore, push_da
 
 ---
 
+## sum-store: Health Check Tests (2 new)
+
+### `health_check_empty_store`
+- **What:** Create empty SumStore, call health_check()
+- **Expected:** chunk_count=0, manifest_count=0, disk_usage < 1KB, store_dir_writable=true
+- **Result:** PASS
+
+### `health_check_with_chunks`
+- **What:** Create SumStore, put 2 chunks (11 bytes + 4096 bytes), call health_check()
+- **Expected:** chunk_count=2, disk_usage > 0, store_dir_writable=true
+- **Result:** PASS
+
+---
+
+## sum-node: Metrics Tests (4 new)
+
+### `metrics_increment_and_snapshot`
+- **What:** Create NodeMetrics, increment chunks_served(3), por_submitted(2), por_failed(1), gc_deleted(5), call snapshot()
+- **Expected:** Snapshot values match: 3, 2, 1, 5, 0
+- **Result:** PASS
+
+### `metrics_peers_inc_dec`
+- **What:** inc_peers 3 times, dec_peers once
+- **Expected:** peers_connected = 2
+- **Result:** PASS
+
+### `metrics_default_is_zero`
+- **What:** Fresh NodeMetrics::default(), call snapshot()
+- **Expected:** All counters are 0
+- **Result:** PASS
+
+### `metrics_gc_batch_increment`
+- **What:** inc_gc_deleted(10) then inc_gc_deleted(25)
+- **Expected:** gc_chunks_deleted = 35
+- **Result:** PASS
+
+---
+
 ## Test Output
 
 ```
-running 7 tests  (sum-store: store)      test result: ok. 7 passed
-running 5 tests  (sum-net: codec)        test result: ok. 5 passed
-running 7 tests  (sum-store: gc)         test result: ok. 7 passed
+running 14 tests  (sum-net)              test result: ok. 14 passed
+running 8 tests   (sum-node)             test result: ok.  8 passed
+running 66 tests  (sum-store)            test result: ok. 66 passed
+running 8 tests   (sum-types)            test result: ok.  8 passed
 
-Total: 89 tests passing across workspace (77 prior + 12 new)
+Total: 96 tests passing across workspace (77 prior + 19 new Phase 4)
 ```

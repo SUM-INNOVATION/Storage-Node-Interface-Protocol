@@ -4,11 +4,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, identify, mdns,
+    gossipsub, identify, kad, mdns,
     identity::Keypair,
     request_response::{self, ProtocolSupport, ResponseChannel},
     swarm::SwarmEvent,
-    Multiaddr, PeerId, SwarmBuilder,
+    Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -22,6 +22,9 @@ use crate::{
     events::SumNetEvent,
     gossip::GossipManager,
 };
+
+/// Kademlia protocol identifier for the SUM Storage Node DHT.
+const KAD_PROTOCOL: &str = "/sum/kad/1.0.0";
 
 // ── SwarmCommand ──────────────────────────────────────────────────────────────
 
@@ -62,9 +65,9 @@ impl SumSwarm {
     /// The keypair should be derived from the user's SUM Chain L1 wallet seed
     /// via [`crate::identity::keypair_from_seed`].
     ///
-    /// Transport:  QUIC (TLS 1.3 baked-in)
-    /// Behaviour:  mDNS + Gossipsub + Identify + chunk transfer
-    /// Listener:   `0.0.0.0:<config.listen_port>` (0 = OS-assigned)
+    /// Transport:  QUIC always; TCP+Noise+Yamux added when `enable_wan` is true.
+    /// Behaviour:  mDNS + Gossipsub + Identify + chunk transfer + Kademlia DHT.
+    /// Listener:   `0.0.0.0:<listen_port>` (QUIC) + `0.0.0.0:<tcp_listen_port>` (TCP, if WAN).
     pub fn build(config: &NetConfig, keypair: Keypair) -> Result<Self> {
         let gossip_cfg = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_secs(10))
@@ -74,47 +77,97 @@ impl SumSwarm {
             .build()
             .map_err(|msg| anyhow::anyhow!("gossipsub config error: {msg}"))?;
 
-        let mut swarm = SwarmBuilder::with_existing_identity(keypair)
-            .with_tokio()
-            .with_quic()
-            .with_behaviour(|key| {
-                let mdns = mdns::tokio::Behaviour::new(
-                    mdns::Config::default(),
-                    key.public().to_peer_id(),
-                )?;
+        // Behaviour constructor — shared between TCP+QUIC and QUIC-only paths.
+        // Returns Box<dyn Error> to satisfy SwarmBuilder's with_behaviour() signature.
+        let make_behaviour = |key: &Keypair| -> std::result::Result<LocalMeshBehaviour, Box<dyn std::error::Error + Send + Sync>> {
+            let local_peer_id = key.public().to_peer_id();
 
-                let gossipsub = gossipsub::Behaviour::new(
-                    gossipsub::MessageAuthenticity::Signed(key.clone()),
-                    gossip_cfg,
-                )
-                .map_err(|msg| anyhow::anyhow!("gossipsub init: {msg}"))?;
+            let mdns = mdns::tokio::Behaviour::new(
+                mdns::Config::default(),
+                local_peer_id,
+            )?;
 
-                let identify = identify::Behaviour::new(identify::Config::new(
-                    "/sum-node/0.1.0".into(),
-                    key.public(),
-                ));
+            let gossipsub_behaviour = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossip_cfg.clone(),
+            )
+            .map_err(|msg| -> Box<dyn std::error::Error + Send + Sync> {
+                msg.into()
+            })?;
 
-                let shard_xfer = request_response::Behaviour::new(
-                    [(SHARD_XFER_PROTOCOL.to_string(), ProtocolSupport::Full)],
-                    request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(120)),
-                );
+            let identify = identify::Behaviour::new(identify::Config::new(
+                "/sum-node/0.1.0".into(),
+                key.public(),
+            ));
 
-                Ok(LocalMeshBehaviour { mdns, gossipsub, identify, shard_xfer })
-            })?
-            .with_swarm_config(|c| {
-                c.with_idle_connection_timeout(Duration::from_secs(60))
+            let shard_xfer = request_response::Behaviour::new(
+                [(SHARD_XFER_PROTOCOL.to_string(), ProtocolSupport::Full)],
+                request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(120)),
+            );
+
+            let kad_store = kad::store::MemoryStore::new(local_peer_id);
+            let mut kad_config = kad::Config::new(
+                StreamProtocol::new(KAD_PROTOCOL),
+            );
+            kad_config.set_query_timeout(Duration::from_secs(60));
+            let kademlia = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
+
+            Ok(LocalMeshBehaviour {
+                mdns,
+                gossipsub: gossipsub_behaviour,
+                identify,
+                shard_xfer,
+                kademlia,
             })
-            .build();
+        };
 
-        let listen_addr: Multiaddr =
+        let mut swarm = if config.enable_wan {
+            // TCP+Noise+Yamux + QUIC (dual transport)
+            SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_tcp(
+                    libp2p::tcp::Config::default(),
+                    libp2p::noise::Config::new,
+                    libp2p::yamux::Config::default,
+                )?
+                .with_quic()
+                .with_behaviour(|key| make_behaviour(key))?
+                .with_swarm_config(|c| {
+                    c.with_idle_connection_timeout(Duration::from_secs(60))
+                })
+                .build()
+        } else {
+            // QUIC-only (LAN mode — current behavior)
+            SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_quic()
+                .with_behaviour(|key| make_behaviour(key))?
+                .with_swarm_config(|c| {
+                    c.with_idle_connection_timeout(Duration::from_secs(60))
+                })
+                .build()
+        };
+
+        // QUIC listener (always)
+        let quic_addr: Multiaddr =
             format!("/ip4/0.0.0.0/udp/{}/quic-v1", config.listen_port)
                 .parse()
                 .context("invalid QUIC listen multiaddr")?;
-
         swarm
-            .listen_on(listen_addr)
+            .listen_on(quic_addr)
             .context("failed to bind QUIC listener")?;
+
+        // TCP listener (WAN mode only)
+        if config.enable_wan {
+            let tcp_addr: Multiaddr =
+                format!("/ip4/0.0.0.0/tcp/{}", config.tcp_listen_port)
+                    .parse()
+                    .context("invalid TCP listen multiaddr")?;
+            swarm
+                .listen_on(tcp_addr)
+                .context("failed to bind TCP listener")?;
+        }
 
         Ok(Self {
             inner:  swarm,
@@ -122,6 +175,45 @@ impl SumSwarm {
             pending_shard_channels: HashMap::new(),
             next_channel_id: 0,
         })
+    }
+
+    /// Bootstrap Kademlia DHT with the provided peer multiaddrs.
+    ///
+    /// Each address must end with `/p2p/<peer_id>`. The node dials the
+    /// bootstrap peers and initiates a Kademlia bootstrap query.
+    pub fn bootstrap_kademlia(&mut self, bootstrap_peers: &[String]) -> Result<()> {
+        for addr_str in bootstrap_peers {
+            let addr: Multiaddr = addr_str.parse()
+                .context(format!("invalid bootstrap multiaddr: {addr_str}"))?;
+
+            // Extract PeerId from the last /p2p/<peer_id> component.
+            let peer_id = addr.iter()
+                .find_map(|proto| {
+                    if let libp2p::multiaddr::Protocol::P2p(pid) = proto {
+                        Some(pid)
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("bootstrap addr missing /p2p/ component: {addr_str}"))?;
+
+            self.inner.behaviour_mut().kademlia
+                .add_address(&peer_id, addr.clone());
+
+            info!(%peer_id, %addr, "added Kademlia bootstrap peer");
+
+            if let Err(e) = self.inner.dial(addr) {
+                warn!(%peer_id, %e, "failed to dial bootstrap peer");
+            }
+        }
+
+        if !bootstrap_peers.is_empty() {
+            self.inner.behaviour_mut().kademlia.bootstrap()
+                .map_err(|e| anyhow::anyhow!("Kademlia bootstrap failed: {e}"))?;
+            info!(peers = bootstrap_peers.len(), "Kademlia bootstrap initiated");
+        }
+
+        Ok(())
     }
 
     /// Subscribe the node to all SUM Storage Node Gossipsub topics.
@@ -242,9 +334,39 @@ impl SumSwarm {
                         warn!(%e, "event channel full — dropping PeerIdentified");
                     }
                 }
+                // Feed identified peer's listen addresses into Kademlia
+                // so the DHT routing table populates beyond bootstrap nodes.
+                for addr in &info.listen_addrs {
+                    self.inner.behaviour_mut().kademlia
+                        .add_address(&peer_id, addr.clone());
+                }
             }
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Identify(e)) => {
                 debug!(?e, "identify event");
+            }
+
+            // ── Kademlia DHT ─────────────────────────────────────────────────
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Kademlia(
+                kad::Event::RoutingUpdated { peer, addresses, .. }
+            )) => {
+                // Wire Kademlia-discovered peers into gossipsub (same as mDNS).
+                self.inner.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                let addrs: Vec<Multiaddr> = addresses.iter().cloned().collect();
+                info!(%peer, addr_count = addrs.len(), "Kademlia peer discovered");
+                if let Err(e) = event_tx.try_send(SumNetEvent::PeerDiscovered {
+                    peer_id: peer,
+                    addrs,
+                }) {
+                    warn!(%e, "event channel full — dropping PeerDiscovered (kad)");
+                }
+            }
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Kademlia(
+                kad::Event::OutboundQueryProgressed { result, .. }
+            )) => {
+                debug!(?result, "Kademlia query progress");
+            }
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Kademlia(e)) => {
+                debug!(?e, "kademlia event");
             }
 
             // ── Chunk transfer ────────────────────────────────────────────────

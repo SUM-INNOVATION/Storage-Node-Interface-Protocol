@@ -33,10 +33,14 @@ pub struct MarketSyncWorker {
     poll_interval: Duration,
     /// CIDs with in-flight fetch requests (avoid duplicates).
     pending_fetches: HashSet<String>,
+    /// When pending_fetches was last cleared (stale entry cleanup).
+    last_fetches_cleared: Instant,
     /// Garbage collector for unassigned chunks.
     gc: GarbageCollector,
     /// When the L1 was last successfully polled (for GC safety).
     last_l1_poll: Instant,
+    /// Consecutive RPC failures (for exponential backoff).
+    consecutive_failures: u32,
 }
 
 impl MarketSyncWorker {
@@ -53,17 +57,20 @@ impl MarketSyncWorker {
             l1_address_base58,
             poll_interval,
             pending_fetches: HashSet::new(),
+            last_fetches_cleared: Instant::now(),
             gc: GarbageCollector::new(gc_grace_period),
             last_l1_poll: Instant::now(),
+            consecutive_failures: 0,
         }
     }
 
-    /// Run the market sync loop indefinitely.
+    /// Run the market sync loop until shutdown is signalled.
     pub async fn run(
         mut self,
         store: Arc<RwLock<SumStore>>,
         net: Arc<SumNet>,
         peer_addresses: Arc<RwLock<HashMap<PeerId, [u8; 20]>>>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
         info!(
             address = %self.l1_address_base58,
@@ -73,9 +80,36 @@ impl MarketSyncWorker {
 
         let mut interval = tokio::time::interval(self.poll_interval);
         loop {
-            interval.tick().await;
-            if let Err(e) = self.sync_cycle(&store, &net, &peer_addresses).await {
-                warn!(%e, "MarketSync cycle failed");
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Clear stale pending fetches every 5 minutes.
+                    if self.last_fetches_cleared.elapsed() > Duration::from_secs(300) {
+                        self.pending_fetches.clear();
+                        self.last_fetches_cleared = Instant::now();
+                    }
+
+                    match self.sync_cycle(&store, &net, &peer_addresses).await {
+                        Ok(()) => { self.consecutive_failures = 0; }
+                        Err(e) => {
+                            self.consecutive_failures += 1;
+                            let backoff_secs = self.poll_interval.as_secs()
+                                * 2u64.pow(self.consecutive_failures.min(5));
+                            warn!(
+                                %e,
+                                backoff_secs,
+                                failures = self.consecutive_failures,
+                                "MarketSync cycle failed — backing off"
+                            );
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        }
+                    }
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("MarketSync worker shutting down");
+                        return;
+                    }
+                }
             }
         }
     }

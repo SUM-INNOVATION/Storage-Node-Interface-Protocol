@@ -75,6 +75,20 @@ struct Cli {
     #[arg(long, env = "SUM_CLIENT_MODE")]
     client: bool,
 
+    /// Enable WAN discovery via Kademlia DHT + TCP transport.
+    /// When disabled (default), only mDNS (LAN) discovery is used.
+    #[arg(long, env = "SUM_ENABLE_WAN")]
+    enable_wan: bool,
+
+    /// Bootstrap peer multiaddrs for Kademlia DHT (repeatable or comma-separated).
+    /// Example: /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
+    #[arg(long = "bootstrap-peer", env = "SUM_BOOTSTRAP_PEERS", value_delimiter = ',')]
+    bootstrap_peers: Vec<String>,
+
+    /// TCP listen port for WAN connections (0 = OS-assigned).
+    #[arg(long, env = "SUM_TCP_PORT", default_value = "0")]
+    tcp_port: u16,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -156,21 +170,29 @@ async fn main() -> Result<()> {
         (Keypair::generate_ed25519(), None)
     };
 
+    // Build network config from CLI args.
+    let net_config = NetConfig {
+        listen_port: 0,
+        tcp_listen_port: cli.tcp_port,
+        enable_wan: cli.enable_wan,
+        bootstrap_peers: cli.bootstrap_peers.clone(),
+    };
+
     match cli.command {
         Command::Listen if cli.client => {
             anyhow::bail!("listen command requires node mode — remove --client flag")
         }
-        Command::Listen => run_listen(keypair, seed, &cli).await,
+        Command::Listen => run_listen(keypair, seed, &cli, net_config).await,
         Command::Ingest { path, upload_timeout_secs } => {
             let rpc_url = cli.rpc_url.clone();
             let client_mode = cli.client;
-            run_ingest(keypair, rpc_url, client_mode, path, upload_timeout_secs).await
+            run_ingest(keypair, rpc_url, client_mode, net_config, path, upload_timeout_secs).await
         }
-        Command::Fetch { cid } => run_fetch(keypair, cid).await,
+        Command::Fetch { cid } => run_fetch(keypair, net_config, cid).await,
         Command::Download { merkle_root, output, max_concurrent, download_timeout_secs } => {
-            run_download(keypair, cli.rpc_url.clone(), merkle_root, output, max_concurrent, download_timeout_secs).await
+            run_download(keypair, cli.rpc_url.clone(), net_config, merkle_root, output, max_concurrent, download_timeout_secs).await
         }
-        Command::Send { message } => run_send(keypair, message).await,
+        Command::Send { message } => run_send(keypair, net_config, message).await,
     }
 }
 
@@ -192,8 +214,8 @@ fn hex_to_bytes_32(hex: &str) -> Result<[u8; 32]> {
 
 // ── Listen mode ───────────────────────────────────────────────────────────────
 
-async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli) -> Result<()> {
-    let net = Arc::new(SumNet::new(NetConfig::default(), keypair.clone()).await?);
+async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli, net_config: NetConfig) -> Result<()> {
+    let net = Arc::new(SumNet::new(net_config, keypair.clone()).await?);
     let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
 
     // Shared PeerId -> L1 Address map (populated by PeerIdentified events).
@@ -208,6 +230,9 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli) -> Resu
     let acl = AclChecker::new(rpc.clone(), peer_addresses.clone());
 
     // Spawn PoR worker if we have an L1 keypair.
+    // Shutdown signal for background workers.
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+
     if let Some(seed) = seed {
         let l1_addr = identity::l1_address_from_keypair(&keypair);
         let l1_base58 = identity::l1_address_base58(&l1_addr);
@@ -218,7 +243,8 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli) -> Resu
             Duration::from_secs(cli.por_poll_secs),
         );
         let store_clone = store.clone();
-        tokio::spawn(async move { por.run(store_clone).await });
+        let por_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move { por.run(store_clone, por_shutdown).await });
         // Spawn MarketSync worker
         let market_sync = MarketSyncWorker::new(
             rpc.clone(),
@@ -230,8 +256,9 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli) -> Resu
         let store_clone2 = store.clone();
         let net_clone = net.clone();
         let peer_addrs_clone = peer_addresses.clone();
+        let market_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            market_sync.run(store_clone2, net_clone, peer_addrs_clone).await;
+            market_sync.run(store_clone2, net_clone, peer_addrs_clone, market_shutdown).await;
         });
     } else {
         warn!("PoR/MarketSync workers not started — no L1 keypair available");
@@ -302,7 +329,10 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli) -> Resu
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl-C — shutting down");
+                info!("Ctrl-C — initiating graceful shutdown");
+                let _ = shutdown_tx.send(true);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                info!("shutting down swarm");
                 net.shutdown().await?;
                 break;
             }
@@ -317,10 +347,11 @@ async fn run_ingest(
     keypair: Keypair,
     rpc_url: String,
     client_mode: bool,
+    net_config: NetConfig,
     path: PathBuf,
     upload_timeout_secs: u64,
 ) -> Result<()> {
-    let net = SumNet::new(NetConfig::default(), keypair).await?;
+    let net = SumNet::new(net_config, keypair).await?;
     let mut store = SumStore::new(StoreConfig::default())?;
 
     info!(path = %path.display(), "ingesting file");
@@ -463,8 +494,8 @@ async fn simple_serve_loop(net: &SumNet, store: &SumStore) -> Result<()> {
 
 // ── Fetch mode ───────────────────────────────────────────────────────────────
 
-async fn run_fetch(keypair: Keypair, cid: String) -> Result<()> {
-    let net = SumNet::new(NetConfig::default(), keypair).await?;
+async fn run_fetch(keypair: Keypair, net_config: NetConfig, cid: String) -> Result<()> {
+    let net = SumNet::new(net_config, keypair).await?;
     let mut store = SumStore::new(StoreConfig::default())?;
 
     if store.has_chunk(&cid) {
@@ -573,6 +604,7 @@ async fn run_fetch(keypair: Keypair, cid: String) -> Result<()> {
 async fn run_download(
     keypair: Keypair,
     rpc_url: String,
+    net_config: NetConfig,
     merkle_root: String,
     output: PathBuf,
     max_concurrent: usize,
@@ -580,7 +612,7 @@ async fn run_download(
 ) -> Result<()> {
     info!(%merkle_root, output = %output.display(), "starting download");
 
-    let net = Arc::new(SumNet::new(NetConfig::default(), keypair.clone()).await?);
+    let net = Arc::new(SumNet::new(net_config, keypair.clone()).await?);
     let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
     let rpc = Arc::new(L1RpcClient::new(rpc_url));
     let peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>> =
@@ -611,8 +643,8 @@ async fn run_download(
 
 // ── Send mode ─────────────────────────────────────────────────────────────────
 
-async fn run_send(keypair: Keypair, message: String) -> Result<()> {
-    let node = SumNet::new(NetConfig::default(), keypair).await?;
+async fn run_send(keypair: Keypair, net_config: NetConfig, message: String) -> Result<()> {
+    let node = SumNet::new(net_config, keypair).await?;
 
     const TIMEOUT: Duration = Duration::from_secs(30);
     info!("waiting for a peer on the LAN (timeout: {TIMEOUT:?})");

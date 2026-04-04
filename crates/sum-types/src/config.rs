@@ -8,11 +8,24 @@ use std::path::PathBuf;
 pub struct NetConfig {
     /// UDP port for QUIC listener. 0 = OS-assigned.
     pub listen_port: u16,
+    /// TCP port for Noise+Yamux listener (WAN fallback). 0 = OS-assigned.
+    pub tcp_listen_port: u16,
+    /// Enable WAN discovery via Kademlia DHT + TCP transport.
+    /// When false, only mDNS (LAN) is used.
+    pub enable_wan: bool,
+    /// Bootstrap peer multiaddrs for Kademlia DHT.
+    /// Example: `/ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...`
+    pub bootstrap_peers: Vec<String>,
 }
 
 impl Default for NetConfig {
     fn default() -> Self {
-        Self { listen_port: 0 }
+        Self {
+            listen_port: 0,
+            tcp_listen_port: 0,
+            enable_wan: false,
+            bootstrap_peers: Vec::new(),
+        }
     }
 }
 

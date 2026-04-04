@@ -142,6 +142,45 @@ impl SumStore {
         info!("store cleanup complete — {} chunks removed", cids.len());
         Ok(())
     }
+
+    /// Health check: returns a snapshot of store health for monitoring.
+    pub fn health_check(&self) -> HealthReport {
+        let chunk_count = self.local.list_all_cids().map(|v| v.len()).unwrap_or(0);
+        let manifest_count = self.manifest_idx.len();
+        let disk_usage_bytes = std::fs::read_dir(self.local.root())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        let store_dir_writable = {
+            let probe = self.config.store_dir.join(".health_probe");
+            if std::fs::write(&probe, b"ok").is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                true
+            } else {
+                false
+            }
+        };
+        HealthReport {
+            chunk_count,
+            manifest_count,
+            disk_usage_bytes,
+            store_dir_writable,
+        }
+    }
+}
+
+/// Health report from [`SumStore::health_check`].
+#[derive(Debug)]
+pub struct HealthReport {
+    pub chunk_count: usize,
+    pub manifest_count: usize,
+    pub disk_usage_bytes: u64,
+    pub store_dir_writable: bool,
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -174,5 +213,40 @@ mod tests {
         assert!(!store.local.has("cid_a"));
         assert!(!store.local.has("cid_b"));
         assert!(!store.local.has("cid_c"));
+    }
+
+    #[test]
+    fn health_check_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig {
+            store_dir: dir.path().join("store"),
+            max_chunk_msg_bytes: 64 * 1024 * 1024,
+        };
+        let store = SumStore::new(config).unwrap();
+
+        let report = store.health_check();
+        assert_eq!(report.chunk_count, 0);
+        assert_eq!(report.manifest_count, 0);
+        // disk_usage may include subdirectory entries (manifests/), so just check it's small
+        assert!(report.disk_usage_bytes < 1024, "expected minimal disk usage, got {}", report.disk_usage_bytes);
+        assert!(report.store_dir_writable);
+    }
+
+    #[test]
+    fn health_check_with_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig {
+            store_dir: dir.path().join("store"),
+            max_chunk_msg_bytes: 64 * 1024 * 1024,
+        };
+        let store = SumStore::new(config).unwrap();
+
+        store.local.put("cid_x", b"hello world").unwrap();
+        store.local.put("cid_y", &vec![0u8; 4096]).unwrap();
+
+        let report = store.health_check();
+        assert_eq!(report.chunk_count, 2);
+        assert!(report.disk_usage_bytes > 0);
+        assert!(report.store_dir_writable);
     }
 }

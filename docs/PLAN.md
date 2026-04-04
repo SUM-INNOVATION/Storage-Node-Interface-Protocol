@@ -64,8 +64,8 @@ Goal: Close remaining gaps, improve storage efficiency, enable WAN connectivity,
     2. File Download Command: sum-node download <merkle_root> --output <path> — manifest fetch, parallel chunk download (max 10 concurrent), CID verification, merkle root verification, file reassembly. [DONE]
     3. Garbage Collection: GarbageCollector with mark-and-sweep, configurable grace period (--gc-grace-secs, default 1 hour), L1-reachability safety guard (pauses if last poll > 5 min). Integrated into MarketSyncWorker. Entry nodes (the R=3 nodes Alice initially pushes to) are NOT treated specially — if the assignment recomputes and an entry node is no longer assigned to a chunk, GC deletes it after the grace period. This is safe because the MarketSync cycle (30s) fetches data to new assignees well before the GC grace period (1 hour) expires. No chunk provenance metadata is stored. [DONE]
     4. Reed-Solomon Erasure Coding: Replace pure 3x chunk replication with coded redundancy (k=4 data + m=2 parity shards). Storage overhead drops from 3x to 1.5x. Requires L1 changes to challenge on shard indices. [NOT STARTED]
-    5. WAN Discovery: Kademlia DHT + AutoNAT + DCUtR for internet-wide peer discovery and NAT traversal. Currently only mDNS (LAN-only). [NOT STARTED]
-    6. Production Hardening: Prometheus metrics, graceful shutdown, health checks, full E2E integration test against live validators. [NOT STARTED]
+    5. WAN Discovery: Kademlia DHT + TCP/Noise/Yamux transport for internet-wide peer discovery. --enable-wan, --bootstrap-peer, --tcp-port CLI flags. Both mDNS (LAN) and Kademlia (WAN) run simultaneously. AutoNAT + DCUtR deferred to future phase. [DONE — see docs/WAN-DISCOVERY-AND-HARDENING.md]
+    6. Production Hardening: Graceful shutdown (watch channel, 5s flush), health check (SumStore::health_check() -> HealthReport), basic metrics (NodeMetrics atomic counters), exponential backoff on RPC failures, bounded responded/pending_fetches sets. Full E2E test against live validators still pending. [DONE — see docs/WAN-DISCOVERY-AND-HARDENING.md]
 
 Phase 5: Client-Side Encryption for Private Files [NOT STARTED — see docs/SECURITY-ANALYSIS.md]
 Goal: Make data confidentiality independent of node honesty. Nodes store ciphertext, never plaintext.
@@ -77,11 +77,12 @@ Goal: Make data confidentiality independent of node honesty. Nodes store ciphert
     and justification for why encryption is the correct layer.
 
 What Can Be Tested Right Now
-    1. cargo test --workspace — 90 unit tests, no setup needed
+    1. cargo test --workspace — 96 unit tests, no setup needed
     2. bash tests/integration/test_p2p.sh — automated 2-node chunk transfer on localhost
     3. Two-terminal ingest + download — ingest on Terminal A, download <merkle_root> --output on Terminal B, diff to verify byte-identical output
     4. LAN test — same as above across two computers on the same WiFi (mDNS discovers peers automatically)
-    5. VPN/Tailscale LAN test — mDNS may work over Tailscale mesh networks, enabling testing across different physical networks without WAN support
+    5. WAN test — two computers on different networks using --enable-wan --bootstrap-peer flags (Kademlia DHT + TCP transport)
+    6. 6-machine E2E test — 2 validators + 2 storage nodes + Alice (client upload) + Bob (client download), LAN or WAN
 
 What Cannot Be Tested Without a Running L1
     1. PoR challenge/response loop (Steps 5-7) — needs validators generating challenges every 100 blocks
@@ -90,17 +91,10 @@ What Cannot Be Tested Without a Running L1
     4. GC in production conditions — needs assignment from live on-chain state
     5. Upload orchestrator with real R=3 assignment — needs storage_getActiveNodes from L1
 
-What Cannot Be Tested Without WAN Support (Phase 4, Objective 5)
-    - Two computers on different networks (different WiFi, different cities, over the internet)
-    - The only peer discovery mechanism is mDNS, which broadcasts on the local network only
-    - WAN requires Kademlia DHT bootstrap nodes — not implemented
-    - Workaround: Tailscale or similar VPN creates a virtual LAN where mDNS works across physical networks
-
 Known Gaps (Current State)
     1. Client mode starts a full swarm: The --client flag makes run_ingest() exit after upload (instead of serving forever), but still starts a full libp2p swarm with gossipsub subscriptions. A true lightweight client that is outbound-only (no listening port, no gossipsub) is a future optimization. See docs/CLIENT-MODE-GAP.md Phase 3.
     2. Steps 4-7 untested against live L1: The PoR loop (market sync, challenge polling, proof generation, settlement) is implemented but has never been tested end-to-end against running sum-chain validators.
     3. Client-side encryption for private files: Nodes hold plaintext on disk. ACL is enforced off-chain by node code and can be bypassed by a modified binary. See docs/SECURITY-ANALYSIS.md.
-        - This is the architecture described in the README: Alice and Bob are external users, not infrastructure operators.
 
 sum-storage-node/
 |
@@ -135,7 +129,7 @@ sum-storage-node/
     |       +-- discovery.rs            # mDNS peer discovery
     |       +-- capability.rs           # [DEFERRED] WAN capability advertisement
     |       +-- nat.rs                  # [DEFERRED] AutoNAT / DCUtR / Relay
-    |       +-- transport.rs            # [DEFERRED] TCP/Noise fallback transport
+    |       +-- transport.rs            # [DEFERRED] TCP/Noise fallback transport (TCP now built into swarm.rs)
     |
     +-- sum-store/                      # Crate 3: File I/O & Merkle Math
     |   +-- src/
@@ -156,7 +150,8 @@ sum-storage-node/
     |
     +-- sum-node/                       # Crate 4: CLI Entry Point
         +-- src/
-            +-- main.rs                 # CLI: listen, ingest, fetch, download, send
+            +-- main.rs                 # CLI: listen, ingest, fetch, download, send + WAN flags
+            +-- metrics.rs             # NodeMetrics atomic counters
             +-- lib.rs                  # Library exports for e2e_helper
             +-- rpc_client.rs           # JSON-RPC client to L1
             +-- tx_builder.rs           # Transaction construction + signing (bincode v1 mirror types)
@@ -167,11 +162,11 @@ sum-storage-node/
             +-- upload.rs               # UploadOrchestrator — multi-node push with confirmation
             +-- bin/e2e_helper.rs       # E2E test helper CLI
 
-Tests: 90 unit tests + P2P integration test passing
+Tests: 96 unit tests + P2P integration test passing
     - sum-types: 8 tests (storage types, RPC types, config)
     - sum-net: 14 tests (codec, identity, base58, L1 address, push round-trip)
-    - sum-store: 63 tests (chunker, merkle, verify, content_id, store, manifest, manifest_index, assignment, announce, mmap, gc)
-    - sum-node: 4 tests (tx_builder)
+    - sum-store: 66 tests (chunker, merkle, verify, content_id, store, manifest, manifest_index, assignment, announce, mmap, gc, health_check, cleanup)
+    - sum-node: 8 tests (tx_builder, metrics)
     - Integration: test_p2p.sh (2-node chunk transfer on localhost)
     - Integration: test_e2e_l1.sh (full PoR loop, requires live validators)
 
