@@ -306,8 +306,10 @@ Step 1: Objective 1 (Resilient Upload) — HIGHEST PRIORITY
   |-- 1b. sum-node/upload.rs: UploadOrchestrator                  [DONE]
   |-- 1c. sum-net/codec.rs: push_data field on ShardRequest       [DONE]
   |-- 1d. sum-store/serve.rs: handle_push_request()               [DONE]
-  |-- 1e. sum-node/main.rs: ingest uses UploadOrchestrator        [NOT DONE — still uses old single-peer flow]
-  +-- 1f. Tests: 1 of 13 passing (codec push round-trip)
+  |-- 1e. sum-node/main.rs: ingest uses UploadOrchestrator        [DONE — --client exits after upload, default enters serve loop]
+  |-- 1f. sum-node/main.rs: --client flag + --upload-timeout      [DONE]
+  |-- 1g. sum-store/lib.rs: SumStore::cleanup()                   [DONE]
+  +-- 1h. Tests: 2 of 13 passing (codec push round-trip + cleanup)
 
 Step 2: Objective 2 (Download + GC) — HIGH PRIORITY
   |-- 2a. sum-node/download.rs: DownloadOrchestrator              [DONE]
@@ -350,15 +352,15 @@ Step 5: Objective 5 (Production Hardening)
 
 | Objective | Tests | Status |
 |-----------|-------|--------|
-| 1. Resilient Upload | 13 | Code complete, not wired into ingest CLI. push_data + push handler + UploadOrchestrator built. 1 codec test passing. |
-| 2. Download + GC | 24 | Download command DONE. GC DONE. 7 GC tests + 4 ChunkStore tests passing. Download integration tests require live peers. |
+| 1. Resilient Upload | 13 | DONE. UploadOrchestrator wired into run_ingest(). --client flag exits after R confirmations. --upload-timeout. cleanup(). 2 tests passing (codec push + cleanup). |
+| 2. Download + GC | 24 | DONE. Download command + GC + ChunkStore extensions. 11 tests passing (4 ChunkStore + 7 GC). Download integration tests require live peers. |
 | 3. Reed-Solomon | 18 | NOT STARTED |
 | 4. WAN Discovery | 14 | NOT STARTED |
 | 5. Production Hardening | 12 | NOT STARTED |
 | **Phase 4 Total** | **81** | |
 | Prior (Phases 1-3) | 77 | All passing |
-| Phase 4 implemented so far | 12 | 4 ChunkStore + 1 codec + 7 GC |
-| **Current Grand Total** | **89** | All passing |
+| Phase 4 implemented so far | 13 | 4 ChunkStore + 1 codec + 7 GC + 1 cleanup |
+| **Current Grand Total** | **90** | All passing |
 
 ---
 

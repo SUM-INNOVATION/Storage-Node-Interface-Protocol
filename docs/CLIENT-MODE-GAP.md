@@ -57,9 +57,9 @@ But `run_ingest()` does NOT use it. It still uses the old single-peer announce-a
 
 ---
 
-## What Needs to Change
+## Current Status
 
-### Phase 1: Wire UploadOrchestrator into `run_ingest()`
+### Phase 1: DONE — UploadOrchestrator wired into `run_ingest()`
 
 **File:** `crates/sum-node/src/main.rs`
 
@@ -84,57 +84,37 @@ PROPOSED:
   8. Exit (do NOT enter serve loop)
 ```
 
-**Key changes:**
-- Remove `simple_serve_loop()` from the ingest flow
-- Add `UploadOrchestrator::run()` after ingestion
-- Add `--upload-timeout` flag (default 120s)
-- After successful upload, optionally clean up local chunks (Alice doesn't need them anymore)
-- Exit with code 0 on full confirmation, code 1 on partial/timeout
+**All implemented:**
+- `run_ingest()` calls `UploadOrchestrator::run()` to push to R=3 assigned nodes
+- `--upload-timeout` flag added (default 120s)
+- `--client` flag added: exits after confirmation, calls `store.cleanup()` to delete local chunks
+- Without `--client`: enters `simple_serve_loop()` after upload (backward compat for node operators)
 
-### Phase 2: Lightweight Client Mode
+### Phase 2: DONE — `--client` flag implemented
 
-**Goal:** A `--client` flag or separate binary that minimizes the libp2p footprint.
+The `--client` flag on `sum-node` enables client mode:
 
-**What a client needs:**
-- QUIC transport (for push/fetch protocol)
-- mDNS or direct peer address (for finding nodes)
-- `/sum/storage/v1` request-response (for push and fetch)
-- Gossipsub subscription to `sum/storage/v1` (for tracking ChunkAnnouncements as confirmations)
+**What the `--client` flag does:**
+- `run_ingest()`: pushes to R=3 via UploadOrchestrator, waits for confirmations, calls `store.cleanup()`, exits
+- `run_download()`: already exits after assembly (no change needed)
+- `listen`: rejected with error ("listen requires node mode")
+- No PorWorker, MarketSyncWorker, GarbageCollector, ACL checker, or chunk serving
 
-**What a client does NOT need:**
-- PorWorker (no challenges to answer — not registered)
-- MarketSyncWorker (no assigned chunks to fetch)
-- GarbageCollector (no long-term storage)
-- ACL checker (no chunks to serve)
-- Chunk serving (handle_request / simple_serve_loop)
-- Persistent chunk store (only temporary during upload)
-
-**Implementation options:**
-
-**Option A — `--client` flag on `sum-node`:**
 ```bash
+# Alice uploads:
 sum-node --client ingest file.pdf --rpc-url http://validator:9944
-sum-node --client download <merkle_root> --output ./file.pdf
+
+# Bob downloads:
+sum-node download <merkle_root> --output ./file.pdf
 ```
-When `--client` is set:
-- `run_ingest()` uses UploadOrchestrator, exits after confirmation
-- `run_download()` already exits after assembly (no change needed)
-- No `listen` command allowed
-- Store directory is a temp dir, cleaned up on exit
 
-**Option B — Separate `sum-client` binary:**
-A distinct binary with only `upload` and `download` subcommands. No `listen` command. Uses a temporary store directory. Simpler CLI, no confusion with node commands.
+### Phase 3: Minimize swarm for client mode [NOT STARTED — future optimization]
 
-**Recommendation:** Option A first (less code duplication), Option B later for production.
-
-### Phase 3: Minimize swarm for client mode
-
-Even with `--client`, the current `SumNet::new()` starts a full swarm with all behaviours. For true lightweight mode:
+Even with `--client`, the current `SumNet::new()` starts a full swarm with all behaviours (gossipsub subscriptions, listening port, mDNS). For true lightweight mode:
 - Skip gossipsub subscriptions (use ShardReceived ACKs for confirmation instead of ChunkAnnouncements)
-- Or: subscribe to `sum/storage/v1` temporarily, unsubscribe on exit
 - Don't start listening on a port (client is outbound-only, not a reachable peer)
 
-This is a deeper change to `sum-net` and can come later. Phase 1 (wiring UploadOrchestrator) gives 90% of the benefit with minimal code changes.
+This is a deeper change to `sum-net` and can come later. The current `--client` flag provides the correct user experience (push, confirm, exit) even if the underlying swarm is heavier than necessary.
 
 ---
 

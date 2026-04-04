@@ -185,7 +185,12 @@ The validators execute the transaction:
 
 ![Step 3](docs/diagrams/step3.svg)
 
-Alice connects to the P2P mesh and discovers nearby storage nodes via mDNS (multicast DNS — nodes broadcast "I'm here" on the local network).
+Alice runs:
+```bash
+sum-node --client ingest file.pdf --rpc-url http://<validator>:9944
+```
+
+Her client connects to the P2P mesh and discovers nearby storage nodes via mDNS (multicast DNS — nodes broadcast "I'm here" on the local network). Alice does not need to register as an ArchiveNode, stake Koppa, or run storage infrastructure — she is an external user of the network.
 
 Alice does **not** push to a single node. Instead, she computes the same deterministic assignment algorithm described in Step 4 — she queries the L1 for the active node list (`storage_getActiveNodes()`), sorts them, and calculates which `R` = 3 nodes are assigned to each chunk. She then pushes each chunk directly to its 3 assigned nodes in parallel using the `/sum/storage/v1` push protocol over QUIC (a fast, encrypted transport protocol).
 
@@ -518,17 +523,27 @@ The download command automatically verifies the entire file by building the Merk
 
 ## CLI Reference
 
+**For external users (Alice/Bob) — client mode:**
+
 | Command | What it does |
 |---------|-------------|
-| `sum-node listen` | Serve chunks, enforce ACLs, respond to PoR challenges, run MarketSync + GC |
-| `sum-node ingest <path>` | Chunk a file, store, announce on mesh |
-| `sum-node download <merkle_root> --output <path>` | Download a complete file by merkle root — manifest fetch, parallel chunk download, CID verification, merkle root verification, file reassembly |
+| `sum-node --client ingest <path>` | Upload a file: chunk locally, push to R=3 assigned nodes, wait for confirmations, clean up local chunks, exit |
+| `sum-node download <merkle_root> --output <path>` | Download a complete file by merkle root: manifest fetch, parallel chunk download, CID verification, merkle root verification, file reassembly, exit |
+
+**For storage node operators — node mode:**
+
+| Command | What it does |
+|---------|-------------|
+| `sum-node listen` | Run as a storage node: serve chunks, enforce ACLs, respond to PoR challenges, run MarketSync + GC |
+| `sum-node ingest <path>` | Upload a file AND stay running to serve chunks (node operator adding a file to the network) |
 | `sum-node fetch <cid>` | Download a single chunk by CID from a LAN peer |
 | `sum-node send <message>` | Broadcast a test gossipsub message |
 
 **Key flags:**
+- `--client` — Run in client mode. Ingest pushes to R=3 and exits (no serving). Listen is not available.
 - `--key-file <path>` — Ed25519 private key seed (hex-encoded). Without it, generates a random keypair (dev mode, PoR disabled).
 - `--rpc-url <url>` — SUM Chain L1 JSON-RPC endpoint (default `http://127.0.0.1:9944`)
+- `--upload-timeout <seconds>` — time to wait for R=3 push confirmations during ingest (default 120)
 - `--gc-grace-secs <seconds>` — how long to keep unassigned chunks before garbage collection deletes them (default 3600 = 1 hour)
 - `--max-concurrent <n>` — maximum parallel chunk fetches during download (default 10)
 
