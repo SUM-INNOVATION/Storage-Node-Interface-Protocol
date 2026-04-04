@@ -60,7 +60,7 @@ Goal: Nodes can deterministically route and distribute file chunks across the ne
 
 Phase 4: Scale-Out & Production Readiness [IN PROGRESS — see docs/PHASE4-EXECUTION-PLAN.md]
 Goal: Close remaining gaps, improve storage efficiency, enable WAN connectivity, and harden for production.
-    1. Resilient Upload: Push protocol (push_data on ShardRequest) + UploadOrchestrator that pushes to R=3 assigned nodes with ACK confirmation. [CODE COMPLETE — not yet wired into ingest CLI]
+    1. Resilient Upload: Push protocol (push_data on ShardRequest) + UploadOrchestrator that pushes to R=3 assigned nodes with ACK confirmation. run_ingest() calls UploadOrchestrator::run(). In client mode (--client), Alice exits after R confirmations. In node mode (default), enters serve loop after upload. [DONE]
     2. File Download Command: sum-node download <merkle_root> --output <path> — manifest fetch, parallel chunk download (max 10 concurrent), CID verification, merkle root verification, file reassembly. [DONE]
     3. Garbage Collection: GarbageCollector with mark-and-sweep, configurable grace period (--gc-grace-secs, default 1 hour), L1-reachability safety guard (pauses if last poll > 5 min). Integrated into MarketSyncWorker. Entry nodes (the R=3 nodes Alice initially pushes to) are NOT treated specially — if the assignment recomputes and an entry node is no longer assigned to a chunk, GC deletes it after the grace period. This is safe because the MarketSync cycle (30s) fetches data to new assignees well before the GC grace period (1 hour) expires. No chunk provenance metadata is stored. [DONE]
     4. Reed-Solomon Erasure Coding: Replace pure 3x chunk replication with coded redundancy (k=4 data + m=2 parity shards). Storage overhead drops from 3x to 1.5x. Requires L1 changes to challenge on shard indices. [NOT STARTED]
@@ -97,16 +97,9 @@ What Cannot Be Tested Without WAN Support (Phase 4, Objective 5)
     - Workaround: Tailscale or similar VPN creates a virtual LAN where mDNS works across physical networks
 
 Known Gaps (Current State)
-The following items are described in the README but are not yet fully implemented:
-    1. No separate client role: The README describes Alice as a non-node user (external client) uploading a file. In practice, Alice must run sum-node ingest which starts a full libp2p swarm (gossipsub, mDNS, chunk serving). A true lightweight client binary that only connects, pushes chunks to R=3 nodes, waits for confirmation, and exits — without running background workers or serving chunks — does not yet exist. This is a critical goal: external users (non-node operators) must be able to store and retrieve files without running storage infrastructure. See Phase 4 Objective 7.
-    2. Single-node upload: The ingest command still pushes chunks to 1 discovered peer only. The UploadOrchestrator (which pushes to R=3) is built but not yet integrated into run_ingest().
-    3. Steps 4-7 untested against live L1: The PoR loop (market sync, challenge polling, proof generation, settlement) is implemented but has never been tested end-to-end against running sum-chain validators.
-
-    Phase 4 Objective 7 — Lightweight Client Mode [NOT STARTED]:
-    Build a separate binary or --client flag for sum-node that enables Alice and Bob to interact with the network without being storage nodes:
-        - Upload mode: chunk file locally, compute assignment from L1, push to R=3 nodes, wait for R confirmations, exit. No gossipsub subscriptions, no PorWorker, no MarketSync, no chunk serving.
-        - Download mode: request manifest, fetch chunks from assigned nodes, verify CIDs, reassemble file, exit. (The download command already supports this flow but still starts a full swarm.)
-        - No stake required. No ArchiveNode registration. Just a wallet with Koppa for AllocateStorage fees.
+    1. Client mode starts a full swarm: The --client flag makes run_ingest() exit after upload (instead of serving forever), but still starts a full libp2p swarm with gossipsub subscriptions. A true lightweight client that is outbound-only (no listening port, no gossipsub) is a future optimization. See docs/CLIENT-MODE-GAP.md Phase 3.
+    2. Steps 4-7 untested against live L1: The PoR loop (market sync, challenge polling, proof generation, settlement) is implemented but has never been tested end-to-end against running sum-chain validators.
+    3. Client-side encryption for private files: Nodes hold plaintext on disk. ACL is enforced off-chain by node code and can be bypassed by a modified binary. See docs/SECURITY-ANALYSIS.md.
         - This is the architecture described in the README: Alice and Bob are external users, not infrastructure operators.
 
 sum-storage-node/
@@ -197,5 +190,5 @@ The Core Engineering Focuses for Team B
     6. The assignment.rs (in sum-store): Deterministic chunk-to-node mapping using blake3(merkle_root ++ chunk_index ++ replica). Same algorithm on L1 and off-chain. [DONE]
     7. The market_sync.rs (in sum-node): Polls L1 for funded files, computes assignments, auto-fetches missing chunks from peers. [DONE]
     8. The download command (in sum-node): DownloadOrchestrator — manifest fetch, parallel chunk download (max 10 concurrent), CID verification, merkle root verification, file reassembly. [DONE]
-    9. The upload orchestrator (in sum-node): UploadOrchestrator — push protocol (push_data on ShardRequest), push to R=3 assigned nodes, ACK confirmation tracking. [CODE COMPLETE — not yet wired into ingest CLI]
+    9. The upload orchestrator (in sum-node): UploadOrchestrator — push protocol (push_data on ShardRequest), push to R=3 assigned nodes, ACK confirmation tracking. Wired into run_ingest(). --client flag exits after confirmation; default enters serve loop. [DONE]
     10. The garbage collector (in sum-store): GarbageCollector with mark-and-sweep, configurable grace period, L1-reachability guard. Integrated into MarketSyncWorker. [DONE]
