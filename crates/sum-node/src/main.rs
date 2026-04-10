@@ -22,7 +22,7 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use sum_net::{SumNet, SumNetEvent, Keypair, ShardResponse, TOPIC_STORAGE, TOPIC_TEST};
@@ -33,6 +33,7 @@ use sum_types::config::{NetConfig, StoreConfig};
 use sum_node::acl::AclChecker;
 use sum_node::download::DownloadOrchestrator;
 use sum_node::market_sync::MarketSyncWorker;
+use sum_node::peer_state::{apply_peer_event, PeerMapChange};
 use sum_node::por_worker::PorWorker;
 use sum_node::rpc_client::L1RpcClient;
 use sum_node::upload::UploadOrchestrator;
@@ -302,13 +303,28 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli, net_con
                             let _ = net.respond_shard(*channel_id, resp).await;
                         }
                     }
-                    SumNetEvent::PeerIdentified { peer_id, l1_address } => {
-                        peer_addresses.write().await.insert(*peer_id, *l1_address);
-                        info!(
-                            peer = %peer_id,
-                            l1 = %identity::l1_address_base58(l1_address),
-                            "peer L1 identity mapped"
-                        );
+                    SumNetEvent::PeerIdentified { .. } | SumNetEvent::PeerDisconnected { .. } => {
+                        let mut map = peer_addresses.write().await;
+                        match apply_peer_event(&mut map, &event) {
+                            PeerMapChange::Inserted => {
+                                if let SumNetEvent::PeerIdentified { peer_id, l1_address } = &event {
+                                    info!(
+                                        peer = %peer_id,
+                                        l1 = %identity::l1_address_base58(l1_address),
+                                        "peer L1 identity mapped"
+                                    );
+                                }
+                            }
+                            PeerMapChange::Removed => {
+                                if let SumNetEvent::PeerDisconnected { peer_id } = &event {
+                                    debug!(peer = %peer_id, "removed disconnected peer from identity map");
+                                }
+                                print_event(&event);
+                            }
+                            PeerMapChange::Unchanged => {
+                                print_event(&event);
+                            }
+                        }
                     }
                     SumNetEvent::MessageReceived { topic, data, from } => {
                         if topic == TOPIC_STORAGE {
@@ -375,10 +391,9 @@ async fn run_ingest(
                     SumNetEvent::PeerDiscovered { .. } => {
                         found_peer = true;
                     }
-                    SumNetEvent::PeerIdentified { peer_id, l1_address } => {
-                        peer_addresses.insert(*peer_id, *l1_address);
+                    _ => {
+                        apply_peer_event(&mut peer_addresses, &event);
                     }
-                    _ => {}
                 }
                 // Wait a bit after first peer to collect more identities
                 if found_peer && peer_addresses.is_empty() {
@@ -388,12 +403,10 @@ async fn run_ingest(
                     // Give a brief window for more peers to identify
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     // Drain any remaining events
-                    while let Ok(event) = tokio::time::timeout(
+                    while let Ok(Some(event)) = tokio::time::timeout(
                         Duration::from_millis(200), net.next_event()
                     ).await {
-                        if let Some(SumNetEvent::PeerIdentified { peer_id, l1_address }) = event {
-                            peer_addresses.insert(peer_id, l1_address);
-                        }
+                        apply_peer_event(&mut peer_addresses, &event);
                     }
                     break;
                 }

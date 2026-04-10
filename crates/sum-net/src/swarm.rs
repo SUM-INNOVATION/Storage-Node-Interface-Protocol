@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -25,6 +25,14 @@ use crate::{
 
 /// Kademlia protocol identifier for the SUM Storage Node DHT.
 const KAD_PROTOCOL: &str = "/sum/kad/1.0.0";
+
+/// How long a pending response channel is kept before it is considered orphaned.
+/// Matches the request-response timeout (120s) so the requester has already
+/// given up by the time we reap.
+const PENDING_CHANNEL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often the reaper runs to clean up orphaned pending channels.
+const REAPER_INTERVAL: Duration = Duration::from_secs(30);
 
 // ── SwarmCommand ──────────────────────────────────────────────────────────────
 
@@ -52,8 +60,9 @@ pub struct SumSwarm {
     inner:  libp2p::Swarm<LocalMeshBehaviour>,
     gossip: GossipManager,
 
-    /// Stores response channels received from inbound chunk requests.
-    pending_shard_channels: HashMap<u64, ResponseChannel<ShardResponse>>,
+    /// Stores response channels received from inbound chunk requests,
+    /// together with the insertion time so orphaned entries can be reaped.
+    pending_shard_channels: HashMap<u64, (ResponseChannel<ShardResponse>, Instant)>,
 
     /// Monotonic counter for channel IDs.
     next_channel_id: u64,
@@ -235,6 +244,8 @@ impl SumSwarm {
         event_tx:   mpsc::Sender<SumNetEvent>,
         mut cmd_rx: mpsc::Receiver<SwarmCommand>,
     ) -> Result<()> {
+        let mut reaper_interval = tokio::time::interval(REAPER_INTERVAL);
+
         loop {
             tokio::select! {
                 event = self.inner.select_next_some() => {
@@ -253,7 +264,7 @@ impl SumSwarm {
                                 .send_request(&peer_id, request);
                         }
                         Some(SwarmCommand::SendShardResponse { channel_id, response }) => {
-                            if let Some(channel) = self.pending_shard_channels.remove(&channel_id) {
+                            if let Some((channel, _inserted)) = self.pending_shard_channels.remove(&channel_id) {
                                 if let Err(resp) = self.inner.behaviour_mut().shard_xfer
                                     .send_response(channel, response)
                                 {
@@ -269,7 +280,24 @@ impl SumSwarm {
                         }
                     }
                 }
+
+                _ = reaper_interval.tick() => {
+                    self.reap_orphaned_channels();
+                }
             }
+        }
+    }
+
+    /// Remove pending response channels that have been waiting longer than
+    /// [`PENDING_CHANNEL_TIMEOUT`]. Dropping the `ResponseChannel` causes
+    /// libp2p to signal a timeout to the requester.
+    fn reap_orphaned_channels(&mut self) {
+        let reaped = reap_stale_entries(
+            &mut self.pending_shard_channels,
+            PENDING_CHANNEL_TIMEOUT,
+        );
+        if reaped > 0 {
+            info!(reaped, remaining = self.pending_shard_channels.len(), "orphaned channel cleanup");
         }
     }
 
@@ -377,7 +405,7 @@ impl SumSwarm {
                     request_response::Message::Request { request, channel, .. } => {
                         let channel_id = self.next_channel_id;
                         self.next_channel_id += 1;
-                        self.pending_shard_channels.insert(channel_id, channel);
+                        self.pending_shard_channels.insert(channel_id, (channel, Instant::now()));
                         info!(
                             %peer,
                             cid = %request.cid,
@@ -389,7 +417,10 @@ impl SumSwarm {
                             request,
                             channel_id,
                         }) {
-                            warn!(%e, "event channel full — dropping ShardRequested");
+                            // Event was dropped — the app layer will never
+                            // respond, so remove the orphaned channel immediately.
+                            self.pending_shard_channels.remove(&channel_id);
+                            warn!(%e, channel_id, "event channel full — dropping ShardRequested and cleaning up pending channel");
                         }
                     }
                     request_response::Message::Response { response, .. } => {
@@ -466,5 +497,86 @@ impl SumSwarm {
 
             _ => {}
         }
+    }
+}
+
+/// Reap entries from a pending-channel map whose insertion time exceeds `timeout`.
+/// Returns the number of entries removed. Extracted for testability.
+pub(crate) fn reap_stale_entries<V>(
+    map: &mut HashMap<u64, (V, Instant)>,
+    timeout: Duration,
+) -> usize {
+    let now = Instant::now();
+    let before = map.len();
+    map.retain(|_id, (_v, inserted)| now.duration_since(*inserted) <= timeout);
+    before - map.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // A trivial stand-in for ResponseChannel (which we can't construct).
+    // reap_stale_entries is generic over V, so any type works.
+
+    #[test]
+    fn reap_stale_entries_removes_expired() {
+        let mut map: HashMap<u64, (String, Instant)> = HashMap::new();
+
+        // Insert one "old" entry (expired) and one "fresh" entry.
+        let old_time = Instant::now() - Duration::from_secs(200);
+        let fresh_time = Instant::now();
+        map.insert(1, ("old".into(), old_time));
+        map.insert(2, ("fresh".into(), fresh_time));
+
+        let reaped = reap_stale_entries(&mut map, PENDING_CHANNEL_TIMEOUT);
+        assert_eq!(reaped, 1);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&2));
+        assert!(!map.contains_key(&1));
+    }
+
+    #[test]
+    fn reap_stale_entries_nothing_to_reap() {
+        let mut map: HashMap<u64, (String, Instant)> = HashMap::new();
+        map.insert(1, ("a".into(), Instant::now()));
+        map.insert(2, ("b".into(), Instant::now()));
+
+        let reaped = reap_stale_entries(&mut map, PENDING_CHANNEL_TIMEOUT);
+        assert_eq!(reaped, 0);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn reap_stale_entries_all_expired() {
+        let mut map: HashMap<u64, (String, Instant)> = HashMap::new();
+        let old = Instant::now() - Duration::from_secs(300);
+        for i in 0..5 {
+            map.insert(i, (format!("ch-{i}"), old));
+        }
+
+        let reaped = reap_stale_entries(&mut map, PENDING_CHANNEL_TIMEOUT);
+        assert_eq!(reaped, 5);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn reap_stale_entries_empty_map() {
+        let mut map: HashMap<u64, (String, Instant)> = HashMap::new();
+        let reaped = reap_stale_entries(&mut map, PENDING_CHANNEL_TIMEOUT);
+        assert_eq!(reaped, 0);
+    }
+
+    #[test]
+    fn reap_stale_entries_recent_not_expired() {
+        let mut map: HashMap<u64, (String, Instant)> = HashMap::new();
+        // Well within the timeout — should NOT be reaped.
+        let recent = Instant::now() - Duration::from_secs(60);
+        map.insert(1, ("recent".into(), recent));
+
+        let reaped = reap_stale_entries(&mut map, PENDING_CHANNEL_TIMEOUT);
+        assert_eq!(reaped, 0);
+        assert_eq!(map.len(), 1);
     }
 }
