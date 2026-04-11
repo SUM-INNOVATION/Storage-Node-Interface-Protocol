@@ -23,6 +23,7 @@ use sum_store::{
 use sum_store::manifest::deserialize_manifest_cbor;
 use sum_types::storage::{DataManifest, REPLICATION_FACTOR};
 
+use crate::peer_state::apply_peer_event;
 use crate::rpc_client::L1RpcClient;
 
 // ── Public Types ─────────────────────────────────────────────────────────────
@@ -97,8 +98,9 @@ impl DownloadOrchestrator {
                                 break;
                             }
                         }
-                        Some(SumNetEvent::PeerIdentified { peer_id, l1_address }) => {
-                            peer_addresses.write().await.insert(peer_id, l1_address);
+                        Some(ref e @ SumNetEvent::PeerIdentified { .. })
+                        | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {
+                            apply_peer_event(&mut *peer_addresses.write().await, e);
                         }
                         None => bail!("network shut down before peer discovery"),
                         _ => {}
@@ -147,8 +149,9 @@ impl DownloadOrchestrator {
                                 discovered_peers.push(peer_id);
                             }
                         }
-                        Some(SumNetEvent::PeerIdentified { peer_id, l1_address }) => {
-                            peer_addresses.write().await.insert(peer_id, l1_address);
+                        Some(ref e @ SumNetEvent::PeerIdentified { .. })
+                        | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {
+                            apply_peer_event(&mut *peer_addresses.write().await, e);
                         }
                         None => bail!("network shut down while waiting for manifest"),
                         _ => {}
@@ -290,8 +293,9 @@ impl DownloadOrchestrator {
                                 discovered_peers.push(peer_id);
                             }
                         }
-                        Some(SumNetEvent::PeerIdentified { peer_id, l1_address }) => {
-                            peer_addresses.write().await.insert(peer_id, l1_address);
+                        Some(ref e @ SumNetEvent::PeerIdentified { .. })
+                        | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {
+                            apply_peer_event(&mut *peer_addresses.write().await, e);
                         }
                         None => bail!("network shut down during chunk fetching"),
                         _ => {}
