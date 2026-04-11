@@ -15,7 +15,6 @@ use sum_net::{SumNet, PeerId};
 use sum_net::identity;
 use sum_store::{SumStore, compute_chunk_assignment, chunks_for_node, nodes_for_chunk};
 use sum_store::gc::GarbageCollector;
-use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_types::rpc_types::StorageFileInfo;
 use sum_types::storage::{CHUNK_SIZE, REPLICATION_FACTOR};
 
@@ -23,6 +22,11 @@ use crate::rpc_client::L1RpcClient;
 
 /// Background worker that syncs this node's assigned chunks from the network,
 /// and garbage-collects unassigned chunks after a grace period.
+///
+/// Fetches are routed through `SumStore::fetcher` (a [`sum_store::FetchManager`])
+/// so the listen-mode event loop in `main.rs` can complete them via
+/// `on_chunk_received`. Deduplication uses `fetcher.is_active(cid)` as the
+/// single source of truth — there is no separate pending-fetches set.
 pub struct MarketSyncWorker {
     rpc: Arc<L1RpcClient>,
     /// This node's L1 address (20 bytes).
@@ -31,10 +35,6 @@ pub struct MarketSyncWorker {
     l1_address_base58: String,
     /// How often to poll the L1 for assignment changes.
     poll_interval: Duration,
-    /// CIDs with in-flight fetch requests (avoid duplicates).
-    pending_fetches: HashSet<String>,
-    /// When pending_fetches was last cleared (stale entry cleanup).
-    last_fetches_cleared: Instant,
     /// Garbage collector for unassigned chunks.
     gc: GarbageCollector,
     /// When the L1 was last successfully polled (for GC safety).
@@ -56,8 +56,6 @@ impl MarketSyncWorker {
             l1_address,
             l1_address_base58,
             poll_interval,
-            pending_fetches: HashSet::new(),
-            last_fetches_cleared: Instant::now(),
             gc: GarbageCollector::new(gc_grace_period),
             last_l1_poll: Instant::now(),
             consecutive_failures: 0,
@@ -82,12 +80,6 @@ impl MarketSyncWorker {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // Clear stale pending fetches every 5 minutes.
-                    if self.last_fetches_cleared.elapsed() > Duration::from_secs(300) {
-                        self.pending_fetches.clear();
-                        self.last_fetches_cleared = Instant::now();
-                    }
-
                     match self.sync_cycle(&store, &net, &peer_addresses).await {
                         Ok(()) => { self.consecutive_failures = 0; }
                         Err(e) => {
@@ -149,9 +141,6 @@ impl MarketSyncWorker {
             let map = peer_addresses.read().await;
             map.iter().map(|(pid, addr)| (*addr, *pid)).collect()
         };
-
-        let mut fetched_count = 0;
-        let mut missing_count = 0;
 
         // 3. For each funded file, compute assignment and fetch missing chunks
         for file in &files {
@@ -241,42 +230,68 @@ impl MarketSyncWorker {
             return Ok(());
         }
 
-        // We have the manifest — check which assigned chunks are missing
-        for chunk_index in &my_chunks {
-            let cid = store_read.manifest_idx.chunk_cid(&root_bytes, *chunk_index);
-            let Some(cid) = cid else { continue };
+        // We have the manifest — collect targets that need fetching.
+        // Done under the read lock so the listen-loop's writer (which calls
+        // on_chunk_received under a write lock) isn't blocked.
+        struct FetchTarget {
+            chunk_index: u32,
+            cid: String,
+            expected_size: u64,
+            peer_id: PeerId,
+        }
+        let mut targets: Vec<FetchTarget> = Vec::new();
+        if let Some(manifest) = store_read.manifest_idx.get_by_merkle_root(&root_bytes) {
+            for chunk_index in &my_chunks {
+                let Some(chunk) = manifest.chunks.get(*chunk_index as usize) else { continue };
+                let cid = &chunk.cid;
 
-            if store_read.local.has(cid) {
-                continue; // Already have this chunk
-            }
-
-            if self.pending_fetches.contains(cid) {
-                continue; // Already fetching
-            }
-
-            // Find a peer to fetch from
-            let chunk_holders = nodes_for_chunk(&assignment, *chunk_index);
-            if let Some(holders) = chunk_holders {
-                for holder_addr in holders {
-                    if holder_addr == &self.l1_address {
-                        continue; // Don't fetch from ourselves
-                    }
-                    if let Some(peer_id) = addr_to_peer.get(holder_addr) {
-                        info!(
-                            root = root_hex,
-                            chunk = chunk_index,
-                            cid = cid,
-                            peer = %peer_id,
-                            "fetching assigned chunk from peer"
-                        );
-                        let cid_owned = cid.to_string();
-                        let _ = net.request_shard_chunk(
-                            *peer_id, cid_owned.clone(), None, None,
-                        ).await;
-                        self.pending_fetches.insert(cid_owned);
-                        break; // One fetch request per chunk
-                    }
+                if store_read.local.has(cid) {
+                    continue; // Already have this chunk
                 }
+                if store_read.fetcher.is_active(cid) {
+                    continue; // Already in flight via FetchManager
+                }
+
+                // Pick the first peer that holds this chunk and isn't us.
+                let Some(holders) = nodes_for_chunk(&assignment, *chunk_index) else { continue };
+                let chosen_peer = holders.iter()
+                    .filter(|h| **h != self.l1_address)
+                    .find_map(|h| addr_to_peer.get(h).copied());
+                let Some(peer_id) = chosen_peer else { continue };
+
+                targets.push(FetchTarget {
+                    chunk_index: *chunk_index,
+                    cid: cid.clone(),
+                    expected_size: chunk.size,
+                    peer_id,
+                });
+            }
+        }
+        drop(store_read);
+
+        // Issue fetches via the shared FetchManager so the listen-mode event
+        // loop can complete them via on_chunk_received. Acquire the write
+        // lock briefly per call to minimize contention with the event loop.
+        for target in targets {
+            info!(
+                root = root_hex,
+                chunk = target.chunk_index,
+                cid = %target.cid,
+                peer = %target.peer_id,
+                expected_size = target.expected_size,
+                "fetching assigned chunk via FetchManager"
+            );
+            let mut store_w = store.write().await;
+            if let Err(e) = store_w.fetcher
+                .start_fetch_with_expected_size(
+                    net.as_ref(),
+                    target.peer_id,
+                    target.cid.clone(),
+                    Some(target.expected_size),
+                )
+                .await
+            {
+                warn!(cid = %target.cid, %e, "failed to start fetch");
             }
         }
 
@@ -319,10 +334,6 @@ impl MarketSyncWorker {
         assigned_cids
     }
 
-    /// Called by the main event loop when a chunk fetch completes.
-    pub fn on_fetch_complete(&mut self, cid: &str) {
-        self.pending_fetches.remove(cid);
-    }
 }
 
 /// Parse a hex string into [u8; 32]. Returns None if invalid.

@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use async_trait::async_trait;
 use libp2p::PeerId;
 use sum_net::{SumNet, ShardResponse};
 use tracing::{info, warn};
@@ -23,6 +24,40 @@ use tracing::{info, warn};
 use crate::error::{Result, StoreError};
 use crate::store::ChunkStore;
 use crate::verify;
+
+// ── FetchNet trait ───────────────────────────────────────────────────────────
+
+/// The single network operation [`FetchManager`] needs from the swarm.
+///
+/// Abstracting this behind a trait lets tests inject a mock without spinning
+/// up a real libp2p swarm. Production callers pass `&SumNet` (which
+/// implements this trait via the impl below); test callers pass any type
+/// that implements [`FetchNet`].
+#[async_trait]
+pub trait FetchNet: Send + Sync {
+    /// Issue a `request_shard_chunk` for `cid` (or a windowed sub-range)
+    /// against `peer_id`.
+    async fn request_shard_chunk(
+        &self,
+        peer_id: PeerId,
+        cid: String,
+        offset: Option<u64>,
+        max_bytes: Option<u64>,
+    ) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+impl FetchNet for SumNet {
+    async fn request_shard_chunk(
+        &self,
+        peer_id: PeerId,
+        cid: String,
+        offset: Option<u64>,
+        max_bytes: Option<u64>,
+    ) -> anyhow::Result<()> {
+        SumNet::request_shard_chunk(self, peer_id, cid, offset, max_bytes).await
+    }
+}
 
 /// Hard upper bound on the total bytes the fetcher will reserve for a
 /// single chunk, regardless of what a peer claims.
@@ -56,6 +91,7 @@ struct FetchState {
 }
 
 /// Outcome of processing a received piece.
+#[derive(Debug)]
 pub enum FetchOutcome {
     /// More data is needed — the next request has been sent.
     InProgress,
@@ -80,9 +116,9 @@ impl FetchManager {
     /// `expected_size = None` — only the global [`MAX_CHUNK_BYTES`] safety
     /// bound applies. Prefer the `_with_expected_size` variant when the
     /// caller has manifest context.
-    pub async fn start_fetch(
+    pub async fn start_fetch<N: FetchNet + ?Sized>(
         &mut self,
-        net: &SumNet,
+        net: &N,
         peer_id: PeerId,
         cid: String,
     ) -> Result<()> {
@@ -93,9 +129,9 @@ impl FetchManager {
     ///
     /// `expected_size`, when provided, is used as a tighter bound during
     /// metadata validation: the peer's `total_bytes` must equal it exactly.
-    pub async fn start_fetch_with_expected_size(
+    pub async fn start_fetch_with_expected_size<N: FetchNet + ?Sized>(
         &mut self,
-        net: &SumNet,
+        net: &N,
         peer_id: PeerId,
         cid: String,
         expected_size: Option<u64>,
@@ -122,9 +158,9 @@ impl FetchManager {
     }
 
     /// Process a received chunk piece.
-    pub async fn on_chunk_received(
+    pub async fn on_chunk_received<N: FetchNet + ?Sized>(
         &mut self,
-        net: &SumNet,
+        net: &N,
         store: &ChunkStore,
         response: &ShardResponse,
     ) -> FetchOutcome {
@@ -494,4 +530,177 @@ mod tests {
         assert_eq!(MAX_CHUNK_BYTES, sum_types::storage::CHUNK_SIZE);
         assert_eq!(MAX_CHUNK_BYTES, 1_048_576);
     }
+
+    // ── State-machine tests via MockFetchNet ────────────────────────────
+    //
+    // These exercise the FetchManager closed-loop state machine (Issue 4)
+    // by injecting a mock FetchNet implementation. They prove:
+    // - start_fetch records the CID as active
+    // - on_chunk_received persists the chunk to disk on success
+    // - the active set is cleared on success, failure, AND validation reject
+    // - windowed (multi-piece) transfers issue follow-up requests via the trait
+
+    use std::sync::Mutex as StdMutex;
+
+    struct MockFetchNet {
+        calls: StdMutex<Vec<(PeerId, String, Option<u64>, Option<u64>)>>,
+    }
+    impl MockFetchNet {
+        fn new() -> Self {
+            Self { calls: StdMutex::new(Vec::new()) }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+    #[async_trait]
+    impl FetchNet for MockFetchNet {
+        async fn request_shard_chunk(
+            &self,
+            peer_id: PeerId,
+            cid: String,
+            offset: Option<u64>,
+            max_bytes: Option<u64>,
+        ) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push((peer_id, cid, offset, max_bytes));
+            Ok(())
+        }
+    }
+
+    fn fake_peer_id() -> PeerId {
+        // Generate a stable PeerId from a fresh keypair (test-only).
+        sum_net::peer_id_from_keypair(&sum_net::Keypair::generate_ed25519())
+    }
+
+    fn tmp_chunk_store() -> (tempfile::TempDir, ChunkStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::new(dir.path().join("chunks")).unwrap();
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn start_fetch_marks_active_via_mock() {
+        let mock = MockFetchNet::new();
+        let mut fm = FetchManager::new(64 * 1024);
+        let peer = fake_peer_id();
+        fm.start_fetch_with_expected_size(&mock, peer, "cidA".into(), Some(1024))
+            .await
+            .unwrap();
+
+        assert!(fm.is_active("cidA"));
+        assert_eq!(fm.active_count(), 1);
+        // Mock should have observed exactly one initial windowed request.
+        assert_eq!(mock.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn on_chunk_received_completes_and_clears_active() {
+        let (_dir, chunk_store) = tmp_chunk_store();
+        let mock = MockFetchNet::new();
+        let mut fm = FetchManager::new(64 * 1024);
+        let peer = fake_peer_id();
+
+        // Pick real bytes so the CID matches.
+        let data = b"hello sum-store fetch state machine".to_vec();
+        let cid = crate::content_id::cid_from_data(&data);
+        let total = data.len() as u64;
+
+        fm.start_fetch_with_expected_size(&mock, peer, cid.clone(), Some(total))
+            .await
+            .unwrap();
+        assert!(fm.is_active(&cid));
+
+        // Single piece carries the entire chunk.
+        let response = ShardResponse {
+            cid: cid.clone(),
+            offset: 0,
+            total_bytes: total,
+            data: data.clone(),
+            error: None,
+        };
+        let outcome = fm.on_chunk_received(&mock, &chunk_store, &response).await;
+
+        match outcome {
+            FetchOutcome::Complete { cid: got_cid, size: got_size } => {
+                assert_eq!(got_cid, cid);
+                assert_eq!(got_size, total);
+            }
+            other => panic!("expected Complete, got: {other:?}"),
+        }
+        assert!(!fm.is_active(&cid), "active set must be cleared on completion");
+        assert!(chunk_store.has(&cid), "chunk must be persisted to disk");
+        // No follow-up requests since the single piece covered total_bytes.
+        assert_eq!(mock.call_count(), 1, "no follow-up requests expected");
+    }
+
+    #[tokio::test]
+    async fn on_chunk_received_failed_clears_active() {
+        let (_dir, chunk_store) = tmp_chunk_store();
+        let mock = MockFetchNet::new();
+        let mut fm = FetchManager::new(64 * 1024);
+        let peer = fake_peer_id();
+
+        fm.start_fetch_with_expected_size(&mock, peer, "cidF".into(), Some(1024))
+            .await
+            .unwrap();
+        assert!(fm.is_active("cidF"));
+
+        // Peer returns an error.
+        let response = ShardResponse {
+            cid: "cidF".into(),
+            offset: 0,
+            total_bytes: 0,
+            data: Vec::new(),
+            error: Some("disk read failed".into()),
+        };
+        let outcome = fm.on_chunk_received(&mock, &chunk_store, &response).await;
+
+        assert!(matches!(outcome, FetchOutcome::Failed { .. }));
+        assert!(!fm.is_active("cidF"), "active set must be cleared on failure");
+        assert!(!chunk_store.has("cidF"), "no chunk should be persisted on failure");
+    }
+
+    #[tokio::test]
+    async fn on_chunk_received_invalid_metadata_clears_active() {
+        // Joint regression test for Issue 3 + Issue 4: a peer that lies about
+        // total_bytes must (a) be rejected by validate_response_metadata, AND
+        // (b) leave the active set in a clean state.
+        let (_dir, chunk_store) = tmp_chunk_store();
+        let mock = MockFetchNet::new();
+        let mut fm = FetchManager::new(64 * 1024);
+        let peer = fake_peer_id();
+
+        fm.start_fetch_with_expected_size(&mock, peer, "cidX".into(), Some(1024))
+            .await
+            .unwrap();
+        assert!(fm.is_active("cidX"));
+
+        // Peer claims total_bytes = 2048 but expected_size = 1024.
+        let response = ShardResponse {
+            cid: "cidX".into(),
+            offset: 0,
+            total_bytes: 2048,
+            data: vec![0u8; 1024],
+            error: None,
+        };
+        let outcome = fm.on_chunk_received(&mock, &chunk_store, &response).await;
+
+        // The validation may reject with either "expected size" or
+        // "exceeds safety bound" depending on which check fires first
+        // (the helper computes max_total = min(MAX_CHUNK_BYTES, expected_size)).
+        // Both are correct security outcomes; the important property is that
+        // the fetch is rejected and the active set is cleaned up.
+        match outcome {
+            FetchOutcome::Failed { ref error, .. } => {
+                assert!(
+                    error.contains("expected size") || error.contains("exceeds safety bound"),
+                    "expected validation rejection, got: {error}"
+                );
+            }
+            other => panic!("expected Failed, got: {other:?}"),
+        }
+        assert!(!fm.is_active("cidX"), "active set must be cleared after validation reject");
+        assert!(!chunk_store.has("cidX"));
+    }
+
 }

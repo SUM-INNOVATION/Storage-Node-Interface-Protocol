@@ -3390,6 +3390,8 @@ dependencies = [
 name = "sum-store"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "bincode 2.0.1",
  "blake3",
  "ciborium",
@@ -3403,6 +3405,7 @@ dependencies = [
  "sum-types",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

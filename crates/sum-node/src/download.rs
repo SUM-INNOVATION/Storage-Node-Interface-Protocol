@@ -251,7 +251,7 @@ impl DownloadOrchestrator {
 
                             let store_read = store.read().await;
                             let outcome = fetcher.on_chunk_received(
-                                &net, &store_read.local, &response,
+                                net.as_ref(), &store_read.local, &response,
                             ).await;
                             drop(store_read);
 
