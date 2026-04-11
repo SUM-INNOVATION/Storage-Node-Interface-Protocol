@@ -16,7 +16,7 @@ pub mod verify;
 pub use announce::{ChunkAnnouncement, decode_announcement, encode_announcement};
 pub use content_id::cid_from_data;
 pub use error::StoreError;
-pub use fetch::{FetchManager, FetchOutcome};
+pub use fetch::{FetchManager, FetchNet, FetchOutcome};
 pub use store::ChunkStore;
 pub use chunker::BinaryChunker;
 pub use manifest_index::ManifestIndex;
