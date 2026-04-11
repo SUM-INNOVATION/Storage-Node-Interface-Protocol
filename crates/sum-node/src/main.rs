@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 use sum_net::{SumNet, SumNetEvent, Keypair, ShardResponse, TOPIC_STORAGE, TOPIC_TEST};
 use sum_net::identity;
 use sum_store::{SumStore, FetchOutcome, decode_announcement};
+use sum_store::manifest::deserialize_manifest_cbor;
 use sum_types::config::{NetConfig, StoreConfig};
 
 use sum_node::acl::AclChecker;
@@ -340,6 +341,60 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli, net_con
                             }
                         }
                         print_event(&event);
+                    }
+                    SumNetEvent::ShardReceived { response, .. } => {
+                        // Manifest responses use the "manifest:<hex>" CID convention
+                        // and bypass FetchManager entirely (manifests aren't tracked
+                        // there). Chunk responses go through FetchManager so the
+                        // background MarketSync state machine closes its loop.
+                        if let Some(root_hex) = response.cid.strip_prefix("manifest:") {
+                            match deserialize_manifest_cbor(&response.data) {
+                                Ok(manifest) => {
+                                    let mut store_w = store.write().await;
+                                    if store_w.manifest_idx.get_by_merkle_root(&manifest.merkle_root).is_none() {
+                                        match store_w.manifest_idx.insert(&manifest) {
+                                            Ok(()) => info!(
+                                                root = %root_hex,
+                                                file_name = %manifest.file_name,
+                                                chunks = manifest.chunk_count,
+                                                "manifest persisted by listen loop"
+                                            ),
+                                            Err(e) => warn!(
+                                                root = %root_hex,
+                                                %e,
+                                                "manifest_idx.insert failed"
+                                            ),
+                                        }
+                                    } else {
+                                        debug!(root = %root_hex, "manifest already indexed — skipping");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(root = %root_hex, %e, "manifest deserialization failed");
+                                }
+                            }
+                        } else {
+                            // Chunk response → route through FetchManager. Use the
+                            // split-borrow pattern so we can hold &mut fetcher and
+                            // &local from the same store guard simultaneously.
+                            let mut store_guard = store.write().await;
+                            let store_mut: &mut SumStore = &mut store_guard;
+                            let outcome = store_mut.fetcher
+                                .on_chunk_received(net.as_ref(), &store_mut.local, &response)
+                                .await;
+                            drop(store_guard);
+                            match outcome {
+                                FetchOutcome::Complete { cid, size } => {
+                                    info!(%cid, size, "background fetch complete");
+                                }
+                                FetchOutcome::InProgress => {
+                                    debug!(cid = %response.cid, "background fetch in progress");
+                                }
+                                FetchOutcome::Failed { cid, error } => {
+                                    warn!(%cid, %error, "background fetch failed");
+                                }
+                            }
+                        }
                     }
                     _ => print_event(&event),
                 }
