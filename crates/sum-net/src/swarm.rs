@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -44,6 +45,18 @@ pub enum SwarmCommand {
 
     /// Send a chunk request to a remote peer.
     RequestShard { peer_id: PeerId, request: ShardRequest },
+
+    /// Push a chunk to a remote peer using a shared, ref-counted buffer.
+    ///
+    /// Multiple replicas can share the same `Arc<[u8]>` payload — the
+    /// command channel only buffers cheap pointer clones, not full copies
+    /// of the chunk. The `Vec<u8>` materialization happens once, in the
+    /// command handler, immediately before libp2p serializes the request.
+    PushShard {
+        peer_id: PeerId,
+        cid: String,
+        data: Arc<[u8]>,
+    },
 
     /// Send a chunk response on a stored response channel.
     SendShardResponse { channel_id: u64, response: ShardResponse },
@@ -260,6 +273,20 @@ impl SumSwarm {
                             }
                         }
                         Some(SwarmCommand::RequestShard { peer_id, request }) => {
+                            self.inner.behaviour_mut().shard_xfer
+                                .send_request(&peer_id, request);
+                        }
+                        Some(SwarmCommand::PushShard { peer_id, cid, data }) => {
+                            // Materialize the Vec<u8> exactly once, here at
+                            // the libp2p hand-off. The Arc<[u8]> may have been
+                            // cloned R times upstream, but those clones share
+                            // a single backing buffer until this point.
+                            let request = ShardRequest {
+                                cid,
+                                offset: None,
+                                max_bytes: None,
+                                push_data: Some(data.to_vec()),
+                            };
                             self.inner.behaviour_mut().shard_xfer
                                 .send_request(&peer_id, request);
                         }

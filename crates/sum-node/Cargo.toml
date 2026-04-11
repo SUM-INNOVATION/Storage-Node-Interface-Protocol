@@ -32,3 +32,7 @@ ed25519-dalek      = { workspace = true }
 bincode1           = { workspace = true }
 hex                = { workspace = true }
 serde-big-array    = { workspace = true }
+async-trait        = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
