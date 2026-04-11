@@ -354,7 +354,13 @@ impl DownloadOrchestrator {
                 break; // Don't busy-loop
             };
 
-            match fetcher.start_fetch(net, peer_id, chunk.cid.clone()).await {
+            // Pass the manifest's known chunk size as a tighter validation
+            // bound: the fetcher will reject any peer response whose
+            // total_bytes does not equal `chunk.size` exactly.
+            match fetcher
+                .start_fetch_with_expected_size(net, peer_id, chunk.cid.clone(), Some(chunk.size))
+                .await
+            {
                 Ok(()) => {
                     in_flight.insert(chunk.cid.clone());
                 }
