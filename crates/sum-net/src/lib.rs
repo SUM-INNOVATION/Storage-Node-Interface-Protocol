@@ -25,6 +25,8 @@ pub use libp2p::PeerId;
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use tokio::sync::mpsc;
 
@@ -127,22 +129,36 @@ impl SumNet {
     /// Push a chunk to a remote peer for storage.
     ///
     /// The peer will verify the CID, store the chunk, and respond with an ACK.
+    ///
+    /// This method takes an owned `Vec<u8>` for backwards compatibility.
+    /// New callers fanning a single chunk to multiple replicas should
+    /// prefer [`Self::push_chunk_shared`], which avoids per-replica copies.
     pub async fn push_chunk(
         &self,
         peer_id: PeerId,
         cid: String,
         data: Vec<u8>,
     ) -> Result<()> {
+        let shared: Arc<[u8]> = Arc::from(data.into_boxed_slice());
+        self.push_chunk_shared(peer_id, cid, shared).await
+    }
+
+    /// Push a chunk using a shared, ref-counted buffer.
+    ///
+    /// Multiple replica pushes for the same chunk can clone the same
+    /// `Arc<[u8]>` cheaply (pointer bump only). The full `Vec<u8>`
+    /// materialization happens once, inside the swarm command handler,
+    /// immediately before libp2p serializes the request — so buffered
+    /// commands in the channel hold pointer-sized handles instead of
+    /// full chunk copies.
+    pub async fn push_chunk_shared(
+        &self,
+        peer_id: PeerId,
+        cid: String,
+        data: Arc<[u8]>,
+    ) -> Result<()> {
         self.cmd_tx
-            .send(SwarmCommand::RequestShard {
-                peer_id,
-                request: ShardRequest {
-                    cid,
-                    offset: None,
-                    max_bytes: None,
-                    push_data: Some(data),
-                },
-            })
+            .send(SwarmCommand::PushShard { peer_id, cid, data })
             .await
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot push chunk"))
     }
