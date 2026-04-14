@@ -58,4 +58,27 @@ pub enum SumNetEvent {
         peer_id: PeerId,
         l1_address: [u8; 20],
     },
+
+    /// AutoNAT determined whether this node is publicly reachable.
+    NatStatusChanged {
+        is_public: bool,
+        public_addr: Option<Multiaddr>,
+    },
+
+    /// A relay reservation was established — this node is now reachable
+    /// via a `/p2p-circuit` address at the listed relay peer.
+    RelayReservation {
+        relay_peer_id: PeerId,
+        relay_addr: Multiaddr,
+    },
+
+    /// DCUtR upgraded a relay circuit to a direct QUIC connection
+    /// via UDP hole-punching.
+    HolePunchSucceeded { peer_id: PeerId },
+
+    /// DCUtR hole-punch failed — the relay circuit remains the data path.
+    HolePunchFailed {
+        peer_id: PeerId,
+        error: String,
+    },
 }
