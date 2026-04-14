@@ -16,6 +16,10 @@ pub struct NetConfig {
     /// Bootstrap peer multiaddrs for Kademlia DHT.
     /// Example: `/ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...`
     pub bootstrap_peers: Vec<String>,
+    /// Volunteer this node as a Circuit Relay v2 server.
+    /// Only enable on publicly-reachable hosts (VPS, port-forwarded home
+    /// server). Does nothing unless `enable_wan` is also true.
+    pub relay_server: bool,
 }
 
 impl Default for NetConfig {
@@ -25,6 +29,7 @@ impl Default for NetConfig {
             tcp_listen_port: 0,
             enable_wan: false,
             bootstrap_peers: Vec::new(),
+            relay_server: false,
         }
     }
 }

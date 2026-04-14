@@ -91,6 +91,12 @@ struct Cli {
     #[arg(long, env = "SUM_TCP_PORT", default_value = "0")]
     tcp_port: u16,
 
+    /// Volunteer this node as a Circuit Relay v2 server.
+    /// Only enable on publicly-reachable hosts (VPS, port-forwarded).
+    /// Requires --enable-wan; otherwise the relay is unreachable.
+    #[arg(long, env = "SUM_RELAY_SERVER")]
+    relay_server: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -172,12 +178,17 @@ async fn main() -> Result<()> {
         (Keypair::generate_ed25519(), None)
     };
 
+    if cli.relay_server && !cli.enable_wan {
+        warn!("--relay-server has no effect without --enable-wan; the relay will not be reachable over the DHT");
+    }
+
     // Build network config from CLI args.
     let net_config = NetConfig {
         listen_port: 0,
         tcp_listen_port: cli.tcp_port,
         enable_wan: cli.enable_wan,
         bootstrap_peers: cli.bootstrap_peers.clone(),
+        relay_server: cli.relay_server,
     };
 
     match cli.command {
@@ -772,5 +783,18 @@ fn print_event(event: &SumNetEvent) {
             info!("CHUNK_FAIL   peer={peer_id}  error={error}"),
         SumNetEvent::PeerIdentified { peer_id, l1_address } =>
             info!("IDENTIFIED   peer={peer_id}  l1={}", identity::l1_address_base58(l1_address)),
+        SumNetEvent::NatStatusChanged { is_public, public_addr } => {
+            let kind = if *is_public { "PUBLIC" } else { "PRIVATE" };
+            match public_addr {
+                Some(addr) => info!("NAT_STATUS   {kind}  addr={addr}"),
+                None       => info!("NAT_STATUS   {kind}"),
+            }
+        }
+        SumNetEvent::RelayReservation { relay_peer_id, relay_addr } =>
+            info!("RELAY_RSV    relay={relay_peer_id}  addr={relay_addr}"),
+        SumNetEvent::HolePunchSucceeded { peer_id } =>
+            info!("HOLEPUNCH_OK peer={peer_id}"),
+        SumNetEvent::HolePunchFailed { peer_id, error } =>
+            info!("HOLEPUNCH_NG peer={peer_id}  error={error}"),
     }
 }

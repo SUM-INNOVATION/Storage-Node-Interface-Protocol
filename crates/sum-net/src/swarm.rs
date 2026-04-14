@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, identify, kad, mdns,
+    dcutr, gossipsub, identify, kad, mdns,
     identity::Keypair,
     request_response::{self, ProtocolSupport, ResponseChannel},
     swarm::SwarmEvent,
-    Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
+    Multiaddr, PeerId, SwarmBuilder,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -22,10 +22,8 @@ use crate::{
     discovery,
     events::SumNetEvent,
     gossip::GossipManager,
+    nat,
 };
-
-/// Kademlia protocol identifier for the SUM Storage Node DHT.
-const KAD_PROTOCOL: &str = "/sum/kad/1.0.0";
 
 /// How long a pending response channel is kept before it is considered orphaned.
 /// Matches the request-response timeout (120s) so the requester has already
@@ -79,6 +77,18 @@ pub struct SumSwarm {
 
     /// Monotonic counter for channel IDs.
     next_channel_id: u64,
+
+    /// Peers that advertise the Circuit Relay v2 hop protocol, discovered
+    /// via Identify. These are the candidates we request reservations from
+    /// when AutoNAT determines we are Private.
+    relay_peers: Vec<PeerId>,
+
+    /// Current NAT status as determined by AutoNAT.
+    nat_status: nat::NatStatus,
+
+    /// The relay peer we currently hold a reservation with, if any.
+    /// Prevents reservation spam on flapping NAT status.
+    active_relay_reservation: Option<PeerId>,
 }
 
 impl SumSwarm {
@@ -99,77 +109,75 @@ impl SumSwarm {
             .build()
             .map_err(|msg| anyhow::anyhow!("gossipsub config error: {msg}"))?;
 
-        // Behaviour constructor — shared between TCP+QUIC and QUIC-only paths.
-        // Returns Box<dyn Error> to satisfy SwarmBuilder's with_behaviour() signature.
-        let make_behaviour = |key: &Keypair| -> std::result::Result<LocalMeshBehaviour, Box<dyn std::error::Error + Send + Sync>> {
-            let local_peer_id = key.public().to_peer_id();
+        // Captured by the behaviour closure; drives whether the relay server
+        // accepts reservations (opt-in, only on publicly-reachable hosts).
+        let relay_server_enabled = config.relay_server;
 
-            let mdns = mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
-                local_peer_id,
-            )?;
+        // Unified transport chain: TCP/Noise/Yamux + QUIC + relay-client.
+        // Relay circuits (v2) run over TCP, so TCP is mandatory whenever
+        // relays are used. In LAN-only mode we still build all three
+        // transports but bind only the QUIC listener and never bootstrap
+        // the DHT, so the WAN transports stay idle.
+        let mut swarm = SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )?
+            .with_quic()
+            .with_relay_client(
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )?
+            .with_behaviour(|key, relay_client| -> std::result::Result<LocalMeshBehaviour, Box<dyn std::error::Error + Send + Sync>> {
+                let local_peer_id = key.public().to_peer_id();
 
-            let gossipsub_behaviour = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossip_cfg.clone(),
-            )
-            .map_err(|msg| -> Box<dyn std::error::Error + Send + Sync> {
-                msg.into()
-            })?;
+                let mdns = mdns::tokio::Behaviour::new(
+                    mdns::Config::default(),
+                    local_peer_id,
+                )?;
 
-            let identify = identify::Behaviour::new(identify::Config::new(
-                "/sum-node/0.1.0".into(),
-                key.public(),
-            ));
+                let gossipsub_behaviour = gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Signed(key.clone()),
+                    gossip_cfg.clone(),
+                )
+                .map_err(|msg| -> Box<dyn std::error::Error + Send + Sync> {
+                    msg.into()
+                })?;
 
-            let shard_xfer = request_response::Behaviour::new(
-                [(SHARD_XFER_PROTOCOL.to_string(), ProtocolSupport::Full)],
-                request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(120)),
-            );
+                let identify = identify::Behaviour::new(identify::Config::new(
+                    "/sum-node/0.1.0".into(),
+                    key.public(),
+                ));
 
-            let kad_store = kad::store::MemoryStore::new(local_peer_id);
-            let mut kad_config = kad::Config::new(
-                StreamProtocol::new(KAD_PROTOCOL),
-            );
-            kad_config.set_query_timeout(Duration::from_secs(60));
-            let kademlia = kad::Behaviour::with_config(local_peer_id, kad_store, kad_config);
+                let shard_xfer = request_response::Behaviour::new(
+                    [(SHARD_XFER_PROTOCOL.to_string(), ProtocolSupport::Full)],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(120)),
+                );
 
-            Ok(LocalMeshBehaviour {
-                mdns,
-                gossipsub: gossipsub_behaviour,
-                identify,
-                shard_xfer,
-                kademlia,
+                let kademlia = discovery::build_kademlia(local_peer_id);
+                let autonat  = nat::build_autonat(local_peer_id);
+                let relay    = nat::build_relay_server(local_peer_id, relay_server_enabled);
+                let dcutr    = dcutr::Behaviour::new(local_peer_id);
+
+                Ok(LocalMeshBehaviour {
+                    mdns,
+                    gossipsub: gossipsub_behaviour,
+                    identify,
+                    shard_xfer,
+                    kademlia,
+                    autonat,
+                    relay,
+                    relay_client,
+                    dcutr,
+                })
+            })?
+            .with_swarm_config(|c| {
+                c.with_idle_connection_timeout(Duration::from_secs(60))
             })
-        };
-
-        let mut swarm = if config.enable_wan {
-            // TCP+Noise+Yamux + QUIC (dual transport)
-            SwarmBuilder::with_existing_identity(keypair)
-                .with_tokio()
-                .with_tcp(
-                    libp2p::tcp::Config::default(),
-                    libp2p::noise::Config::new,
-                    libp2p::yamux::Config::default,
-                )?
-                .with_quic()
-                .with_behaviour(|key| make_behaviour(key))?
-                .with_swarm_config(|c| {
-                    c.with_idle_connection_timeout(Duration::from_secs(60))
-                })
-                .build()
-        } else {
-            // QUIC-only (LAN mode — current behavior)
-            SwarmBuilder::with_existing_identity(keypair)
-                .with_tokio()
-                .with_quic()
-                .with_behaviour(|key| make_behaviour(key))?
-                .with_swarm_config(|c| {
-                    c.with_idle_connection_timeout(Duration::from_secs(60))
-                })
-                .build()
-        };
+            .build();
 
         // QUIC listener (always)
         let quic_addr: Multiaddr =
@@ -196,6 +204,9 @@ impl SumSwarm {
             gossip: GossipManager::new(),
             pending_shard_channels: HashMap::new(),
             next_channel_id: 0,
+            relay_peers: Vec::new(),
+            nat_status: nat::NatStatus::Unknown,
+            active_relay_reservation: None,
         })
     }
 
@@ -389,6 +400,26 @@ impl SumSwarm {
                         warn!(%e, "event channel full — dropping PeerIdentified");
                     }
                 }
+
+                // Feed the observed-address hint into our external-address
+                // candidates. AutoNAT needs this to settle on Public, and
+                // DCUtR needs it to advertise a dialable candidate during
+                // hole-punch coordination.
+                self.inner.add_external_address(info.observed_addr.clone());
+
+                // Detect relay-capable peers so we can request a reservation
+                // when AutoNAT determines we are Private. The relay hop
+                // protocol string contains "relay" — matching works across
+                // minor version bumps.
+                let supports_relay = info
+                    .protocols
+                    .iter()
+                    .any(|p| p.as_ref().contains("relay"));
+                if supports_relay && !self.relay_peers.contains(&peer_id) {
+                    self.relay_peers.push(peer_id);
+                    debug!(%peer_id, "identified as relay-capable peer");
+                }
+
                 // Feed identified peer's listen addresses into Kademlia
                 // so the DHT routing table populates beyond bootstrap nodes.
                 for addr in &info.listen_addrs {
@@ -422,6 +453,27 @@ impl SumSwarm {
             }
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Kademlia(e)) => {
                 debug!(?e, "kademlia event");
+            }
+
+            // ── AutoNAT / Relay / DCUtR ──────────────────────────────────────
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Autonat(e)) => {
+                nat::handle_autonat_event(
+                    e,
+                    &self.relay_peers,
+                    &mut self.inner,
+                    &mut self.nat_status,
+                    &mut self.active_relay_reservation,
+                    event_tx,
+                );
+            }
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Relay(e)) => {
+                nat::handle_relay_server_event(e);
+            }
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::RelayClient(e)) => {
+                nat::handle_relay_client_event(e, event_tx);
+            }
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Dcutr(e)) => {
+                nat::handle_dcutr_event(e, event_tx);
             }
 
             // ── Chunk transfer ────────────────────────────────────────────────

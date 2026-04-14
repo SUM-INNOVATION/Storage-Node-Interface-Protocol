@@ -1,10 +1,36 @@
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
+use std::time::Duration;
 
-use libp2p::{gossipsub, mdns, PeerId};
+use libp2p::{gossipsub, kad, mdns, PeerId, StreamProtocol};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::events::SumNetEvent;
+
+/// Kademlia protocol identifier for the SUM Storage Node DHT.
+const KAD_PROTOCOL: &str = "/sum/kad/1.0.0";
+
+/// Build the Kademlia behaviour with SUM-specific tuning.
+///
+/// - Server mode: every SUM node is a full DHT participant.
+/// - 20-way replication: aggressive for a young network.
+/// - 1-hour record TTL with 10-minute republish keeps the DHT fresh.
+pub fn build_kademlia(local_peer_id: PeerId) -> kad::Behaviour<kad::store::MemoryStore> {
+    let store = kad::store::MemoryStore::new(local_peer_id);
+
+    let mut config = kad::Config::new(StreamProtocol::new(KAD_PROTOCOL));
+    config
+        .set_query_timeout(Duration::from_secs(60))
+        .set_record_ttl(Some(Duration::from_secs(3600)))
+        .set_replication_factor(NonZeroUsize::new(20).unwrap())
+        .set_publication_interval(Some(Duration::from_secs(600)))
+        .set_provider_record_ttl(Some(Duration::from_secs(3600)));
+
+    let mut behaviour = kad::Behaviour::with_config(local_peer_id, store, config);
+    behaviour.set_mode(Some(kad::Mode::Server));
+    behaviour
+}
 
 /// Handle a single mDNS event.
 ///
