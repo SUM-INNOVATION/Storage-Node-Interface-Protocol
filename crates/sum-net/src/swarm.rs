@@ -7,6 +7,7 @@ use futures::StreamExt;
 use libp2p::{
     dcutr, gossipsub, identify, kad, mdns,
     identity::Keypair,
+    multiaddr::Protocol,
     request_response::{self, ProtocolSupport, ResponseChannel},
     swarm::SwarmEvent,
     Multiaddr, PeerId, SwarmBuilder,
@@ -78,17 +79,20 @@ pub struct SumSwarm {
     /// Monotonic counter for channel IDs.
     next_channel_id: u64,
 
-    /// Peers that advertise the Circuit Relay v2 hop protocol, discovered
-    /// via Identify. These are the candidates we request reservations from
-    /// when AutoNAT determines we are Private.
-    relay_peers: Vec<PeerId>,
+    /// Candidate relay peers indexed by peer id. Seeded from
+    /// `--bootstrap-peer` (with `confirmed: false`) and promoted to
+    /// `confirmed: true` when identify reports that the peer advertises the
+    /// relay hop protocol. Only confirmed candidates are reservation targets.
+    relay_peers: HashMap<PeerId, nat::RelayCandidate>,
 
     /// Current NAT status as determined by AutoNAT.
     nat_status: nat::NatStatus,
 
-    /// The relay peer we currently hold a reservation with, if any.
-    /// Prevents reservation spam on flapping NAT status.
-    active_relay_reservation: Option<PeerId>,
+    /// Tri-state reservation machine (see [`nat::RelayReservationState`]):
+    /// `None` → `Pending(peer)` on listen_on success → `Active(peer)` on
+    /// `ReservationReqAccepted` → `None` again on `ListenerClosed` (denial,
+    /// timeout, explicit close). Prevents reservation stacking and wedging.
+    active_relay_reservation: nat::RelayReservationState,
 }
 
 impl SumSwarm {
@@ -204,9 +208,9 @@ impl SumSwarm {
             gossip: GossipManager::new(),
             pending_shard_channels: HashMap::new(),
             next_channel_id: 0,
-            relay_peers: Vec::new(),
+            relay_peers: HashMap::new(),
             nat_status: nat::NatStatus::Unknown,
-            active_relay_reservation: None,
+            active_relay_reservation: nat::RelayReservationState::None,
         })
     }
 
@@ -232,6 +236,17 @@ impl SumSwarm {
 
             self.inner.behaviour_mut().kademlia
                 .add_address(&peer_id, addr.clone());
+
+            // Stash the bootstrap address as an UNCONFIRMED relay candidate.
+            // We explicitly do NOT set `confirmed = true` — that flag flips
+            // only when identify reports the remote advertises the relay
+            // hop protocol. Unconfirmed entries are ignored by the AutoNAT
+            // reservation path, so passing `--bootstrap-peer` for a peer
+            // that isn't a relay won't cause us to reserve against it.
+            let entry = self.relay_peers.entry(peer_id).or_default();
+            if is_dialable_over_wan(&addr) && !entry.addrs.contains(&addr) {
+                entry.addrs.push(addr.clone());
+            }
 
             info!(%peer_id, %addr, "added Kademlia bootstrap peer");
 
@@ -415,9 +430,28 @@ impl SumSwarm {
                     .protocols
                     .iter()
                     .any(|p| p.as_ref().contains("relay"));
-                if supports_relay && !self.relay_peers.contains(&peer_id) {
-                    self.relay_peers.push(peer_id);
-                    debug!(%peer_id, "identified as relay-capable peer");
+                if supports_relay {
+                    // Identify has confirmed this peer advertises the relay
+                    // hop protocol — flip `confirmed = true` so the AutoNAT
+                    // handler will consider it for reservations. Merge any
+                    // new WAN-dialable addresses with whatever we had from
+                    // bootstrap.
+                    let entry = self.relay_peers.entry(peer_id).or_default();
+                    entry.confirmed = true;
+                    let mut added = 0usize;
+                    for addr in &info.listen_addrs {
+                        if is_dialable_over_wan(addr) && !entry.addrs.contains(addr) {
+                            entry.addrs.push(addr.clone());
+                            added += 1;
+                        }
+                    }
+                    debug!(
+                        %peer_id,
+                        total_addrs = entry.addrs.len(),
+                        added,
+                        confirmed = entry.confirmed,
+                        "identified as relay-capable peer"
+                    );
                 }
 
                 // Feed identified peer's listen addresses into Kademlia
@@ -470,7 +504,7 @@ impl SumSwarm {
                 nat::handle_relay_server_event(e);
             }
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::RelayClient(e)) => {
-                nat::handle_relay_client_event(e, event_tx);
+                nat::handle_relay_client_event(e, &mut self.active_relay_reservation, event_tx);
             }
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Dcutr(e)) => {
                 nat::handle_dcutr_event(e, event_tx);
@@ -547,9 +581,37 @@ impl SumSwarm {
             // ── Transport ─────────────────────────────────────────────────────
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(%address, "listening on address");
+
+                // Circuit-relay listen addresses are how NAT'd peers advertise
+                // their reachability to the mesh. Register it as an external
+                // address so Identify broadcasts it to connected peers — that's
+                // the signal other peers use to learn they can dial us via the
+                // relay (and that DCUtR can then upgrade that circuit to a
+                // direct QUIC connection).
+                if address.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                    self.inner.add_external_address(address.clone());
+                    debug!(%address, "advertised circuit relay address as external");
+                }
+
                 if let Err(e) = event_tx.try_send(SumNetEvent::Listening { addr: address }) {
                     warn!(%e, "event channel full — dropping Listening");
                 }
+            }
+
+            // A circuit listener can close for three reasons we care about:
+            // explicit relay denial, relay-side close (reservation expired /
+            // relay shutting down), or local transport failure. In all three
+            // cases we need to reset the reservation state machine so the
+            // next AutoNAT Private tick is free to retry against another
+            // relay candidate. Without this, a one-time denial wedges the
+            // node into `Pending(peer)` forever and it never reaches out
+            // again.
+            SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+                debug!(?addresses, ?reason, "listener closed");
+                nat::handle_listener_closed_for_reservation(
+                    &addresses,
+                    &mut self.active_relay_reservation,
+                );
             }
 
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -577,6 +639,62 @@ impl SumSwarm {
             _ => {}
         }
     }
+}
+
+/// Return `true` if `addr` is a WAN-dialable multiaddr.
+///
+/// Filters out loopback, RFC1918 private ranges, link-local, and the
+/// CGNAT `100.64.0.0/10` block for IPv4; loopback, link-local, and ULA
+/// (`fc00::/7`) for IPv6. DNS-based addresses (`/dns/`, `/dns4/`, `/dns6/`,
+/// `/dnsaddr/`) are accepted as-is — we trust operators to advertise names
+/// that resolve to real WAN addresses, and if resolution yields a private
+/// address the subsequent dial will simply fail.
+///
+/// Addresses with no host component (e.g. bare `/p2p/<peer>/p2p-circuit`)
+/// return `false` — the helper only endorses addresses that carry enough
+/// information to actually dial.
+pub(crate) fn is_dialable_over_wan(addr: &Multiaddr) -> bool {
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Ip4(ip) => {
+                // Loopback 127.0.0.0/8
+                if ip.is_loopback() { return false; }
+                // Link-local 169.254.0.0/16
+                if ip.is_link_local() { return false; }
+                // Unspecified 0.0.0.0
+                if ip.is_unspecified() { return false; }
+                // RFC1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                let octets = ip.octets();
+                if octets[0] == 10 { return false; }
+                if octets[0] == 172 && (16..=31).contains(&octets[1]) { return false; }
+                if octets[0] == 192 && octets[1] == 168 { return false; }
+                // CGNAT 100.64.0.0/10
+                if octets[0] == 100 && (64..=127).contains(&octets[1]) { return false; }
+                return true;
+            }
+            Protocol::Ip6(ip) => {
+                if ip.is_loopback() { return false; }
+                if ip.is_unspecified() { return false; }
+                // Link-local fe80::/10
+                let segs = ip.segments();
+                if segs[0] & 0xffc0 == 0xfe80 { return false; }
+                // ULA fc00::/7
+                if segs[0] & 0xfe00 == 0xfc00 { return false; }
+                return true;
+            }
+            // DNS-backed host components. We can't cheaply validate where
+            // they resolve; treating them as dialable lets operators point
+            // peers at stable relay hostnames (the common production shape).
+            Protocol::Dns(_)
+            | Protocol::Dns4(_)
+            | Protocol::Dns6(_)
+            | Protocol::Dnsaddr(_) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Reap entries from a pending-channel map whose insertion time exceeds `timeout`.
@@ -657,5 +775,81 @@ mod tests {
         let reaped = reap_stale_entries(&mut map, PENDING_CHANNEL_TIMEOUT);
         assert_eq!(reaped, 0);
         assert_eq!(map.len(), 1);
+    }
+
+    // ── is_dialable_over_wan ──────────────────────────────────────────
+
+    #[test]
+    fn is_dialable_over_wan_matrix() {
+        fn ma(s: &str) -> Multiaddr {
+            s.parse().expect("test multiaddr must parse")
+        }
+
+        // Public IPv4 → dialable.
+        assert!(is_dialable_over_wan(&ma("/ip4/8.8.8.8/tcp/4001")));
+        assert!(is_dialable_over_wan(&ma("/ip4/164.92.93.224/tcp/4001")));
+        assert!(is_dialable_over_wan(&ma("/ip4/1.2.3.4/udp/4001/quic-v1")));
+
+        // Loopback → not dialable.
+        assert!(!is_dialable_over_wan(&ma("/ip4/127.0.0.1/tcp/4001")));
+        assert!(!is_dialable_over_wan(&ma("/ip4/127.1.2.3/udp/4001/quic-v1")));
+
+        // RFC1918 → not dialable.
+        assert!(!is_dialable_over_wan(&ma("/ip4/10.0.0.1/tcp/4001")));
+        assert!(!is_dialable_over_wan(&ma("/ip4/172.16.0.1/tcp/4001")));
+        assert!(!is_dialable_over_wan(&ma("/ip4/172.31.255.254/tcp/4001")));
+        assert!(!is_dialable_over_wan(&ma("/ip4/192.168.1.1/tcp/4001")));
+
+        // 172.32.0.1 is NOT RFC1918 (only 172.16–172.31 is private).
+        assert!(is_dialable_over_wan(&ma("/ip4/172.32.0.1/tcp/4001")));
+
+        // CGNAT 100.64.0.0/10 → not dialable.
+        assert!(!is_dialable_over_wan(&ma("/ip4/100.64.0.1/tcp/4001")));
+        assert!(!is_dialable_over_wan(&ma("/ip4/100.127.255.254/tcp/4001")));
+
+        // 100.63.x.x and 100.128.x.x are NOT CGNAT — they're public.
+        assert!(is_dialable_over_wan(&ma("/ip4/100.63.0.1/tcp/4001")));
+        assert!(is_dialable_over_wan(&ma("/ip4/100.128.0.1/tcp/4001")));
+
+        // Link-local 169.254.0.0/16 → not dialable.
+        assert!(!is_dialable_over_wan(&ma("/ip4/169.254.1.1/tcp/4001")));
+
+        // Unspecified 0.0.0.0 → not dialable.
+        assert!(!is_dialable_over_wan(&ma("/ip4/0.0.0.0/tcp/4001")));
+
+        // IPv6 loopback → not dialable.
+        assert!(!is_dialable_over_wan(&ma("/ip6/::1/tcp/4001")));
+
+        // IPv6 link-local fe80::/10 → not dialable.
+        assert!(!is_dialable_over_wan(&ma("/ip6/fe80::1/tcp/4001")));
+
+        // IPv6 ULA fc00::/7 → not dialable.
+        assert!(!is_dialable_over_wan(&ma("/ip6/fc00::1/tcp/4001")));
+        assert!(!is_dialable_over_wan(&ma("/ip6/fd00::1/tcp/4001")));
+
+        // Public IPv6 → dialable.
+        assert!(is_dialable_over_wan(&ma("/ip6/2001:db8::1/tcp/4001")));
+
+        // Bare /p2p/... with no IP → not dialable.
+        let peer_id_str = "12D3KooWDbWRosFwyo6oPW2vw57y3dc8zLqixyPpxSUKQ5qUeiSc";
+        assert!(!is_dialable_over_wan(&ma(&format!("/p2p/{peer_id_str}"))));
+
+        // ── DNS-backed addresses MUST be dialable (Codex fix) ──
+        //
+        // Operators commonly advertise stable relay hostnames like
+        // `/dns4/relay.example.com/tcp/4001`. Filtering these out at the
+        // WAN helper drops them before the reservation logic ever sees
+        // them — which is the entire defect we're guarding against here.
+        assert!(is_dialable_over_wan(&ma("/dns4/relay.example.com/tcp/4001")));
+        assert!(is_dialable_over_wan(&ma("/dns4/relay.example.com/udp/4001/quic-v1")));
+        assert!(is_dialable_over_wan(&ma("/dns6/relay.example.com/tcp/4001")));
+        assert!(is_dialable_over_wan(&ma("/dns/relay.example.com/tcp/4001")));
+        assert!(is_dialable_over_wan(&ma("/dnsaddr/relay.example.com")));
+
+        // DNS with /p2p/<peer> appended — still dialable (common bootstrap form).
+        let relay_peer = "12D3KooWDbWRosFwyo6oPW2vw57y3dc8zLqixyPpxSUKQ5qUeiSc";
+        assert!(is_dialable_over_wan(&ma(&format!(
+            "/dns4/bootstrap.example.com/tcp/4001/p2p/{relay_peer}"
+        ))));
     }
 }
