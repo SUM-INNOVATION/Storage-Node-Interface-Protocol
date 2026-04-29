@@ -93,6 +93,12 @@ pub struct SumSwarm {
     /// `ReservationReqAccepted` → `None` again on `ListenerClosed` (denial,
     /// timeout, explicit close). Prevents reservation stacking and wedging.
     active_relay_reservation: nat::RelayReservationState,
+
+    /// Per-peer reference count of currently-open **non-relayed** (direct)
+    /// connections. Used by the direct-dial shortcut to avoid stacking
+    /// redundant dials when we already have a usable direct path. Updated
+    /// from `SwarmEvent::ConnectionEstablished` / `ConnectionClosed`.
+    direct_connections: HashMap<PeerId, u32>,
 }
 
 impl SumSwarm {
@@ -117,11 +123,17 @@ impl SumSwarm {
         // accepts reservations (opt-in, only on publicly-reachable hosts).
         let relay_server_enabled = config.relay_server;
 
-        // Unified transport chain: TCP/Noise/Yamux + QUIC + relay-client.
+        // Unified transport chain: TCP/Noise/Yamux + QUIC + DNS + relay-client.
         // Relay circuits (v2) run over TCP, so TCP is mandatory whenever
         // relays are used. In LAN-only mode we still build all three
         // transports but bind only the QUIC listener and never bootstrap
         // the DHT, so the WAN transports stay idle.
+        //
+        // `with_dns()` wraps the underlying transports with a system DNS
+        // resolver so `/dns4/host/...` multiaddrs (used in our bootstrap
+        // peers) actually resolve. Without this, dials against any DNS
+        // multiaddr fail at the swarm with "Multiaddr is not supported"
+        // and the node can never reach the relay on a fresh startup.
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
@@ -130,6 +142,7 @@ impl SumSwarm {
                 libp2p::yamux::Config::default,
             )?
             .with_quic()
+            .with_dns()?
             .with_relay_client(
                 libp2p::noise::Config::new,
                 libp2p::yamux::Config::default,
@@ -185,7 +198,7 @@ impl SumSwarm {
 
         // QUIC listener (always)
         let quic_addr: Multiaddr =
-            format!("/ip4/0.0.0.0/udp/{}/quic-v1", config.listen_port)
+            format!("/ip4/0.0.0.0/udp/{}/quic-v1", config.udp_listen_port)
                 .parse()
                 .context("invalid QUIC listen multiaddr")?;
         swarm
@@ -211,6 +224,7 @@ impl SumSwarm {
             relay_peers: HashMap::new(),
             nat_status: nat::NatStatus::Unknown,
             active_relay_reservation: nat::RelayReservationState::None,
+            direct_connections: HashMap::new(),
         })
     }
 
@@ -460,6 +474,29 @@ impl SumSwarm {
                     self.inner.behaviour_mut().kademlia
                         .add_address(&peer_id, addr.clone());
                 }
+
+                // ── Direct-dial shortcut (Issue #8 candidate D) ────────
+                //
+                // If we don't already have a direct (non-circuit) connection
+                // to this peer, look at the addresses they just advertised
+                // for any WAN-dialable, non-circuit candidate and attempt
+                // to dial it. This bypasses DCUtR for the asymmetric NAT
+                // case (private peer dialing a publicly-reachable peer)
+                // by establishing a direct path the moment we learn the
+                // public address from Identify.
+                //
+                // libp2p de-duplicates concurrent dial attempts to the
+                // same peer/address pair, and dial errors are non-fatal,
+                // so it's safe to call this on every identify event for
+                // peers we don't already have a direct connection to.
+                if !self.direct_connections.contains_key(&peer_id) {
+                    if let Some(addr) = pick_direct_dial_candidate(&info.listen_addrs, peer_id) {
+                        debug!(%peer_id, %addr, "attempting direct dial (no direct connection yet)");
+                        if let Err(e) = self.inner.dial(addr) {
+                            debug!(%peer_id, %e, "direct-dial attempt rejected by swarm");
+                        }
+                    }
+                }
             }
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Identify(e)) => {
                 debug!(?e, "identify event");
@@ -614,15 +651,31 @@ impl SumSwarm {
                 );
             }
 
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                info!(%peer_id, "connection established");
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                let relayed = endpoint.is_relayed();
+                if !relayed {
+                    *self.direct_connections.entry(peer_id).or_insert(0) += 1;
+                }
+                info!(%peer_id, relayed, "connection established");
                 if let Err(e) = event_tx.try_send(SumNetEvent::PeerConnected { peer_id }) {
                     warn!(%e, "event channel full — dropping PeerConnected");
                 }
             }
 
-            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                debug!(%peer_id, ?cause, "connection closed");
+            SwarmEvent::ConnectionClosed { peer_id, endpoint, cause, .. } => {
+                let relayed = endpoint.is_relayed();
+                if !relayed {
+                    if let std::collections::hash_map::Entry::Occupied(mut e) =
+                        self.direct_connections.entry(peer_id)
+                    {
+                        let v = e.get_mut();
+                        *v = v.saturating_sub(1);
+                        if *v == 0 {
+                            e.remove();
+                        }
+                    }
+                }
+                debug!(%peer_id, relayed, ?cause, "connection closed");
                 if let Err(e) = event_tx.try_send(SumNetEvent::PeerDisconnected { peer_id }) {
                     warn!(%e, "event channel full — dropping PeerDisconnected");
                 }
@@ -695,6 +748,42 @@ pub(crate) fn is_dialable_over_wan(addr: &Multiaddr) -> bool {
         }
     }
     false
+}
+
+/// Pick the first WAN-dialable, non-circuit address from a peer's
+/// advertised `listen_addrs` and return it suffixed with `/p2p/<peer_id>`.
+///
+/// Used by the identify handler to bypass DCUtR when we already know a
+/// public address for the remote peer — e.g. asymmetric NAT, where one
+/// peer is publicly reachable and the other only needs to dial outbound.
+///
+/// Returns `None` if no usable candidate is found. Filters out:
+/// - LAN / loopback / RFC1918 / link-local / CGNAT / ULA (via [`is_dialable_over_wan`])
+/// - Addresses already containing a `/p2p-circuit` component (we don't
+///   want to re-establish a circuit; if the peer is *only* reachable via
+///   relay, we already have that path).
+pub(crate) fn pick_direct_dial_candidate(
+    listen_addrs: &[Multiaddr],
+    peer_id: PeerId,
+) -> Option<Multiaddr> {
+    for addr in listen_addrs {
+        if !is_dialable_over_wan(addr) {
+            continue;
+        }
+        if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+            continue;
+        }
+        // Build the dialable form: ensure `/p2p/<peer>` is present so
+        // libp2p can verify the remote peer id during connection setup.
+        let already_has_p2p = addr.iter().any(|p| matches!(p, Protocol::P2p(_)));
+        let full_addr = if already_has_p2p {
+            addr.clone()
+        } else {
+            addr.clone().with(Protocol::P2p(peer_id))
+        };
+        return Some(full_addr);
+    }
+    None
 }
 
 /// Reap entries from a pending-channel map whose insertion time exceeds `timeout`.
@@ -851,5 +940,109 @@ mod tests {
         assert!(is_dialable_over_wan(&ma(&format!(
             "/dns4/bootstrap.example.com/tcp/4001/p2p/{relay_peer}"
         ))));
+    }
+
+    // ── pick_direct_dial_candidate ───────────────────────────────────────
+
+    fn rand_peer() -> PeerId {
+        // Generate a unique peer id from a fresh keypair. Using libp2p's
+        // ed25519 because that's what the rest of the crate uses.
+        let kp = libp2p::identity::Keypair::generate_ed25519();
+        kp.public().to_peer_id()
+    }
+
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().expect("test multiaddr must parse")
+    }
+
+    #[test]
+    fn pick_direct_dial_returns_first_wan_addr_with_p2p_appended() {
+        let peer = rand_peer();
+        let addrs = vec![
+            ma("/ip4/127.0.0.1/tcp/4001"),                  // loopback — skip
+            ma("/ip4/192.168.1.5/tcp/4001"),                // RFC1918 — skip
+            ma("/ip4/8.8.8.8/tcp/4001"),                    // public — pick this
+            ma("/ip4/1.2.3.4/udp/4001/quic-v1"),            // also public — would also work
+        ];
+        let picked = pick_direct_dial_candidate(&addrs, peer).expect("should pick a candidate");
+        // First WAN-dialable address wins.
+        assert_eq!(
+            picked.to_string(),
+            format!("/ip4/8.8.8.8/tcp/4001/p2p/{peer}")
+        );
+    }
+
+    #[test]
+    fn pick_direct_dial_skips_circuit_addresses() {
+        let peer = rand_peer();
+        let relay = rand_peer();
+        let addrs = vec![
+            // Circuit address — must NOT be picked.
+            ma(&format!("/ip4/164.92.93.224/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{peer}")),
+            // Direct WAN address — should be the choice.
+            ma("/ip4/172.91.65.115/tcp/4001"),
+        ];
+        let picked = pick_direct_dial_candidate(&addrs, peer).expect("should fall through to direct");
+        assert_eq!(
+            picked.to_string(),
+            format!("/ip4/172.91.65.115/tcp/4001/p2p/{peer}")
+        );
+    }
+
+    #[test]
+    fn pick_direct_dial_returns_none_when_only_lan_or_circuit() {
+        let peer = rand_peer();
+        let relay = rand_peer();
+        let addrs = vec![
+            ma("/ip4/192.168.1.5/tcp/4001"),
+            ma("/ip4/10.0.0.166/tcp/4001"),
+            ma(&format!("/ip4/164.92.93.224/tcp/4001/p2p/{relay}/p2p-circuit")),
+        ];
+        assert!(pick_direct_dial_candidate(&addrs, peer).is_none());
+    }
+
+    #[test]
+    fn pick_direct_dial_preserves_existing_p2p_segment() {
+        // If the address already carries `/p2p/<peer>`, we MUST NOT append
+        // a duplicate.
+        let peer = rand_peer();
+        let addrs = vec![ma(&format!("/ip4/8.8.8.8/tcp/4001/p2p/{peer}"))];
+        let picked = pick_direct_dial_candidate(&addrs, peer).unwrap();
+
+        // Exactly one P2p component.
+        let p2p_count = picked
+            .iter()
+            .filter(|p| matches!(p, Protocol::P2p(_)))
+            .count();
+        assert_eq!(p2p_count, 1);
+        assert_eq!(picked.to_string(), format!("/ip4/8.8.8.8/tcp/4001/p2p/{peer}"));
+    }
+
+    #[test]
+    fn pick_direct_dial_accepts_dns_addresses() {
+        let peer = rand_peer();
+        let addrs = vec![ma("/dns4/relay.example.com/tcp/4001")];
+        let picked = pick_direct_dial_candidate(&addrs, peer).unwrap();
+        assert_eq!(
+            picked.to_string(),
+            format!("/dns4/relay.example.com/tcp/4001/p2p/{peer}")
+        );
+    }
+
+    #[test]
+    fn pick_direct_dial_empty_input_returns_none() {
+        let peer = rand_peer();
+        assert!(pick_direct_dial_candidate(&[], peer).is_none());
+    }
+
+    #[test]
+    fn pick_direct_dial_quic_address_is_picked() {
+        let peer = rand_peer();
+        let addrs = vec![ma("/ip4/8.8.8.8/udp/4001/quic-v1")];
+        let picked = pick_direct_dial_candidate(&addrs, peer).unwrap();
+        assert_eq!(
+            picked.to_string(),
+            format!("/ip4/8.8.8.8/udp/4001/quic-v1/p2p/{peer}")
+        );
     }
 }

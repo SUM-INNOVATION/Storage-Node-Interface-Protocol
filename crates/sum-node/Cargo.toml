@@ -23,6 +23,7 @@ clap               = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
+thiserror          = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 blake3             = { workspace = true }
@@ -33,6 +34,7 @@ bincode1           = { workspace = true }
 hex                = { workspace = true }
 serde-big-array    = { workspace = true }
 async-trait        = { workspace = true }
+ciborium           = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

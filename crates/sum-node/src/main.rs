@@ -14,7 +14,7 @@
 //! RUST_LOG=info cargo run --bin sum-node -- send "Hello from SUM Node"
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +29,7 @@ use sum_net::{SumNet, SumNetEvent, Keypair, ShardResponse, TOPIC_STORAGE, TOPIC_
 use sum_net::identity;
 use sum_store::{SumStore, FetchOutcome, decode_announcement};
 use sum_store::manifest::deserialize_manifest_cbor;
+use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_types::config::{NetConfig, StoreConfig};
 
 use sum_node::acl::AclChecker;
@@ -36,6 +37,7 @@ use sum_node::download::DownloadOrchestrator;
 use sum_node::market_sync::MarketSyncWorker;
 use sum_node::peer_state::{apply_peer_event, PeerMapChange};
 use sum_node::por_worker::PorWorker;
+use sum_node::profile::{log_profile_banner, NodeProfile};
 use sum_node::rpc_client::L1RpcClient;
 use sum_node::upload::UploadOrchestrator;
 
@@ -91,11 +93,27 @@ struct Cli {
     #[arg(long, env = "SUM_TCP_PORT", default_value = "0")]
     tcp_port: u16,
 
+    /// UDP listen port for the QUIC transport (0 = OS-assigned).
+    ///
+    /// Pin a stable port if you need this node to be reliably dialable
+    /// over QUIC from the WAN — e.g. behind UPnP UDP port-forward, or
+    /// to give DCUtR a fixed hole-punch target. With the default `0`
+    /// the OS picks a fresh ephemeral UDP port on every restart.
+    #[arg(long, env = "SUM_UDP_PORT", default_value = "0")]
+    udp_port: u16,
+
     /// Volunteer this node as a Circuit Relay v2 server.
     /// Only enable on publicly-reachable hosts (VPS, port-forwarded).
     /// Requires --enable-wan; otherwise the relay is unreachable.
     #[arg(long, env = "SUM_RELAY_SERVER")]
     relay_server: bool,
+
+    /// Runtime profile. `production` fails closed on every uncertain ACL path
+    /// (RPC errors, unregistered files, unknown CIDs all deny). `dev` relaxes
+    /// those paths for local testing without an L1 chain — never use it for
+    /// real deployments.
+    #[arg(long, env = "SUM_PROFILE", default_value = "production", value_enum)]
+    profile: NodeProfile,
 
     #[command(subcommand)]
     command: Command,
@@ -114,6 +132,12 @@ enum Command {
         /// Upload timeout in seconds (time to wait for R=3 push confirmations).
         #[arg(long, default_value = "120")]
         upload_timeout_secs: u64,
+        /// Manifest-replication timeout in seconds. Ingest only declares
+        /// success after every chunk recipient ACKs the manifest push,
+        /// so they can resolve `cid -> merkle_root` for ACL purposes.
+        /// Manifests are KB-scale; 60 s is generous default headroom.
+        #[arg(long, default_value = "60")]
+        manifest_push_timeout_secs: u64,
     },
 
     /// Fetch a chunk by CID from a LAN peer.
@@ -157,6 +181,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    log_profile_banner(cli.profile);
+
     // Load or generate keypair + extract seed.
     let (keypair, seed) = if let Some(ref key_path) = cli.key_file {
         let hex_str = std::fs::read_to_string(key_path)?
@@ -184,7 +210,7 @@ async fn main() -> Result<()> {
 
     // Build network config from CLI args.
     let net_config = NetConfig {
-        listen_port: 0,
+        udp_listen_port: cli.udp_port,
         tcp_listen_port: cli.tcp_port,
         enable_wan: cli.enable_wan,
         bootstrap_peers: cli.bootstrap_peers.clone(),
@@ -196,10 +222,25 @@ async fn main() -> Result<()> {
             anyhow::bail!("listen command requires node mode — remove --client flag")
         }
         Command::Listen => run_listen(keypair, seed, &cli, net_config).await,
-        Command::Ingest { path, upload_timeout_secs } => {
+        Command::Ingest {
+            path,
+            upload_timeout_secs,
+            manifest_push_timeout_secs,
+        } => {
             let rpc_url = cli.rpc_url.clone();
             let client_mode = cli.client;
-            run_ingest(keypair, rpc_url, client_mode, net_config, path, upload_timeout_secs).await
+            let profile = cli.profile;
+            run_ingest(
+                keypair,
+                rpc_url,
+                client_mode,
+                net_config,
+                path,
+                upload_timeout_secs,
+                manifest_push_timeout_secs,
+                profile,
+            )
+            .await
         }
         Command::Fetch { cid } => run_fetch(keypair, net_config, cid).await,
         Command::Download { merkle_root, output, max_concurrent, download_timeout_secs } => {
@@ -239,8 +280,13 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli, net_con
     let rpc = Arc::new(L1RpcClient::new(cli.rpc_url.clone()));
     info!(rpc_url = %cli.rpc_url, "L1 RPC client initialized");
 
-    // ACL checker.
-    let acl = AclChecker::new(rpc.clone(), peer_addresses.clone());
+    // ACL checker. Profile gating decides whether RPC errors / unregistered
+    // files / unknown CIDs fail-closed (production) or fail-open (dev).
+    let acl = Arc::new(AclChecker::new(
+        rpc.clone(),
+        peer_addresses.clone(),
+        cli.profile,
+    ));
 
     // Spawn PoR worker if we have an L1 keypair.
     // Shutdown signal for background workers.
@@ -284,35 +330,57 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli, net_con
             Some(event) = net.next_event() => {
                 match &event {
                     SumNetEvent::ShardRequested { peer_id, request, channel_id } => {
-                        // ACL check before serving.
-                        let store_read = store.read().await;
-                        let allowed = acl
-                            .check_access(peer_id, &request.cid, &store_read.manifest_idx)
-                            .await
-                            .unwrap_or_else(|e| {
-                                warn!(%e, "ACL check failed (RPC error) — denying");
-                                false
-                            });
-
-                        if allowed {
-                            sum_store::serve::handle_request(
-                                &net, &store_read.local, &store_read.manifest_idx,
-                                request, *channel_id,
-                            ).await;
-                        } else {
-                            info!(
-                                peer = %peer_id,
-                                cid = %request.cid,
-                                "ACCESS DENIED — peer not in file ACL"
-                            );
-                            let resp = ShardResponse {
-                                cid: request.cid.clone(),
-                                offset: 0,
-                                total_bytes: 0,
-                                data: Vec::new(),
-                                error: Some("ACCESS_DENIED: not in file access list".into()),
-                            };
-                            let _ = net.respond_shard(*channel_id, resp).await;
+                        // Four-way dispatch:
+                        //   - Manifest push (mutates manifest_idx) → write lock + handle_manifest_push.
+                        //     Without this branch, archives that received chunk pushes never learn the
+                        //     `cid → root` mapping, so production ACL would deny pulls to those CIDs.
+                        //   - Chunk push: read lock; `serve::handle_request` already validates CID.
+                        //   - Pulls: ACL gate + read lock + `handle_request`.
+                        let is_manifest = request.cid.starts_with(MANIFEST_REQUEST_PREFIX);
+                        let is_push = request.push_data.is_some();
+                        match (is_manifest, is_push) {
+                            (true, true) => {
+                                let mut store_w = store.write().await;
+                                sum_store::serve::handle_manifest_push(
+                                    &net, &mut store_w.manifest_idx, request, *channel_id,
+                                ).await;
+                            }
+                            (false, true) => {
+                                let store_read = store.read().await;
+                                sum_store::serve::handle_request(
+                                    &net, &store_read.local, &store_read.manifest_idx,
+                                    request, *channel_id,
+                                ).await;
+                            }
+                            // Pull paths (manifest or chunk) — apply ACL.
+                            (_, false) => {
+                                let store_read = store.read().await;
+                                let allowed = acl
+                                    .check_access_or_default(
+                                        peer_id, &request.cid, &store_read.manifest_idx,
+                                    )
+                                    .await;
+                                if allowed {
+                                    sum_store::serve::handle_request(
+                                        &net, &store_read.local, &store_read.manifest_idx,
+                                        request, *channel_id,
+                                    ).await;
+                                } else {
+                                    info!(
+                                        peer = %peer_id,
+                                        cid = %request.cid,
+                                        "ACCESS DENIED — peer not in file ACL"
+                                    );
+                                    let resp = ShardResponse {
+                                        cid: request.cid.clone(),
+                                        offset: 0,
+                                        total_bytes: 0,
+                                        data: Vec::new(),
+                                        error: Some("ACCESS_DENIED: not in file access list".into()),
+                                    };
+                                    let _ = net.respond_shard(*channel_id, resp).await;
+                                }
+                            }
                         }
                     }
                     SumNetEvent::PeerIdentified { .. } | SumNetEvent::PeerDisconnected { .. } => {
@@ -432,6 +500,8 @@ async fn run_ingest(
     net_config: NetConfig,
     path: PathBuf,
     upload_timeout_secs: u64,
+    manifest_push_timeout_secs: u64,
+    profile: NodeProfile,
 ) -> Result<()> {
     let net = SumNet::new(net_config, keypair).await?;
     let mut store = SumStore::new(StoreConfig::default())?;
@@ -486,10 +556,11 @@ async fn run_ingest(
         }
     }
 
-    // Push to R=3 assigned nodes via UploadOrchestrator.
+    // Push to R=3 assigned nodes via UploadOrchestrator. The same RPC
+    // client is reused below by the post-ingest serve loop's ACL checker.
     let rpc = Arc::new(L1RpcClient::new(rpc_url));
     let orchestrator = UploadOrchestrator::new(
-        rpc,
+        rpc.clone(),
         Duration::from_secs(upload_timeout_secs),
     );
 
@@ -498,65 +569,276 @@ async fn run_ingest(
         "pushing chunks to assigned nodes"
     );
 
-    let upload_result = orchestrator.run(
-        &net, &store, &manifest, &peer_addresses,
-    ).await;
+    let upload_result = orchestrator
+        .run(&net, &store, &manifest, &peer_addresses)
+        .await
+        .map_err(|e| anyhow::anyhow!("upload orchestrator failed: {e}"))?;
 
-    match &upload_result {
-        Ok(result) => {
-            info!(
-                confirmed = result.confirmed,
-                total = result.total,
-                timeout = result.timeout,
-                failed = result.failed.len(),
-                "upload complete"
-            );
-            if result.timeout || !result.failed.is_empty() {
-                warn!("some pushes failed or timed out — do NOT delete your local copy");
-                for f in &result.failed {
-                    warn!(cid = %f.cid, error = %f.error, "push failed");
-                }
-            }
+    info!(
+        confirmed = upload_result.confirmed,
+        total = upload_result.total,
+        chunks_fully_confirmed = upload_result.chunks_fully_confirmed,
+        chunk_count = manifest.chunk_count,
+        timeout = upload_result.timeout,
+        failed = upload_result.failed.len(),
+        "upload complete"
+    );
+
+    // Strict success criterion: every chunk must reach R replicas.
+    if let Err(failure) = upload_result.check_success(sum_types::storage::REPLICATION_FACTOR as u32)
+    {
+        // Surface every failed push for operator triage.
+        for f in &upload_result.failed {
+            warn!(chunk_index = f.chunk_index, cid = %f.cid, error = %f.error, "push failed");
         }
-        Err(e) => {
-            warn!(%e, "upload orchestrator failed — falling back to gossipsub announce");
-        }
+        // Bail loud — no gossipsub fallback. The previous behaviour silently
+        // declared success after announcing on gossipsub, which let users
+        // believe a file was replicated when it wasn't.
+        anyhow::bail!("ingest failed: {failure}");
     }
 
-    // Announce via gossipsub (so other nodes learn about the file even if push failed).
+    // Replicate the manifest to every peer that ACKed at least one
+    // chunk. Without this, archives have chunks but no manifest index;
+    // production ACL on chunk pulls would treat all the CIDs we just
+    // successfully replicated as unknown and deny.
+    //
+    // This is **synchronous** — ingest does not declare success until
+    // every recipient ACKs the manifest. Without that, client mode
+    // could clean up the local copy while one or more archives still
+    // hold chunks but no manifest, leaving the file effectively
+    // unservable for those replicas.
+    push_manifest_to_recipients(
+        &net,
+        &manifest,
+        &upload_result.chunk_recipients,
+        Duration::from_secs(manifest_push_timeout_secs),
+    )
+    .await?;
+
+    // Announce CHUNK metadata on gossipsub. NB: this is the per-chunk
+    // `ChunkAnnouncement` topic from sum-store::announce — not a
+    // manifest-bytes broadcast. Other nodes use these to discover that
+    // chunks exist; they still have to fetch the manifest separately.
     store.announce_chunks(&net, &manifest).await?;
-    info!("all chunks announced via gossipsub");
+    info!("chunk metadata announced via gossipsub");
 
     if client_mode {
-        // Client mode: clean up local chunks and exit.
-        if upload_result.as_ref().map(|r| r.confirmed > 0 && r.failed.is_empty()).unwrap_or(false) {
-            info!("client mode — cleaning up local chunks");
-            store.cleanup()?;
-        } else {
-            warn!("client mode — skipping cleanup (upload incomplete)");
-        }
+        // Client mode: every chunk is at R replicas AND every replica
+        // ACKed the manifest, so the local copy is safe to drop.
+        info!("client mode — cleaning up local chunks");
+        store.cleanup()?;
         net.shutdown().await?;
         info!("client mode — exiting");
     } else {
-        // Node mode: enter serve loop (backward compat for node operators).
+        // Node mode: enter serve loop with the same ACL policy as `listen`.
         info!("node mode — listening for requests (Ctrl-C to stop)");
-        simple_serve_loop(&net, &store).await?;
+        let peer_addrs_shared: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>> =
+            Arc::new(RwLock::new(peer_addresses));
+        let acl = Arc::new(AclChecker::new(rpc, peer_addrs_shared.clone(), profile));
+        let store_shared = Arc::new(RwLock::new(store));
+        simple_serve_loop(&net, store_shared, acl, peer_addrs_shared).await?;
     }
 
     Ok(())
 }
 
-/// Simple serve loop without ACL (used by ingest after announcing).
-async fn simple_serve_loop(net: &SumNet, store: &SumStore) -> Result<()> {
+/// Push the manifest to every peer in `recipients` and wait for an ACK
+/// (or error response) from each before returning.
+///
+/// Returns `Ok(())` only when every recipient has ACKed without error.
+/// Returns an `Err` if:
+///
+/// * A peer's response carries a non-empty `error` field (the peer
+///   rejected the manifest — e.g. CBOR decode failed or the merkle
+///   root in the manifest didn't match the CID-encoded root).
+/// * `timeout` elapses with one or more recipients still pending.
+/// * Manifest CBOR serialization fails (programmer error).
+/// * The push enqueue fails for any recipient.
+///
+/// Why synchronous: archives that hold chunks but lack the manifest
+/// can't resolve `cid -> root`, so production ACL denies their pulls.
+/// Letting client-mode cleanup or node-mode serve start before every
+/// archive has the manifest leaves the file unservable from those
+/// replicas. Better to surface the failure here than ship a "succeeded"
+/// signal that produces unservable replicas.
+async fn push_manifest_to_recipients(
+    net: &SumNet,
+    manifest: &sum_types::storage::DataManifest,
+    recipients: &std::collections::HashSet<sum_net::PeerId>,
+    timeout: Duration,
+) -> Result<()> {
+    if recipients.is_empty() {
+        return Ok(());
+    }
+
+    // Serialize once. The CBOR shape mirrors handle_manifest_request's
+    // pull-side response, so receivers can route through the same code
+    // path without protocol changes.
+    let mut cbor = Vec::new();
+    ciborium::ser::into_writer(manifest, &mut cbor)
+        .map_err(|e| anyhow::anyhow!("manifest CBOR-serialize failed: {e}"))?;
+    let root_hex: String = manifest
+        .merkle_root
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let cid = format!("{MANIFEST_REQUEST_PREFIX}{root_hex}");
+    let data: Arc<[u8]> = Arc::from(cbor.into_boxed_slice());
+
+    let mut pending: HashSet<sum_net::PeerId> = recipients.clone();
+    let mut rejections: HashMap<sum_net::PeerId, String> = HashMap::new();
+
+    info!(
+        recipients = pending.len(),
+        bytes = data.len(),
+        root = %root_hex,
+        timeout_secs = timeout.as_secs(),
+        "pushing manifest to chunk recipients (waiting for ACKs)"
+    );
+
+    // Send pushes. Enqueue failures are fatal — we can't have an archive
+    // with chunks but no manifest, so don't pretend it's fine.
+    for peer_id in recipients {
+        net.push_chunk_shared(*peer_id, cid.clone(), Arc::clone(&data))
+            .await
+            .map_err(|e| anyhow::anyhow!("manifest push enqueue failed for {peer_id}: {e}"))?;
+    }
+
+    // Drain ACKs (or rejections) until every recipient has responded or
+    // we hit the deadline. Other event types (PeerIdentified, Listening,
+    // etc.) flow past untouched — ingest is past peer discovery so we
+    // don't need to record them here.
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !pending.is_empty() {
+        tokio::select! {
+            event = net.next_event() => {
+                match event {
+                    Some(SumNetEvent::ShardReceived { peer_id, response }) => {
+                        if response.cid != cid {
+                            // Some other concurrent push or an out-of-order
+                            // event — ignore.
+                            continue;
+                        }
+                        if !pending.remove(&peer_id) {
+                            // Either a duplicate ACK or an unrelated peer
+                            // responded; nothing to do.
+                            continue;
+                        }
+                        match response.error {
+                            Some(err) => {
+                                warn!(%peer_id, %err, "manifest push REJECTED by archive");
+                                rejections.insert(peer_id, err);
+                            }
+                            None => {
+                                info!(%peer_id, remaining = pending.len(),
+                                    "manifest push ACKed");
+                            }
+                        }
+                    }
+                    None => {
+                        anyhow::bail!(
+                            "network shut down while waiting for manifest ACKs ({} pending)",
+                            pending.len()
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                let pending_addrs: Vec<String> =
+                    pending.iter().map(|p| p.to_string()).collect();
+                anyhow::bail!(
+                    "manifest replication timed out: {} of {} archives have chunks but no \
+                     manifest. Pending: {}",
+                    pending.len(),
+                    recipients.len(),
+                    pending_addrs.join(", ")
+                );
+            }
+        }
+    }
+
+    if !rejections.is_empty() {
+        let detail: Vec<String> = rejections
+            .iter()
+            .map(|(p, e)| format!("{p}: {e}"))
+            .collect();
+        anyhow::bail!(
+            "manifest push rejected by {} archive(s): {}",
+            rejections.len(),
+            detail.join("; ")
+        );
+    }
+
+    info!(recipients = recipients.len(), "manifest replicated to all chunk recipients");
+    Ok(())
+}
+
+/// Serve loop used after ingest announces the file. Same four-way
+/// dispatch as `run_listen`: manifest pushes take a write lock, chunk
+/// pushes use a read lock with CID-only validation, pulls go through
+/// the ACL checker.
+async fn simple_serve_loop(
+    net: &SumNet,
+    store: Arc<RwLock<SumStore>>,
+    acl: Arc<AclChecker>,
+    peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>>,
+) -> Result<()> {
     loop {
         tokio::select! {
             Some(event) = net.next_event() => {
                 match &event {
-                    SumNetEvent::ShardRequested { request, channel_id, .. } => {
-                        sum_store::serve::handle_request(
-                            net, &store.local, &store.manifest_idx,
-                            request, *channel_id,
-                        ).await;
+                    SumNetEvent::ShardRequested { peer_id, request, channel_id } => {
+                        let is_manifest = request.cid.starts_with(MANIFEST_REQUEST_PREFIX);
+                        let is_push = request.push_data.is_some();
+                        match (is_manifest, is_push) {
+                            (true, true) => {
+                                let mut store_w = store.write().await;
+                                sum_store::serve::handle_manifest_push(
+                                    net, &mut store_w.manifest_idx, request, *channel_id,
+                                ).await;
+                            }
+                            (false, true) => {
+                                let store_read = store.read().await;
+                                sum_store::serve::handle_request(
+                                    net, &store_read.local, &store_read.manifest_idx,
+                                    request, *channel_id,
+                                ).await;
+                            }
+                            (_, false) => {
+                                let store_read = store.read().await;
+                                let allowed = acl
+                                    .check_access_or_default(
+                                        peer_id, &request.cid, &store_read.manifest_idx,
+                                    )
+                                    .await;
+                                if allowed {
+                                    sum_store::serve::handle_request(
+                                        net, &store_read.local, &store_read.manifest_idx,
+                                        request, *channel_id,
+                                    ).await;
+                                } else {
+                                    info!(
+                                        peer = %peer_id,
+                                        cid = %request.cid,
+                                        "ACCESS DENIED — peer not in file ACL"
+                                    );
+                                    let resp = ShardResponse {
+                                        cid: request.cid.clone(),
+                                        offset: 0,
+                                        total_bytes: 0,
+                                        data: Vec::new(),
+                                        error: Some("ACCESS_DENIED: not in file access list".into()),
+                                    };
+                                    let _ = net.respond_shard(*channel_id, resp).await;
+                                }
+                            }
+                        }
+                    }
+                    SumNetEvent::PeerIdentified { .. } | SumNetEvent::PeerDisconnected { .. } => {
+                        let mut map = peer_addresses.write().await;
+                        let _ = apply_peer_event(&mut map, &event);
+                        print_event(&event);
                     }
                     _ => print_event(&event),
                 }
@@ -712,6 +994,8 @@ async fn run_download(
         chunks_skipped = result.chunks_skipped,
         total_bytes = result.total_bytes,
         merkle_verified = result.merkle_verified,
+        peers_contacted = result.peers_contacted.len(),
+        duration_ms = result.duration().as_millis() as u64,
         output = %output.display(),
         "download complete"
     );
