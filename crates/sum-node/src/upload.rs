@@ -87,6 +87,11 @@ pub struct UploadOrchestrator {
 }
 
 /// Result of an upload operation.
+///
+/// `confirmed` and `total` are aggregate (chunk, node) ACK counts kept for
+/// observability. The success criterion is **per-chunk**: every chunk must
+/// reach R replica ACKs. Use [`UploadResult::check_success`] to test it.
+#[derive(Debug, Clone)]
 pub struct UploadResult {
     /// Number of (chunk, node) push confirmations received.
     pub confirmed: u32,
@@ -95,14 +100,96 @@ pub struct UploadResult {
     /// Whether the timeout was reached before all confirmations.
     pub timeout: bool,
     /// Details of failed pushes.
-    pub failed: Vec<UploadFailure>,
+    pub failed: Vec<FailedPush>,
+    /// Per-chunk ACK count, indexed by `chunk_index`. Length equals the
+    /// manifest's `chunk_count`. `per_chunk_confirmations[i]` is the number
+    /// of distinct replica ACKs for chunk `i`.
+    pub per_chunk_confirmations: Vec<u32>,
+    /// Number of chunks that reached the replication threshold:
+    /// `chunks_fully_confirmed = |{ i : per_chunk_confirmations[i] >= R }|`.
+    /// Treated as a cached hint by [`Self::check_success`], which
+    /// recomputes the verdict from `per_chunk_confirmations`.
+    pub chunks_fully_confirmed: u32,
+    /// Distinct peers that ACKed at least one chunk. Used by callers to
+    /// know who to push the manifest to so those archives can resolve
+    /// `cid → root` for ACL purposes.
+    pub chunk_recipients: HashSet<PeerId>,
 }
 
 /// A single failed push attempt.
-pub struct UploadFailure {
+#[derive(Debug, Clone)]
+pub struct FailedPush {
     pub chunk_index: u32,
     pub cid: String,
     pub error: String,
+}
+
+/// Why an upload should be considered unsuccessful. Distinct from a
+/// transport-level `Err` from the orchestrator: this is the post-run
+/// verdict against the per-chunk replication target.
+#[derive(Debug, thiserror::Error)]
+pub enum UploadFailure {
+    #[error("upload timed out before all chunks reached the replication target")]
+    Timeout,
+    #[error("{count} chunk push(es) failed at the transport layer")]
+    FailedPushes {
+        count: usize,
+        pushes: Vec<FailedPush>,
+    },
+    #[error(
+        "only {fully_confirmed_chunks}/{expected_chunks} chunks reached \
+         R={replication_factor} replicas; under-replicated indices: {under_replicated:?}"
+    )]
+    IncompleteConfirmations {
+        expected_chunks: u32,
+        fully_confirmed_chunks: u32,
+        replication_factor: u32,
+        under_replicated: Vec<u32>,
+    },
+}
+
+impl UploadResult {
+    /// Verify every chunk reached `replication_factor` replica ACKs.
+    ///
+    /// `chunks_fully_confirmed` on the struct is treated as a cached
+    /// hint only — the verdict is recomputed from
+    /// `per_chunk_confirmations` here so a stale or wrong cache cannot
+    /// cause `check_success` to silently approve an under-replicated
+    /// upload.
+    pub fn check_success(&self, replication_factor: u32) -> Result<(), UploadFailure> {
+        if self.timeout {
+            return Err(UploadFailure::Timeout);
+        }
+        if !self.failed.is_empty() {
+            return Err(UploadFailure::FailedPushes {
+                count: self.failed.len(),
+                pushes: self.failed.clone(),
+            });
+        }
+        let expected_chunks = self.per_chunk_confirmations.len() as u32;
+        let under_replicated: Vec<u32> = self
+            .per_chunk_confirmations
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &count)| {
+                if count < replication_factor {
+                    Some(i as u32)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let fully_confirmed_chunks = expected_chunks - under_replicated.len() as u32;
+        if !under_replicated.is_empty() {
+            return Err(UploadFailure::IncompleteConfirmations {
+                expected_chunks,
+                fully_confirmed_chunks,
+                replication_factor,
+                under_replicated,
+            });
+        }
+        Ok(())
+    }
 }
 
 // ── Implementation ───────────────────────────────────────────────────────────
@@ -176,9 +263,20 @@ impl UploadOrchestrator {
             addr_to_peer.insert(addr, pid);
         }
 
+        // CID -> chunk_index lookup for per-chunk confirmation accounting.
+        // Built once from the manifest; ACKs come back keyed by CID, and we
+        // need the chunk_index to bump the right slot in
+        // `per_chunk_confirmations`.
+        let mut cid_to_index: HashMap<String, u32> = HashMap::new();
+        for chunk in &manifest.chunks {
+            cid_to_index.insert(chunk.cid.clone(), chunk.chunk_index);
+        }
+
         let mut total_pushes: u32 = 0;
         let mut confirmed: u32 = 0;
-        let mut failed: Vec<UploadFailure> = Vec::new();
+        let mut failed: Vec<FailedPush> = Vec::new();
+        let mut per_chunk_confirmations: Vec<u32> = vec![0; manifest.chunk_count as usize];
+        let mut chunk_recipients: HashSet<PeerId> = HashSet::new();
         let deadline = tokio::time::Instant::now() + self.timeout;
         let mut timed_out = false;
 
@@ -204,7 +302,7 @@ impl UploadOrchestrator {
 
                 for node_addr in assigned {
                     let Some(&peer_id) = addr_to_peer.get(node_addr) else {
-                        failed.push(UploadFailure {
+                        failed.push(FailedPush {
                             chunk_index: chunk.chunk_index,
                             cid: chunk.cid.clone(),
                             error: format!("no PeerId for node {}", hex::encode(node_addr)),
@@ -221,7 +319,7 @@ impl UploadOrchestrator {
                             total_pushes += 1;
                         }
                         Err(e) => {
-                            failed.push(UploadFailure {
+                            failed.push(FailedPush {
                                 chunk_index: chunk.chunk_index,
                                 cid: chunk.cid.clone(),
                                 error: e.to_string(),
@@ -250,6 +348,10 @@ impl UploadOrchestrator {
                                 if response.error.is_none() {
                                     if slice_pending.remove(&(response.cid.clone(), peer_id)) {
                                         confirmed += 1;
+                                        if let Some(&idx) = cid_to_index.get(&response.cid) {
+                                            per_chunk_confirmations[idx as usize] += 1;
+                                        }
+                                        chunk_recipients.insert(peer_id);
                                         info!(
                                             cid = %response.cid,
                                             %peer_id,
@@ -266,8 +368,12 @@ impl UploadOrchestrator {
                                             %err,
                                             "push rejected by peer"
                                         );
-                                        failed.push(UploadFailure {
-                                            chunk_index: 0,
+                                        let chunk_index = cid_to_index
+                                            .get(&response.cid)
+                                            .copied()
+                                            .unwrap_or(u32::MAX);
+                                        failed.push(FailedPush {
+                                            chunk_index,
                                             cid: response.cid.clone(),
                                             error: err.clone(),
                                         });
@@ -288,8 +394,9 @@ impl UploadOrchestrator {
                         timed_out = true;
                         // Record remaining pending in this slice as failures.
                         for (cid, peer_id) in slice_pending.drain() {
-                            failed.push(UploadFailure {
-                                chunk_index: 0,
+                            let chunk_index = cid_to_index.get(&cid).copied().unwrap_or(u32::MAX);
+                            failed.push(FailedPush {
+                                chunk_index,
                                 cid,
                                 error: format!("timeout — no ACK from {peer_id}"),
                             });
@@ -300,11 +407,19 @@ impl UploadOrchestrator {
             }
         }
 
+        let chunks_fully_confirmed = per_chunk_confirmations
+            .iter()
+            .filter(|&&count| count >= REPLICATION_FACTOR as u32)
+            .count() as u32;
+
         Ok(UploadResult {
             confirmed,
             total: total_pushes,
             timeout: timed_out,
             failed,
+            per_chunk_confirmations,
+            chunks_fully_confirmed,
+            chunk_recipients,
         })
     }
 }
@@ -423,5 +538,146 @@ mod tests {
         let rpc = Arc::new(L1RpcClient::new("http://invalid".into()));
         let orch = UploadOrchestrator::new(rpc, Duration::from_secs(1));
         assert_eq!(orch.max_in_flight_chunks, DEFAULT_MAX_IN_FLIGHT_CHUNKS);
+    }
+
+    // ── UploadResult::check_success matrix ────────────────────────────────
+
+    fn make_result(
+        per_chunk: Vec<u32>,
+        timeout: bool,
+        failed: Vec<FailedPush>,
+        replication_factor: u32,
+    ) -> UploadResult {
+        let chunks_fully_confirmed = per_chunk
+            .iter()
+            .filter(|&&n| n >= replication_factor)
+            .count() as u32;
+        let confirmed: u32 = per_chunk.iter().sum();
+        UploadResult {
+            confirmed,
+            total: confirmed + failed.len() as u32,
+            timeout,
+            failed,
+            per_chunk_confirmations: per_chunk,
+            chunks_fully_confirmed,
+            chunk_recipients: HashSet::new(),
+        }
+    }
+
+    /// Every chunk fully replicated to R archives → check_success returns Ok.
+    #[test]
+    fn check_success_happy_path_full_replication() {
+        let r = REPLICATION_FACTOR as u32;
+        let result = make_result(vec![r, r, r, r, r], false, vec![], r);
+        assert!(result.check_success(r).is_ok());
+    }
+
+    /// Exactly one chunk receives only R-1 ACKs → IncompleteConfirmations
+    /// with that chunk's index reported.
+    #[test]
+    fn check_success_under_replicates_single_chunk() {
+        let r = REPLICATION_FACTOR as u32;
+        // Chunk 5 only got R-1 ACKs.
+        let mut per_chunk = vec![r; 10];
+        per_chunk[5] = r - 1;
+        let result = make_result(per_chunk, false, vec![], r);
+        match result.check_success(r) {
+            Err(UploadFailure::IncompleteConfirmations {
+                expected_chunks,
+                fully_confirmed_chunks,
+                replication_factor,
+                under_replicated,
+            }) => {
+                assert_eq!(expected_chunks, 10);
+                assert_eq!(fully_confirmed_chunks, 9);
+                assert_eq!(replication_factor, r);
+                assert_eq!(under_replicated, vec![5]);
+            }
+            other => panic!("expected IncompleteConfirmations, got {other:?}"),
+        }
+    }
+
+    /// Timeout dominates: even if some chunks are fully confirmed, a timeout
+    /// flag means the result is `Err(Timeout)`.
+    #[test]
+    fn check_success_timeout_dominates() {
+        let r = REPLICATION_FACTOR as u32;
+        let result = make_result(vec![r, r, 0, 0], true, vec![], r);
+        assert!(matches!(result.check_success(r), Err(UploadFailure::Timeout)));
+    }
+
+    /// Any FailedPush in the result is fatal regardless of confirmation
+    /// counts — the orchestrator already knows something went wrong.
+    #[test]
+    fn check_success_failed_push_is_fatal() {
+        let r = REPLICATION_FACTOR as u32;
+        let failed = vec![FailedPush {
+            chunk_index: 7,
+            cid: "bafk_test_chunk7".to_string(),
+            error: "store write failed".to_string(),
+        }];
+        let result = make_result(vec![r; 10], false, failed.clone(), r);
+        match result.check_success(r) {
+            Err(UploadFailure::FailedPushes { count, pushes }) => {
+                assert_eq!(count, 1);
+                assert_eq!(pushes.len(), 1);
+                assert_eq!(pushes[0].chunk_index, 7);
+            }
+            other => panic!("expected FailedPushes, got {other:?}"),
+        }
+    }
+
+    /// `check_success` must not trust a stale `chunks_fully_confirmed`
+    /// field — it must recompute the verdict from `per_chunk_confirmations`
+    /// every time. Without this, a corrupted or hand-forged result could
+    /// claim success while leaving chunks under-replicated.
+    #[test]
+    fn check_success_recomputes_fully_confirmed_ignoring_cache() {
+        let r = REPLICATION_FACTOR as u32;
+        // Real per-chunk state: chunk 2 is missing one ACK.
+        let mut per_chunk = vec![r; 4];
+        per_chunk[2] = r - 1;
+        // Build a result that LIES about fully-confirmed (claims all 4).
+        let result = UploadResult {
+            confirmed: per_chunk.iter().sum(),
+            total: 4 * r,
+            timeout: false,
+            failed: vec![],
+            per_chunk_confirmations: per_chunk,
+            chunks_fully_confirmed: 4, // ← stale / forged cache
+            chunk_recipients: HashSet::new(),
+        };
+        match result.check_success(r) {
+            Err(UploadFailure::IncompleteConfirmations {
+                fully_confirmed_chunks,
+                under_replicated,
+                ..
+            }) => {
+                // The verdict comes from the recomputed list, NOT the cache.
+                assert_eq!(fully_confirmed_chunks, 3);
+                assert_eq!(under_replicated, vec![2]);
+            }
+            other => panic!("expected IncompleteConfirmations, got {other:?}"),
+        }
+    }
+
+    /// Mixed under-replication produces a precise list of bad indices in
+    /// ascending order.
+    #[test]
+    fn check_success_mixed_under_replication_indices() {
+        let r = REPLICATION_FACTOR as u32;
+        // Chunks 0, 3, 8 are under-replicated.
+        let per_chunk = vec![
+            r - 1, r, r, r - 2, r, r, r, r, 0, r,
+        ];
+        let result = make_result(per_chunk, false, vec![], r);
+        match result.check_success(r) {
+            Err(UploadFailure::IncompleteConfirmations {
+                under_replicated, ..
+            }) => {
+                assert_eq!(under_replicated, vec![0, 3, 8]);
+            }
+            other => panic!("expected IncompleteConfirmations, got {other:?}"),
+        }
     }
 }

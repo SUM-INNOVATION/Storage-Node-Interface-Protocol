@@ -148,14 +148,23 @@ pub fn build_autonat(local_peer_id: PeerId) -> autonat::Behaviour {
 /// When `enabled` is true, the node accepts relay reservations from firewalled
 /// peers and relays short-lived circuits so DCUtR can upgrade them.
 ///
-/// Circuit bytes capped at 8 MiB — relay circuits are only meant to last long
-/// enough for DCUtR to hole-punch (seconds, not minutes). Allowing bulk
-/// traffic through the relay would DDoS volunteer nodes before the direct
-/// connection upgrade succeeds.
+/// Circuit sizing is intentionally tight (8 MiB / 120 s). Relay circuits
+/// are short-lived hops meant to give DCUtR time to upgrade them into a
+/// direct connection — they are NOT a bulk data plane. Allowing large
+/// or long-lived circuits would let a single peer DDoS the relay before
+/// hole-punching completes.
+///
+/// Production deployments rely on direct dial / DCUtR for the actual
+/// data plane. Peers stuck behind symmetric NAT / CGNAT without admin
+/// access to their router will not be reliably reachable for bulk
+/// transfer through this relay; a future re-architecture (e.g. paid
+/// long-lived circuits, or a separate dedicated CDN tier) would be the
+/// right place to lift these caps.
 ///
 /// Rate limits prevent a single peer from exhausting relay resources:
 /// - Max 2 reservations per peer per 60 s
 /// - Max 4 circuit opens per peer per 60 s
+/// - Max 8 circuit opens per source IP per 60 s
 ///
 /// When `enabled` is false, `max_reservations: 0` means no clients are
 /// accepted — the behaviour is inert but present in the NetworkBehaviour struct.
@@ -165,7 +174,7 @@ pub fn build_relay_server(local_peer_id: PeerId, enabled: bool) -> relay::Behavi
             max_reservations: 128,
             max_reservations_per_peer: 4,
             max_circuit_duration: Duration::from_secs(120),
-            max_circuit_bytes: 1 << 23, // 8 MiB — tight cap for pre-upgrade relay
+            max_circuit_bytes: 1 << 23, // 8 MiB — protocol-correct cap
             ..Default::default()
         }
         // Rate-limit reservation requests: max 2 per peer per 60 s.

@@ -20,3 +20,8 @@ target/
 
 # OS
 Thumbs.db
+
+# Local test / debug artifacts (ad-hoc logs, never committed)
+SNIP_*.txt
+*.log
+SNIP-V2-CHAIN-PLAN.md

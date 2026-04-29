@@ -5,6 +5,7 @@ members = [
     "crates/sum-net",
     "crates/sum-store",
     "crates/sum-node",
+    "crates/sum-crypto",
 ]
 
 [workspace.package]
@@ -67,6 +68,23 @@ cid        = "0.11"
 multihash  = "0.19"
 tempfile   = "3.14"
 
+# ─── Cryptography (sum-crypto) ──────────────────────────────────────────────
+
+# AEAD: ChaCha20-Poly1305 (RFC 8439). Used for per-chunk encryption,
+# per-recipient key wrap, and manifest encryption.
+chacha20poly1305 = "0.10"
+# X25519 ECDH (RFC 7748) for per-recipient key wrapping.
+x25519-dalek     = { version = "2.0", default-features = false, features = ["zeroize", "static_secrets"] }
+# HKDF-SHA256 (RFC 5869) for chunk-key / chunk-nonce / KEK / manifest-key derivation.
+hkdf             = "0.12"
+sha2             = "0.10"
+# Constant-time comparison primitives (re-exported by AEAD libs but pinned for explicit use).
+subtle           = "2.5"
+# Zeroize sensitive material on drop.
+zeroize          = { version = "1.7", features = ["derive"] }
+# CSPRNG for ephemeral key material.
+rand_core        = { version = "0.6", features = ["getrandom"] }
+
 # ─── Async Utilities ─────────────────────────────────────────────────────────
 
 futures     = "0.3"
@@ -91,6 +109,8 @@ chrono  = { version = "0.4",  features = ["serde"] }
 
 # ─── Internal Crates ─────────────────────────────────────────────────────────
 
-sum-types = { path = "crates/sum-types" }
-sum-net   = { path = "crates/sum-net" }
-sum-store = { path = "crates/sum-store" }
+sum-types  = { path = "crates/sum-types" }
+sum-net    = { path = "crates/sum-net" }
+sum-store  = { path = "crates/sum-store" }
+sum-node   = { path = "crates/sum-node" }
+sum-crypto = { path = "crates/sum-crypto" }
