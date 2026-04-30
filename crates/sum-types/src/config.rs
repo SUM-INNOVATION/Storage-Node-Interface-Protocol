@@ -6,9 +6,18 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct NetConfig {
-    /// UDP port for QUIC listener. 0 = OS-assigned.
-    pub listen_port: u16,
-    /// TCP port for Noise+Yamux listener (WAN fallback). 0 = OS-assigned.
+    /// UDP port for the QUIC listener. `0` = OS-assigned (ephemeral).
+    ///
+    /// Setting an explicit port is required for stable WAN connectivity
+    /// when the node is behind a NAT and depends on UDP hole-punching
+    /// or UPnP-forwarded UDP. With an OS-assigned port the public UDP
+    /// port changes on every restart, breaking DCUtR and any
+    /// pre-configured port forwards.
+    pub udp_listen_port: u16,
+    /// TCP port for the Noise+Yamux listener. `0` = OS-assigned.
+    ///
+    /// Same caveat as [`Self::udp_listen_port`] — pin a stable port for
+    /// any peer that needs to be reliably dialable from the WAN.
     pub tcp_listen_port: u16,
     /// Enable WAN discovery via Kademlia DHT + TCP transport.
     /// When false, only mDNS (LAN) is used.
@@ -25,7 +34,7 @@ pub struct NetConfig {
 impl Default for NetConfig {
     fn default() -> Self {
         Self {
-            listen_port: 0,
+            udp_listen_port: 0,
             tcp_listen_port: 0,
             enable_wan: false,
             bootstrap_peers: Vec::new(),

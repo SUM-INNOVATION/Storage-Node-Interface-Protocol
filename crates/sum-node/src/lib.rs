@@ -6,6 +6,7 @@ pub mod market_sync;
 pub mod metrics;
 pub mod peer_state;
 pub mod por_worker;
+pub mod profile;
 pub mod rpc_client;
 pub mod tx_builder;
 pub mod upload;
