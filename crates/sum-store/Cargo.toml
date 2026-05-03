@@ -25,4 +25,7 @@ anyhow     = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio      = { workspace = true }
+tokio    = { workspace = true }
+# W3 — hex used by `tests/assignment_v2_conformance.rs` to spell
+# Appendix C byte vectors as compact literals.
+hex      = { workspace = true }

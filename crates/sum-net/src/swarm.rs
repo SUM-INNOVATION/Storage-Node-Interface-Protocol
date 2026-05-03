@@ -19,7 +19,11 @@ use sum_types::config::NetConfig;
 
 use crate::{
     behaviour::{LocalMeshBehaviour, LocalMeshBehaviourEvent},
-    codec::{ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL},
+    codec::{
+        ShardRequest, ShardRequestV2, ShardRequestVersioned, ShardResponse,
+        ShardResponseV2, ShardResponseVersioned, VersionedShardCodec,
+        SHARD_XFER_PROTOCOL_V1, SHARD_XFER_PROTOCOL_V2,
+    },
     discovery,
     events::SumNetEvent,
     gossip::GossipManager,
@@ -37,15 +41,27 @@ const REAPER_INTERVAL: Duration = Duration::from_secs(30);
 // ── SwarmCommand ──────────────────────────────────────────────────────────────
 
 /// Commands sent from the [`crate::SumNet`] handle into the running swarm loop.
+///
+/// V1 and V2 outbound paths each get their own command variant; the
+/// libp2p `request_response::Behaviour` underneath is shared and the
+/// negotiated protocol is decided per-stream by libp2p (V2 preferred
+/// when both peers register both protocols).
 #[derive(Debug)]
 pub enum SwarmCommand {
     /// Publish bytes to a named Gossipsub topic.
     Publish { topic: String, data: Vec<u8> },
 
-    /// Send a chunk request to a remote peer.
+    /// Send a V1 chunk request to a remote peer.
     RequestShard { peer_id: PeerId, request: ShardRequest },
 
-    /// Push a chunk to a remote peer using a shared, ref-counted buffer.
+    /// Send a V2 request (Pull / Push / ManifestPush / ManifestPull) to
+    /// a remote peer. Carries the chain-plan-v3.2 request shape directly.
+    RequestShardV2 {
+        peer_id: PeerId,
+        request: ShardRequestV2,
+    },
+
+    /// Push a V1 chunk to a remote peer using a shared, ref-counted buffer.
     ///
     /// Multiple replicas can share the same `Arc<[u8]>` payload — the
     /// command channel only buffers cheap pointer clones, not full copies
@@ -57,8 +73,14 @@ pub enum SwarmCommand {
         data: Arc<[u8]>,
     },
 
-    /// Send a chunk response on a stored response channel.
+    /// Send a V1 response on a stored V1 response channel.
     SendShardResponse { channel_id: u64, response: ShardResponse },
+
+    /// Send a V2 response on a stored V2 response channel.
+    SendShardResponseV2 {
+        channel_id: u64,
+        response: ShardResponseV2,
+    },
 
     /// Exit the event loop cleanly.
     Shutdown,
@@ -74,7 +96,12 @@ pub struct SumSwarm {
 
     /// Stores response channels received from inbound chunk requests,
     /// together with the insertion time so orphaned entries can be reaped.
-    pending_shard_channels: HashMap<u64, (ResponseChannel<ShardResponse>, Instant)>,
+    /// One map for both V1 and V2 since `request_response::Behaviour` is
+    /// codec-agnostic at the channel level — the channel is typed as
+    /// `ResponseChannel<ShardResponseVersioned>` and the V1/V2 wrap
+    /// happens in the [`SwarmCommand::SendShardResponse`] /
+    /// [`SwarmCommand::SendShardResponseV2`] handlers.
+    pending_shard_channels: HashMap<u64, (ResponseChannel<ShardResponseVersioned>, Instant)>,
 
     /// Monotonic counter for channel IDs.
     next_channel_id: u64,
@@ -168,8 +195,22 @@ impl SumSwarm {
                     key.public(),
                 ));
 
-                let shard_xfer = request_response::Behaviour::new(
-                    [(SHARD_XFER_PROTOCOL.to_string(), ProtocolSupport::Full)],
+                // Register V2 first so libp2p prefers V2 when both peers
+                // support both protocols. Order matters here: libp2p's
+                // request_response negotiation picks the FIRST protocol
+                // mutually supported in the iterator order. V1 stays
+                // listed (Full) so legacy peers continue to flow.
+                //
+                // Both protocols share one `VersionedShardCodec` instance
+                // — the codec dispatches on the negotiated protocol name
+                // passed to each `read_*`/`write_*` call. See
+                // `crate::codec::VersionedShardCodec`.
+                let shard_xfer = request_response::Behaviour::with_codec(
+                    VersionedShardCodec::default(),
+                    [
+                        (SHARD_XFER_PROTOCOL_V2.to_string(), ProtocolSupport::Full),
+                        (SHARD_XFER_PROTOCOL_V1.to_string(), ProtocolSupport::Full),
+                    ],
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_secs(120)),
                 );
@@ -314,13 +355,21 @@ impl SumSwarm {
                         }
                         Some(SwarmCommand::RequestShard { peer_id, request }) => {
                             self.inner.behaviour_mut().shard_xfer
-                                .send_request(&peer_id, request);
+                                .send_request(&peer_id, ShardRequestVersioned::V1(request));
+                        }
+                        Some(SwarmCommand::RequestShardV2 { peer_id, request }) => {
+                            self.inner.behaviour_mut().shard_xfer
+                                .send_request(&peer_id, ShardRequestVersioned::V2(request));
                         }
                         Some(SwarmCommand::PushShard { peer_id, cid, data }) => {
                             // Materialize the Vec<u8> exactly once, here at
                             // the libp2p hand-off. The Arc<[u8]> may have been
                             // cloned R times upstream, but those clones share
                             // a single backing buffer until this point.
+                            //
+                            // V1 push path — V2 callers use
+                            // `RequestShardV2 { request: ShardRequestV2::Push { … } }`
+                            // which carries the Merkle proof inline.
                             let request = ShardRequest {
                                 cid,
                                 offset: None,
@@ -328,17 +377,33 @@ impl SumSwarm {
                                 push_data: Some(data.to_vec()),
                             };
                             self.inner.behaviour_mut().shard_xfer
-                                .send_request(&peer_id, request);
+                                .send_request(&peer_id, ShardRequestVersioned::V1(request));
                         }
                         Some(SwarmCommand::SendShardResponse { channel_id, response }) => {
                             if let Some((channel, _inserted)) = self.pending_shard_channels.remove(&channel_id) {
+                                let cid_for_log = response.cid.clone();
                                 if let Err(resp) = self.inner.behaviour_mut().shard_xfer
-                                    .send_response(channel, response)
+                                    .send_response(channel, ShardResponseVersioned::V1(response))
                                 {
-                                    warn!(cid = %resp.cid, "failed to send chunk response — channel closed");
+                                    let resp_cid = match &resp {
+                                        ShardResponseVersioned::V1(r) => r.cid.as_str(),
+                                        ShardResponseVersioned::V2(_) => "<V2 response on V1 path?>",
+                                    };
+                                    warn!(cid = %cid_for_log, returned_cid = %resp_cid, "failed to send V1 chunk response — channel closed");
                                 }
                             } else {
-                                warn!(channel_id, "no pending channel for chunk response");
+                                warn!(channel_id, "no pending channel for V1 chunk response");
+                            }
+                        }
+                        Some(SwarmCommand::SendShardResponseV2 { channel_id, response }) => {
+                            if let Some((channel, _inserted)) = self.pending_shard_channels.remove(&channel_id) {
+                                if let Err(_) = self.inner.behaviour_mut().shard_xfer
+                                    .send_response(channel, ShardResponseVersioned::V2(response))
+                                {
+                                    warn!(channel_id, "failed to send V2 response — channel closed");
+                                }
+                            } else {
+                                warn!(channel_id, "no pending channel for V2 response");
                             }
                         }
                         Some(SwarmCommand::Shutdown) | None => {
@@ -548,6 +613,11 @@ impl SumSwarm {
             }
 
             // ── Chunk transfer ────────────────────────────────────────────────
+            //
+            // V1 and V2 streams share the underlying behaviour but emit
+            // distinct domain events so the call-site match is exhaustive
+            // and per-version dispatch (PushValidator, AssignmentAttestor
+            // for V2) can stay typed.
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
                 request_response::Event::Message { peer, message, .. }
             )) => {
@@ -556,36 +626,61 @@ impl SumSwarm {
                         let channel_id = self.next_channel_id;
                         self.next_channel_id += 1;
                         self.pending_shard_channels.insert(channel_id, (channel, Instant::now()));
-                        info!(
-                            %peer,
-                            cid = %request.cid,
-                            channel_id,
-                            "inbound chunk request"
-                        );
-                        if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequested {
-                            peer_id: peer,
-                            request,
-                            channel_id,
-                        }) {
-                            // Event was dropped — the app layer will never
-                            // respond, so remove the orphaned channel immediately.
-                            self.pending_shard_channels.remove(&channel_id);
-                            warn!(%e, channel_id, "event channel full — dropping ShardRequested and cleaning up pending channel");
+                        match request {
+                            ShardRequestVersioned::V1(req) => {
+                                info!(%peer, cid = %req.cid, channel_id, "inbound V1 chunk request");
+                                if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequested {
+                                    peer_id: peer,
+                                    request: req,
+                                    channel_id,
+                                }) {
+                                    self.pending_shard_channels.remove(&channel_id);
+                                    warn!(%e, channel_id, "event channel full — dropping V1 ShardRequested and cleaning up pending channel");
+                                }
+                            }
+                            ShardRequestVersioned::V2(req) => {
+                                info!(%peer, channel_id, kind = v2_request_kind(&req), "inbound V2 chunk request");
+                                if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequestedV2 {
+                                    peer_id: peer,
+                                    request: req,
+                                    channel_id,
+                                }) {
+                                    self.pending_shard_channels.remove(&channel_id);
+                                    warn!(%e, channel_id, "event channel full — dropping V2 ShardRequested and cleaning up pending channel");
+                                }
+                            }
                         }
                     }
                     request_response::Message::Response { response, .. } => {
-                        info!(
-                            %peer,
-                            cid = %response.cid,
-                            offset = response.offset,
-                            bytes = response.data.len(),
-                            "chunk data received"
-                        );
-                        if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceived {
-                            peer_id: peer,
-                            response,
-                        }) {
-                            warn!(%e, "event channel full — dropping ShardReceived");
+                        match response {
+                            ShardResponseVersioned::V1(resp) => {
+                                info!(
+                                    %peer,
+                                    cid = %resp.cid,
+                                    offset = resp.offset,
+                                    bytes = resp.data.len(),
+                                    "V1 chunk data received"
+                                );
+                                if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceived {
+                                    peer_id: peer,
+                                    response: resp,
+                                }) {
+                                    warn!(%e, "event channel full — dropping V1 ShardReceived");
+                                }
+                            }
+                            ShardResponseVersioned::V2(resp) => {
+                                info!(
+                                    %peer,
+                                    kind = v2_response_kind(&resp),
+                                    "V2 response received"
+                                );
+                                if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceivedV2 {
+                                    peer_id: peer,
+                                    response: resp,
+                                }) {
+                                    warn!(%e, "event channel full — dropping V2 ShardReceived");
+                                }
+                            }
                         }
                     }
                 }
@@ -796,6 +891,26 @@ pub(crate) fn reap_stale_entries<V>(
     let before = map.len();
     map.retain(|_id, (_v, inserted)| now.duration_since(*inserted) <= timeout);
     before - map.len()
+}
+
+/// Compact label for a V2 request, used in tracing only.
+fn v2_request_kind(req: &ShardRequestV2) -> &'static str {
+    match req {
+        ShardRequestV2::Pull { .. } => "Pull",
+        ShardRequestV2::Push { .. } => "Push",
+        ShardRequestV2::ManifestPush { .. } => "ManifestPush",
+        ShardRequestV2::ManifestPull { .. } => "ManifestPull",
+    }
+}
+
+/// Compact label for a V2 response, used in tracing only.
+fn v2_response_kind(resp: &ShardResponseV2) -> &'static str {
+    match resp {
+        ShardResponseV2::Data { .. } => "Data",
+        ShardResponseV2::PushAck { .. } => "PushAck",
+        ShardResponseV2::ManifestPushAck { .. } => "ManifestPushAck",
+        ShardResponseV2::ManifestData { .. } => "ManifestData",
+    }
 }
 
 #[cfg(test)]

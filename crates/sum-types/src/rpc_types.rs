@@ -55,6 +55,260 @@ pub struct NodeRecordInfo {
     pub registered_at: u64,
 }
 
+// ── V2 RPC types (chain plan v3.2) ───────────────────────────────────────────
+//
+// These mirror the chain plan §4 wire shapes. Field naming follows the
+// existing V1 convention (snake_case, hex-encoded merkle roots, base58
+// addresses, lifecycle/visibility surfaced as integers per §4 line 470).
+//
+// The chain plan uses Rust syntax in §4 to describe the responses; the
+// actual JSON-RPC wire goes through `serde_json` so we choose
+// representations that round-trip cleanly: `LifecycleV2` and
+// `VisibilityV2` are `#[serde(transparent)]` newtypes over `u8`,
+// `TxStatusV2` is an internally-tagged enum keyed on `"status"` with
+// lowercase variant names.
+
+/// File lifecycle state on chain. Wire format: a plain `u8`.
+///
+/// Constants are defined to match chain plan §3.1: `Pending = 0`,
+/// `Active = 1`, `Abandoned = 2`. Future variants (e.g. `Rotated = 3`
+/// from chain plan Ask 10) would extend this without breaking the wire.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct LifecycleV2(pub u8);
+
+impl LifecycleV2 {
+    pub const PENDING: Self = Self(0);
+    pub const ACTIVE: Self = Self(1);
+    pub const ABANDONED: Self = Self(2);
+
+    pub fn is_pending(self) -> bool { self == Self::PENDING }
+    pub fn is_active(self) -> bool { self == Self::ACTIVE }
+    pub fn is_abandoned(self) -> bool { self == Self::ABANDONED }
+}
+
+/// File visibility on chain. Wire format: a plain `u8`.
+///
+/// `Public = 0`, `Private = 1`. Phase 0b is Public-only; Private wiring
+/// lands in Phase 4 once `sum-crypto` is plumbed into the ingest path.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct VisibilityV2(pub u8);
+
+impl VisibilityV2 {
+    pub const PUBLIC: Self = Self(0);
+    pub const PRIVATE: Self = Self(1);
+
+    pub fn is_public(self) -> bool { self == Self::PUBLIC }
+    pub fn is_private(self) -> bool { self == Self::PRIVATE }
+}
+
+/// One entry of a V2 access list (chain plan §3.1).
+///
+/// For Public files all `encrypted_key_bundle` fields MUST be `None`;
+/// for Private files all MUST be `Some(160-hex-char-string)`. Owner
+/// always present in the list. `expires_at` is a block height; `None`
+/// = no expiry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessEntryV2 {
+    /// L1 address in base58 (matches the V1 `StorageFileInfo.access_list` element type).
+    pub address: String,
+    /// 80-byte encrypted key bundle as a 0x-prefixed hex string (162 chars).
+    /// `None` for Public files.
+    pub encrypted_key_bundle: Option<String>,
+    /// Expiry block height; `None` = no expiry.
+    pub expires_at: Option<u64>,
+}
+
+/// Response from `storage_getFileInfoV2` (chain plan §4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageFileInfoV2 {
+    /// 0x-prefixed hex (64 hex chars + "0x").
+    pub merkle_root: String,
+    /// Owner's L1 address in base58.
+    pub owner: String,
+    /// Plaintext file size in bytes.
+    pub plaintext_size_bytes: u64,
+    /// Total bytes stored on archive nodes (= plaintext for Public,
+    /// plaintext + 16 × chunk_count for Private).
+    pub stored_size_bytes: u64,
+    /// Number of leaves in the file's Merkle tree. Bounded above by the
+    /// chain's `max_chunk_count_per_file` (default 1_048_576, §3.4).
+    pub chunk_count: u32,
+    /// Remaining Koppa in the storage fee pool (base units).
+    pub fee_pool: u64,
+    /// Block height at which `RegisterFilePendingV2` was finalized.
+    pub created_at: u64,
+    /// Block height at which `ActivateFileV2` finalized; `None` until then.
+    pub activated_at_height: Option<u64>,
+    /// Block height at which `AbandonFileV2` finalized; `None` for files
+    /// still in `Pending`/`Active` lifecycle.
+    ///
+    /// **Chain version gating:** this field requires chain v3.3+ (post
+    /// W11 follow-up binary). Earlier chain versions don't populate the
+    /// underlying `StorageMetadataV2.abandoned_at_height` field, so a
+    /// V2 file row deserialized from a pre-v3.3 chain may carry `None`
+    /// even when `lifecycle == Abandoned`. Callers MUST treat `None`
+    /// defensively as "abandoned-height unavailable" rather than as a
+    /// retryable error — chain plan §3.5 doesn't expose a separate
+    /// "was abandoned at" timestamp for archival auditing pre-v3.3.
+    #[serde(default)]
+    pub abandoned_at_height: Option<u64>,
+    /// Block height of the active-archive-node snapshot used for this file's
+    /// chunk assignment (chain plan §5.3, Ask 15 Option A).
+    pub assignment_height: u64,
+    pub visibility: VisibilityV2,
+    pub lifecycle: LifecycleV2,
+    /// Paginated access list entries. Pagination params: `access_offset`,
+    /// `access_limit` (default 256). Phase 0b's typical Public files have
+    /// empty access lists, so pagination rarely matters in practice.
+    pub access_list: Vec<AccessEntryV2>,
+}
+
+/// Response from `chain_getBlockHeight` (chain plan §4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockHeightInfo {
+    pub height: u64,
+    /// `"finalized"` (depth ≥ N for the active consensus mode) or
+    /// `"latest"` (most recent included).
+    pub finality: String,
+}
+
+/// Response from `chain_getChainParams` (shipped by the chain team in
+/// Phase 2 — see SNIP-V2-RPC-CHEATSHEET §"chain_getChainParams" and
+/// the chain repo `crates/rpc/src/types.rs::ChainParamsInfo`).
+///
+/// Flat JSON shape (no nested `staking`/`messaging`/`docclass`
+/// sub-objects). Six SNIP V2 params are populated alongside the
+/// consensus values; W10 uses these to populate `IngestParams` so we
+/// don't bake defaults into the V2 ingest pipeline.
+///
+/// **Always read this once at startup** — chain plan v3.2 treats
+/// these as protocol constants per chain genesis, not per-block
+/// values. A change here would be a hard fork.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainParamsInfo {
+    /// Chain identifier (mainnet / testnet / local-mirror = 31337).
+    pub chain_id: u64,
+    /// Block production cadence (e.g. 2,000 ms for the local mirror).
+    pub block_time_ms: u64,
+    /// Number of confirmation depths required before a tx is treated as
+    /// `Finalized` (PoA: 3; BFT: 0).
+    pub finality_depth: u64,
+    /// Minimum fee per tx in Koppa base units. Tx builders must set
+    /// `tx.fee >= min_fee`.
+    pub min_fee: u128,
+    /// V2 deterministic-assignment replication factor — the number of
+    /// archives each chunk is assigned to. Default = 3.
+    pub assignment_replication_factor: u32,
+    /// Cap on `chunk_indices.len()` per `AcceptAssignmentV2` tx. Default
+    /// = 65,536. Files whose per-archive assignment exceeds this split
+    /// across multiple OR-merge txs.
+    pub max_chunk_indices_per_tx: u32,
+    /// Cap on `chunk_count` per file. Default = 1,048,576 (1 MiB chunks
+    /// × 2^20 = 1 TiB max plaintext).
+    pub max_chunk_count_per_file: u32,
+    /// Blocks between `RegisterFilePendingV2` finalization and the
+    /// earliest height at which `AbandonFileV2` can succeed (and at
+    /// which post-activation PoR challenges become valid). Default = 50.
+    /// **Not** a pre-activation coverage timeout; W10 uses a wall-clock
+    /// `activation_wait_secs` for that.
+    pub activation_grace_blocks: u64,
+    /// Cap on per-archive `assigned_count` work performed by chain when
+    /// answering `storage_getAssignmentCoverageV2`. Above this, chain
+    /// returns `null` and clients recompute via `chunks_for_archive_v2`.
+    /// Default = 16,384.
+    pub max_assigned_count_chunk_count: u32,
+}
+
+/// Response from `chain_getTransactionStatus` (chain plan §4).
+///
+/// **Wire shape**: internally-tagged JSON with `"status"` key and
+/// lowercase variant names — `{"status": "pending"}`,
+/// `{"status": "included", "block_height": 123}`, etc.
+///
+/// Semantics for the SNIP tx finality waiter (W9):
+/// * `Unknown` — keep polling; not fatal during the wait window.
+/// * `Pending` — keep polling.
+/// * `Included` — keep polling; not yet finalized.
+/// * `Finalized` — done; return the block height.
+/// * `Failed` — terminal for THIS tx hash. Caller must NOT retry the
+///   same hash. May rebuild a new tx with a fresh nonce only if the
+///   operation is idempotent and the failure is classified as transient.
+/// * `Dropped` — terminal for THIS tx hash, but resubmitting the same
+///   logical operation (with a new nonce) is safe since the tx never
+///   touched chain state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum TxStatusV2 {
+    Unknown,
+    Pending,
+    Included { block_height: u64 },
+    Finalized { block_height: u64 },
+    Failed {
+        block_height: Option<u64>,
+        reason: String,
+    },
+    Dropped,
+}
+
+/// Per-archive coverage summary inside `AssignmentCoverageV2`.
+///
+/// `attested_count` is a popcount over the archive's attestation
+/// bitmap row; the raw bitmap bytes are NEVER serialized in the RPC
+/// response (chain plan §4 line 474).
+///
+/// `assigned_count` is `Option<u32>` (JSON nullable) by chain plan
+/// v3.2 design. The chain caps per-archive assignment-count work at
+/// `MAX_ASSIGNED_COUNT_CHUNK_COUNT = 16_384` chunks; above that cap
+/// every entry's `assigned_count` arrives as `null` and the SNIP
+/// client MUST recompute counts locally via
+/// `sum_store::assignment_v2::chunks_for_archive_v2` (which is
+/// bit-identical to chain validation per Appendix C). Without the
+/// cap, an attacker could DoS the RPC by registering a file at the
+/// per-file maximum of 1,048,576 chunks. Coverage fields
+/// (`covered_count`, `missing_indices`, `can_activate_now`) are
+/// always populated regardless.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveCoverageSummaryV2 {
+    /// L1 address in base58.
+    pub archive: String,
+    /// Number of chunks the deterministic V2 assignment puts on this
+    /// archive. `None` when chain elides the count for files above
+    /// `MAX_ASSIGNED_COUNT_CHUNK_COUNT = 16_384`.
+    pub assigned_count: Option<u32>,
+    /// Number of chunks this archive has attested via `AcceptAssignmentV2`.
+    pub attested_count: u32,
+    /// Whether the archive is currently `Active` (still counts toward
+    /// `ActivateFileV2` validity). A `Slashed`/`Inactive` archive's
+    /// attestations are dropped from the coverage popcount.
+    pub currently_active: bool,
+}
+
+/// Response from `storage_getAssignmentCoverageV2` (chain plan v3.2 §4).
+///
+/// Owner polls until `can_activate_now == true`, then submits
+/// `ActivateFileV2`. `missing_offset` is a **chunk-index lower bound**,
+/// not a list offset — pagination cycles `missing_offset =
+/// last_returned_index + 1` and is stable under concurrent attestations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssignmentCoverageV2 {
+    pub chunk_count: u32,
+    /// Popcount over the OR of all snapshot-active archive bitmaps.
+    pub covered_count: u32,
+    /// `covered_count == chunk_count && lifecycle == Pending`.
+    pub can_activate_now: bool,
+    /// Total uncovered chunks across the whole file (not just the window).
+    pub missing_total: u32,
+    /// Echoed back from the request (or 0 if not specified).
+    pub missing_offset: u32,
+    /// Ascending list of `i ≥ missing_offset` where coverage[i] == 0.
+    /// Capped at `missing_limit` (default 1024; W9 client passes 1024).
+    pub missing_indices: Vec<u32>,
+    /// Per-archive popcount summaries; bounded by snapshot size.
+    pub per_archive: Vec<ArchiveCoverageSummaryV2>,
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -118,5 +372,302 @@ mod tests {
         }"#;
         let info: StorageFileInfo = serde_json::from_str(json).unwrap();
         assert!(info.access_list.is_empty());
+    }
+
+    // ── V2 type round-trips (chain plan v3.2 §4) ─────────────────────────────
+
+    #[test]
+    fn lifecycle_visibility_serialize_as_u8() {
+        // Wire shape is a plain integer (not a string variant).
+        assert_eq!(
+            serde_json::to_string(&LifecycleV2::PENDING).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleV2::ACTIVE).unwrap(),
+            "1"
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleV2::ABANDONED).unwrap(),
+            "2"
+        );
+        assert_eq!(
+            serde_json::to_string(&VisibilityV2::PUBLIC).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            serde_json::to_string(&VisibilityV2::PRIVATE).unwrap(),
+            "1"
+        );
+
+        // And the helper predicates round-trip.
+        let lc: LifecycleV2 = serde_json::from_str("1").unwrap();
+        assert!(lc.is_active());
+        assert!(!lc.is_pending());
+        let v: VisibilityV2 = serde_json::from_str("0").unwrap();
+        assert!(v.is_public());
+    }
+
+    #[test]
+    fn storage_file_info_v2_public_round_trip() {
+        // A typical Phase 0b Public file: empty access_list, lifecycle Pending.
+        let json = r#"{
+            "merkle_root": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "owner": "DzPJAYgL5J5RdXRKhcZX1QfD2V8uFhDv3Q",
+            "plaintext_size_bytes": 10485760,
+            "stored_size_bytes": 10485760,
+            "chunk_count": 10,
+            "fee_pool": 100000000000,
+            "created_at": 12345,
+            "activated_at_height": null,
+            "assignment_height": 12345,
+            "visibility": 0,
+            "lifecycle": 0,
+            "access_list": []
+        }"#;
+        let info: StorageFileInfoV2 = serde_json::from_str(json).unwrap();
+        assert_eq!(info.chunk_count, 10);
+        assert_eq!(info.plaintext_size_bytes, info.stored_size_bytes);
+        assert!(info.visibility.is_public());
+        assert!(info.lifecycle.is_pending());
+        assert!(info.activated_at_height.is_none());
+        assert!(info.access_list.is_empty());
+    }
+
+    #[test]
+    fn storage_file_info_v2_private_with_access_entries() {
+        // Private file: stored_size = plaintext_size + 16 * chunk_count;
+        // access_list entries carry encrypted_key_bundle (160 hex + "0x").
+        let bundle_hex = format!("0x{}", "ab".repeat(80)); // 160 hex chars
+        let json = format!(
+            r#"{{
+                "merkle_root": "0x{root}",
+                "owner": "ownerB58",
+                "plaintext_size_bytes": 1000000,
+                "stored_size_bytes": 1000160,
+                "chunk_count": 10,
+                "fee_pool": 0,
+                "created_at": 100,
+                "activated_at_height": 150,
+                "assignment_height": 100,
+                "visibility": 1,
+                "lifecycle": 1,
+                "access_list": [
+                    {{
+                        "address": "ownerB58",
+                        "encrypted_key_bundle": "{bundle_hex}",
+                        "expires_at": null
+                    }},
+                    {{
+                        "address": "recipientB58",
+                        "encrypted_key_bundle": "{bundle_hex}",
+                        "expires_at": 200
+                    }}
+                ]
+            }}"#,
+            root = "11".repeat(32),
+            bundle_hex = bundle_hex,
+        );
+        let info: StorageFileInfoV2 = serde_json::from_str(&json).unwrap();
+        assert!(info.visibility.is_private());
+        assert!(info.lifecycle.is_active());
+        assert_eq!(info.activated_at_height, Some(150));
+        assert_eq!(info.stored_size_bytes - info.plaintext_size_bytes, 16 * 10);
+        assert_eq!(info.access_list.len(), 2);
+        assert!(info.access_list[0].encrypted_key_bundle.is_some());
+        assert!(info.access_list[0].expires_at.is_none()); // owner: no expiry
+        assert_eq!(info.access_list[1].expires_at, Some(200));
+    }
+
+    /// `abandoned_at_height` requires chain v3.3+. Pre-v3.3 chains
+    /// don't include the field at all → `Option::None` via
+    /// `#[serde(default)]`. Post-v3.3 chains include it as either
+    /// `null` (file not yet abandoned) or a `u64` (block height of the
+    /// finalized `AbandonFileV2`).
+    #[test]
+    fn storage_file_info_v2_abandoned_at_height_pre_and_post_v3_3() {
+        // Pre-v3.3 chain: field omitted entirely. Must default to None.
+        let pre_v3_3 = r#"{
+            "merkle_root": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "owner": "ownerB58",
+            "plaintext_size_bytes": 0,
+            "stored_size_bytes": 0,
+            "chunk_count": 1,
+            "fee_pool": 0,
+            "created_at": 100,
+            "activated_at_height": null,
+            "assignment_height": 100,
+            "visibility": 0,
+            "lifecycle": 2,
+            "access_list": []
+        }"#;
+        let pre: StorageFileInfoV2 = serde_json::from_str(pre_v3_3).unwrap();
+        assert!(pre.lifecycle.is_abandoned());
+        assert_eq!(pre.abandoned_at_height, None,
+            "pre-v3.3 chains omit the field; SNIP must default to None");
+
+        // Post-v3.3 chain: explicit value.
+        let post_v3_3 = r#"{
+            "merkle_root": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "owner": "ownerB58",
+            "plaintext_size_bytes": 0,
+            "stored_size_bytes": 0,
+            "chunk_count": 1,
+            "fee_pool": 0,
+            "created_at": 100,
+            "activated_at_height": null,
+            "abandoned_at_height": 175,
+            "assignment_height": 100,
+            "visibility": 0,
+            "lifecycle": 2,
+            "access_list": []
+        }"#;
+        let post: StorageFileInfoV2 = serde_json::from_str(post_v3_3).unwrap();
+        assert!(post.lifecycle.is_abandoned());
+        assert_eq!(post.abandoned_at_height, Some(175));
+    }
+
+    #[test]
+    fn block_height_info_round_trip() {
+        let json = r#"{"height": 12345, "finality": "finalized"}"#;
+        let info: BlockHeightInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.height, 12345);
+        assert_eq!(info.finality, "finalized");
+
+        // "latest" finality also valid.
+        let json = r#"{"height": 12347, "finality": "latest"}"#;
+        let info: BlockHeightInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.finality, "latest");
+    }
+
+    #[test]
+    fn tx_status_v2_all_variants_round_trip() {
+        // Internally-tagged with "status" key, lowercase variant names.
+        let cases = [
+            (r#"{"status": "unknown"}"#, TxStatusV2::Unknown),
+            (r#"{"status": "pending"}"#, TxStatusV2::Pending),
+            (
+                r#"{"status": "included", "block_height": 100}"#,
+                TxStatusV2::Included { block_height: 100 },
+            ),
+            (
+                r#"{"status": "finalized", "block_height": 200}"#,
+                TxStatusV2::Finalized { block_height: 200 },
+            ),
+            (
+                r#"{"status": "failed", "block_height": null, "reason": "low-order x25519 public key rejected"}"#,
+                TxStatusV2::Failed {
+                    block_height: None,
+                    reason: "low-order x25519 public key rejected".into(),
+                },
+            ),
+            (
+                r#"{"status": "failed", "block_height": 300, "reason": "insufficient balance"}"#,
+                TxStatusV2::Failed {
+                    block_height: Some(300),
+                    reason: "insufficient balance".into(),
+                },
+            ),
+            (r#"{"status": "dropped"}"#, TxStatusV2::Dropped),
+        ];
+        for (json, expected) in cases {
+            let actual: TxStatusV2 = serde_json::from_str(json).unwrap();
+            assert_eq!(actual, expected, "mismatch on `{json}`");
+            // Round-trip back to JSON and re-parse: must match original variant.
+            let reserialized = serde_json::to_string(&actual).unwrap();
+            let reparsed: TxStatusV2 = serde_json::from_str(&reserialized).unwrap();
+            assert_eq!(reparsed, expected, "re-parse round-trip mismatch on `{json}`");
+        }
+    }
+
+    #[test]
+    fn assignment_coverage_v2_round_trip() {
+        let json = r#"{
+            "chunk_count": 10,
+            "covered_count": 7,
+            "can_activate_now": false,
+            "missing_total": 3,
+            "missing_offset": 0,
+            "missing_indices": [3, 5, 9],
+            "per_archive": [
+                {
+                    "archive": "archA",
+                    "assigned_count": 5,
+                    "attested_count": 4,
+                    "currently_active": true
+                },
+                {
+                    "archive": "archB",
+                    "assigned_count": 5,
+                    "attested_count": 3,
+                    "currently_active": true
+                }
+            ]
+        }"#;
+        let cov: AssignmentCoverageV2 = serde_json::from_str(json).unwrap();
+        assert_eq!(cov.chunk_count, 10);
+        assert_eq!(cov.covered_count, 7);
+        assert!(!cov.can_activate_now);
+        assert_eq!(cov.missing_total, 3);
+        assert_eq!(cov.missing_indices, vec![3, 5, 9]);
+        assert_eq!(cov.per_archive.len(), 2);
+        assert_eq!(cov.per_archive[0].assigned_count, Some(5));
+        assert_eq!(cov.per_archive[1].attested_count, 3);
+    }
+
+    /// Chain plan v3.2 caps per-archive assignment work at
+    /// `MAX_ASSIGNED_COUNT_CHUNK_COUNT = 16_384`. For files above that
+    /// cap, every entry's `assigned_count` arrives as JSON `null` and
+    /// the client must recompute locally. Pin that the `null` shape
+    /// deserializes to `None` rather than tripping a parse error.
+    #[test]
+    fn assignment_coverage_v2_archive_assigned_count_null_for_large_files() {
+        let json = r#"{
+            "chunk_count": 1048576,
+            "covered_count": 524288,
+            "can_activate_now": false,
+            "missing_total": 524288,
+            "missing_offset": 0,
+            "missing_indices": [],
+            "per_archive": [
+                {
+                    "archive": "archA",
+                    "assigned_count": null,
+                    "attested_count": 200000,
+                    "currently_active": true
+                },
+                {
+                    "archive": "archB",
+                    "assigned_count": null,
+                    "attested_count": 324288,
+                    "currently_active": true
+                }
+            ]
+        }"#;
+        let cov: AssignmentCoverageV2 = serde_json::from_str(json).unwrap();
+        assert_eq!(cov.chunk_count, 1_048_576);
+        assert_eq!(cov.per_archive.len(), 2);
+        assert!(cov.per_archive[0].assigned_count.is_none());
+        assert!(cov.per_archive[1].assigned_count.is_none());
+        // Coverage fields stay populated regardless of the cap.
+        assert_eq!(cov.covered_count, 524_288);
+        assert_eq!(cov.missing_total, 524_288);
+    }
+
+    #[test]
+    fn assignment_coverage_v2_can_activate_now_true_path() {
+        // covered_count == chunk_count; missing list empty.
+        let json = r#"{
+            "chunk_count": 4,
+            "covered_count": 4,
+            "can_activate_now": true,
+            "missing_total": 0,
+            "missing_offset": 0,
+            "missing_indices": [],
+            "per_archive": []
+        }"#;
+        let cov: AssignmentCoverageV2 = serde_json::from_str(json).unwrap();
+        assert!(cov.can_activate_now);
+        assert_eq!(cov.missing_total, 0);
     }
 }

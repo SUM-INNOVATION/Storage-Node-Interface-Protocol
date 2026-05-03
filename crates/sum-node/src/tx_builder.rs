@@ -55,6 +55,131 @@ pub fn build_register_archive_node_tx(
     sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
 }
 
+// ── V2 Builders (chain plan v3.2) ─────────────────────────────────────────────
+//
+// !! BEFORE TESTNET INTEGRATION !!
+//
+// The mirror types below (`NodeRegistryOperationV2Mirror`,
+// `StorageMetadataOperationV2Mirror`, `AccessEntryV2Mirror`,
+// `TxPayloadMirror::{NodeRegistryV2, StorageMetadataV2}`) MUST be
+// confirmed bit-for-bit against the actual L1 code before any V2 tx
+// touches a real chain endpoint. Specifically:
+//
+//   1. **Payload-level variant indices.** Bincode v1 encodes enum
+//      variants as `u32` LE. We slot:
+//        * `TxPayloadMirror::NodeRegistryV2`     at index 19
+//        * `TxPayloadMirror::StorageMetadataV2`  at index 20
+//      both immediately after the existing V1 `NodeRegistry = 17`,
+//      `StorageMetadata = 18`. The chain plan v3.2 §3.1/§3.3 introduce
+//      both V2 ops as "additive" without pinning the payload-side
+//      indices, so this ordering is an assumption — confirm against
+//      the actual L1 `TxPayload` enum. The
+//      `payload_v2_variant_indices_are_stable` test pins the local
+//      assumption; cross-chain confirmation is out-of-band.
+//   2. **`StorageMetadataOperationV2Mirror` variant order**:
+//      `RegisterFilePendingV2 = 0`, `ActivateFileV2 = 1`,
+//      `AbandonFileV2 = 2`, `AddAccessV2 = 3`, `RemoveAccessV2 = 4`,
+//      `UpdateAccessV2 = 5`, `AcceptAssignmentV2 = 6` (added v3.2 §3.6).
+//      Pinned by the `v2_op_variant_indices_are_stable` test.
+//   3. **`AccessEntryV2Mirror` field order** — bincode v1 is positional
+//      for structs.
+//
+// Conformance test plan: round-trip a fixture tx through `bincode1`
+// here AND against the L1's actual decoder (out-of-band, requires
+// chain-team coordination) before any real ingest.
+
+/// Build a hex-encoded `SignedTransaction` for `RegisterFilePendingV2`
+/// (chain plan §3.1).
+///
+/// **Phase 0b is Public-only**: callers MUST pass `visibility = 0` and
+/// either an empty `initial_access` OR access entries with
+/// `encrypted_key_bundle == None`. Private-file ingest lands in Phase 4.
+#[allow(clippy::too_many_arguments)]
+pub fn build_register_file_pending_v2_tx(
+    ed25519_seed: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+    fee: u128,
+    merkle_root: [u8; 32],
+    plaintext_size_bytes: u64,
+    stored_size_bytes: u64,
+    chunk_count: u32,
+    fee_deposit: u64,
+    visibility: u8,
+    initial_access: Vec<AccessEntryV2Mirror>,
+) -> Result<String> {
+    let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
+        operation: StorageMetadataOperationV2Mirror::RegisterFilePendingV2 {
+            merkle_root,
+            plaintext_size_bytes,
+            stored_size_bytes,
+            chunk_count,
+            fee_deposit,
+            visibility,
+            initial_access,
+        },
+    });
+    sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
+}
+
+/// Build a hex-encoded `SignedTransaction` for `ActivateFileV2`.
+pub fn build_activate_file_v2_tx(
+    ed25519_seed: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+    fee: u128,
+    merkle_root: [u8; 32],
+) -> Result<String> {
+    let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
+        operation: StorageMetadataOperationV2Mirror::ActivateFileV2 { merkle_root },
+    });
+    sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
+}
+
+/// Build a hex-encoded `SignedTransaction` for `AbandonFileV2`.
+///
+/// On chain success: 90% of `fee_deposit` refunded to owner, 10% burned
+/// (chain plan §3.5). The call site that submits this should be the
+/// ingest abandon-path or the explicit `sum-node abandon` subcommand.
+pub fn build_abandon_file_v2_tx(
+    ed25519_seed: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+    fee: u128,
+    merkle_root: [u8; 32],
+) -> Result<String> {
+    let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
+        operation: StorageMetadataOperationV2Mirror::AbandonFileV2 { merkle_root },
+    });
+    sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
+}
+
+/// Build a hex-encoded `SignedTransaction` for `AcceptAssignmentV2`
+/// (chain plan §3.6, v3.2 bitmap OR-merge).
+///
+/// Each call ORs the bits in `chunk_indices` into the per-`(file,
+/// archive)` attestation bitmap. **Caller's responsibility**: ensure
+/// `chunk_indices.len() ≤ max_chunk_indices_per_tx` (default 65,536).
+/// For archives whose assignment exceeds that cap, build multiple txs
+/// each with a disjoint slice of the assigned indices and submit them
+/// independently (OR-merge makes the order irrelevant).
+pub fn build_accept_assignment_v2_tx(
+    ed25519_seed: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+    fee: u128,
+    merkle_root: [u8; 32],
+    chunk_indices: Vec<u32>,
+) -> Result<String> {
+    let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
+        operation: StorageMetadataOperationV2Mirror::AcceptAssignmentV2 {
+            merkle_root,
+            chunk_indices,
+        },
+    });
+    sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
+}
+
 /// Build a hex-encoded `SignedTransaction` for `StorageMetadata::RegisterFile`.
 pub fn build_register_file_tx(
     ed25519_seed: &[u8; 32],
@@ -165,6 +290,33 @@ struct NodeRegistryTxDataMirror {
     operation: NodeRegistryOperationMirror,
 }
 
+// ── V2 NodeRegistry mirrors (chain plan v3.2 §3.3) ──────────────────────────
+//
+// `NodeRegistryV2` is included so `TxPayloadMirror::NodeRegistryV2` (variant
+// index 19) lines up correctly relative to `StorageMetadataV2` (index 20).
+// Phase 0b doesn't construct any V2 NodeRegistry txs — `RegisterEncryptionKey`
+// is consumed by Phase 4 (Private file ingest). Mirror is included now to
+// avoid an off-by-one in `TxPayloadMirror`'s variant indices.
+
+/// Mirror of `NodeRegistryOperationV2` (chain plan §3.3).
+///
+/// Currently single-variant (`RegisterEncryptionKey` at index 0). Future
+/// V2 NodeRegistry ops would extend this without breaking V1 wire compat.
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
+enum NodeRegistryOperationV2Mirror {
+    /// X25519 encryption pubkey for the signer's account; overwrite-on-rewrite.
+    /// Chain rejects low-order points (chain plan v3.1 §3.3) with `Failed(22)`.
+    RegisterEncryptionKey { encryption_pubkey: [u8; 32] }, // 0
+}
+
+/// Mirror of `NodeRegistryV2TxData`.
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
+struct NodeRegistryV2TxDataMirror {
+    operation: NodeRegistryOperationV2Mirror,
+}
+
 // ── Storage Metadata mirrors ─────────────────────────────────────────────────
 
 /// Mirror of `StorageMetadataOperation` (variant indices must match L1).
@@ -208,32 +360,147 @@ struct StorageMetadataTxDataMirror {
     operation: StorageMetadataOperationMirror,
 }
 
+// ── V2 Storage Metadata mirrors (chain plan v3.2 §3.1, §3.6) ────────────────
+//
+// Variant indices in `StorageMetadataOperationV2Mirror` MUST match the
+// L1 `StorageMetadataOperationV2` enum exactly — bincode v1 encodes
+// variants as u32 indices. We follow the order the chain plan §3.1
+// publishes (RegisterFilePendingV2 first, …, UpdateAccessV2 last) and
+// place AcceptAssignmentV2 at the end as variant 6 to match v3.2's
+// "added in §3.6" placement. **Any mismatch on the L1 side → all V2
+// txs we sign are misinterpreted.** This must be verified against
+// actual L1 code before testnet, per the safety note at the top of
+// this module's V2 builder section.
+
+/// Mirror of `AccessEntryV2` (chain plan §3.1).
+///
+/// Field order follows the chain plan exactly. Bincode v1 is positional
+/// for structs, so any reorder here breaks chain compatibility silently.
+///
+/// `[u8; 80]` exceeds the default serde array-derive cutoff of 32, so
+/// the bundle is wrapped via `serde_big_array::BigArray`. Serde derives
+/// don't directly support `#[serde(with = ...)]` on `Option<[u8; N]>`
+/// for N > 32, so we use a wrapping `Bundle80` newtype that implements
+/// `Serialize`/`Deserialize` manually using `BigArray`. Wire shape is
+/// identical to `[u8; 80]` — bincode v1 doesn't encode struct names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessEntryV2Mirror {
+    pub address: [u8; 20],
+    pub encrypted_key_bundle: Option<Bundle80>,
+    pub expires_at: Option<u64>,
+}
+
+/// Newtype around `[u8; 80]` (the encrypted-key-bundle wire size).
+///
+/// Exists solely to enable serde derives on
+/// `AccessEntryV2Mirror.encrypted_key_bundle: Option<…>` — `[u8; 80]`
+/// doesn't impl `Serialize`/`Deserialize` by default and the
+/// `#[serde(with = ...)]` workaround doesn't compose cleanly with
+/// `Option<>`. Construct via `Bundle80(arr)` and read the inner bytes
+/// via `.0`.
+#[derive(Debug, Clone, Copy)]
+pub struct Bundle80(pub [u8; 80]);
+
+impl Serialize for Bundle80 {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        BigArray::serialize(&self.0, ser)
+    }
+}
+
+impl<'de> Deserialize<'de> for Bundle80 {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        Ok(Bundle80(BigArray::deserialize(de)?))
+    }
+}
+
+/// Mirror of `StorageMetadataOperationV2`. Variant indices are critical;
+/// see the safety note at the top of the V2 builder section.
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
+enum StorageMetadataOperationV2Mirror {
+    RegisterFilePendingV2 {
+        merkle_root: [u8; 32],
+        plaintext_size_bytes: u64,
+        stored_size_bytes: u64,
+        chunk_count: u32,
+        fee_deposit: u64,
+        visibility: u8,
+        initial_access: Vec<AccessEntryV2Mirror>,
+    },                                                                              // 0
+    ActivateFileV2 { merkle_root: [u8; 32] },                                       // 1
+    AbandonFileV2 { merkle_root: [u8; 32] },                                        // 2
+    AddAccessV2 {
+        merkle_root: [u8; 32],
+        entry: AccessEntryV2Mirror,
+    },                                                                              // 3
+    RemoveAccessV2 {
+        merkle_root: [u8; 32],
+        address: [u8; 20],
+    },                                                                              // 4
+    UpdateAccessV2 {
+        merkle_root: [u8; 32],
+        address: [u8; 20],
+        new_entry: AccessEntryV2Mirror,
+    },                                                                              // 5
+    AcceptAssignmentV2 {
+        merkle_root: [u8; 32],
+        chunk_indices: Vec<u32>,
+    },                                                                              // 6 — added v3.2 §3.6
+}
+
+/// Mirror of `StorageMetadataV2TxData` (paired payload wrapper).
+#[derive(Debug, Serialize, Deserialize)]
+struct StorageMetadataV2TxDataMirror {
+    operation: StorageMetadataOperationV2Mirror,
+}
+
 // ── Transaction envelope mirrors ─────────────────────────────────────────────
 
-/// Mirror of `TxPayload` — 19 variants.
-/// `NodeRegistry` at index 17, `StorageMetadata` at index 18.
+/// Mirror of `TxPayload`. V1 layout: `NodeRegistry` at index 17,
+/// `StorageMetadata` at index 18.
+///
+/// **V2 ordering matters.** The chain plan v3.2 §3.1/§3.3 introduce
+/// `NodeRegistryOperationV2` (carrying `RegisterEncryptionKey`) and
+/// `StorageMetadataOperationV2` (carrying `RegisterFilePendingV2`,
+/// etc.) and treat both as "additive" payload variants. The chain plan
+/// publishes `NodeRegistryV2` *before* `StorageMetadataV2` in its
+/// schema text, so we slot `NodeRegistryV2` at variant index 19 and
+/// `StorageMetadataV2` at variant index 20. Bincode v1 encodes enum
+/// variants as `u32` indices; any divergence here causes silent
+/// payload-type corruption on chain.
+///
+/// `NodeRegistryV2` is included as a placeholder mirror so the wire
+/// indices line up correctly today. We don't expose builders for it in
+/// Phase 0b (Phase 4 will, when `RegisterEncryptionKey` is wired in
+/// for Private files).
+///
+/// **!! BEFORE TESTNET INTEGRATION !!** confirm both the index for
+/// `NodeRegistryV2` (19) and `StorageMetadataV2` (20) against the
+/// actual L1 `TxPayload` enum.
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 enum TxPayloadMirror {
-    Transfer { to: [u8; 20], amount: u128 },  // 0
-    Nft(Vec<u8>),                              // 1
-    Token(Vec<u8>),                            // 2
-    ContractDeploy(Vec<u8>),                   // 3
-    ContractCall(Vec<u8>),                     // 4
-    Staking(Vec<u8>),                          // 5
-    Messaging(Vec<u8>),                        // 6
-    DocClass(Vec<u8>),                         // 7
-    Tax(Vec<u8>),                              // 8
-    Equity(Vec<u8>),                           // 9
-    Agreement(Vec<u8>),                        // 10
-    Legal(Vec<u8>),                            // 11
-    Property(Vec<u8>),                         // 12
-    Healthcare(Vec<u8>),                       // 13
-    Employment(Vec<u8>),                       // 14
-    Finance(Vec<u8>),                          // 15
-    PolicyAccount(Vec<u8>),                    // 16
-    NodeRegistry(NodeRegistryTxDataMirror),    // 17
-    StorageMetadata(StorageMetadataTxDataMirror), // 18
+    Transfer { to: [u8; 20], amount: u128 },             // 0
+    Nft(Vec<u8>),                                        // 1
+    Token(Vec<u8>),                                      // 2
+    ContractDeploy(Vec<u8>),                             // 3
+    ContractCall(Vec<u8>),                               // 4
+    Staking(Vec<u8>),                                    // 5
+    Messaging(Vec<u8>),                                  // 6
+    DocClass(Vec<u8>),                                   // 7
+    Tax(Vec<u8>),                                        // 8
+    Equity(Vec<u8>),                                     // 9
+    Agreement(Vec<u8>),                                  // 10
+    Legal(Vec<u8>),                                      // 11
+    Property(Vec<u8>),                                   // 12
+    Healthcare(Vec<u8>),                                 // 13
+    Employment(Vec<u8>),                                 // 14
+    Finance(Vec<u8>),                                    // 15
+    PolicyAccount(Vec<u8>),                              // 16
+    NodeRegistry(NodeRegistryTxDataMirror),              // 17
+    StorageMetadata(StorageMetadataTxDataMirror),        // 18
+    NodeRegistryV2(NodeRegistryV2TxDataMirror),          // 19 — placeholder for Phase 4
+    StorageMetadataV2(StorageMetadataV2TxDataMirror),    // 20 — Phase 0b builders target this
 }
 
 /// Mirror of `TransactionV2`.
@@ -351,6 +618,282 @@ mod tests {
             }
             _ => panic!("wrong TxInner variant"),
         }
+    }
+
+    // ── V2 builder tests ─────────────────────────────────────────────────────
+    //
+    // These verify that our mirror types round-trip through bincode v1
+    // back into the same shape. They CANNOT verify cross-implementation
+    // compat with the L1 side — that requires either (a) the L1 code
+    // accessible in the same workspace or (b) a separate conformance
+    // run against a live chain endpoint. Both are out of scope for
+    // Phase 0b unit tests; flagged in the V2 builder safety note.
+
+    #[test]
+    fn register_file_pending_v2_round_trips() {
+        let seed = [30u8; 32];
+        let merkle_root = [0x77; 32];
+        let access = vec![AccessEntryV2Mirror {
+            address: [0xAA; 20],
+            encrypted_key_bundle: None, // Public file
+            expires_at: None,
+        }];
+        let hex = build_register_file_pending_v2_tx(
+            &seed,
+            1337, // chain_id
+            5,    // nonce
+            1_000_000, // fee
+            merkle_root,
+            10_485_760, // plaintext_size_bytes
+            10_485_760, // stored_size_bytes (Public: same)
+            10,         // chunk_count
+            500_000,    // fee_deposit
+            0,          // visibility = Public
+            access.clone(),
+        )
+        .unwrap();
+
+        let bytes = hex::decode(&hex).unwrap();
+        let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
+
+        match signed.inner {
+            TxInnerMirror::V2(tx) => {
+                assert_eq!(tx.chain_id, 1337);
+                assert_eq!(tx.nonce, 5);
+                match tx.payload {
+                    TxPayloadMirror::StorageMetadataV2(data) => match data.operation {
+                        StorageMetadataOperationV2Mirror::RegisterFilePendingV2 {
+                            merkle_root: r,
+                            plaintext_size_bytes,
+                            stored_size_bytes,
+                            chunk_count,
+                            fee_deposit,
+                            visibility,
+                            initial_access,
+                        } => {
+                            assert_eq!(r, merkle_root);
+                            assert_eq!(plaintext_size_bytes, 10_485_760);
+                            assert_eq!(stored_size_bytes, 10_485_760);
+                            assert_eq!(chunk_count, 10);
+                            assert_eq!(fee_deposit, 500_000);
+                            assert_eq!(visibility, 0);
+                            assert_eq!(initial_access.len(), 1);
+                            assert_eq!(initial_access[0].address, [0xAA; 20]);
+                            assert!(initial_access[0].encrypted_key_bundle.is_none());
+                        }
+                        _ => panic!("wrong V2 op variant"),
+                    },
+                    _ => panic!("expected StorageMetadataV2 payload variant"),
+                }
+            }
+            _ => panic!("wrong TxInner variant"),
+        }
+    }
+
+    #[test]
+    fn activate_file_v2_and_abandon_file_v2_round_trip() {
+        let seed = [31u8; 32];
+        let root = [0x88; 32];
+
+        for builder_label in ["activate", "abandon"] {
+            let hex = match builder_label {
+                "activate" => build_activate_file_v2_tx(&seed, 1, 0, 100, root).unwrap(),
+                _ => build_abandon_file_v2_tx(&seed, 1, 0, 100, root).unwrap(),
+            };
+            let bytes = hex::decode(&hex).unwrap();
+            let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
+            match signed.inner {
+                TxInnerMirror::V2(tx) => match tx.payload {
+                    TxPayloadMirror::StorageMetadataV2(data) => match (builder_label, data.operation)
+                    {
+                        ("activate", StorageMetadataOperationV2Mirror::ActivateFileV2 {
+                            merkle_root: r,
+                        }) => assert_eq!(r, root),
+                        ("abandon", StorageMetadataOperationV2Mirror::AbandonFileV2 {
+                            merkle_root: r,
+                        }) => assert_eq!(r, root),
+                        (lbl, op) => panic!("wrong variant for {lbl}: {op:?}"),
+                    },
+                    _ => panic!("expected StorageMetadataV2 payload"),
+                },
+                _ => panic!("wrong TxInner variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn accept_assignment_v2_carries_chunk_indices() {
+        let seed = [32u8; 32];
+        let root = [0x99; 32];
+        // 70k indices: typical multi-tx batch shape (caller will split
+        // before calling, but the builder itself accepts any length).
+        let chunk_indices: Vec<u32> = (0..70_000).collect();
+        let hex =
+            build_accept_assignment_v2_tx(&seed, 1, 0, 100, root, chunk_indices.clone()).unwrap();
+
+        let bytes = hex::decode(&hex).unwrap();
+        let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
+        match signed.inner {
+            TxInnerMirror::V2(tx) => match tx.payload {
+                TxPayloadMirror::StorageMetadataV2(data) => match data.operation {
+                    StorageMetadataOperationV2Mirror::AcceptAssignmentV2 {
+                        merkle_root: r,
+                        chunk_indices: idx,
+                    } => {
+                        assert_eq!(r, root);
+                        assert_eq!(idx.len(), 70_000);
+                        assert_eq!(idx[0], 0);
+                        assert_eq!(idx[69_999], 69_999);
+                    }
+                    _ => panic!("wrong V2 op variant"),
+                },
+                _ => panic!("expected StorageMetadataV2 payload"),
+            },
+            _ => panic!("wrong TxInner variant"),
+        }
+    }
+
+    /// **Payload-level** variant-index pin. Catches the High-priority
+    /// reviewer finding: SNIP and L1 must agree on which `TxPayload`
+    /// variant is `StorageMetadataV2`. Without this pin, an accidental
+    /// reorder would silently misroute every V2 storage tx.
+    ///
+    /// Bincode v1 encodes enum variants as `u32` little-endian. The
+    /// first 4 bytes of a serialized payload ARE the variant tag.
+    #[test]
+    fn payload_v2_variant_indices_are_stable() {
+        fn variant_index(p: TxPayloadMirror) -> u32 {
+            let bytes = bincode1::serialize(&p).unwrap();
+            assert!(bytes.len() >= 4, "expected at least 4 bytes for payload tag");
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+
+        // V1 baselines (sanity — these are pinned by the existing chain tests
+        // too, but cross-checking here means a single test catches both
+        // V1 drift and V2 drift).
+        assert_eq!(
+            variant_index(TxPayloadMirror::NodeRegistry(NodeRegistryTxDataMirror {
+                operation: NodeRegistryOperationMirror::Register {
+                    role: NodeRoleMirror::ArchiveNode,
+                    stake: 0,
+                },
+            })),
+            17,
+            "V1 NodeRegistry payload index drift"
+        );
+        assert_eq!(
+            variant_index(TxPayloadMirror::StorageMetadata(StorageMetadataTxDataMirror {
+                operation: StorageMetadataOperationMirror::RegisterFile {
+                    merkle_root: [0; 32],
+                    total_size_bytes: 0,
+                    access_list: vec![],
+                    fee_deposit: 0,
+                },
+            })),
+            18,
+            "V1 StorageMetadata payload index drift"
+        );
+
+        // V2 placements per chain plan v3.2 schema-text ordering:
+        // NodeRegistryV2 at 19, StorageMetadataV2 at 20.
+        assert_eq!(
+            variant_index(TxPayloadMirror::NodeRegistryV2(NodeRegistryV2TxDataMirror {
+                operation: NodeRegistryOperationV2Mirror::RegisterEncryptionKey {
+                    encryption_pubkey: [0; 32],
+                },
+            })),
+            19,
+            "NodeRegistryV2 payload index must be 19"
+        );
+        assert_eq!(
+            variant_index(TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
+                operation: StorageMetadataOperationV2Mirror::ActivateFileV2 {
+                    merkle_root: [0; 32],
+                },
+            })),
+            20,
+            "StorageMetadataV2 payload index must be 20 — \
+             slot 19 is reserved for NodeRegistryV2"
+        );
+    }
+
+    /// V2 mirror variant indices must serialize to the expected `u32`
+    /// values. Bincode v1 emits enum variants as `u32` little-endian.
+    /// This test asserts the exact byte at the variant-discriminant
+    /// position. If this test ever changes, the L1 cross-compat is in
+    /// danger — DO NOT mutate variant order without coordinating with
+    /// chain team.
+    #[test]
+    fn v2_op_variant_indices_are_stable() {
+        // Build a synthetic op of each variant, serialize, peek the
+        // discriminant byte. Bincode v1 default config writes the
+        // variant tag as little-endian u32 (4 bytes).
+        fn variant_index(op: StorageMetadataOperationV2Mirror) -> u32 {
+            let bytes = bincode1::serialize(&op).unwrap();
+            assert!(bytes.len() >= 4, "expected at least 4 bytes for variant tag");
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+        assert_eq!(
+            variant_index(StorageMetadataOperationV2Mirror::RegisterFilePendingV2 {
+                merkle_root: [0; 32],
+                plaintext_size_bytes: 0,
+                stored_size_bytes: 0,
+                chunk_count: 0,
+                fee_deposit: 0,
+                visibility: 0,
+                initial_access: vec![],
+            }),
+            0
+        );
+        assert_eq!(
+            variant_index(StorageMetadataOperationV2Mirror::ActivateFileV2 {
+                merkle_root: [0; 32]
+            }),
+            1
+        );
+        assert_eq!(
+            variant_index(StorageMetadataOperationV2Mirror::AbandonFileV2 {
+                merkle_root: [0; 32]
+            }),
+            2
+        );
+        assert_eq!(
+            variant_index(StorageMetadataOperationV2Mirror::AddAccessV2 {
+                merkle_root: [0; 32],
+                entry: AccessEntryV2Mirror {
+                    address: [0; 20],
+                    encrypted_key_bundle: None,
+                    expires_at: None,
+                },
+            }),
+            3
+        );
+        assert_eq!(
+            variant_index(StorageMetadataOperationV2Mirror::RemoveAccessV2 {
+                merkle_root: [0; 32],
+                address: [0; 20],
+            }),
+            4
+        );
+        assert_eq!(
+            variant_index(StorageMetadataOperationV2Mirror::UpdateAccessV2 {
+                merkle_root: [0; 32],
+                address: [0; 20],
+                new_entry: AccessEntryV2Mirror {
+                    address: [0; 20],
+                    encrypted_key_bundle: None,
+                    expires_at: None,
+                },
+            }),
+            5
+        );
+        assert_eq!(
+            variant_index(StorageMetadataOperationV2Mirror::AcceptAssignmentV2 {
+                merkle_root: [0; 32],
+                chunk_indices: vec![],
+            }),
+            6
+        );
     }
 
     #[test]
