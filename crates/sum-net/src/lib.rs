@@ -15,7 +15,11 @@ pub mod transport;   // deferred — TCP/Noise fallback transport
 
 pub use events::SumNetEvent;
 pub use gossip::{TOPIC_CAPABILITY, TOPIC_STORAGE, TOPIC_TEST};
-pub use codec::{ShardCodec, ShardRequest, ShardResponse, SHARD_XFER_PROTOCOL};
+pub use codec::{
+    ShardCodec, ShardRequest, ShardRequestV2, ShardRequestVersioned, ShardResponse,
+    ShardResponseV2, ShardResponseVersioned, VersionedShardCodec, SHARD_XFER_PROTOCOL,
+    SHARD_XFER_PROTOCOL_V1, SHARD_XFER_PROTOCOL_V2,
+};
 pub use identity::{
     keypair_from_seed, l1_address_from_keypair, l1_address_base58,
     l1_address_from_base58, l1_address_from_peer_public_key, peer_id_from_keypair,
@@ -163,7 +167,7 @@ impl SumNet {
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot push chunk"))
     }
 
-    /// Send a chunk response on a pending response channel.
+    /// Send a V1 chunk response on a pending response channel.
     pub async fn respond_shard(
         &self,
         channel_id: u64,
@@ -173,6 +177,111 @@ impl SumNet {
             .send(SwarmCommand::SendShardResponse { channel_id, response })
             .await
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot respond chunk"))
+    }
+
+    // ── V2 chunk transfer (chain plan v3.2 §3.6) ─────────────────────────
+    //
+    // Each helper carries the precise on-wire shape — no `Option<>`
+    // squeezing like V1 — so call sites can't miss a field.
+    //
+    // Outbound negotiation prefers V2 (we register V2 first in the
+    // protocol list passed to `request_response::Behaviour::with_codec`,
+    // and libp2p picks the first mutually-supported protocol). There is
+    // **no automatic V2 → V1 fallback** for the helpers here: if a
+    // peer doesn't advertise `/sum/storage/v2`, the codec will refuse
+    // to write a V2 payload onto a V1 stream and the call surfaces as
+    // an `OutboundFailure` (see `VersionedShardCodec::write_request`).
+    // Callers that want V1 fallback semantics must catch that failure
+    // and retry via the V1 helpers explicitly.
+
+    /// V2 Pull — request `[offset, offset+max_bytes)` of the chunk at `cid`.
+    pub async fn pull_chunk_v2(
+        &self,
+        peer_id: PeerId,
+        cid: String,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(SwarmCommand::RequestShardV2 {
+                peer_id,
+                request: ShardRequestV2::Pull { cid, offset, max_bytes },
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot pull chunk v2"))
+    }
+
+    /// V2 Push — send a chunk and its strict Merkle proof. The receiver
+    /// runs `PushValidator::validate_push` (chain plan v3.2 §3.6
+    /// receive-side) before persisting.
+    pub async fn push_chunk_v2(
+        &self,
+        peer_id: PeerId,
+        data: Vec<u8>,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        merkle_path: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(SwarmCommand::RequestShardV2 {
+                peer_id,
+                request: ShardRequestV2::Push {
+                    data,
+                    merkle_root,
+                    chunk_index,
+                    merkle_path,
+                },
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot push chunk v2"))
+    }
+
+    /// V2 ManifestPush — send the CBOR manifest blob keyed by `merkle_root`.
+    /// The receiver validates internal consistency (root recomputed from
+    /// the manifest's chunk descriptors) before persisting.
+    pub async fn push_manifest_v2(
+        &self,
+        peer_id: PeerId,
+        merkle_root: [u8; 32],
+        manifest_bytes: Vec<u8>,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(SwarmCommand::RequestShardV2 {
+                peer_id,
+                request: ShardRequestV2::ManifestPush {
+                    merkle_root,
+                    manifest_bytes,
+                },
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot push manifest v2"))
+    }
+
+    /// V2 ManifestPull — request the CBOR manifest for `merkle_root`.
+    pub async fn pull_manifest_v2(
+        &self,
+        peer_id: PeerId,
+        merkle_root: [u8; 32],
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(SwarmCommand::RequestShardV2 {
+                peer_id,
+                request: ShardRequestV2::ManifestPull { merkle_root },
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot pull manifest v2"))
+    }
+
+    /// Send a V2 response on a pending response channel.
+    pub async fn respond_shard_v2(
+        &self,
+        channel_id: u64,
+        response: ShardResponseV2,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(SwarmCommand::SendShardResponseV2 { channel_id, response })
+            .await
+            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot respond v2"))
     }
 
     // ── Lifecycle ───────────────────────────────────────────────────────
