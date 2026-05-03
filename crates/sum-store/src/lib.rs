@@ -1,5 +1,6 @@
 pub mod announce;
 pub mod assignment;
+pub mod assignment_v2;
 pub mod chunker;
 pub mod content_id;
 pub mod error;

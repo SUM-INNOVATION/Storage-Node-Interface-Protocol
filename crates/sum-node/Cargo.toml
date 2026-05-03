@@ -35,6 +35,8 @@ hex                = { workspace = true }
 serde-big-array    = { workspace = true }
 async-trait        = { workspace = true }
 ciborium           = { workspace = true }
+lru                = { workspace = true }
+memmap2            = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

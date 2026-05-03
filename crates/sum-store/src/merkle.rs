@@ -73,6 +73,17 @@ impl MerkleTree {
         self.levels.first().map_or(0, |l| l.len())
     }
 
+    /// Same as [`Self::generate_proof`] but returns the proof in the
+    /// wire-format `[u8; 32]` representation used by V2's
+    /// `ShardRequestV2::Push.merkle_path`. Avoids per-push conversion
+    /// at the upload site.
+    pub fn proof_bytes(&self, chunk_index: u32) -> Vec<[u8; 32]> {
+        self.generate_proof(chunk_index)
+            .into_iter()
+            .map(|h| *h.as_bytes())
+            .collect()
+    }
+
     /// Generate a Merkle proof (sibling hashes, bottom-up) for a given chunk.
     ///
     /// The returned `Vec<blake3::Hash>` is ordered from the leaf level upward,

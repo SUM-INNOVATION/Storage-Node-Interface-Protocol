@@ -8,9 +8,18 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tracing::debug;
 
-use sum_types::rpc_types::{ChallengeInfo, NodeRecordInfo, StorageFileInfo};
+use sum_types::rpc_types::{
+    AssignmentCoverageV2, BlockHeightInfo, ChainParamsInfo, ChallengeInfo, NodeRecordInfo,
+    StorageFileInfo, StorageFileInfoV2, TxStatusV2,
+};
 
 /// JSON-RPC client connected to a SUM Chain L1 node.
+///
+/// `Clone` is cheap: `reqwest::Client` already shares its connection
+/// pool internally, and `rpc_url` is a `String` clone. This lets V2
+/// components (PushValidator, AssignmentAttestor, V2Dispatcher) each
+/// own their own typed handle while still sharing the connection pool.
+#[derive(Clone)]
 pub struct L1RpcClient {
     client: reqwest::Client,
     rpc_url: String,
@@ -135,8 +144,248 @@ impl L1RpcClient {
         self.call("chain_id", json!([])).await
     }
 
+    // ── V2 RPC endpoints (chain plan v3.2 §4) ─────────────────────────────
+    //
+    // These complement the V1 methods above; legacy V1 files keep using
+    // `get_access_list`, `get_active_nodes`, etc. Phase 0b's ingest /
+    // push validator / attestor / finality waiter call the V2 variants
+    // exclusively.
+
+    /// `chain_getBlockHeight` — current block height + finality flag.
+    /// Used by the strict ACL expiry check (`expires_at` comparison),
+    /// the snapshot freshness check, and any place a "what block are we
+    /// at right now" answer is needed.
+    pub async fn chain_get_block_height(&self) -> Result<BlockHeightInfo> {
+        self.call("chain_getBlockHeight", json!([])).await
+    }
+
+    /// `chain_getChainParams` — live consensus + V2 protocol constants.
+    ///
+    /// Read at startup; values are protocol-constant per genesis (a
+    /// change would be a hard fork). Used by W10 ingest to populate
+    /// `IngestParams` from chain rather than baking defaults.
+    pub async fn chain_get_chain_params(&self) -> Result<ChainParamsInfo> {
+        self.call("chain_getChainParams", json!([])).await
+    }
+
+    /// `chain_getTransactionStatus(tx_hash)` — V2 finality primitive.
+    /// Wire shape: `{"status": "...", ...}` with internally-tagged
+    /// variants per chain plan §4.
+    ///
+    /// W9 (`tx_wait::wait_for_finalized`) is the canonical caller — see
+    /// the `TxStatusV2` doc-comment in `sum_types::rpc_types` for
+    /// per-variant semantics.
+    pub async fn chain_get_transaction_status(&self, tx_hash: &str) -> Result<TxStatusV2> {
+        self.call("chain_getTransactionStatus", json!([tx_hash])).await
+    }
+
+    /// `storage_getFileInfoV2` — V2 file row + paginated access list.
+    ///
+    /// Per chain plan v3.2 §4 the response signature is non-nullable
+    /// (`-> StorageFileInfoV2`); "file not found" surfaces as a
+    /// JSON-RPC error rather than `null`. We therefore return
+    /// `Result<StorageFileInfoV2>` and let the underlying RPC error
+    /// path carry "not found" up to the caller. Callers that want to
+    /// distinguish "not registered" from "transport error" should
+    /// inspect the error message (chain plan §10 receipt-code mapping).
+    ///
+    /// `access_offset`/`access_limit` paginate the access list; pass
+    /// `None`/`None` for the chain default (offset=0, limit=256).
+    /// Public-file ingests typically have empty access lists, so the
+    /// pagination is a no-op for Phase 0b.
+    pub async fn storage_get_file_info_v2(
+        &self,
+        merkle_root_hex: &str,
+        access_offset: Option<u32>,
+        access_limit: Option<u32>,
+    ) -> Result<StorageFileInfoV2> {
+        self.call(
+            "storage_getFileInfoV2",
+            json!([merkle_root_hex, access_offset, access_limit]),
+        )
+        .await
+    }
+
+    /// `storage_getActiveNodesAtHeight(h)` — Ask 15 height-based snapshot.
+    /// Walks back to the most recent snapshot ≤ `h`; the genesis
+    /// snapshot at h=0 is guaranteed to exist (chain plan §5.3).
+    ///
+    /// Snapshots are immutable per height, so callers should cache
+    /// these aggressively — same `h` always yields the same response.
+    pub async fn storage_get_active_nodes_at_height(
+        &self,
+        height: u64,
+    ) -> Result<Vec<NodeRecordInfo>> {
+        self.call("storage_getActiveNodesAtHeight", json!([height])).await
+    }
+
+    /// `storage_getAssignmentCoverageV2` — bitmap coverage state for
+    /// a Pending/Active V2 file.
+    ///
+    /// `missing_offset` is a **chunk-index lower bound**, not an offset
+    /// into the missing list. Callers paginating uncovered chunks should
+    /// cycle `missing_offset = last_returned_index + 1` per chain plan
+    /// §4 line 474. `missing_limit` defaults to 1024 client-side per
+    /// the W9-confirmed semantics; the chain caps it at 16384.
+    pub async fn storage_get_assignment_coverage_v2(
+        &self,
+        merkle_root_hex: &str,
+        missing_offset: Option<u32>,
+        missing_limit: Option<u32>,
+    ) -> Result<AssignmentCoverageV2> {
+        self.call(
+            "storage_getAssignmentCoverageV2",
+            json!([merkle_root_hex, missing_offset, missing_limit]),
+        )
+        .await
+    }
+
     /// URL this client is connected to.
     pub fn rpc_url(&self) -> &str {
         &self.rpc_url
+    }
+}
+
+// ── Contract tests ───────────────────────────────────────────────────────────
+//
+// These verify the JSON-RPC wire shape we assume for V2 endpoints. Each
+// test stands up a one-shot in-process HTTP responder on an ephemeral
+// port, serves a single canned response, and asserts the client's
+// behavior.
+//
+// **Why a contract test for `storage_getFileInfoV2` matters**: chain
+// plan v3.2 §4 declares the response signature as `-> StorageFileInfoV2`
+// (non-nullable). If the chain instead returns `null` in the `result`
+// field for unknown roots, our non-Option client decoding will surface
+// a JSON deserialization error — distinct from a JSON-RPC error. The
+// test pins the "JSON-RPC error → client `Err`" path explicitly so the
+// shape contract can't drift unnoticed.
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Spawn a one-shot HTTP responder. Returns the URL the client
+    /// should target. The responder accepts exactly one connection,
+    /// drains the request body, and writes back the canned response.
+    async fn one_shot_responder(response_body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the inbound request — we don't inspect it here, just
+            // need to clear the socket buffer before writing the response.
+            // HTTP/1.1 with Content-Length means we can read a fixed
+            // amount; for brevity, read until we've seen \r\n\r\n + the
+            // declared body length (or just read what's available, which
+            // is enough for our single-shot use case).
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body,
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+        url
+    }
+
+    /// Happy path: chain returns a complete `StorageFileInfoV2` JSON.
+    /// Client must decode without error and surface a `StorageFileInfoV2`.
+    #[tokio::test]
+    async fn storage_get_file_info_v2_decodes_success_shape() {
+        let body = r#"{
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "merkle_root": "0xabcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+                "owner": "OwnerB58Addr",
+                "plaintext_size_bytes": 10485760,
+                "stored_size_bytes": 10485760,
+                "chunk_count": 10,
+                "fee_pool": 100000,
+                "created_at": 12345,
+                "activated_at_height": null,
+                "assignment_height": 12345,
+                "visibility": 0,
+                "lifecycle": 0,
+                "access_list": []
+            }
+        }"#
+        .to_string();
+        let url = one_shot_responder(body).await;
+        let client = L1RpcClient::new(url);
+        let info = client
+            .storage_get_file_info_v2(
+                "0xabcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+                None,
+                None,
+            )
+            .await
+            .expect("client must decode success shape");
+        assert_eq!(info.chunk_count, 10);
+        assert!(info.lifecycle.is_pending());
+        assert!(info.visibility.is_public());
+    }
+
+    /// "File not found" path: chain returns a JSON-RPC error object.
+    /// Client must surface this as `Err`, NOT silently as `Ok` of
+    /// some sentinel value. This is the reviewer-required test that
+    /// pins the not-found wire shape explicitly.
+    #[tokio::test]
+    async fn storage_get_file_info_v2_jsonrpc_error_surfaces_as_err() {
+        let body = r#"{
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32602,
+                "message": "file not registered: 0x000...000"
+            }
+        }"#
+        .to_string();
+        let url = one_shot_responder(body).await;
+        let client = L1RpcClient::new(url);
+        let result = client
+            .storage_get_file_info_v2(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                None,
+                None,
+            )
+            .await;
+        let err = result.expect_err("expected RPC error, got Ok");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RPC error") || msg.contains("file not registered"),
+            "error message must surface the JSON-RPC error: {msg}"
+        );
+    }
+
+    /// Defensive: if the chain returns `result: null` (i.e. behaves
+    /// like the V1 `storage_getAccessList` and the chain plan literal
+    /// is wrong), our non-Option decoding produces a deserialization
+    /// error. The test pins this behavior so a future ambiguity gets
+    /// caught here, not in production.
+    #[tokio::test]
+    async fn storage_get_file_info_v2_null_result_is_decode_error() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_string();
+        let url = one_shot_responder(body).await;
+        let client = L1RpcClient::new(url);
+        let result = client
+            .storage_get_file_info_v2(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                None,
+                None,
+            )
+            .await;
+        // Either we get an Err (JSON deserialize fails on null → struct)
+        // OR something else completely unexpected. We assert Err.
+        assert!(
+            result.is_err(),
+            "non-Option client must NOT silently accept null; got {result:?}"
+        );
     }
 }

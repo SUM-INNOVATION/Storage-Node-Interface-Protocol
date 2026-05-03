@@ -1,6 +1,6 @@
 use libp2p::{Multiaddr, PeerId};
 
-use crate::codec::{ShardRequest, ShardResponse};
+use crate::codec::{ShardRequest, ShardRequestV2, ShardResponse, ShardResponseV2};
 
 /// Domain-level events emitted by the SUM Storage Node networking layer.
 /// Never exposes raw libp2p internals to callers.
@@ -31,22 +31,41 @@ pub enum SumNetEvent {
         data: Vec<u8>,
     },
 
-    /// A remote peer requested a chunk from us.
+    /// A remote peer requested a V1 chunk from us (`/sum/storage/v1`).
     /// The higher layer (sum-store) should call
-    /// `SumNet::respond_shard(channel_id, response)`.
+    /// `SumNet::respond_shard(channel_id, response)` with a V1 response.
     ShardRequested {
         peer_id: PeerId,
         request: ShardRequest,
         channel_id: u64,
     },
 
-    /// We received chunk data from a remote peer (response to our request).
+    /// We received V1 chunk data from a remote peer (response to our V1 request).
     ShardReceived {
         peer_id: PeerId,
         response: ShardResponse,
     },
 
-    /// An outbound chunk request failed.
+    /// A remote peer issued a V2 request to us (`/sum/storage/v2`). V2
+    /// covers four variants: `Pull`, `Push`, `ManifestPush`,
+    /// `ManifestPull` (chain plan v3.2 §3.6 receive-side). The higher
+    /// layer (sum-node V2 dispatcher) routes to `PushValidator` /
+    /// manifest store / serve, and replies with
+    /// `SumNet::respond_shard_v2(channel_id, ShardResponseV2)`.
+    ShardRequestedV2 {
+        peer_id: PeerId,
+        request: ShardRequestV2,
+        channel_id: u64,
+    },
+
+    /// We received a V2 response from a remote peer (response to our V2 request).
+    ShardReceivedV2 {
+        peer_id: PeerId,
+        response: ShardResponseV2,
+    },
+
+    /// An outbound chunk request failed (V1 OR V2 — covers both since
+    /// the libp2p outbound failure is protocol-agnostic).
     ShardRequestFailed {
         peer_id: PeerId,
         error: String,

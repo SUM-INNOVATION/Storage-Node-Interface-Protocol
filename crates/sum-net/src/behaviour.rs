@@ -3,7 +3,7 @@ use libp2p::{
     swarm::NetworkBehaviour,
 };
 
-use crate::codec::ShardCodec;
+use crate::codec::VersionedShardCodec;
 
 /// Composed [`NetworkBehaviour`] for the SUM Storage Node mesh.
 ///
@@ -12,7 +12,9 @@ use crate::codec::ShardCodec;
 /// - `Mdns(mdns::Event)`
 /// - `Gossipsub(gossipsub::Event)`
 /// - `Identify(identify::Event)`
-/// - `ShardXfer(request_response::Event<ShardRequest, ShardResponse>)`
+/// - `ShardXfer(request_response::Event<ShardRequestVersioned, ShardResponseVersioned>)`
+///   — the codec dispatches V1 vs V2 on the libp2p-negotiated protocol.
+///   See [`crate::codec::VersionedShardCodec`].
 /// - `Kademlia(kad::Event)`
 /// - `Autonat(autonat::Event)`
 /// - `Relay(relay::Event)`
@@ -23,7 +25,7 @@ pub struct LocalMeshBehaviour {
     pub mdns:         mdns::tokio::Behaviour,
     pub gossipsub:    gossipsub::Behaviour,
     pub identify:     identify::Behaviour,
-    pub shard_xfer:   request_response::Behaviour<ShardCodec>,
+    pub shard_xfer:   request_response::Behaviour<VersionedShardCodec>,
     pub kademlia:     kad::Behaviour<kad::store::MemoryStore>,
     pub autonat:      autonat::Behaviour,
     pub relay:        relay::Behaviour,
