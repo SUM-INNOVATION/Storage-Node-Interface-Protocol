@@ -184,6 +184,7 @@ impl AttestTriggerRpc for MockRpc {
         Ok(FileShape {
             chunk_count: info.chunk_count,
             assignment_height: info.assignment_height,
+            visibility: info.visibility,
         })
     }
     async fn fetch_snapshot(&self, height: u64) -> Result<Vec<[u8; 20]>> {

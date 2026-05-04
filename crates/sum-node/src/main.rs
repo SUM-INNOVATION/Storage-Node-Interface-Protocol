@@ -35,6 +35,7 @@ use sum_types::config::{NetConfig, StoreConfig};
 use sum_node::acl::AclChecker;
 use sum_node::assignment_attestor::AssignmentAttestor;
 use sum_node::download::DownloadOrchestrator;
+use sum_node::download_private::run_download_private;
 use sum_node::inbound_v2::V2Dispatcher;
 use sum_node::market_sync::MarketSyncWorker;
 use sum_node::peer_state::{apply_peer_event, PeerMapChange};
@@ -429,7 +430,7 @@ async fn main() -> Result<()> {
         }
         Command::Fetch { cid } => run_fetch(keypair, net_config, cid).await,
         Command::Download { merkle_root, output, max_concurrent, download_timeout_secs } => {
-            run_download(keypair, cli.rpc_url.clone(), net_config, merkle_root, output, max_concurrent, download_timeout_secs).await
+            run_download(keypair, seed, cli.rpc_url.clone(), net_config, merkle_root, output, max_concurrent, download_timeout_secs).await
         }
         Command::Send { message } => run_send(keypair, net_config, message).await,
     }
@@ -1917,8 +1918,10 @@ async fn run_fetch(keypair: Keypair, net_config: NetConfig, cid: String) -> Resu
 
 // ── Download mode ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run_download(
     keypair: Keypair,
+    seed: Option<[u8; 32]>,
     rpc_url: String,
     net_config: NetConfig,
     merkle_root: String,
@@ -1928,12 +1931,65 @@ async fn run_download(
 ) -> Result<()> {
     info!(%merkle_root, output = %output.display(), "starting download");
 
-    let net = Arc::new(SumNet::new(net_config, keypair.clone()).await?);
-    let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
+    // ── Step 1: pre-flight chain probes BEFORE any libp2p work ─────
+    //
+    // We need the V2 file row to know whether this is a Private file,
+    // and we want to fail fast on the obvious operator mistakes
+    // (missing --key-file for a Private file) without burning a UDP
+    // bind, mDNS announce, or QUIC handshake. Doing the RPC probe
+    // first costs one HTTP round-trip but lets us bail before any
+    // network state mutates.
+    let parsed_root = parse_merkle_root_hex(&merkle_root)?;
+    let root_hex = format!("0x{}", hex::encode(parsed_root));
     let rpc = Arc::new(L1RpcClient::new(rpc_url));
+    let v2_info = rpc
+        .storage_get_file_info_v2(&root_hex, None, None)
+        .await
+        .ok();
+
+    // Private + missing seed → bail before SumNet::new.
+    if let Some(info) = v2_info.as_ref() {
+        if info.visibility.is_private() && seed.is_none() {
+            anyhow::bail!(
+                "download of Private file {merkle_root} requires --key-file \
+                 (no X25519 secret to unwrap K_file)"
+            );
+        }
+    }
+
+    // ── Step 2: now safe to start networking ───────────────────────
+    let net = Arc::new(SumNet::new(net_config, keypair.clone()).await?);
+
+    // V2 dispatch. We ONLY take the Private path when chain confirms
+    // this is a Private V2 row; every other outcome — Public V2,
+    // pre-V2 / V1 file, V2 RPC unsupported, transient RPC error, file
+    // not found — falls through to the existing Public download
+    // orchestrator with no behavior change. This way V1 / legacy
+    // Public downloads cannot regress when the chain side adds or
+    // removes V2 metadata for unrelated files.
+    if let Some(info) = v2_info {
+        if info.visibility.is_private() {
+            let seed = seed.expect("checked above before SumNet::new");
+            return run_download_private(
+                keypair,
+                seed,
+                rpc,
+                net,
+                info,
+                parsed_root,
+                output,
+                max_concurrent,
+                Duration::from_secs(timeout_secs),
+            )
+            .await;
+        }
+        // Public V2 row: fall through to the existing Public path.
+    }
+
+    // ── Step 3: existing Public / V1 / legacy path ────────────────
+    let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
     let peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>> =
         Arc::new(RwLock::new(HashMap::new()));
-
     let orchestrator = DownloadOrchestrator::new(
         merkle_root,
         output.clone(),

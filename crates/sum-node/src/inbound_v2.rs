@@ -129,6 +129,27 @@ pub trait AttestTriggerRpc: Send + Sync {
 pub struct FileShape {
     pub chunk_count: u32,
     pub assignment_height: u64,
+    /// File visibility from chain. Phase 4b uses this in the
+    /// ManifestPush handler to choose between Public CBOR validation
+    /// (existing behavior) and Private opaque-bytes storage.
+    pub visibility: sum_types::rpc_types::VisibilityV2,
+}
+
+/// Build a placeholder `DataManifest` for the Private ManifestPush
+/// path. The `spawn_attestation` helper accepts a `DataManifest` for
+/// signature uniformity with the Public path, but its body never
+/// reads any field — attestation works off chain state and the
+/// in-memory `held` tracker. Returning this stub keeps both paths
+/// source-compatible without forking the helper signature.
+fn private_manifest_stub(merkle_root: [u8; 32]) -> DataManifest {
+    DataManifest {
+        file_name: String::new(),
+        file_hash: [0u8; 32],
+        total_size_bytes: 0,
+        chunk_count: 0,
+        merkle_root,
+        chunks: Vec::new(),
+    }
 }
 
 /// File-level access check for V2 pulls. Same semantics as the V1 path's
@@ -197,6 +218,7 @@ impl AttestTriggerRpc for L1RpcClient {
         Ok(FileShape {
             chunk_count: info.chunk_count,
             assignment_height: info.assignment_height,
+            visibility: info.visibility,
         })
     }
 
@@ -426,7 +448,10 @@ where
             .validate_push(merkle_root, chunk_index, &data, &merkle_path)
             .await;
         let resp = match validate {
-            Ok(leaf_hash) => {
+            Ok(crate::push_validator::ValidatedPush {
+                leaf_hash,
+                visibility,
+            }) => {
                 let cid = cid_from_blake3_hash(&blake3::Hash::from(leaf_hash));
                 let stores = self.store.read().await;
                 if let Err(e) = stores.local.put(&cid, &data) {
@@ -435,6 +460,64 @@ where
                         merkle_root,
                         chunk_index,
                         error: Some(format!("store error: {e}")),
+                    }
+                } else if visibility.is_private() {
+                    // Phase 4b: for Private files, the serving-side
+                    // ACL gate (`merkle_root_for_cid`) needs the
+                    // ciphertext-CID → merkle-root mapping to resolve
+                    // chunk pulls. The Private manifest is encrypted,
+                    // so `cid_to_root` (populated from a decoded
+                    // `DataManifest`) stays empty. This handler is
+                    // the ONLY code path that records the mapping.
+                    //
+                    // Strict policy: if the mapping write fails we
+                    // return an ACK error rather than logging-and-
+                    // ACK-ing-success. A successful ACK with no
+                    // mapping would silently mark the chunk as
+                    // un-pullable for authorized recipients (the bug
+                    // the reviewer flagged). The pusher retrying is
+                    // safe: `local.put` is idempotent and
+                    // `record_private_chunk_cid` is idempotent for
+                    // the same `(cid, root)` pair.
+                    drop(stores);
+                    let mut stores = self.store.write().await;
+                    if let Err(e) = stores
+                        .manifest_idx
+                        .record_private_chunk_cid(merkle_root, &cid)
+                    {
+                        warn!(
+                            %peer_id,
+                            cid = %cid,
+                            root = %hex::encode(merkle_root),
+                            %e,
+                            "V2 Push (Private): cid->root mapping write FAILED — refusing ACK"
+                        );
+                        ShardResponseV2::PushAck {
+                            merkle_root,
+                            chunk_index,
+                            error: Some(format!(
+                                "private chunk mapping persistence failed: {e}"
+                            )),
+                        }
+                    } else {
+                        self.held
+                            .lock()
+                            .expect("held mutex poisoned")
+                            .entry(merkle_root)
+                            .or_default()
+                            .insert(chunk_index);
+                        debug!(
+                            %peer_id,
+                            root = %hex::encode(merkle_root),
+                            chunk_index,
+                            cid = %cid,
+                            "V2 Push (Private): chunk validated, stored, and cid->root recorded"
+                        );
+                        ShardResponseV2::PushAck {
+                            merkle_root,
+                            chunk_index,
+                            error: None,
+                        }
                     }
                 } else {
                     drop(stores);
@@ -449,7 +532,7 @@ where
                         root = %hex::encode(merkle_root),
                         chunk_index,
                         cid = %cid,
-                        "V2 Push: chunk validated and stored"
+                        "V2 Push (Public): chunk validated and stored"
                     );
                     ShardResponseV2::PushAck {
                         merkle_root,
@@ -487,6 +570,81 @@ where
         manifest_bytes: Vec<u8>,
     ) {
         let root_hex = hex::encode(merkle_root);
+
+        // Phase 4b: dispatch by chain-stated visibility BEFORE deciding
+        // whether to validate as CBOR. The chain is the canonical
+        // source for what shape this file's manifest takes:
+        //   * Public  → CBOR DataManifest, validated + decoded.
+        //   * Private → opaque encrypted bytes, stored verbatim.
+        // If the chain probe fails we refuse the push rather than
+        // guessing — a bad guess either drops legitimate Private
+        // bytes (false-rejecting) or accepts arbitrary garbage as
+        // "Private" (false-trusting). One probe per file (manifest
+        // push happens once per ingest); chunk pushes don't pay this
+        // cost because `validate_push` already returns visibility.
+        let visibility = match self.trigger_rpc.fetch_file_shape(&merkle_root).await {
+            Ok(s) => s.visibility,
+            Err(e) => {
+                warn!(root = %root_hex, %e, "V2 ManifestPush: chain visibility probe failed — refusing push");
+                let resp = ShardResponseV2::ManifestPushAck {
+                    merkle_root,
+                    error: Some(format!("chain probe failed: {e}")),
+                };
+                if let Err(e) = net.respond_shard_v2(channel_id, resp).await {
+                    warn!(channel_id, %e, "V2 ManifestPush: failed to send ACK after chain probe error");
+                }
+                return;
+            }
+        };
+
+        if visibility.is_private() {
+            // Private: store opaque bytes verbatim, no CBOR/Merkle
+            // checks (the chain commits to the ciphertext-Merkle root
+            // directly via the per-chunk push hashes).
+            let len = manifest_bytes.len();
+            {
+                let mut stores = self.store.write().await;
+                if stores.manifest_idx.get_private_bytes(&merkle_root).is_some() {
+                    info!(root = %root_hex, "V2 ManifestPush (Private): already stored (idempotent)");
+                } else if let Err(e) =
+                    stores.manifest_idx.insert_private(merkle_root, manifest_bytes)
+                {
+                    warn!(root = %root_hex, %e, "V2 ManifestPush (Private): insert_private failed");
+                    let resp = ShardResponseV2::ManifestPushAck {
+                        merkle_root,
+                        error: Some(format!("private manifest persistence failed: {e}")),
+                    };
+                    if let Err(e) = net.respond_shard_v2(channel_id, resp).await {
+                        warn!(channel_id, %e, "V2 ManifestPush (Private): failed to send ACK after persist error");
+                    }
+                    return;
+                } else {
+                    info!(
+                        root = %root_hex,
+                        bytes = len,
+                        "V2 ManifestPush (Private): stored opaque bytes"
+                    );
+                }
+            }
+            // ACK and spawn attestation. Attestation does NOT consult
+            // the manifest contents — it batches `held ∩ assignment`
+            // from the in-memory tracker and `chunk_count /
+            // assignment_height` from chain. Pass an empty stub
+            // DataManifest only because the existing helper signature
+            // takes one; the underlying `run_attestation` ignores it.
+            let resp = ShardResponseV2::ManifestPushAck {
+                merkle_root,
+                error: None,
+            };
+            if let Err(e) = net.respond_shard_v2(channel_id, resp).await {
+                warn!(channel_id, %e, "V2 ManifestPush (Private): failed to send ACK");
+                return;
+            }
+            self.spawn_attestation(merkle_root, private_manifest_stub(merkle_root));
+            return;
+        }
+
+        // Public path (existing behavior, unchanged for V1/legacy compat).
         let manifest = match validate_manifest_push(&root_hex, &manifest_bytes) {
             Ok(m) => m,
             Err(reason) => {
@@ -582,30 +740,40 @@ where
                 error: Some("ACCESS_DENIED: not in file access list".into()),
             };
         }
-        match stores.manifest_idx.get_by_merkle_root(&merkle_root) {
-            Some(manifest) => {
-                let mut buf = Vec::new();
-                match ciborium::ser::into_writer(&manifest, &mut buf) {
-                    Ok(()) => ShardResponseV2::ManifestData {
-                        merkle_root,
-                        manifest_bytes: buf,
-                        error: None,
-                    },
-                    Err(e) => ShardResponseV2::ManifestData {
-                        merkle_root,
-                        manifest_bytes: Vec::new(),
-                        error: Some(format!("manifest serialization error: {e}")),
-                    },
-                }
-            }
-            None => ShardResponseV2::ManifestData {
+        // Public first: if we have a CBOR DataManifest indexed, serve
+        // it as CBOR (existing behavior, byte-identical for V1/legacy).
+        if let Some(manifest) = stores.manifest_idx.get_by_merkle_root(&merkle_root) {
+            let mut buf = Vec::new();
+            return match ciborium::ser::into_writer(&manifest, &mut buf) {
+                Ok(()) => ShardResponseV2::ManifestData {
+                    merkle_root,
+                    manifest_bytes: buf,
+                    error: None,
+                },
+                Err(e) => ShardResponseV2::ManifestData {
+                    merkle_root,
+                    manifest_bytes: Vec::new(),
+                    error: Some(format!("manifest serialization error: {e}")),
+                },
+            };
+        }
+        // Private fallback (Phase 4b): serve the opaque encrypted
+        // bytes verbatim. Authorized recipients (already past the ACL
+        // check above) decrypt locally with `K_file`.
+        if let Some(opaque) = stores.manifest_idx.get_private_bytes(&merkle_root) {
+            return ShardResponseV2::ManifestData {
                 merkle_root,
-                manifest_bytes: Vec::new(),
-                error: Some(format!(
-                    "manifest not found for root: {}",
-                    hex::encode(merkle_root)
-                )),
-            },
+                manifest_bytes: opaque.to_vec(),
+                error: None,
+            };
+        }
+        ShardResponseV2::ManifestData {
+            merkle_root,
+            manifest_bytes: Vec::new(),
+            error: Some(format!(
+                "manifest not found for root: {}",
+                hex::encode(merkle_root)
+            )),
         }
     }
 
@@ -614,6 +782,13 @@ where
     /// immediately after sending `ManifestPushAck`. Attestation outcomes
     /// are logged at info/warn; failed batches are recoverable via
     /// `storage_getAssignmentCoverageV2` in W10/W11 resume flows.
+    ///
+    /// The `_manifest` argument is intentionally unused — attestation
+    /// reads `chunk_count` and `assignment_height` from chain via
+    /// `fetch_file_shape` and the `held` set from the in-memory tracker
+    /// updated by the V2 push handler. This keeps the Private path
+    /// (where no decoded manifest exists) source-compatible with the
+    /// Public path.
     fn spawn_attestation(&self, merkle_root: [u8; 32], _manifest: DataManifest) {
         let attestor = self.attestor.clone();
         let trigger_rpc = self.trigger_rpc.clone();
@@ -834,6 +1009,7 @@ mod tests {
             Ok(FileShape {
                 chunk_count: info.chunk_count,
                 assignment_height: info.assignment_height,
+                visibility: info.visibility,
             })
         }
         async fn fetch_snapshot(&self, height: u64) -> anyhow::Result<Vec<[u8; 20]>> {
@@ -889,6 +1065,17 @@ mod tests {
             visibility: VisibilityV2::PUBLIC,
             lifecycle: LifecycleV2::ACTIVE,
             access_list: vec![],
+        }
+    }
+
+    fn file_info_active_private(
+        root: &[u8; 32],
+        chunk_count: u32,
+        assignment_height: u64,
+    ) -> StorageFileInfoV2 {
+        StorageFileInfoV2 {
+            visibility: VisibilityV2::PRIVATE,
+            ..file_info_active(root, chunk_count, assignment_height)
         }
     }
 
@@ -1195,15 +1382,15 @@ mod tests {
         }
         let i = good.expect("need at least one chunk assigned to my_addr");
 
-        let leaf = match dispatcher
+        let validated = match dispatcher
             .validator
             .validate_push(root, i, &chunks[i as usize], &tree.proof_bytes(i))
             .await
         {
-            Ok(h) => h,
+            Ok(v) => v,
             Err(e) => panic!("validate_push failed: {e}"),
         };
-        let cid = cid_from_blake3_hash(&blake3::Hash::from(leaf));
+        let cid = cid_from_blake3_hash(&blake3::Hash::from(validated.leaf_hash));
 
         // Apply the side effects (mirror what dispatcher.handle does)
         // through the same code path by manually invoking handle_push's
@@ -1425,6 +1612,559 @@ mod tests {
             }
             other => panic!("expected ManifestData response, got {other:?}"),
         }
+    }
+
+    // ── Phase 4b: Private manifest push/pull ────────────────────────
+
+    /// `RespondNet` capture — collects every response sent by a
+    /// dispatcher so push/pull tests can assert on them without going
+    /// through libp2p. Channel IDs are kept as a Vec rather than a
+    /// HashMap because tests below send exactly one push per case.
+    #[derive(Default)]
+    struct RecorderNet {
+        responses: StdMutex<Vec<(u64, ShardResponseV2)>>,
+    }
+    impl RecorderNet {
+        fn new() -> Self {
+            Self::default()
+        }
+        fn last(&self) -> Option<(u64, ShardResponseV2)> {
+            self.responses.lock().unwrap().last().cloned()
+        }
+    }
+    #[async_trait::async_trait]
+    impl RespondNet for RecorderNet {
+        async fn respond_shard_v2(
+            &self,
+            channel_id: u64,
+            response: ShardResponseV2,
+        ) -> anyhow::Result<()> {
+            self.responses.lock().unwrap().push((channel_id, response));
+            Ok(())
+        }
+    }
+
+    /// Helper: register a Private V2 file on the mock chain at
+    /// `assignment_height = 100` so `fetch_file_shape` returns
+    /// `visibility = PRIVATE`.
+    fn register_private_file(rpc: &AllMockRpc, root: [u8; 32]) {
+        let root_hex = format!("0x{}", hex::encode(root));
+        rpc.add_file(
+            &root_hex,
+            StorageFileInfoV2 {
+                merkle_root: root_hex.clone(),
+                owner: "owner".into(),
+                plaintext_size_bytes: 0,
+                stored_size_bytes: 0,
+                chunk_count: 0,
+                fee_pool: 0,
+                created_at: 0,
+                activated_at_height: None,
+                abandoned_at_height: None,
+                assignment_height: 100,
+                visibility: sum_types::rpc_types::VisibilityV2::PRIVATE,
+                lifecycle: sum_types::rpc_types::LifecycleV2::ACTIVE,
+                access_list: vec![],
+            },
+        );
+    }
+    fn register_public_file(rpc: &AllMockRpc, root: [u8; 32]) {
+        let root_hex = format!("0x{}", hex::encode(root));
+        rpc.add_file(
+            &root_hex,
+            StorageFileInfoV2 {
+                merkle_root: root_hex.clone(),
+                owner: "owner".into(),
+                plaintext_size_bytes: 0,
+                stored_size_bytes: 0,
+                chunk_count: 0,
+                fee_pool: 0,
+                created_at: 0,
+                activated_at_height: None,
+                abandoned_at_height: None,
+                assignment_height: 100,
+                visibility: sum_types::rpc_types::VisibilityV2::PUBLIC,
+                lifecycle: sum_types::rpc_types::LifecycleV2::ACTIVE,
+                access_list: vec![],
+            },
+        );
+    }
+
+    /// Phase 4b core blocker fix: a chain-marked Private file's
+    /// ManifestPush carries opaque encrypted bytes that MUST be
+    /// stored verbatim. Receiver does not CBOR-decode and does not
+    /// recompute Merkle root — those are inapplicable for ciphertext.
+    #[tokio::test]
+    async fn private_manifest_push_with_chain_marked_private_acks_and_stores_opaque_bytes() {
+        let stores = make_stores();
+        let root = [0xC0u8; 32];
+        let opaque: Vec<u8> = (0..200u8).map(|i| i ^ 0xA5).collect(); // arbitrary "encrypted" bytes
+
+        let rpc = AllMockRpc::new();
+        register_private_file(&rpc, root);
+        let dispatcher =
+            build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
+
+        let net = RecorderNet::new();
+        dispatcher
+            .handle_manifest_push(&net, /* channel_id = */ 7, root, opaque.clone())
+            .await;
+
+        // ACK shape: success.
+        match net.last().expect("at least one response").1 {
+            ShardResponseV2::ManifestPushAck { merkle_root, error } => {
+                assert_eq!(merkle_root, root);
+                assert!(
+                    error.is_none(),
+                    "Private push must ACK without error; got {error:?}"
+                );
+            }
+            other => panic!("expected ManifestPushAck, got {other:?}"),
+        }
+
+        // Storage shape: opaque bytes only, NOT in the Public index.
+        let s = stores.read().await;
+        assert_eq!(
+            s.manifest_idx.get_private_bytes(&root),
+            Some(opaque.as_slice()),
+            "Private push must persist bytes verbatim"
+        );
+        assert!(
+            s.manifest_idx.get_by_merkle_root(&root).is_none(),
+            "Private push must NOT populate the Public CBOR index"
+        );
+    }
+
+    /// Round-trip: push opaque Private bytes, pull them back via the
+    /// V2 manifest pull handler. Bytes must come back byte-identical
+    /// — recipients downstream rely on this for `decrypt_manifest`
+    /// to succeed (any byte change trips the AEAD tag).
+    #[tokio::test]
+    async fn private_manifest_pull_returns_pushed_bytes_verbatim() {
+        let stores = make_stores();
+        let root = [0xC1u8; 32];
+        let opaque: Vec<u8> = (0..150u8).map(|i| i.wrapping_mul(7) ^ 0x33).collect();
+
+        let rpc = AllMockRpc::new();
+        register_private_file(&rpc, root);
+        let dispatcher =
+            build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
+
+        // Push.
+        let net = RecorderNet::new();
+        dispatcher
+            .handle_manifest_push(&net, 1, root, opaque.clone())
+            .await;
+        // (Sanity: ACKed clean.)
+        let (_, ack) = net.last().unwrap();
+        assert!(matches!(
+            ack,
+            ShardResponseV2::ManifestPushAck { error: None, .. }
+        ));
+
+        // Pull.
+        let resp = dispatcher
+            .build_manifest_pull_response(fake_peer(), root)
+            .await;
+        match resp {
+            ShardResponseV2::ManifestData {
+                merkle_root,
+                manifest_bytes,
+                error,
+            } => {
+                assert_eq!(merkle_root, root);
+                assert!(error.is_none(), "pull error: {error:?}");
+                assert_eq!(
+                    manifest_bytes, opaque,
+                    "Private pull MUST return the bytes byte-identical to what was pushed"
+                );
+            }
+            other => panic!("expected ManifestData, got {other:?}"),
+        }
+    }
+
+    /// The Public path is unchanged: garbage-CBOR pushes still
+    /// reject. Pinned here to catch any future regression that
+    /// accidentally widens the Public branch to accept arbitrary
+    /// bytes.
+    #[tokio::test]
+    async fn public_manifest_push_still_rejects_garbage_cbor() {
+        let stores = make_stores();
+        let root = [0xD0u8; 32];
+
+        let rpc = AllMockRpc::new();
+        register_public_file(&rpc, root);
+        let dispatcher =
+            build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
+
+        let net = RecorderNet::new();
+        dispatcher
+            .handle_manifest_push(&net, 1, root, b"this is not valid CBOR".to_vec())
+            .await;
+
+        match net.last().unwrap().1 {
+            ShardResponseV2::ManifestPushAck { error, .. } => {
+                let err = error.expect("Public push must reject garbage CBOR");
+                // The error string comes from `validate_manifest_push`;
+                // we just need it to be non-empty and not silently
+                // succeed.
+                assert!(!err.is_empty(), "Public reject must carry a reason");
+            }
+            other => panic!("expected ManifestPushAck, got {other:?}"),
+        }
+
+        // Storage is untouched.
+        let s = stores.read().await;
+        assert!(s.manifest_idx.get_by_merkle_root(&root).is_none());
+        assert!(s.manifest_idx.get_private_bytes(&root).is_none());
+    }
+
+    /// Chain probe failure (file not registered, RPC down, etc.)
+    /// refuses the push rather than guessing visibility. Defends
+    /// against a malicious peer pushing arbitrary "Private" bytes
+    /// for a root the chain has never heard of.
+    #[tokio::test]
+    async fn manifest_push_chain_probe_failure_refuses() {
+        let stores = make_stores();
+        let root = [0xE0u8; 32];
+
+        // RPC has NO file registered for this root → fetch_file_shape
+        // returns Err → handler must refuse.
+        let rpc = AllMockRpc::new();
+        let dispatcher =
+            build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
+
+        let net = RecorderNet::new();
+        dispatcher
+            .handle_manifest_push(&net, 1, root, b"any bytes".to_vec())
+            .await;
+
+        match net.last().unwrap().1 {
+            ShardResponseV2::ManifestPushAck { error, .. } => {
+                let err = error.expect("chain probe failure must surface as ACK error");
+                assert!(
+                    err.contains("chain probe failed") || err.contains("unknown root"),
+                    "expected chain-probe error, got: {err}"
+                );
+            }
+            other => panic!("expected ManifestPushAck, got {other:?}"),
+        }
+        // Storage not touched in either flavor.
+        let s = stores.read().await;
+        assert!(s.manifest_idx.get_by_merkle_root(&root).is_none());
+        assert!(s.manifest_idx.get_private_bytes(&root).is_none());
+    }
+
+    /// End-to-end: encrypt a manifest under K_file (the same way Phase
+    /// 4a `encrypt_for_private` does), push it as a Private file, pull
+    /// it back, decrypt with the same K_file, and verify the
+    /// recovered DataManifest matches what we encrypted. This is the
+    /// reviewer's load-bearing case — it's the path a real Private
+    /// download will take end-to-end (push → serve → fetch → decrypt).
+    #[tokio::test]
+    async fn private_manifest_round_trip_encrypts_pushes_pulls_decrypts() {
+        use sum_crypto::{decrypt_manifest, encrypt_manifest};
+
+        let stores = make_stores();
+        // Construct a one-chunk plaintext manifest, encrypt under K_file,
+        // and put both the encrypted blob and the chain row in place.
+        let plaintext_manifest = DataManifest {
+            file_name: "round-trip.bin".into(),
+            file_hash: [0xAA; 32],
+            total_size_bytes: 42,
+            chunk_count: 1,
+            merkle_root: [0xC2u8; 32],
+            chunks: vec![sum_types::storage::ChunkDescriptor {
+                chunk_index: 0,
+                offset: 0,
+                size: 64,
+                blake3_hash: [0xBB; 32],
+                cid: "bafk_test".into(),
+                plaintext_blake3_hash: Some([0xCC; 32]),
+            }],
+        };
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(&plaintext_manifest, &mut cbor).unwrap();
+        let k_file = [0x42u8; 32];
+        let encrypted = encrypt_manifest(&k_file, &cbor);
+
+        let rpc = AllMockRpc::new();
+        register_private_file(&rpc, plaintext_manifest.merkle_root);
+        let dispatcher =
+            build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
+
+        // Push encrypted bytes.
+        let net = RecorderNet::new();
+        dispatcher
+            .handle_manifest_push(&net, 1, plaintext_manifest.merkle_root, encrypted.clone())
+            .await;
+        assert!(matches!(
+            net.last().unwrap().1,
+            ShardResponseV2::ManifestPushAck { error: None, .. }
+        ));
+
+        // Pull encrypted bytes back.
+        let resp = dispatcher
+            .build_manifest_pull_response(fake_peer(), plaintext_manifest.merkle_root)
+            .await;
+        let pulled_bytes = match resp {
+            ShardResponseV2::ManifestData { manifest_bytes, error: None, .. } => manifest_bytes,
+            other => panic!("expected ManifestData, got {other:?}"),
+        };
+        assert_eq!(
+            pulled_bytes, encrypted,
+            "round-trip MUST preserve the encrypted bytes exactly"
+        );
+
+        // Decrypt + parse — proves the integration covers a real
+        // Phase 4b download flow end-to-end.
+        let decrypted_cbor = decrypt_manifest(&k_file, &pulled_bytes)
+            .expect("decrypt under same K_file");
+        let recovered: DataManifest =
+            ciborium::de::from_reader(&decrypted_cbor[..]).expect("CBOR parse");
+        assert_eq!(recovered.merkle_root, plaintext_manifest.merkle_root);
+        assert_eq!(recovered.chunk_count, 1);
+        assert_eq!(
+            recovered.chunks[0].plaintext_blake3_hash,
+            Some([0xCC; 32])
+        );
+    }
+
+    /// Phase 4b chain-of-failure fix: an accepted V2 Push for a
+    /// chain-marked Private file MUST record the chunk's
+    /// ciphertext-CID → merkle-root mapping in `ManifestIndex` so the
+    /// serving-side ACL gate can resolve a later chunk-pull request.
+    /// Without this mapping, authorized recipients who hold a valid
+    /// access entry get denied at the ACL gate ("unknown CID")
+    /// because the encrypted manifest never populates `cid_to_root`.
+    #[tokio::test]
+    async fn private_v2_push_records_cid_to_root_for_acl_resolution() {
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let assignment_height = 700u64;
+        let (manifest, chunks, tree) = make_manifest(8, 0x4B);
+        let root = manifest.merkle_root;
+
+        let rpc = AllMockRpc::new();
+        // Mark the file PRIVATE on chain — `probe_visibility` returns Private.
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            file_info_active_private(&root, manifest.chunk_count, assignment_height),
+        );
+        rpc.add_snapshot(
+            assignment_height,
+            snapshot.iter().map(node_record).collect(),
+            snapshot.clone(),
+        );
+        rpc.set_nonce(&l1_address_base58(&my_addr), 1);
+
+        let stores = make_stores();
+        let dispatcher = build_dispatcher(rpc, snapshot.clone(), my_addr, stores.clone());
+
+        // Pick a chunk this node is V2-assigned to.
+        let r = crate::push_validator::V2Params::DEFAULTS.assignment_replication_factor;
+        let i = (0..manifest.chunk_count)
+            .find(|&i| {
+                sum_store::assignment_v2::assigned_archives(&root, &snapshot, i, r)
+                    .contains(&my_addr)
+            })
+            .expect("at least one assigned chunk");
+
+        // Drive the actual handle_push code path (not a manual side-effect copy)
+        // so the new probe-then-record logic gets exercised.
+        let net = RecorderNet::new();
+        dispatcher
+            .handle_push(
+                &net,
+                fake_peer(),
+                /* channel_id = */ 9,
+                chunks[i as usize].clone(),
+                root,
+                i,
+                tree.proof_bytes(i),
+            )
+            .await;
+
+        // ACK was successful (no error).
+        match net.last().unwrap().1 {
+            ShardResponseV2::PushAck { error, .. } => {
+                assert!(error.is_none(), "Private V2 Push must ACK clean: {error:?}");
+            }
+            other => panic!("expected PushAck, got {other:?}"),
+        }
+
+        // Reverse-resolve the ciphertext CID → merkle root.
+        // ACL would call `merkle_root_for_cid` on the chunk-pull
+        // request; without the Phase 4b fix this returns `None` and
+        // ACL denies the pull.
+        let leaf = *blake3::hash(&chunks[i as usize]).as_bytes();
+        let cid = cid_from_blake3_hash(&blake3::Hash::from(leaf));
+        let s = stores.read().await;
+        assert_eq!(
+            s.manifest_idx.merkle_root_for_cid(&cid),
+            Some(&root),
+            "Private V2 Push MUST record cid->root so ACL can resolve later"
+        );
+        // Also: the Public CBOR-derived index stays untouched (Private
+        // doesn't have a decoded manifest to populate it from).
+        assert!(
+            s.manifest_idx.get_by_merkle_root(&root).is_none(),
+            "Private push must NOT populate the Public CBOR index"
+        );
+    }
+
+    /// Reviewer-required Phase 4b strictness: when a Private V2 Push
+    /// stores the chunk on disk but the cid->root mapping write fails
+    /// (e.g. a pre-existing rebind conflict, sidecar disk error), the
+    /// dispatcher MUST return a `PushAck { error: Some(...) }`, NOT a
+    /// silent success. A success ACK with no mapping leaves the chunk
+    /// un-servable through ACL — authorized recipients would be
+    /// denied at the ACL gate forever after.
+    ///
+    /// We provoke the failure deterministically by pre-recording the
+    /// chunk's expected CID against a different merkle root, which
+    /// `record_private_chunk_cid` rejects with a rebind error.
+    #[tokio::test]
+    async fn private_v2_push_returns_error_when_cid_mapping_fails() {
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let assignment_height = 850u64;
+        let (manifest, chunks, tree) = make_manifest(8, 0x4D);
+        let root = manifest.merkle_root;
+
+        let rpc = AllMockRpc::new();
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            file_info_active_private(&root, manifest.chunk_count, assignment_height),
+        );
+        rpc.add_snapshot(
+            assignment_height,
+            snapshot.iter().map(node_record).collect(),
+            snapshot.clone(),
+        );
+        rpc.set_nonce(&l1_address_base58(&my_addr), 1);
+
+        let stores = make_stores();
+        let dispatcher = build_dispatcher(rpc, snapshot.clone(), my_addr, stores.clone());
+
+        let r = crate::push_validator::V2Params::DEFAULTS.assignment_replication_factor;
+        let i = (0..manifest.chunk_count)
+            .find(|&i| {
+                sum_store::assignment_v2::assigned_archives(&root, &snapshot, i, r)
+                    .contains(&my_addr)
+            })
+            .expect("at least one assigned chunk");
+
+        // Compute the chunk's CID up front and pre-record it under a
+        // *different* root, which will make the dispatcher's
+        // `record_private_chunk_cid` call fail with a rebind error.
+        let leaf = *blake3::hash(&chunks[i as usize]).as_bytes();
+        let cid = cid_from_blake3_hash(&blake3::Hash::from(leaf));
+        {
+            let mut s = stores.write().await;
+            s.manifest_idx
+                .record_private_chunk_cid([0xFFu8; 32], &cid)
+                .expect("seed conflict");
+        }
+
+        let net = RecorderNet::new();
+        dispatcher
+            .handle_push(
+                &net,
+                fake_peer(),
+                /* channel_id = */ 11,
+                chunks[i as usize].clone(),
+                root,
+                i,
+                tree.proof_bytes(i),
+            )
+            .await;
+
+        match net.last().unwrap().1 {
+            ShardResponseV2::PushAck { error, .. } => {
+                let err = error.expect(
+                    "Private push MUST return ACK error when cid->root mapping fails",
+                );
+                assert!(
+                    err.contains("private chunk mapping persistence failed"),
+                    "expected mapping-failure error, got: {err}"
+                );
+            }
+            other => panic!("expected PushAck, got {other:?}"),
+        }
+
+        // Held tracker must NOT be updated when we return ACK error
+        // — held is observed by attestation, and a chunk we ACK'd as
+        // failed must not get attested.
+        assert!(
+            dispatcher.held_for(&root).is_empty(),
+            "held set must stay empty when push ACK is an error"
+        );
+    }
+
+    /// Public V2 Push doesn't touch the Private cid index — it relies
+    /// on the manifest's CBOR-decoded chunk list to populate
+    /// `cid_to_root`. Pin that the Phase 4b change didn't accidentally
+    /// double-write.
+    #[tokio::test]
+    async fn public_v2_push_does_not_touch_private_cid_index() {
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let assignment_height = 800u64;
+        let (manifest, chunks, tree) = make_manifest(8, 0x4C);
+        let root = manifest.merkle_root;
+
+        let rpc = AllMockRpc::new();
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            // Public — file_info_active sets visibility=PUBLIC.
+            file_info_active(&root, manifest.chunk_count, assignment_height),
+        );
+        rpc.add_snapshot(
+            assignment_height,
+            snapshot.iter().map(node_record).collect(),
+            snapshot.clone(),
+        );
+        rpc.set_nonce(&l1_address_base58(&my_addr), 1);
+
+        let stores = make_stores();
+        let dispatcher = build_dispatcher(rpc, snapshot.clone(), my_addr, stores.clone());
+
+        let r = crate::push_validator::V2Params::DEFAULTS.assignment_replication_factor;
+        let i = (0..manifest.chunk_count)
+            .find(|&i| {
+                sum_store::assignment_v2::assigned_archives(&root, &snapshot, i, r)
+                    .contains(&my_addr)
+            })
+            .expect("at least one assigned chunk");
+
+        let net = RecorderNet::new();
+        dispatcher
+            .handle_push(
+                &net,
+                fake_peer(),
+                1,
+                chunks[i as usize].clone(),
+                root,
+                i,
+                tree.proof_bytes(i),
+            )
+            .await;
+
+        // The Public path does NOT call record_private_chunk_cid.
+        // Reload the index from disk to confirm no `<root>.private_chunks`
+        // sidecar got written.
+        let path = stores
+            .read()
+            .await
+            .config
+            .store_dir
+            .join("manifests")
+            .join(format!("{}.private_chunks", hex::encode(root)));
+        assert!(
+            !path.exists(),
+            "Public push must NOT write a private_chunks sidecar (would inflate disk + confuse ACL routing)"
+        );
     }
 
     /// Reviewer-required: ACL-allowed V2 ManifestPull serves CBOR.

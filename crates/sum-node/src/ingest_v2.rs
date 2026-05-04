@@ -590,6 +590,7 @@ fn encrypt_for_private(
     use rand_core::{OsRng, RngCore};
     use std::io::Write;
     use sum_crypto::{encrypt_chunk, encrypt_manifest, wrap_for_recipient};
+    use zeroize::Zeroizing;
 
     let in_file = std::fs::File::open(path)
         .map_err(|e| anyhow::anyhow!("private ingest: open {path:?} failed: {e}"))?;
@@ -608,9 +609,14 @@ fn encrypt_for_private(
             .map_err(|e| anyhow::anyhow!("private ingest: mmap {path:?} failed: {e}"))?
     };
 
-    // Fresh K_file (locked decision #5: random via OsRng).
-    let mut k_file = [0u8; 32];
-    OsRng.fill_bytes(&mut k_file);
+    // Fresh K_file (locked decision #5: random via OsRng). Held in
+    // `Zeroizing<[u8; 32]>` so the key bytes are zeroed when this
+    // binding goes out of scope (whether via normal return, `?`, or
+    // panic). Key-lifetime hygiene only — the ciphertext written to
+    // `ciphertext_temp` below is intentionally on disk and is governed
+    // by the tempfile's own drop, not by K_file's.
+    let mut k_file: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut *k_file);
 
     // Plaintext whole-file hash (recipient verifies after assembly).
     let file_hash = *blake3::hash(&plaintext_mmap).as_bytes();
@@ -708,12 +714,9 @@ fn encrypt_for_private(
         });
     }
 
-    // K_file is no longer needed in scope. Best-effort scrub: overwrite
-    // the on-stack copy. (Future hardening: a `Zeroizing<[u8; 32]>`
-    // wrapper would handle this on drop automatically.)
-    for b in k_file.iter_mut() {
-        *b = 0;
-    }
+    // `k_file` is no longer needed; it goes out of scope at the end of
+    // this function and `Zeroizing<[u8; 32]>` wipes the bytes on drop.
+    // No manual scrub loop needed.
 
     let ciphertext_mmap = unsafe {
         memmap2::Mmap::map(ciphertext_temp.as_file())

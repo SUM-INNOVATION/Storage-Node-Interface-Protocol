@@ -191,51 +191,70 @@ async fn handle_manifest_request(
         }
     };
 
-    // Look up manifest
-    let Some(manifest_data) = manifest_idx.get_by_merkle_root(&root_bytes) else {
+    // Public lookup: serve as CBOR (V1/legacy behavior, byte-identical).
+    if let Some(manifest_data) = manifest_idx.get_by_merkle_root(&root_bytes) {
+        let mut cbor_buf = Vec::new();
+        if let Err(e) = ciborium::ser::into_writer(manifest_data, &mut cbor_buf) {
+            let resp = ShardResponse {
+                cid: request.cid.clone(),
+                offset: 0,
+                total_bytes: 0,
+                data: Vec::new(),
+                error: Some(format!("manifest serialization error: {e}")),
+            };
+            let _ = net.respond_shard(channel_id, resp).await;
+            return;
+        }
+        info!(
+            root = root_hex,
+            bytes = cbor_buf.len(),
+            channel_id,
+            "serving Public manifest (CBOR)"
+        );
         let resp = ShardResponse {
             cid: request.cid.clone(),
             offset: 0,
-            total_bytes: 0,
-            data: Vec::new(),
-            error: Some(format!("manifest not found for root: {root_hex}")),
+            total_bytes: cbor_buf.len() as u64,
+            data: cbor_buf,
+            error: None,
         };
-        let _ = net.respond_shard(channel_id, resp).await;
-        return;
-    };
-
-    // CBOR-serialize the manifest
-    let mut cbor_buf = Vec::new();
-    if let Err(e) = ciborium::ser::into_writer(manifest_data, &mut cbor_buf) {
-        let resp = ShardResponse {
-            cid: request.cid.clone(),
-            offset: 0,
-            total_bytes: 0,
-            data: Vec::new(),
-            error: Some(format!("manifest serialization error: {e}")),
-        };
-        let _ = net.respond_shard(channel_id, resp).await;
+        if let Err(e) = net.respond_shard(channel_id, resp).await {
+            warn!(root = root_hex, %e, "failed to send manifest response");
+        }
         return;
     }
 
-    info!(
-        root = root_hex,
-        bytes = cbor_buf.len(),
-        channel_id,
-        "serving manifest"
-    );
+    // Private fallback (Phase 4b): serve the opaque encrypted bytes
+    // verbatim. Authorized recipients decrypt locally with `K_file`.
+    if let Some(opaque) = manifest_idx.get_private_bytes(&root_bytes) {
+        info!(
+            root = root_hex,
+            bytes = opaque.len(),
+            channel_id,
+            "serving Private manifest (opaque)"
+        );
+        let resp = ShardResponse {
+            cid: request.cid.clone(),
+            offset: 0,
+            total_bytes: opaque.len() as u64,
+            data: opaque.to_vec(),
+            error: None,
+        };
+        if let Err(e) = net.respond_shard(channel_id, resp).await {
+            warn!(root = root_hex, %e, "failed to send Private manifest response");
+        }
+        return;
+    }
 
+    // Not found in either store.
     let resp = ShardResponse {
         cid: request.cid.clone(),
         offset: 0,
-        total_bytes: cbor_buf.len() as u64,
-        data: cbor_buf,
-        error: None,
+        total_bytes: 0,
+        data: Vec::new(),
+        error: Some(format!("manifest not found for root: {root_hex}")),
     };
-
-    if let Err(e) = net.respond_shard(channel_id, resp).await {
-        warn!(root = root_hex, %e, "failed to send manifest response");
-    }
+    let _ = net.respond_shard(channel_id, resp).await;
 }
 
 /// Handle a push (store) request: verify CID, write to disk, ACK.
