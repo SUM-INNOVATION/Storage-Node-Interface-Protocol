@@ -1,5 +1,6 @@
 //! Shared library modules for the sum-node binary and e2e-helper.
 
+pub mod access;
 pub mod acl;
 pub mod assignment_attestor;
 pub mod download;

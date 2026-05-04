@@ -252,6 +252,50 @@ enum Command {
     /// for finality. Re-runs are idempotent (chain overwrites the slot).
     RegisterEncryptionKey,
 
+    /// Phase 4c — share a Private V2 file with a new recipient.
+    /// Owner-only: recovers `K_file` locally from the owner's own
+    /// access bundle on chain, wraps it for the new recipient's
+    /// registered X25519 key, and submits `AddAccessV2`. The chain
+    /// never sees `K_file`.
+    Share {
+        /// Hex-encoded 32-byte merkle root of the file.
+        merkle_root: String,
+        /// Recipient: `<base58 L1 addr>` or `<addr>:<expires_at_height>`
+        /// or `<addr>:none`. The recipient's X25519 pubkey is fetched
+        /// from chain via `account_getEncryptionPublicKey`; missing
+        /// keys cause `share` to abort BEFORE submitting any tx.
+        #[arg(long)]
+        recipient: String,
+    },
+
+    /// Phase 4c — revoke a recipient's access to a Private V2 file.
+    /// Owner-only. Removes the chain-side access entry. Does NOT
+    /// rotate `K_file`: the revoked recipient still holds their old
+    /// bundle locally but chain ACL denies them on the next pull.
+    /// For forward secrecy, revoke + re-ingest under a fresh key.
+    Revoke {
+        /// Hex-encoded 32-byte merkle root of the file.
+        merkle_root: String,
+        /// Address to revoke. The expiry segment (if any) is ignored
+        /// for revoke.
+        #[arg(long)]
+        recipient: String,
+    },
+
+    /// Phase 4c — update a recipient's expiry on a Private V2 file.
+    /// Owner-only. Preserves the existing encrypted_key_bundle
+    /// byte-for-byte; only the entry's `expires_at` changes.
+    /// REQUIRES an explicit expiry directive: `<addr>:<height>` to
+    /// set, `<addr>:none` to clear. A bare `<addr>` is rejected as
+    /// no-op so the operator's intent is unambiguous.
+    UpdateAccess {
+        /// Hex-encoded 32-byte merkle root of the file.
+        merkle_root: String,
+        /// Recipient + explicit expiry directive (`:<height>` or `:none`).
+        #[arg(long)]
+        recipient: String,
+    },
+
     /// Discover a peer on the LAN, publish a test message, then exit.
     Send {
         /// UTF-8 message to broadcast on `sum/test/v1`.
@@ -425,6 +469,57 @@ async fn main() -> Result<()> {
                 cli.rpc_url.clone(),
                 cli.chain_id,
                 cli.attest_fee,
+            )
+            .await
+        }
+        Command::Share { merkle_root, recipient } => {
+            let seed = seed.ok_or_else(|| {
+                anyhow::anyhow!("share requires --key-file (owner key recovers K_file locally)")
+            })?;
+            let parsed_root = parse_merkle_root_hex(&merkle_root)?;
+            let recipient_spec = sum_node::access::parse_recipient_spec(&recipient)?;
+            sum_node::access::run_share(
+                keypair,
+                seed,
+                cli.rpc_url.clone(),
+                cli.chain_id,
+                cli.attest_fee,
+                parsed_root,
+                recipient_spec,
+            )
+            .await
+        }
+        Command::Revoke { merkle_root, recipient } => {
+            let seed = seed.ok_or_else(|| {
+                anyhow::anyhow!("revoke requires --key-file (RemoveAccessV2 needs a signing key)")
+            })?;
+            let parsed_root = parse_merkle_root_hex(&merkle_root)?;
+            let target = sum_node::access::parse_recipient_spec(&recipient)?;
+            sum_node::access::run_revoke(
+                keypair,
+                seed,
+                cli.rpc_url.clone(),
+                cli.chain_id,
+                cli.attest_fee,
+                parsed_root,
+                target,
+            )
+            .await
+        }
+        Command::UpdateAccess { merkle_root, recipient } => {
+            let seed = seed.ok_or_else(|| {
+                anyhow::anyhow!("update-access requires --key-file (UpdateAccessV2 needs a signing key)")
+            })?;
+            let parsed_root = parse_merkle_root_hex(&merkle_root)?;
+            let target = sum_node::access::parse_recipient_spec(&recipient)?;
+            sum_node::access::run_update_access(
+                keypair,
+                seed,
+                cli.rpc_url.clone(),
+                cli.chain_id,
+                cli.attest_fee,
+                parsed_root,
+                target,
             )
             .await
         }
