@@ -65,8 +65,8 @@ pub struct NodeRecordInfo {
 // actual JSON-RPC wire goes through `serde_json` so we choose
 // representations that round-trip cleanly: `LifecycleV2` and
 // `VisibilityV2` are `#[serde(transparent)]` newtypes over `u8`,
-// `TxStatusV2` is an internally-tagged enum keyed on `"status"` with
-// lowercase variant names.
+// `TxStatusV2` is an internally-tagged enum keyed on `"kind"` with
+// snake_case variant names — chain-confirmed wire shape.
 
 /// File lifecycle state on chain. Wire format: a plain `u8`.
 ///
@@ -174,18 +174,32 @@ pub struct BlockHeightInfo {
     pub finality: String,
 }
 
-/// Response from `chain_getChainParams` (shipped by the chain team in
-/// Phase 2 — see SNIP-V2-RPC-CHEATSHEET §"chain_getChainParams" and
-/// the chain repo `crates/rpc/src/types.rs::ChainParamsInfo`).
+/// Response from `chain_getChainParams` (chain-confirmed wire shape).
 ///
 /// Flat JSON shape (no nested `staking`/`messaging`/`docclass`
-/// sub-objects). Six SNIP V2 params are populated alongside the
-/// consensus values; W10 uses these to populate `IngestParams` so we
-/// don't bake defaults into the V2 ingest pipeline.
+/// sub-objects). Models the fields SNIP actively consumes — the chain
+/// emits additional consensus / fee / metadata-cap fields that SNIP
+/// doesn't need (`max_block_bytes`, `max_txs_per_block`,
+/// `storage_fee_per_byte`, `max_metadata_bytes`, `max_access_list_bytes`,
+/// `abandonment_fee_percent`); serde silently ignores those, keeping
+/// the struct minimal.
 ///
-/// **Always read this once at startup** — chain plan v3.2 treats
-/// these as protocol constants per chain genesis, not per-block
-/// values. A change here would be a hard fork.
+/// **Removed in this revision**: `max_assigned_count_chunk_count`. The
+/// chain does NOT emit this field; the per-archive count cap is
+/// detected at runtime via `assigned_count: None` in
+/// `AssignmentCoverageV2`. Earlier SNIP revisions made it required,
+/// which silently broke `chain_getChainParams` deserialization.
+///
+/// **Added in this revision**: `v2_enabled_from_height`. SNIP must
+/// gate every V2 lifecycle tx (RegisterFilePendingV2,
+/// AcceptAssignmentV2, ActivateFileV2, AbandonFileV2,
+/// RegisterEncryptionKey) on `current_block_height >=
+/// v2_enabled_from_height` to avoid burning fees against a chain that
+/// hasn't activated V2 yet.
+///
+/// **Always read this once at startup** — chain treats these as
+/// protocol constants per chain genesis, not per-block values. A
+/// change would be a hard fork.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainParamsInfo {
     /// Chain identifier (mainnet / testnet / local-mirror = 31337).
@@ -214,18 +228,32 @@ pub struct ChainParamsInfo {
     /// **Not** a pre-activation coverage timeout; W10 uses a wall-clock
     /// `activation_wait_secs` for that.
     pub activation_grace_blocks: u64,
-    /// Cap on per-archive `assigned_count` work performed by chain when
-    /// answering `storage_getAssignmentCoverageV2`. Above this, chain
-    /// returns `null` and clients recompute via `chunks_for_archive_v2`.
-    /// Default = 16,384.
-    pub max_assigned_count_chunk_count: u32,
+    /// Block height at which the V2 storage lifecycle becomes valid.
+    /// Tx submission for V2 ops MUST verify
+    /// `Some(h)` where `current_height >= h`, or the tx will be
+    /// rejected and fees burned.
+    ///
+    /// `Option<u64>` so all three chain-emission shapes deserialize:
+    ///   - field missing → `None` via `#[serde(default)]`
+    ///   - explicit `null` → `None`
+    ///   - explicit `u64` → `Some(n)`
+    ///
+    /// Semantically, `None` means "no activation height set on chain"
+    /// (chain hasn't planned a V2 cutover, or is too old to know about
+    /// V2 at all). SNIP must NOT treat `None` as "enabled from
+    /// genesis" — a sane gate refuses V2 tx submission until the
+    /// chain advertises a concrete number.
+    #[serde(default)]
+    pub v2_enabled_from_height: Option<u64>,
 }
 
-/// Response from `chain_getTransactionStatus` (chain plan §4).
+/// Response from `chain_getTransactionStatus` (chain plan §4,
+/// chain-confirmed wire shape).
 ///
-/// **Wire shape**: internally-tagged JSON with `"status"` key and
-/// lowercase variant names — `{"status": "pending"}`,
-/// `{"status": "included", "block_height": 123}`, etc.
+/// **Wire shape**: internally-tagged JSON with `"kind"` key and
+/// snake_case variant names — `{"kind": "pending"}`,
+/// `{"kind": "included", "block_height": 123}`,
+/// `{"kind": "failed", "block_height": null, "reason": "..."}`, etc.
 ///
 /// Semantics for the SNIP tx finality waiter (W9):
 /// * `Unknown` — keep polling; not fatal during the wait window.
@@ -238,8 +266,15 @@ pub struct ChainParamsInfo {
 /// * `Dropped` — terminal for THIS tx hash, but resubmitting the same
 ///   logical operation (with a new nonce) is safe since the tx never
 ///   touched chain state.
+/// Wire shape: chain emits `{"kind": "<variant>", ...payload-fields}`
+/// with `kind` lower_snake_case. Example:
+///   `{"kind": "finalized", "block_height": 123}`
+///   `{"kind": "failed", "block_height": null, "reason": "fee_too_low"}`
+///   `{"kind": "pending"}`
+/// Earlier SNIP code keyed this on `"status"` — that drops every
+/// real-chain status response on the floor as a deserialization error.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "status", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TxStatusV2 {
     Unknown,
     Pending,
@@ -258,24 +293,23 @@ pub enum TxStatusV2 {
 /// bitmap row; the raw bitmap bytes are NEVER serialized in the RPC
 /// response (chain plan §4 line 474).
 ///
-/// `assigned_count` is `Option<u32>` (JSON nullable) by chain plan
-/// v3.2 design. The chain caps per-archive assignment-count work at
-/// `MAX_ASSIGNED_COUNT_CHUNK_COUNT = 16_384` chunks; above that cap
-/// every entry's `assigned_count` arrives as `null` and the SNIP
-/// client MUST recompute counts locally via
-/// `sum_store::assignment_v2::chunks_for_archive_v2` (which is
-/// bit-identical to chain validation per Appendix C). Without the
-/// cap, an attacker could DoS the RPC by registering a file at the
-/// per-file maximum of 1,048,576 chunks. Coverage fields
-/// (`covered_count`, `missing_indices`, `can_activate_now`) are
-/// always populated regardless.
+/// `assigned_count` is `Option<u32>` (JSON nullable) by chain design.
+/// The chain caps per-archive assignment-count work at an internal
+/// threshold (currently 16,384 chunks) and elides the count for files
+/// above that cap; the SNIP client treats `None` as "recompute
+/// locally" via `sum_store::assignment_v2::chunks_for_archive_v2`
+/// (which is bit-identical to chain validation per Appendix C). The
+/// cap value itself is **not** exposed via `chain_getChainParams` — do
+/// not try to read it. Coverage fields (`covered_count`,
+/// `missing_indices`, `can_activate_now`) are always populated
+/// regardless.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchiveCoverageSummaryV2 {
     /// L1 address in base58.
     pub archive: String,
     /// Number of chunks the deterministic V2 assignment puts on this
     /// archive. `None` when chain elides the count for files above
-    /// `MAX_ASSIGNED_COUNT_CHUNK_COUNT = 16_384`.
+    /// the chain's internal per-archive count cap (currently 16,384).
     pub assigned_count: Option<u32>,
     /// Number of chunks this archive has attested via `AcceptAssignmentV2`.
     pub attested_count: u32,
@@ -542,33 +576,34 @@ mod tests {
 
     #[test]
     fn tx_status_v2_all_variants_round_trip() {
-        // Internally-tagged with "status" key, lowercase variant names.
+        // Wire shape (chain-confirmed): internally-tagged on `kind`,
+        // snake_case variant names.
         let cases = [
-            (r#"{"status": "unknown"}"#, TxStatusV2::Unknown),
-            (r#"{"status": "pending"}"#, TxStatusV2::Pending),
+            (r#"{"kind": "unknown"}"#, TxStatusV2::Unknown),
+            (r#"{"kind": "pending"}"#, TxStatusV2::Pending),
             (
-                r#"{"status": "included", "block_height": 100}"#,
+                r#"{"kind": "included", "block_height": 100}"#,
                 TxStatusV2::Included { block_height: 100 },
             ),
             (
-                r#"{"status": "finalized", "block_height": 200}"#,
+                r#"{"kind": "finalized", "block_height": 200}"#,
                 TxStatusV2::Finalized { block_height: 200 },
             ),
             (
-                r#"{"status": "failed", "block_height": null, "reason": "low-order x25519 public key rejected"}"#,
+                r#"{"kind": "failed", "block_height": null, "reason": "low-order x25519 public key rejected"}"#,
                 TxStatusV2::Failed {
                     block_height: None,
                     reason: "low-order x25519 public key rejected".into(),
                 },
             ),
             (
-                r#"{"status": "failed", "block_height": 300, "reason": "insufficient balance"}"#,
+                r#"{"kind": "failed", "block_height": 300, "reason": "insufficient balance"}"#,
                 TxStatusV2::Failed {
                     block_height: Some(300),
                     reason: "insufficient balance".into(),
                 },
             ),
-            (r#"{"status": "dropped"}"#, TxStatusV2::Dropped),
+            (r#"{"kind": "dropped"}"#, TxStatusV2::Dropped),
         ];
         for (json, expected) in cases {
             let actual: TxStatusV2 = serde_json::from_str(json).unwrap();
@@ -577,6 +612,74 @@ mod tests {
             let reserialized = serde_json::to_string(&actual).unwrap();
             let reparsed: TxStatusV2 = serde_json::from_str(&reserialized).unwrap();
             assert_eq!(reparsed, expected, "re-parse round-trip mismatch on `{json}`");
+        }
+    }
+
+    /// Pin the *exact* tag key. If anyone "fixes" the discriminant back
+    /// to `"status"` later, this test fires loudly instead of letting a
+    /// silent on-chain regression slip through. Reads each variant via
+    /// the canonical wire shape and asserts the deserialized value is
+    /// the *correct* enum case (not the default Unknown via fallback).
+    #[test]
+    fn tx_status_v2_tag_key_is_kind_not_status() {
+        // The chain emits `kind`. If we keyed on `status` here, every
+        // real chain response would land as a parse error.
+        let json_kind = r#"{"kind": "finalized", "block_height": 7}"#;
+        let parsed: TxStatusV2 = serde_json::from_str(json_kind).unwrap();
+        assert!(matches!(parsed, TxStatusV2::Finalized { block_height: 7 }));
+
+        // The legacy/wrong key MUST fail to deserialize. If it ever
+        // succeeds again, this test catches the silent regression.
+        let json_status = r#"{"status": "finalized", "block_height": 7}"#;
+        let bad: Result<TxStatusV2, _> = serde_json::from_str(json_status);
+        assert!(
+            bad.is_err(),
+            "deserializing on the legacy `status` key must fail; got {bad:?}"
+        );
+    }
+
+    /// Per-variant contract assertions — exhaustively cover the six
+    /// kinds the chain emits, each with its expected payload shape.
+    /// Any one of these failing means the chain's response shape and
+    /// SNIP's expectation have drifted.
+    #[test]
+    fn tx_status_v2_per_variant_contract() {
+        // pending — tag-only.
+        match serde_json::from_str::<TxStatusV2>(r#"{"kind":"pending"}"#).unwrap() {
+            TxStatusV2::Pending => (),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+        // included — block_height required.
+        match serde_json::from_str::<TxStatusV2>(r#"{"kind":"included","block_height":42}"#).unwrap() {
+            TxStatusV2::Included { block_height } => assert_eq!(block_height, 42),
+            other => panic!("expected Included, got {other:?}"),
+        }
+        // finalized — block_height required.
+        match serde_json::from_str::<TxStatusV2>(r#"{"kind":"finalized","block_height":99}"#).unwrap() {
+            TxStatusV2::Finalized { block_height } => assert_eq!(block_height, 99),
+            other => panic!("expected Finalized, got {other:?}"),
+        }
+        // failed — block_height nullable, reason required.
+        match serde_json::from_str::<TxStatusV2>(
+            r#"{"kind":"failed","block_height":null,"reason":"x"}"#,
+        )
+        .unwrap()
+        {
+            TxStatusV2::Failed { block_height, reason } => {
+                assert!(block_height.is_none());
+                assert_eq!(reason, "x");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // dropped — tag-only.
+        match serde_json::from_str::<TxStatusV2>(r#"{"kind":"dropped"}"#).unwrap() {
+            TxStatusV2::Dropped => (),
+            other => panic!("expected Dropped, got {other:?}"),
+        }
+        // unknown — tag-only.
+        match serde_json::from_str::<TxStatusV2>(r#"{"kind":"unknown"}"#).unwrap() {
+            TxStatusV2::Unknown => (),
+            other => panic!("expected Unknown, got {other:?}"),
         }
     }
 
@@ -616,7 +719,7 @@ mod tests {
     }
 
     /// Chain plan v3.2 caps per-archive assignment work at
-    /// `MAX_ASSIGNED_COUNT_CHUNK_COUNT = 16_384`. For files above that
+    /// the chain's internal per-archive count cap (currently 16,384). For files above that
     /// cap, every entry's `assigned_count` arrives as JSON `null` and
     /// the client must recompute locally. Pin that the `null` shape
     /// deserializes to `None` rather than tripping a parse error.
@@ -669,5 +772,135 @@ mod tests {
         let cov: AssignmentCoverageV2 = serde_json::from_str(json).unwrap();
         assert!(cov.can_activate_now);
         assert_eq!(cov.missing_total, 0);
+    }
+
+    // ── chain_getChainParams wire-shape contract ────────────────────────
+    //
+    // These tests pin the wire shape SNIP commits to deserialize. They
+    // intentionally use the EXACT field set the chain currently emits
+    // (including the consensus / fee / metadata-cap fields SNIP doesn't
+    // model, like `max_block_bytes`, `storage_fee_per_byte`, etc.) so
+    // a future chain rev that drops or renames a field is caught HERE,
+    // not at runtime when an operator's node fails to start.
+
+    /// Full chain wire shape with every field present and numeric.
+    /// `v2_enabled_from_height = 12_345` means V2 is on for finalized
+    /// heights at and after block 12,345. Extra chain fields SNIP
+    /// doesn't model (max_block_bytes, storage_fee_per_byte, etc.)
+    /// must deserialize without error — serde silently drops unknown
+    /// fields with the default config we use.
+    #[test]
+    fn chain_params_full_chain_shape_round_trips() {
+        let json = r#"{
+            "chain_id": 31337,
+            "block_time_ms": 2000,
+            "max_block_bytes": 8388608,
+            "max_txs_per_block": 1024,
+            "min_fee": 1000,
+            "finality_depth": 3,
+            "storage_fee_per_byte": 1,
+            "max_metadata_bytes": 65536,
+            "max_access_list_bytes": 16384,
+            "activation_grace_blocks": 50,
+            "abandonment_fee_percent": 10,
+            "max_chunk_count_per_file": 1048576,
+            "max_chunk_indices_per_tx": 65536,
+            "assignment_replication_factor": 3,
+            "v2_enabled_from_height": 12345
+        }"#;
+        let cp: ChainParamsInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(cp.chain_id, 31337);
+        assert_eq!(cp.block_time_ms, 2000);
+        assert_eq!(cp.finality_depth, 3);
+        assert_eq!(cp.min_fee, 1000);
+        assert_eq!(cp.assignment_replication_factor, 3);
+        assert_eq!(cp.max_chunk_indices_per_tx, 65536);
+        assert_eq!(cp.max_chunk_count_per_file, 1_048_576);
+        assert_eq!(cp.activation_grace_blocks, 50);
+        assert_eq!(cp.v2_enabled_from_height, Some(12345));
+    }
+
+    /// `v2_enabled_from_height: null` (chain hasn't activated V2 yet,
+    /// or never will on this chain) MUST deserialize to `None` — not
+    /// a parse error and not a silent default to 0. This is the
+    /// load-bearing case: SNIP's V2 gate refuses tx submission when
+    /// the field is `None`.
+    #[test]
+    fn chain_params_v2_enabled_from_height_null_is_none() {
+        let json = r#"{
+            "chain_id": 31337,
+            "block_time_ms": 2000,
+            "max_block_bytes": 8388608,
+            "max_txs_per_block": 1024,
+            "min_fee": 1000,
+            "finality_depth": 3,
+            "storage_fee_per_byte": 1,
+            "max_metadata_bytes": 65536,
+            "max_access_list_bytes": 16384,
+            "activation_grace_blocks": 50,
+            "abandonment_fee_percent": 10,
+            "max_chunk_count_per_file": 1048576,
+            "max_chunk_indices_per_tx": 65536,
+            "assignment_replication_factor": 3,
+            "v2_enabled_from_height": null
+        }"#;
+        let cp: ChainParamsInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cp.v2_enabled_from_height, None,
+            "JSON null MUST decode to None, not Some(0); the V2 gate \
+             distinguishes 'no activation height set' from 'enabled at genesis'"
+        );
+    }
+
+    /// Field omitted entirely (older chain version, or partial
+    /// rollout). `#[serde(default)]` must leave it as `None`.
+    #[test]
+    fn chain_params_v2_enabled_from_height_missing_is_none() {
+        let json = r#"{
+            "chain_id": 31337,
+            "block_time_ms": 2000,
+            "max_block_bytes": 8388608,
+            "max_txs_per_block": 1024,
+            "min_fee": 1000,
+            "finality_depth": 3,
+            "storage_fee_per_byte": 1,
+            "max_metadata_bytes": 65536,
+            "max_access_list_bytes": 16384,
+            "activation_grace_blocks": 50,
+            "abandonment_fee_percent": 10,
+            "max_chunk_count_per_file": 1048576,
+            "max_chunk_indices_per_tx": 65536,
+            "assignment_replication_factor": 3
+        }"#;
+        let cp: ChainParamsInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(cp.v2_enabled_from_height, None);
+    }
+
+    /// `v2_enabled_from_height: 0` is NOT `None` — it's a real,
+    /// distinct semantic ("V2 enabled from genesis"). Pin that
+    /// distinction so a future "let's just default null to 0"
+    /// regression fires here.
+    #[test]
+    fn chain_params_v2_enabled_from_height_zero_is_some_zero() {
+        let json = r#"{
+            "chain_id": 31337,
+            "block_time_ms": 2000,
+            "max_block_bytes": 8388608,
+            "max_txs_per_block": 1024,
+            "min_fee": 1000,
+            "finality_depth": 3,
+            "storage_fee_per_byte": 1,
+            "max_metadata_bytes": 65536,
+            "max_access_list_bytes": 16384,
+            "activation_grace_blocks": 50,
+            "abandonment_fee_percent": 10,
+            "max_chunk_count_per_file": 1048576,
+            "max_chunk_indices_per_tx": 65536,
+            "assignment_replication_factor": 3,
+            "v2_enabled_from_height": 0
+        }"#;
+        let cp: ChainParamsInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(cp.v2_enabled_from_height, Some(0));
+        assert_ne!(cp.v2_enabled_from_height, None);
     }
 }
