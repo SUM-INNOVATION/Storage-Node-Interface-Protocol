@@ -57,6 +57,7 @@ impl BinaryChunker {
                 size: end - offset,
                 blake3_hash: *hash.as_bytes(),
                 cid,
+                plaintext_blake3_hash: None,
             });
         }
 

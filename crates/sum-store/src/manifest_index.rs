@@ -152,6 +152,7 @@ mod tests {
                     size: 1_048_576,
                     blake3_hash: [root_byte + 1; 32],
                     cid: format!("bafk_chunk0_{root_byte}"),
+                    plaintext_blake3_hash: None,
                 },
                 ChunkDescriptor {
                     chunk_index: 1,
@@ -159,6 +160,7 @@ mod tests {
                     size: 1_048_576,
                     blake3_hash: [root_byte + 2; 32],
                     cid: format!("bafk_chunk1_{root_byte}"),
+                    plaintext_blake3_hash: None,
                 },
             ],
         }

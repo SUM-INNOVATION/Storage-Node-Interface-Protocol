@@ -35,7 +35,7 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
 use crate::errors::CryptoError;
-use crate::kdf::{hkdf_expand, RECIPIENT_KEK_INFO};
+use crate::kdf::{hkdf_expand, RECIPIENT_KEK_INFO, X25519_DERIVATION_INFO};
 
 /// Constant-time check that an X25519 ECDH output is non-zero.
 ///
@@ -58,6 +58,35 @@ fn shared_is_contributory(shared: &SharedSecret) -> bool {
 
 /// Total bundle size: `eph_pub (32) || wrap (32) || tag (16)` = 80 bytes.
 pub const RECIPIENT_BUNDLE_SIZE: usize = 80;
+
+/// Derive a deterministic X25519 encryption keypair from an Ed25519
+/// signing seed. The X25519 private scalar is `HKDF-SHA256(salt = "",
+/// ikm = ed25519_seed, info = "snip-x25519-encryption-key-v1")[..32]`,
+/// then clamped per RFC 7748 by `x25519_dalek::StaticSecret::from`.
+///
+/// **Why HKDF, not raw seed reuse:** the same Ed25519 seed already
+/// derives the node's signing key, peer-id, and L1 address.
+/// Using domain-separated HKDF keeps the encryption-key domain
+/// independent — leaking either key (signing or encryption) cannot
+/// retroactively recover the other, and a future protocol change to
+/// either domain is a one-line `info` rotation rather than a wholesale
+/// re-key. The chain plan's locked decision (Phase 4a) requires this
+/// exact `info` tag — changing it would break interoperability with
+/// previously registered keys.
+///
+/// Returns `(x25519_private_scalar_bytes, x25519_public_key_bytes)`.
+/// The private scalar is the **clamped** scalar (suitable for direct
+/// use with `x25519_dalek::StaticSecret`), and the public key is its
+/// scalar-base-multiple — the value to register on chain via
+/// `RegisterEncryptionKey`.
+pub fn x25519_keypair_from_ed25519_seed(
+    ed25519_seed: &[u8; 32],
+) -> ([u8; 32], [u8; 32]) {
+    let derived = hkdf_expand::<32>(&[], ed25519_seed, X25519_DERIVATION_INFO);
+    let secret = StaticSecret::from(derived);
+    let public = PublicKey::from(&secret);
+    (secret.to_bytes(), public.to_bytes())
+}
 
 // Bundle layout: [0..32] eph_pub | [32..64] wrap ciphertext | [64..80] tag.
 // We only need start/end markers for the eph_pub slice and the bundle
@@ -335,5 +364,44 @@ mod tests {
             matches!(res, Err(CryptoError::NonContributoryKey)),
             "unwrap must reject low-order eph_pub, got {res:?}"
         );
+    }
+
+    // ── Phase 4a: x25519_keypair_from_ed25519_seed ─────────────────────
+
+    /// Same Ed25519 seed always yields the same X25519 keypair. Locks
+    /// the HKDF derivation contract — if anyone changes the `info` tag
+    /// or the salt, every existing registered key on chain becomes
+    /// orphaned (the X25519 private key for an account would no longer
+    /// match its registered public key).
+    #[test]
+    fn x25519_derivation_is_deterministic() {
+        let seed = [0x42u8; 32];
+        let (sk_a, pk_a) = x25519_keypair_from_ed25519_seed(&seed);
+        let (sk_b, pk_b) = x25519_keypair_from_ed25519_seed(&seed);
+        assert_eq!(sk_a, sk_b);
+        assert_eq!(pk_a, pk_b);
+    }
+
+    /// Different Ed25519 seeds yield different X25519 keypairs.
+    #[test]
+    fn x25519_derivation_changes_with_seed() {
+        let (_, pk_1) = x25519_keypair_from_ed25519_seed(&[0x01; 32]);
+        let (_, pk_2) = x25519_keypair_from_ed25519_seed(&[0x02; 32]);
+        assert_ne!(pk_1, pk_2);
+    }
+
+    /// Round-trip: derive a keypair from a seed, wrap K_file for the
+    /// derived public key, unwrap with the derived private key. Proves
+    /// the derived bytes are a valid X25519 keypair end-to-end (not
+    /// just plausible-looking 32-byte values).
+    #[test]
+    fn x25519_derivation_round_trips_through_wrap_unwrap() {
+        let seed = [0x99u8; 32];
+        let (sk, pk) = x25519_keypair_from_ed25519_seed(&seed);
+        let addr = fixed_addr(0xAB);
+        let k_file = fixed_kfile();
+        let bundle = wrap_for_recipient(&k_file, &addr, &pk).unwrap();
+        let recovered = unwrap_for_self(&bundle, &sk, &addr).unwrap();
+        assert_eq!(recovered, k_file);
     }
 }

@@ -175,6 +175,7 @@ fn build_synthetic_store(
             size: chunk_bytes as u64,
             blake3_hash: *hash.as_bytes(),
             cid,
+            plaintext_blake3_hash: None,
         });
         chunk_hashes.push(hash);
     }

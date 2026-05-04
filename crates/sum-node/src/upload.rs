@@ -488,6 +488,7 @@ mod tests {
                 size: 0,
                 blake3_hash: [0u8; 32],
                 cid: format!("cid{idx}"),
+                plaintext_blake3_hash: None,
             }
         }
         let chunks: Vec<ChunkDescriptor> = (0..10).map(dummy).collect();
