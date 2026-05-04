@@ -151,12 +151,18 @@ impl L1RpcClient {
     // push validator / attestor / finality waiter call the V2 variants
     // exclusively.
 
-    /// `chain_getBlockHeight` — current block height + finality flag.
-    /// Used by the strict ACL expiry check (`expires_at` comparison),
-    /// the snapshot freshness check, and any place a "what block are we
-    /// at right now" answer is needed.
+    /// `chain_getBlockHeight(["finalized"])` — finalized chain head.
+    ///
+    /// Always passes the explicit `"finalized"` param; without it the
+    /// chain defaults missing/null/`"latest"` to the latest-included
+    /// height, which makes safety-critical checks (V2-enabled gate,
+    /// abandon grace, terminal-failed reorg windows) racy. Every caller
+    /// that compares "are we past block X" wants finalized, so we do
+    /// not expose a non-finalized variant — if a caller ever genuinely
+    /// needs the latest head, add a separate method with explicit
+    /// `["latest"]` rather than overloading this one.
     pub async fn chain_get_block_height(&self) -> Result<BlockHeightInfo> {
-        self.call("chain_getBlockHeight", json!([])).await
+        self.call("chain_getBlockHeight", json!(["finalized"])).await
     }
 
     /// `chain_getChainParams` — live consensus + V2 protocol constants.
@@ -169,8 +175,8 @@ impl L1RpcClient {
     }
 
     /// `chain_getTransactionStatus(tx_hash)` — V2 finality primitive.
-    /// Wire shape: `{"status": "...", ...}` with internally-tagged
-    /// variants per chain plan §4.
+    /// Wire shape: `{"kind": "...", ...}` with internally-tagged
+    /// variants (chain-confirmed; earlier drafts said `"status"`).
     ///
     /// W9 (`tx_wait::wait_for_finalized`) is the canonical caller — see
     /// the `TxStatusV2` doc-comment in `sum_types::rpc_types` for

@@ -76,11 +76,13 @@ pub fn build_register_archive_node_tx(
 //      the actual L1 `TxPayload` enum. The
 //      `payload_v2_variant_indices_are_stable` test pins the local
 //      assumption; cross-chain confirmation is out-of-band.
-//   2. **`StorageMetadataOperationV2Mirror` variant order**:
+//   2. **`StorageMetadataOperationV2Mirror` variant order** (chain-confirmed):
 //      `RegisterFilePendingV2 = 0`, `ActivateFileV2 = 1`,
-//      `AbandonFileV2 = 2`, `AddAccessV2 = 3`, `RemoveAccessV2 = 4`,
-//      `UpdateAccessV2 = 5`, `AcceptAssignmentV2 = 6` (added v3.2 §3.6).
-//      Pinned by the `v2_op_variant_indices_are_stable` test.
+//      `AbandonFileV2 = 2`, `AcceptAssignmentV2 = 3`, `AddAccessV2 = 4`,
+//      `RemoveAccessV2 = 5`, `UpdateAccessV2 = 6`. Earlier drafts placed
+//      `AcceptAssignmentV2` at index 6; chain team confirmed final
+//      ordering puts it at 3. Pinned by the
+//      `v2_op_variant_indices_are_stable` test.
 //   3. **`AccessEntryV2Mirror` field order** — bincode v1 is positional
 //      for structs.
 //
@@ -360,17 +362,19 @@ struct StorageMetadataTxDataMirror {
     operation: StorageMetadataOperationMirror,
 }
 
-// ── V2 Storage Metadata mirrors (chain plan v3.2 §3.1, §3.6) ────────────────
+// ── V2 Storage Metadata mirrors (chain-confirmed final ordering) ────────────
 //
 // Variant indices in `StorageMetadataOperationV2Mirror` MUST match the
 // L1 `StorageMetadataOperationV2` enum exactly — bincode v1 encodes
-// variants as u32 indices. We follow the order the chain plan §3.1
-// publishes (RegisterFilePendingV2 first, …, UpdateAccessV2 last) and
-// place AcceptAssignmentV2 at the end as variant 6 to match v3.2's
-// "added in §3.6" placement. **Any mismatch on the L1 side → all V2
-// txs we sign are misinterpreted.** This must be verified against
-// actual L1 code before testnet, per the safety note at the top of
-// this module's V2 builder section.
+// variants as u32 indices. Chain team confirmed the final order is
+// `RegisterFilePendingV2 = 0`, `ActivateFileV2 = 1`,
+// `AbandonFileV2 = 2`, `AcceptAssignmentV2 = 3` (NOT 6 as
+// the v3.2 §3.6 draft suggested), `AddAccessV2 = 4`,
+// `RemoveAccessV2 = 5`, `UpdateAccessV2 = 6`. **Any mismatch on the
+// L1 side → all V2 txs we sign are misinterpreted.** Pinned by
+// `v2_op_variant_indices_are_stable`. Cross-chain bincode round-trip
+// is out-of-band, per the safety note at the top of this module's V2
+// builder section.
 
 /// Mirror of `AccessEntryV2` (chain plan §3.1).
 ///
@@ -415,6 +419,13 @@ impl<'de> Deserialize<'de> for Bundle80 {
 
 /// Mirror of `StorageMetadataOperationV2`. Variant indices are critical;
 /// see the safety note at the top of the V2 builder section.
+///
+/// **Variant order is locked against the chain**: chain team confirmed
+/// `AcceptAssignmentV2` is at index 3, between `AbandonFileV2` and the
+/// access-list ops. Earlier (v3.2 §3.6) drafts placed it at index 6;
+/// chain final ordering moved it to 3. The
+/// `v2_op_variant_indices_are_stable` test pins each index byte for
+/// byte against bincode v1's u32 LE discriminant encoding.
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 enum StorageMetadataOperationV2Mirror {
@@ -429,23 +440,23 @@ enum StorageMetadataOperationV2Mirror {
     },                                                                              // 0
     ActivateFileV2 { merkle_root: [u8; 32] },                                       // 1
     AbandonFileV2 { merkle_root: [u8; 32] },                                        // 2
+    AcceptAssignmentV2 {
+        merkle_root: [u8; 32],
+        chunk_indices: Vec<u32>,
+    },                                                                              // 3 — chain final ordering
     AddAccessV2 {
         merkle_root: [u8; 32],
         entry: AccessEntryV2Mirror,
-    },                                                                              // 3
+    },                                                                              // 4
     RemoveAccessV2 {
         merkle_root: [u8; 32],
         address: [u8; 20],
-    },                                                                              // 4
+    },                                                                              // 5
     UpdateAccessV2 {
         merkle_root: [u8; 32],
         address: [u8; 20],
         new_entry: AccessEntryV2Mirror,
-    },                                                                              // 5
-    AcceptAssignmentV2 {
-        merkle_root: [u8; 32],
-        chunk_indices: Vec<u32>,
-    },                                                                              // 6 — added v3.2 §3.6
+    },                                                                              // 6
 }
 
 /// Mirror of `StorageMetadataV2TxData` (paired payload wrapper).
@@ -857,6 +868,15 @@ mod tests {
             }),
             2
         );
+        // Chain-confirmed: AcceptAssignmentV2 is at index 3 (NOT 6 as
+        // the v3.2 §3.6 draft suggested). The access-list ops shift up.
+        assert_eq!(
+            variant_index(StorageMetadataOperationV2Mirror::AcceptAssignmentV2 {
+                merkle_root: [0; 32],
+                chunk_indices: vec![],
+            }),
+            3
+        );
         assert_eq!(
             variant_index(StorageMetadataOperationV2Mirror::AddAccessV2 {
                 merkle_root: [0; 32],
@@ -866,14 +886,14 @@ mod tests {
                     expires_at: None,
                 },
             }),
-            3
+            4
         );
         assert_eq!(
             variant_index(StorageMetadataOperationV2Mirror::RemoveAccessV2 {
                 merkle_root: [0; 32],
                 address: [0; 20],
             }),
-            4
+            5
         );
         assert_eq!(
             variant_index(StorageMetadataOperationV2Mirror::UpdateAccessV2 {
@@ -885,15 +905,230 @@ mod tests {
                     expires_at: None,
                 },
             }),
-            5
-        );
-        assert_eq!(
-            variant_index(StorageMetadataOperationV2Mirror::AcceptAssignmentV2 {
-                merkle_root: [0; 32],
-                chunk_indices: vec![],
-            }),
             6
         );
+    }
+
+    // ── Bincode wire fixtures (mirror of chain-side
+    // `crates/primitives/tests/v2_wire_fixtures.rs`) ────────────────────
+    //
+    // These pin the EXACT bincode-v1 byte layout SNIP emits for each
+    // V2 operation, using the same fixed inputs the chain-side
+    // fixture tests use. If chain ever changes a variant index,
+    // field order, or integer encoding without coordinating, ONE of
+    // these tests fires here — long before a real tx hits a real
+    // chain. Cross-checked against chain's locked hex strings; any
+    // divergence between SNIP's actual hex and chain's expected hex
+    // is a production wire break.
+    //
+    // The expected hex strings are derived from bincode-v1 spec:
+    //   * Enum variant tag: u32 little-endian (4 bytes).
+    //   * `[u8; N]`:        raw N bytes, no length prefix.
+    //   * `Vec<T>`:         u64 LE length prefix, then elements.
+    //   * `u32`:            4 bytes LE.
+    //   * `u64`:            8 bytes LE.
+    //   * `u128`:           16 bytes LE.
+    //   * `Option<T>`:      0x00 (None) | 0x01 + payload (Some).
+    //   * `String`:         u64 LE length + UTF-8 bytes.
+    //   * struct fields:    serialized in declaration order, no separators.
+
+    /// Shared with chain-side `v2_wire_fixtures.rs` — any drift in
+    /// these constants is also a wire break.
+    const FIXTURE_MERKLE_ROOT: [u8; 32] = [0x42; 32];
+    const FIXTURE_ENCRYPTION_PUBKEY: [u8; 32] = [0x11; 32];
+    fn fixture_chunk_indices() -> Vec<u32> {
+        vec![1, 2, 3]
+    }
+
+    /// Helper: serialize `op` via bincode-v1 and lowercase-hex-encode.
+    fn op_hex(op: StorageMetadataOperationV2Mirror) -> String {
+        hex::encode(bincode1::serialize(&op).unwrap())
+    }
+    fn nr_op_hex(op: NodeRegistryOperationV2Mirror) -> String {
+        hex::encode(bincode1::serialize(&op).unwrap())
+    }
+
+    #[test]
+    fn fixture_register_encryption_key_bytes() {
+        // Variant 0: tag=00000000, then 32 bytes of 0x11.
+        let expected = "00000000".to_string()
+            + &"11".repeat(32);
+        let actual = nr_op_hex(NodeRegistryOperationV2Mirror::RegisterEncryptionKey {
+            encryption_pubkey: FIXTURE_ENCRYPTION_PUBKEY,
+        });
+        assert_eq!(
+            actual, expected,
+            "RegisterEncryptionKey wire bytes diverged from chain fixture"
+        );
+    }
+
+    #[test]
+    fn fixture_register_file_pending_v2_bytes() {
+        // SNIP-side fixture inputs (auxiliary fields are SNIP's
+        // choice; the chain-side fixture may use different values for
+        // these and the hex will differ on those bytes). The shared
+        // bytes — variant tag + merkle_root prefix — must match.
+        let visibility = 1u8; // Private
+        let plaintext_size_bytes = 1024u64;
+        let stored_size_bytes = 1040u64; // 1024 + 16 AEAD tag
+        let chunk_count = 1u32;
+        let fee_deposit = 0u64;
+
+        let actual = op_hex(StorageMetadataOperationV2Mirror::RegisterFilePendingV2 {
+            merkle_root: FIXTURE_MERKLE_ROOT,
+            plaintext_size_bytes,
+            stored_size_bytes,
+            chunk_count,
+            fee_deposit,
+            visibility,
+            initial_access: vec![],
+        });
+
+        // Variant 0 → tag = 00000000.
+        // Then merkle_root (32 × 0x42) follows immediately.
+        let shared_prefix = "00000000".to_string() + &"42".repeat(32);
+        assert!(
+            actual.starts_with(&shared_prefix),
+            "RegisterFilePendingV2 prefix mismatch (variant tag + merkle_root must \
+             match chain fixture). expected_prefix={shared_prefix} actual={actual}"
+        );
+
+        // Lock the SNIP-local auxiliary suffix exactly as well so a
+        // future field reorder in the mirror is also caught locally.
+        // plaintext_size_bytes=1024 → 0x00040000 00000000 (LE u64)
+        // stored_size_bytes=1040    → 0x10040000 00000000
+        // chunk_count=1             → 0x01000000           (LE u32)
+        // fee_deposit=0             → 0x00000000 00000000
+        // visibility=1              → 0x01
+        // initial_access (empty Vec)→ 0x00000000 00000000  (u64 length=0)
+        let aux = "0004000000000000".to_string() // plaintext_size_bytes=1024
+            + "1004000000000000" // stored_size_bytes=1040
+            + "01000000"          // chunk_count=1
+            + "0000000000000000"  // fee_deposit=0
+            + "01"                // visibility=1
+            + "0000000000000000"; // empty initial_access Vec length
+        let expected = shared_prefix + &aux;
+        assert_eq!(
+            actual, expected,
+            "RegisterFilePendingV2 SNIP-local fixture drift"
+        );
+    }
+
+    #[test]
+    fn fixture_activate_file_v2_bytes() {
+        let actual = op_hex(StorageMetadataOperationV2Mirror::ActivateFileV2 {
+            merkle_root: FIXTURE_MERKLE_ROOT,
+        });
+        // Variant 1 → tag=01000000, then merkle_root.
+        let expected = "01000000".to_string() + &"42".repeat(32);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn fixture_abandon_file_v2_bytes() {
+        let actual = op_hex(StorageMetadataOperationV2Mirror::AbandonFileV2 {
+            merkle_root: FIXTURE_MERKLE_ROOT,
+        });
+        // Variant 2 → tag=02000000, then merkle_root.
+        let expected = "02000000".to_string() + &"42".repeat(32);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn fixture_accept_assignment_v2_bytes() {
+        let actual = op_hex(StorageMetadataOperationV2Mirror::AcceptAssignmentV2 {
+            merkle_root: FIXTURE_MERKLE_ROOT,
+            chunk_indices: fixture_chunk_indices(),
+        });
+        // Variant 3 (chain-confirmed; was 6 in earlier draft) →
+        // tag=03000000, then merkle_root, then Vec<u32> as
+        // u64-LE-length-prefix(=3) + 3 u32s [1, 2, 3].
+        let expected = "03000000".to_string()
+            + &"42".repeat(32)
+            + "0300000000000000" // length = 3 (u64 LE)
+            + "01000000"          // 1 u32 LE
+            + "02000000"          // 2 u32 LE
+            + "03000000";         // 3 u32 LE
+        assert_eq!(
+            actual, expected,
+            "AcceptAssignmentV2 wire bytes diverged from chain fixture"
+        );
+    }
+
+    /// TxPayload-wrapped form: NodeRegistryV2 at index 19 carrying
+    /// RegisterEncryptionKey at inner-index 0.
+    #[test]
+    fn fixture_tx_payload_node_registry_v2_register_encryption_key() {
+        let payload = TxPayloadMirror::NodeRegistryV2(NodeRegistryV2TxDataMirror {
+            operation: NodeRegistryOperationV2Mirror::RegisterEncryptionKey {
+                encryption_pubkey: FIXTURE_ENCRYPTION_PUBKEY,
+            },
+        });
+        let actual = hex::encode(bincode1::serialize(&payload).unwrap());
+        // Outer TxPayload variant=19 → 0x13000000.
+        // Inner NodeRegistryOperationV2 variant=0 → 0x00000000.
+        // Then 32 bytes of 0x11.
+        let expected = "13000000".to_string()
+            + "00000000"
+            + &"11".repeat(32);
+        assert_eq!(actual, expected, "TxPayload::NodeRegistryV2 != index 19");
+    }
+
+    /// TxPayload-wrapped form: StorageMetadataV2 at index 20 carrying
+    /// AcceptAssignmentV2 at inner-index 3.
+    #[test]
+    fn fixture_tx_payload_storage_metadata_v2_accept_assignment() {
+        let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
+            operation: StorageMetadataOperationV2Mirror::AcceptAssignmentV2 {
+                merkle_root: FIXTURE_MERKLE_ROOT,
+                chunk_indices: fixture_chunk_indices(),
+            },
+        });
+        let actual = hex::encode(bincode1::serialize(&payload).unwrap());
+        let expected = "14000000".to_string() // outer = 20
+            + "03000000"                       // inner = 3 (chain-confirmed)
+            + &"42".repeat(32)                 // merkle_root
+            + "0300000000000000"               // chunk_indices Vec length = 3
+            + "01000000"
+            + "02000000"
+            + "03000000";
+        assert_eq!(
+            actual, expected,
+            "TxPayload::StorageMetadataV2 != 20 OR AcceptAssignmentV2 != 3"
+        );
+    }
+
+    /// TxPayload-wrapped form: StorageMetadataV2 carrying
+    /// ActivateFileV2 (inner index 1) and AbandonFileV2 (inner 2).
+    /// Pins those variants are reachable through the wrapper too,
+    /// not only as bare ops.
+    #[test]
+    fn fixture_tx_payload_storage_metadata_v2_activate_and_abandon() {
+        for (op, inner_tag, label) in [
+            (
+                StorageMetadataOperationV2Mirror::ActivateFileV2 {
+                    merkle_root: FIXTURE_MERKLE_ROOT,
+                },
+                "01000000",
+                "activate",
+            ),
+            (
+                StorageMetadataOperationV2Mirror::AbandonFileV2 {
+                    merkle_root: FIXTURE_MERKLE_ROOT,
+                },
+                "02000000",
+                "abandon",
+            ),
+        ] {
+            let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
+                operation: op,
+            });
+            let actual = hex::encode(bincode1::serialize(&payload).unwrap());
+            let expected = "14000000".to_string()
+                + inner_tag
+                + &"42".repeat(32);
+            assert_eq!(actual, expected, "{label} wrapper bytes diverged");
+        }
     }
 
     #[test]

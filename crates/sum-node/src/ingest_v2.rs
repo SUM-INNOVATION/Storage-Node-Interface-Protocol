@@ -250,6 +250,18 @@ pub struct IngestParams {
     /// `AbandonFileV2` is admissible. **Not used to control S4
     /// termination.**
     pub activation_grace_blocks: u64,
+    /// Block height at which the chain accepts V2 lifecycle txs.
+    /// `None` means **V2 disabled on this chain** (chain emits JSON
+    /// `null` or omits the field); the pipeline must refuse to submit
+    /// any V2 tx in that state — silently mapping `None` to `0` would
+    /// burn fees against a chain that doesn't have V2 yet. `Some(h)`
+    /// means V2 enabled at finalized height ≥ `h`.
+    ///
+    /// The gate runs before each V2 lifecycle entry point
+    /// (RegisterFilePendingV2, AcceptAssignmentV2, ActivateFileV2,
+    /// AbandonFileV2, RegisterEncryptionKey). See
+    /// `IngestPipeline::check_v2_enabled`.
+    pub v2_enabled_from_height: Option<u64>,
 }
 
 impl IngestParams {
@@ -271,6 +283,7 @@ impl IngestParams {
             push_wait_secs: defaults.push_wait_secs,
             manifest_push_wait_secs: defaults.manifest_push_wait_secs,
             activation_grace_blocks: p.activation_grace_blocks,
+            v2_enabled_from_height: p.v2_enabled_from_height,
         }
     }
 }
@@ -516,6 +529,17 @@ where
 
     /// Run the full S0–S6 pipeline against `path`.
     pub async fn run(&self, path: &Path) -> IngestOutcome {
+        // ── V2-enabled gate ────────────────────────────────────────
+        // Cheap RPC + cheap comparison; runs before any work that
+        // would burn CPU (chunking) or fees (S1 tx).
+        if let Err(e) = self.check_v2_enabled().await {
+            return IngestOutcome::Failed {
+                stage: IngestStage::Register,
+                manifest: None,
+                source: e,
+            };
+        }
+
         // ── S0 ─────────────────────────────────────────────────────
         let (manifest, mmap, tree) = match self.s0_chunk(path).await {
             Ok(triple) => triple,
@@ -541,7 +565,16 @@ where
         }
 
         // ── S1 ─────────────────────────────────────────────────────
-        let (register_tx_hash, register_height) = match self.s1_register_pending(&manifest).await {
+        // Public path: stored == plaintext, visibility = 0, no recipients.
+        let (register_tx_hash, register_height) = match self
+            .s1_register_pending(
+                &manifest,
+                manifest.total_size_bytes,
+                0,
+                vec![],
+            )
+            .await
+        {
             Ok(pair) => pair,
             Err(e) => {
                 return IngestOutcome::Failed {
@@ -591,7 +624,7 @@ where
         };
 
         // ── S3 ─────────────────────────────────────────────────────
-        if let Err(e) = self.s3_push_manifest(&manifest, &distinct_assigned).await {
+        if let Err(e) = self.s3_push_manifest(&manifest, &distinct_assigned, None).await {
             return IngestOutcome::PendingNeedsAction {
                 merkle_root,
                 manifest,
@@ -652,6 +685,40 @@ where
         }
     }
 
+    /// Verify the chain has activated V2 storage at the *finalized*
+    /// head before submitting any V2 lifecycle tx. Returns the
+    /// finalized height on success so callers can reuse it for the
+    /// abandon-grace check etc. without a second RPC.
+    ///
+    /// Why finalized: comparing against the latest-included height
+    /// risks a reorg dropping us back below `v2_enabled_from_height`
+    /// after we've burned the fee.
+    ///
+    /// Three failure shapes (all `Err`, never silent):
+    /// 1. `v2_enabled_from_height` is `None` (chain advertised JSON
+    ///    `null` or omitted the field) — V2 is disabled on this chain.
+    /// 2. `v2_enabled_from_height` is `Some(h)` but `finalized_height
+    ///    < h` — V2 is scheduled but not active yet.
+    /// 3. RPC failure on `chain_get_block_height` itself.
+    async fn check_v2_enabled(&self) -> Result<u64> {
+        let info = self.rpc.chain_get_block_height().await?;
+        match self.params.v2_enabled_from_height {
+            None => anyhow::bail!(
+                "V2 disabled on this chain (chain_getChainParams.v2_enabled_from_height = null) — \
+                 refusing to submit V2 lifecycle tx; the chain would reject it"
+            ),
+            Some(enabled_at) if info.height < enabled_at => anyhow::bail!(
+                "V2 not enabled yet: finalized height {} < v2_enabled_from_height {} \
+                 ({} blocks remaining); refusing to submit V2 lifecycle tx — \
+                 the chain would reject it and burn the fee",
+                info.height,
+                enabled_at,
+                enabled_at - info.height,
+            ),
+            Some(_) => Ok(info.height),
+        }
+    }
+
     // ── Stage helpers ────────────────────────────────────────────────
 
     async fn s0_chunk(&self, path: &Path) -> Result<(DataManifest, memmap2::Mmap, MerkleTree)> {
@@ -673,6 +740,9 @@ where
     async fn s1_register_pending(
         &self,
         manifest: &DataManifest,
+        stored_size_bytes: u64,
+        visibility: u8,
+        initial_access: Vec<crate::tx_builder::AccessEntryV2Mirror>,
     ) -> Result<(String, u64)> {
         let nonce = self.rpc.get_nonce(&self.my_addr_base58).await?;
         let tx_hex = build_register_file_pending_v2_tx(
@@ -682,11 +752,11 @@ where
             self.params.fee_per_tx,
             manifest.merkle_root,
             manifest.total_size_bytes,
-            manifest.total_size_bytes, // Public: stored == plaintext
+            stored_size_bytes,
             manifest.chunk_count,
             0, // fee_deposit; W10b CLI may parameterize
-            0, // visibility = Public
-            vec![], // empty initial_access (Public)
+            visibility,
+            initial_access,
         )?;
         let tx_hash = self.rpc.send_raw_transaction(&tx_hex).await?;
         let height = wait_for_finalized(
@@ -913,6 +983,7 @@ where
         &self,
         manifest: &DataManifest,
         distinct_assigned: &BTreeSet<[u8; 20]>,
+        override_bytes: Option<Vec<u8>>,
     ) -> Result<()> {
         // Push the manifest to **exactly the set of archives the
         // per-chunk V2 assignment landed on** in S2. Sending to
@@ -928,9 +999,18 @@ where
         targets.dedup();
         let needed: HashSet<PeerId> = targets.iter().copied().collect();
 
-        // Serialize manifest once.
-        let mut manifest_bytes = Vec::new();
-        ciborium::ser::into_writer(manifest, &mut manifest_bytes)?;
+        // Public path serializes the plaintext manifest as CBOR. Private
+        // path passes the already-encrypted manifest bytes via
+        // `override_bytes` — the wire payload is opaque ciphertext at
+        // that point and must NOT be re-CBORed here.
+        let manifest_bytes = match override_bytes {
+            Some(bytes) => bytes,
+            None => {
+                let mut bytes = Vec::new();
+                ciborium::ser::into_writer(manifest, &mut bytes)?;
+                bytes
+            }
+        };
 
         for peer in &targets {
             self.net
@@ -1055,6 +1135,15 @@ where
         merkle_root: [u8; 32],
         file_path: &Path,
     ) -> IngestOutcome {
+        // V2-enabled gate first — resume's S5 ActivateFileV2 is a V2
+        // tx and would burn fees if V2 isn't activated yet.
+        if let Err(e) = self.check_v2_enabled().await {
+            return IngestOutcome::Failed {
+                stage: IngestStage::Register,
+                manifest: None,
+                source: e,
+            };
+        }
         // Re-chunk and verify the path matches the recorded root.
         let (manifest, mmap, tree) = match self.s0_chunk(file_path).await {
             Ok(triple) => triple,
@@ -1123,8 +1212,13 @@ where
             return IngestOutcome::AbandonedOnChain {
                 merkle_root,
                 manifest,
-                // Chain v3.3+ surfaces this; pre-v3.3 returns None.
-                // Defensively passed through — operator guidance only.
+                // Chain-confirmed live: `abandoned_at_height` is
+                // atomic with the Abandoned lifecycle update on
+                // post-v3.3 validators, so a `Some(h)` is the
+                // expected shape here. We still tolerate `None`
+                // (pre-v3.3 chain build) and surface it to the
+                // operator — `None` carries no fatal meaning, just
+                // "chain didn't tell us when."
                 abandoned_at_height: info.abandoned_at_height,
             };
         }
@@ -1253,7 +1347,11 @@ where
             };
 
             // Re-push manifest to all distinct-assigned archives (idempotent).
-            if let Err(e) = self.s3_push_manifest(&manifest, &distinct_assigned).await {
+            // Phase 4a: resume() is Public-only for now. Private resume
+            // would need to recover K_file from the owner's bundle on
+            // chain (locked decision #5) and re-encrypt the manifest;
+            // that's deferred to Phase 4a-resume.
+            if let Err(e) = self.s3_push_manifest(&manifest, &distinct_assigned, None).await {
                 return IngestOutcome::PendingNeedsAction {
                     merkle_root,
                     manifest,
@@ -1363,13 +1461,17 @@ where
     // → earliest_admissible_height = created_at + grace + 1.
 
     pub async fn abandon(&self, merkle_root: [u8; 32]) -> AbandonOutcome {
+        // V2-enabled gate up front — `chain_get_block_height` already
+        // returns finalized height (chain plan: explicit `["finalized"]`
+        // param), so we can reuse the same value for the grace check
+        // below without a second RPC.
+        let current_height = match self.check_v2_enabled().await {
+            Ok(h) => h,
+            Err(e) => return AbandonOutcome::Failed { source: e },
+        };
         let root_hex = format!("0x{}", hex::encode(merkle_root));
         let info = match self.rpc.storage_get_file_info_v2(&root_hex).await {
             Ok(info) => info,
-            Err(e) => return AbandonOutcome::Failed { source: e },
-        };
-        let current_height = match self.rpc.chain_get_block_height().await {
-            Ok(h) => h.height,
             Err(e) => return AbandonOutcome::Failed { source: e },
         };
 
@@ -1795,6 +1897,10 @@ mod tests {
             push_wait_secs: d.push_wait_secs,
             manifest_push_wait_secs: d.manifest_push_wait_secs,
             activation_grace_blocks: 50,
+            // V2 enabled from genesis in tests — gate logic for the
+            // `None` and `not-yet-enabled` failure modes is covered
+            // separately in `v2_enabled_gate_*` cases below.
+            v2_enabled_from_height: Some(0),
         }
     }
 
@@ -2356,7 +2462,7 @@ mod tests {
             max_chunk_indices_per_tx: 65_536,
             max_chunk_count_per_file: 1_048_576,
             activation_grace_blocks: 50,
-            max_assigned_count_chunk_count: 16_384,
+            v2_enabled_from_height: Some(12_000),
         };
         let p = IngestParams::from_chain_params(&cp, IngestParamsDefaults::default());
         assert_eq!(p.chain_id, 31337);
@@ -2365,8 +2471,136 @@ mod tests {
         assert_eq!(p.max_chunk_count_per_file, 1_048_576);
         assert_eq!(p.activation_grace_blocks, 50);
         assert_eq!(p.fee_per_tx, 1_000);
+        assert_eq!(p.v2_enabled_from_height, Some(12_000));
         // Defaults for the wall-clock knobs.
         assert_eq!(p.poll_interval, Duration::from_secs(2));
+    }
+
+    // ── V2-enabled gate behavior ────────────────────────────────────────
+
+    /// Chain emits `v2_enabled_from_height: null` (V2 disabled).
+    /// SNIP MUST refuse `run`/`run_private`/`resume`/`abandon` with a
+    /// pre-S1 `Failed` outcome — never burn fees against a chain that
+    /// hasn't activated V2.
+    #[tokio::test]
+    async fn v2_enabled_gate_refuses_when_chain_emits_null() {
+        let bytes = vec![0xAB; 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let rpc = Arc::new(MockRpc::default());
+        // No tx-related responses queued — if the gate is correctly
+        // gating, S1 never runs, so we never reach `send_raw_transaction`.
+        let net = Arc::new(MockNet::new());
+
+        let mut params = params_for_test(defaults_for_tests());
+        params.v2_enabled_from_height = None;
+
+        let pipeline = build_pipeline(rpc.clone(), net, HashMap::new(), my_addr, params);
+        match pipeline.run(&path).await {
+            IngestOutcome::Failed { stage, source, .. } => {
+                assert_eq!(stage, IngestStage::Register);
+                let msg = source.to_string();
+                assert!(
+                    msg.contains("V2 disabled on this chain")
+                        && msg.contains("v2_enabled_from_height = null"),
+                    "expected V2-disabled error message, got: {msg}"
+                );
+            }
+            other => panic!("expected Failed (V2 disabled), got {other:?}"),
+        }
+        // Critical: NO tx submission attempted.
+        assert!(
+            rpc.sent_txs.lock().unwrap().is_empty(),
+            "gate must refuse before signing — sent_txs MUST be empty"
+        );
+    }
+
+    /// Chain emits `v2_enabled_from_height: Some(h)` but the
+    /// finalized head is below `h`. Same refusal shape as the `None`
+    /// case: `Failed`, no tx submission.
+    #[tokio::test]
+    async fn v2_enabled_gate_refuses_when_head_below_threshold() {
+        let bytes = vec![0xAB; 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let rpc = Arc::new(MockRpc::default());
+        let net = Arc::new(MockNet::new());
+
+        // MockRpc returns finalized height = 1000. Set the gate to
+        // require height ≥ 5000 so we're 4000 blocks short.
+        let mut params = params_for_test(defaults_for_tests());
+        params.v2_enabled_from_height = Some(5_000);
+
+        let pipeline = build_pipeline(rpc.clone(), net, HashMap::new(), my_addr, params);
+        match pipeline.run(&path).await {
+            IngestOutcome::Failed { stage, source, .. } => {
+                assert_eq!(stage, IngestStage::Register);
+                let msg = source.to_string();
+                assert!(
+                    msg.contains("V2 not enabled yet") && msg.contains("4000"),
+                    "expected 'V2 not enabled yet' with countdown, got: {msg}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
+    }
+
+    /// Resume path's gate. Same wiring; covered separately because the
+    /// resume entry has its own pre-flight order (gate → re-chunk →
+    /// lifecycle gate → snapshot → coverage → S5).
+    #[tokio::test]
+    async fn v2_enabled_gate_refuses_resume_when_disabled() {
+        let bytes = vec![0xCD; 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let rpc = Arc::new(MockRpc::default());
+        let net = Arc::new(MockNet::new());
+
+        let mut params = params_for_test(defaults_for_tests());
+        params.v2_enabled_from_height = None;
+
+        let pipeline = build_pipeline(rpc.clone(), net, HashMap::new(), my_addr, params);
+        let merkle_root = [0xAA; 32];
+        match pipeline.resume(merkle_root, &path).await {
+            IngestOutcome::Failed { stage, source, .. } => {
+                assert_eq!(stage, IngestStage::Register);
+                assert!(source.to_string().contains("V2 disabled on this chain"));
+            }
+            other => panic!("expected Failed (V2 disabled), got {other:?}"),
+        }
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
+    }
+
+    /// Abandon's gate. Special because abandon already had its own
+    /// `chain_get_block_height` call — the gate consolidates that
+    /// into one RPC. Verify the Failure path comes through the
+    /// `AbandonOutcome::Failed` shape, not a panic / silent bypass.
+    #[tokio::test]
+    async fn v2_enabled_gate_refuses_abandon_when_disabled() {
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let rpc = Arc::new(MockRpc::default());
+        let net = Arc::new(MockNet::new());
+
+        let mut params = params_for_test(defaults_for_tests());
+        params.v2_enabled_from_height = None;
+
+        let pipeline = build_pipeline(rpc.clone(), net, HashMap::new(), my_addr, params);
+        let merkle_root = [0xAA; 32];
+        match pipeline.abandon(merkle_root).await {
+            AbandonOutcome::Failed { source } => {
+                assert!(source.to_string().contains("V2 disabled on this chain"));
+            }
+            other => panic!("expected AbandonOutcome::Failed, got {other:?}"),
+        }
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
     }
 
     /// Reviewer-required: `PushAck`s from peers NOT assigned to a chunk

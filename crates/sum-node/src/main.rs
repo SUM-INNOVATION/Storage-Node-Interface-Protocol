@@ -1195,6 +1195,12 @@ async fn run_ingest_v2(
                     push_wait_secs: defaults.push_wait_secs,
                     manifest_push_wait_secs: defaults.manifest_push_wait_secs,
                     activation_grace_blocks: 50,
+                    // Dev fallback assumes V2 is enabled from genesis
+                    // (matches the local-mirror profile). Any production
+                    // chain will provide this via chain_getChainParams,
+                    // and `None` there means V2 disabled — caller's gate
+                    // refuses tx submission in that case.
+                    v2_enabled_from_height: Some(0),
                 }
             }
         },
@@ -1349,6 +1355,7 @@ async fn build_v2_ingest_params(
                     push_wait_secs: defaults.push_wait_secs,
                     manifest_push_wait_secs: defaults.manifest_push_wait_secs,
                     activation_grace_blocks: 50,
+                    v2_enabled_from_height: Some(0),
                 })
             }
         },
