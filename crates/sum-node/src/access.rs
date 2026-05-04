@@ -602,6 +602,63 @@ pub(crate) async fn recover_k_file_from_owner_bundle(
         .ok_or_else(|| AccessOpError::OwnerEntryMissing {
             addr_b58: owner_b58.to_string(),
         })?;
+    unwrap_owner_entry(seed, owner_addr, &entry)
+}
+
+/// Synchronous variant of [`recover_k_file_from_owner_bundle`]: uses
+/// ONLY the supplied seed page, no pagination.
+///
+/// **Why no pagination is fine for resume.** The chain caps the
+/// total `access_list` byte size (chain plan §3.1
+/// `max_access_list_bytes`), and each `AccessEntryV2` carries an
+/// 80-byte `Bundle80`, a base58 address, and an `Option<u64>`
+/// expiry. The default first page (256 entries) comfortably absorbs
+/// any realistic Private file's access list under that cap, and
+/// Phase 4a's "owner-first" insertion order puts the owner at index
+/// 0 of the access list. So for resume — which only needs the
+/// owner's entry to recover `K_file` — a single-page lookup is
+/// sufficient.
+///
+/// If a future chain rev raises the access-list cap such that
+/// real-world files need more than one page, resume must switch to
+/// the paginated [`recover_k_file_from_owner_bundle`] (which already
+/// exists for `share`'s use case) — the typed `OwnerEntryMissing`
+/// error from this helper would surface in that scenario as a clear
+/// signal to do so.
+///
+/// Factored out from `recover_k_file_from_owner_bundle` so callers
+/// without a concrete `L1RpcClient` (e.g. `IngestPipeline::resume`,
+/// which holds a generic `Arc<R: V2IngestRpc>` so tests can mock the
+/// RPC) can still reuse the privacy-critical code path. Refuses with
+/// the same typed errors when the bundle is missing or the unwrap
+/// fails.
+pub(crate) fn recover_k_file_from_seed_page(
+    seed: &[u8; 32],
+    owner_addr: [u8; 20],
+    owner_b58: &str,
+    seed_page: &StorageFileInfoV2,
+) -> Result<Zeroizing<[u8; 32]>, AccessOpError> {
+    let entry = seed_page
+        .access_list
+        .iter()
+        .find(|e| e.address == owner_b58)
+        .cloned()
+        .ok_or_else(|| AccessOpError::OwnerEntryMissing {
+            addr_b58: owner_b58.to_string(),
+        })?;
+    unwrap_owner_entry(seed, owner_addr, &entry)
+}
+
+/// Inner helper shared by both recovery entry points. Parses the
+/// bundle hex, derives the X25519 secret, unwraps `K_file`. Held
+/// here in one place so the recovery semantics are identical
+/// regardless of whether the entry came from a seed page or a
+/// paginated walk.
+fn unwrap_owner_entry(
+    seed: &[u8; 32],
+    owner_addr: [u8; 20],
+    entry: &AccessEntryV2,
+) -> Result<Zeroizing<[u8; 32]>, AccessOpError> {
     let bundle_hex = entry
         .encrypted_key_bundle
         .as_deref()
