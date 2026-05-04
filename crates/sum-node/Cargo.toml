@@ -18,6 +18,7 @@ path = "src/bin/e2e_helper.rs"
 sum-types          = { workspace = true }
 sum-net            = { workspace = true }
 sum-store          = { workspace = true }
+sum-crypto         = { workspace = true }
 tokio              = { workspace = true }
 clap               = { workspace = true }
 tracing            = { workspace = true }
@@ -37,6 +38,8 @@ async-trait        = { workspace = true }
 ciborium           = { workspace = true }
 lru                = { workspace = true }
 memmap2            = { workspace = true }
+tempfile           = { workspace = true }
+rand_core          = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

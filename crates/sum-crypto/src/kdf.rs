@@ -16,6 +16,12 @@ pub(crate) const CHUNK_NONCE_INFO: &[u8] = b"snip-chunk-nonce-v1";
 pub(crate) const MANIFEST_KEY_INFO: &[u8] = b"snip-manifest-key-v1";
 /// Domain-separation tag for the per-recipient KEK derived from X25519 ECDH.
 pub(crate) const RECIPIENT_KEK_INFO: &[u8] = b"snip-recipient-kek-v1";
+/// Domain-separation tag for deriving an X25519 encryption keypair from
+/// an Ed25519 signing seed. Keeps the encryption key domain-distinct
+/// from any other use of the same seed (signing, peer-id derivation,
+/// etc.) so a leak of the X25519 private key cannot retroactively
+/// compromise other domains, and vice versa.
+pub(crate) const X25519_DERIVATION_INFO: &[u8] = b"snip-x25519-encryption-key-v1";
 
 /// Derive `OUT_LEN` bytes via HKDF-SHA256.
 ///

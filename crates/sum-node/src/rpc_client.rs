@@ -151,12 +151,18 @@ impl L1RpcClient {
     // push validator / attestor / finality waiter call the V2 variants
     // exclusively.
 
-    /// `chain_getBlockHeight` — current block height + finality flag.
-    /// Used by the strict ACL expiry check (`expires_at` comparison),
-    /// the snapshot freshness check, and any place a "what block are we
-    /// at right now" answer is needed.
+    /// `chain_getBlockHeight(["finalized"])` — finalized chain head.
+    ///
+    /// Always passes the explicit `"finalized"` param; without it the
+    /// chain defaults missing/null/`"latest"` to the latest-included
+    /// height, which makes safety-critical checks (V2-enabled gate,
+    /// abandon grace, terminal-failed reorg windows) racy. Every caller
+    /// that compares "are we past block X" wants finalized, so we do
+    /// not expose a non-finalized variant — if a caller ever genuinely
+    /// needs the latest head, add a separate method with explicit
+    /// `["latest"]` rather than overloading this one.
     pub async fn chain_get_block_height(&self) -> Result<BlockHeightInfo> {
-        self.call("chain_getBlockHeight", json!([])).await
+        self.call("chain_getBlockHeight", json!(["finalized"])).await
     }
 
     /// `chain_getChainParams` — live consensus + V2 protocol constants.
@@ -169,8 +175,8 @@ impl L1RpcClient {
     }
 
     /// `chain_getTransactionStatus(tx_hash)` — V2 finality primitive.
-    /// Wire shape: `{"status": "...", ...}` with internally-tagged
-    /// variants per chain plan §4.
+    /// Wire shape: `{"kind": "...", ...}` with internally-tagged
+    /// variants (chain-confirmed; earlier drafts said `"status"`).
     ///
     /// W9 (`tx_wait::wait_for_finalized`) is the canonical caller — see
     /// the `TxStatusV2` doc-comment in `sum_types::rpc_types` for
@@ -217,6 +223,41 @@ impl L1RpcClient {
         height: u64,
     ) -> Result<Vec<NodeRecordInfo>> {
         self.call("storage_getActiveNodesAtHeight", json!([height])).await
+    }
+
+    /// `account_getEncryptionPublicKey(addr)` — fetch the X25519
+    /// encryption public key the address has registered (Phase 4 — Private
+    /// files). Returns `None` when the account has no key on chain;
+    /// callers must treat that as "this recipient cannot receive private
+    /// shares yet" rather than silently dropping them.
+    ///
+    /// **Chain-confirmed wire shape**: `Option<"0x" + 64-char-lowercase-hex>`.
+    /// We additionally tolerate the `0x` prefix being absent (defensive)
+    /// and uppercase hex (case-insensitive `hex::decode`) so a future
+    /// chain RPC-layer convention change doesn't immediately break
+    /// every existing client. Anything else (wrong length, non-hex)
+    /// surfaces as `Err` — silently returning `None` would let an
+    /// upgrade bug look like "no recipients have registered yet."
+    pub async fn account_get_encryption_public_key(
+        &self,
+        addr_base58: &str,
+    ) -> Result<Option<[u8; 32]>> {
+        let raw: Option<String> = self
+            .call("account_getEncryptionPublicKey", json!([addr_base58]))
+            .await?;
+        let Some(s) = raw else {
+            return Ok(None);
+        };
+        let stripped = s.strip_prefix("0x").unwrap_or(&s);
+        let bytes = hex::decode(stripped)
+            .with_context(|| format!("encryption pubkey for {addr_base58} is not valid hex"))?;
+        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "encryption pubkey for {addr_base58} must be 32 bytes, got {}",
+                bytes.len()
+            )
+        })?;
+        Ok(Some(arr))
     }
 
     /// `storage_getAssignmentCoverageV2` — bitmap coverage state for
@@ -387,5 +428,96 @@ mod contract_tests {
             result.is_err(),
             "non-Option client must NOT silently accept null; got {result:?}"
         );
+    }
+
+    /// Chain-confirmed wire shape for
+    /// `account_getEncryptionPublicKey`: `Option<0x-prefixed lowercase hex32>`.
+    /// Pin the canonical chain shape end-to-end (from RPC bytes to
+    /// `[u8; 32]`) so a future chain-side prefixing or casing change
+    /// is caught at this layer.
+    #[tokio::test]
+    async fn account_get_encryption_public_key_chain_canonical_shape() {
+        let body = r#"{"jsonrpc":"2.0","id":1,
+            "result": "0x1111111111111111111111111111111111111111111111111111111111111111"
+        }"#.to_string();
+        let url = one_shot_responder(body).await;
+        let client = L1RpcClient::new(url);
+        let pk = client
+            .account_get_encryption_public_key("OwnerB58Addr")
+            .await
+            .expect("decode chain-canonical lowercase 0x-prefixed hex32");
+        assert_eq!(pk, Some([0x11; 32]));
+    }
+
+    /// `null` → `None`: the account has no key registered. SNIP must
+    /// surface this as `Ok(None)` so the caller can decide whether to
+    /// abort the ingest (locked decision: refuse a Private file
+    /// targeting a recipient with no chain key) vs. continue.
+    #[tokio::test]
+    async fn account_get_encryption_public_key_null_is_none() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_string();
+        let url = one_shot_responder(body).await;
+        let client = L1RpcClient::new(url);
+        let pk = client
+            .account_get_encryption_public_key("OwnerB58Addr")
+            .await
+            .expect("null result must decode as Ok(None)");
+        assert_eq!(pk, None);
+    }
+
+    /// Defensive forward-compat: tolerate uppercase hex and absent
+    /// `0x` prefix (some early-test chain builds emitted these). This
+    /// is intentional flex on the SNIP side; the chain commits only to
+    /// the lowercase 0x-prefixed shape, so this test pins SNIP's
+    /// laxer-than-spec acceptance — a future regression that becomes
+    /// strict-only would fire here.
+    #[tokio::test]
+    async fn account_get_encryption_public_key_tolerates_legacy_shapes() {
+        for body_str in [
+            // Bare hex, no 0x.
+            r#"{"jsonrpc":"2.0","id":1,
+                "result":"1111111111111111111111111111111111111111111111111111111111111111"}"#,
+            // Uppercase hex, with prefix.
+            r#"{"jsonrpc":"2.0","id":1,
+                "result":"0x1111111111111111111111111111111111111111111111111111111111111111"}"#,
+            // Mixed case.
+            r#"{"jsonrpc":"2.0","id":1,
+                "result":"0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa"}"#,
+        ] {
+            let url = one_shot_responder(body_str.to_string()).await;
+            let client = L1RpcClient::new(url);
+            let pk = client
+                .account_get_encryption_public_key("OwnerB58Addr")
+                .await
+                .expect("legacy shape should decode");
+            assert!(pk.is_some());
+        }
+    }
+
+    /// Pathological inputs: wrong length / non-hex MUST surface as
+    /// `Err`, NOT as `Ok(None)`. Silently returning `None` would let
+    /// an upgrade bug look like "no recipients registered."
+    #[tokio::test]
+    async fn account_get_encryption_public_key_invalid_payload_errors() {
+        for body_str in [
+            // Odd-length hex.
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x111"}"#,
+            // Too short (16 bytes instead of 32).
+            r#"{"jsonrpc":"2.0","id":1,
+                "result":"0x11111111111111111111111111111111"}"#,
+            // Non-hex characters.
+            r#"{"jsonrpc":"2.0","id":1,
+                "result":"0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"}"#,
+        ] {
+            let url = one_shot_responder(body_str.to_string()).await;
+            let client = L1RpcClient::new(url);
+            let res = client
+                .account_get_encryption_public_key("OwnerB58Addr")
+                .await;
+            assert!(
+                res.is_err(),
+                "malformed payload must NOT silently decode as None; got {res:?}"
+            );
+        }
     }
 }

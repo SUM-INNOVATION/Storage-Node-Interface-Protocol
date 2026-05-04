@@ -23,11 +23,29 @@ pub struct ChunkDescriptor {
     /// Byte offset within the original file.
     pub offset: u64,
     /// Actual byte count (last chunk may be < CHUNK_SIZE).
+    ///
+    /// For Public files this is plaintext bytes; for Private (V2) files
+    /// this is the *ciphertext* size (plaintext + 16-byte AEAD tag), so
+    /// `chunk_count == ceil(stored_size_bytes / CHUNK_SIZE)` holds for
+    /// both visibilities — the chain rule is uniform.
     pub size: u64,
-    /// BLAKE3 hash of this chunk's data (32 bytes).
+    /// BLAKE3 hash of this chunk's stored bytes (32 bytes).
+    ///
+    /// For Public this is the plaintext hash; for Private this is the
+    /// hash of the *ciphertext* chunk that lives on disk and is fetched
+    /// over the wire. This is what the chain commits to and what
+    /// serving nodes prove against the file's Merkle root.
     pub blake3_hash: [u8; 32],
     /// CIDv1 string (BLAKE3, raw codec) for content addressing.
     pub cid: String,
+    /// BLAKE3 hash of this chunk's *plaintext* bytes (Private files only).
+    ///
+    /// Used by the downloader to verify decrypted content end-to-end.
+    /// `None` for Public files (where `blake3_hash` already covers the
+    /// plaintext) and absent on the wire to keep Public manifests
+    /// byte-identical to the pre-V2 format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plaintext_blake3_hash: Option<[u8; 32]>,
 }
 
 // ── Data Manifest ────────────────────────────────────────────────────────────
@@ -72,10 +90,62 @@ mod tests {
             size: CHUNK_SIZE,
             blake3_hash: [0xaa; 32],
             cid: "bafkr4itest".into(),
+            plaintext_blake3_hash: None,
         };
         let json = serde_json::to_string(&cd).unwrap();
         let round: ChunkDescriptor = serde_json::from_str(&json).unwrap();
         assert_eq!(cd, round);
+    }
+
+    #[test]
+    fn chunk_descriptor_omits_plaintext_hash_when_none() {
+        // Public-file manifests must serialize byte-identically to the
+        // pre-V2 format (no `plaintext_blake3_hash` field on the wire).
+        let cd = ChunkDescriptor {
+            chunk_index: 0,
+            offset: 0,
+            size: CHUNK_SIZE,
+            blake3_hash: [0xaa; 32],
+            cid: "bafkr4itest".into(),
+            plaintext_blake3_hash: None,
+        };
+        let json = serde_json::to_string(&cd).unwrap();
+        assert!(
+            !json.contains("plaintext_blake3_hash"),
+            "expected field to be skipped, got: {json}"
+        );
+    }
+
+    #[test]
+    fn chunk_descriptor_with_plaintext_hash_round_trips() {
+        let cd = ChunkDescriptor {
+            chunk_index: 7,
+            offset: 7 * CHUNK_SIZE,
+            size: CHUNK_SIZE,
+            blake3_hash: [0xaa; 32],
+            cid: "bafkr4itest".into(),
+            plaintext_blake3_hash: Some([0xdd; 32]),
+        };
+        let json = serde_json::to_string(&cd).unwrap();
+        assert!(json.contains("plaintext_blake3_hash"));
+        let round: ChunkDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(cd, round);
+    }
+
+    #[test]
+    fn chunk_descriptor_accepts_legacy_manifests() {
+        // Legacy (V1) manifests have no `plaintext_blake3_hash` field;
+        // `serde(default)` must let them deserialize cleanly.
+        let legacy = r#"{
+            "chunk_index": 0,
+            "offset": 0,
+            "size": 1048576,
+            "blake3_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "cid": "bafkr4ilegacy"
+        }"#;
+        let cd: ChunkDescriptor = serde_json::from_str(legacy).unwrap();
+        assert!(cd.plaintext_blake3_hash.is_none());
     }
 
     #[test]

@@ -916,6 +916,7 @@ mod tests {
                     size,
                     blake3_hash: *h.as_bytes(),
                     cid: cid_from_blake3_hash(h),
+                    plaintext_blake3_hash: None,
                 };
                 offset += size;
                 d

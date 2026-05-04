@@ -514,6 +514,7 @@ mod tests {
                 size: 32,
                 blake3_hash: *hash.as_bytes(),
                 cid: crate::content_id::cid_from_blake3_hash(&hash),
+                plaintext_blake3_hash: None,
             });
             leaf_hashes.push(hash);
         }
