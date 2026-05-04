@@ -500,6 +500,63 @@ The download command automatically verifies the entire file by building the Merk
 
 ---
 
+## V2 Lifecycle (Phase 0b — chain plan v3.2)
+
+Steps 0–8 above describe the **V1 protocol** (`/sum/storage/v1`), which is preserved for backwards compatibility. Phase 0b adds a **V2 lifecycle** (`/sum/storage/v2`) that closes a real gap in V1: a V1 receiving node has no way to verify a pushed chunk actually belongs to the registered file *before* it lands on disk, and no way to attest to chain that it's holding what it should. V2 fixes both with per-push Merkle proofs and a chain-recorded bitmap of attested chunks.
+
+Both protocols coexist on the same libp2p swarm. The codec dispatches per-stream on the negotiated protocol name; V1 wire bytes are bit-compatible with what nodes have been speaking since the project shipped.
+
+### V2 file lifecycle states
+
+```
+                         (file doesn't exist on chain)
+                                      │
+                                      │ RegisterFilePendingV2 finalizes
+                                      ▼
+                                  ┌────────┐
+                                  │Pending │
+                                  └────────┘
+                  ActivateFileV2  │      │  AbandonFileV2
+                  (all assigned   │      │  (after grace +
+                   chunks         │      │   strict-> rule)
+                   attested)      ▼      ▼
+                              ┌──────┐ ┌──────────┐
+                              │Active│ │Abandoned │
+                              └──────┘ └──────────┘
+```
+
+`AbandonFileV2` is admissible only when `current_height > created_at + activation_grace_blocks` (chain plan v3.2 §3.5, strict greater-than). On success, 90 % of the registration fee deposit refunds to the owner and 10 % is burned.
+
+### V2 ingest walkthrough
+
+Alice runs `sum-node ingest-v2 file.pdf`. The pipeline executes seven stages:
+
+1. **Chunk locally** (same as V1: 1 MB chunks, BLAKE3 leaves, Merkle tree, `DataManifest`).
+2. **`RegisterFilePendingV2`** — Alice signs and submits a tx with merkle_root, chunk_count, fee deposit, visibility (Public in Phase 0b), and an empty initial access list. Wait for finalization. The chain captures `assignment_height = current_block_height` at this point — that's the snapshot that determines per-chunk assignment for the lifetime of the file.
+3. **Read the snapshot** via `storage_getActiveNodesAtHeight(assignment_height)` (chain plan §5.3 / Ask 15).
+4. **Push chunks with Merkle proofs inline.** Each push carries `(data, merkle_root, chunk_index, merkle_path)`. The receiving node validates four things before persisting: the file is registered and not Abandoned (`storage_getFileInfoV2`), `chunk_index < chunk_count`, the receiving archive is in the snapshot AND in the V2 deterministic assignment for this `chunk_index`, and `verify_merkle_proof_bytes_for_tree(blake3(data), chunk_index, merkle_path, merkle_root, chunk_count)` succeeds. Wire CID is never trusted — leaf hash is derived from `data`. Per (chunk, peer) retry budget is 2.
+5. **`ManifestPush`** sends the CBOR manifest to each distinct assigned archive. Receivers re-derive the merkle_root from the manifest's chunk descriptors and reject any mismatch. Receivers ACK as soon as the manifest is persisted; attestation runs as a background spawn so inbound request latency is decoupled from chain finality.
+6. **`AcceptAssignmentV2`** is what each archive submits after ManifestPush. It carries a list of `chunk_index: u32` values; chain OR-merges those bits into a per-(file, archive) bitmap. Files whose per-archive assignment exceeds `max_chunk_indices_per_tx` (default 65,536) split across multiple OR-merge txs that compose into the same bitmap.
+7. **`storage_getAssignmentCoverageV2`** poll until `can_activate_now == true` (every chunk has at least one accepting archive that's currently `Active`), then submit **`ActivateFileV2`**. File transitions Pending → Active. PoR challenges become eligible after `activated_at_height + activation_grace_blocks`.
+
+### Resume and abandon
+
+If anything after step 2 fails — a network partition, a slow chain, or a missing manifest ACK — the file is left `Pending` on chain. Two operator commands recover:
+
+- **`sum-node resume <merkle_root> <path>`** — re-chunks the file (asserts the path's computed merkle_root equals the one passed; otherwise typed `RootMismatch`), reads chain state, and runs only the residual work. If the file is already `Active`, no-op (reports the chain-recorded heights). If `Abandoned`, terminal. Otherwise pulls `coverage.missing_indices` (paginated via `missing_offset`) and runs a partial push wave restricted to those chunk indices, then re-runs ManifestPush (idempotent on receivers), then waits for coverage, then activates.
+- **`sum-node abandon <merkle_root>`** — pre-checks lifecycle is Pending and `current_height > created_at + activation_grace_blocks` before submitting (otherwise returns `NotAdmissible` with the earliest admissible height; saves a wasted tx fee). On success, the file is permanently Abandoned and 90 % of the deposit refunds.
+
+### V2 vs V1 — when does each one fire?
+
+| Protocol | Triggered by | Receiver behaviour |
+|---|---|---|
+| `/sum/storage/v1` | Legacy `sum-node ingest` and the V1 `--client ingest` path | Original V1 push: verify CID, write to disk, gossip an announcement. ACL is enforced on pulls but pushes have no chain-level proof. |
+| `/sum/storage/v2` | `sum-node ingest-v2`, `resume`, `abandon`, plus the V2 dispatcher's manifest/chunk/manifest-push/manifest-pull replies | Chain-rooted: every push is Merkle-proof verified against chain state before disk write; every successful manifest push triggers an attestation tx; pulls run through the same ACL gate as V1. |
+
+V2 is the chain-canonical path going forward. V1 stays operational for legacy traffic and read-only access to existing files; new ingest should use V2 to get chain-attestable replication.
+
+---
+
 ## Summary
 
 | Layer | What it knows | What it stores |
@@ -534,21 +591,36 @@ The download command automatically verifies the entire file by building the Merk
 
 | Command | What it does |
 |---------|-------------|
-| `sum-node listen` | Run as a storage node: serve chunks, enforce ACLs, respond to PoR challenges, run MarketSync + GC |
-| `sum-node ingest <path>` | Upload a file AND stay running to serve chunks (node operator adding a file to the network) |
+| `sum-node listen` | Run as a storage node: serve chunks, enforce ACLs, respond to PoR challenges, run MarketSync + GC, dispatch V2 inbound when a signing key is present |
+| `sum-node ingest <path>` | V1 upload: chunk, push to R=3 assigned nodes, stay running to serve chunks |
 | `sum-node fetch <cid>` | Download a single chunk by CID from a LAN peer |
 | `sum-node send <message>` | Broadcast a test gossipsub message |
 
+**For V2 lifecycle operations (chain plan v3.2 — Phase 0b):**
+
+| Command | What it does |
+|---------|-------------|
+| `sum-node ingest-v2 <path>` | V2 ingest pipeline: chunk → `RegisterFilePendingV2` → push with Merkle proofs → ManifestPush → coverage poll → `ActivateFileV2`. On any post-register failure the file is left `Pending` and the command exits with operator guidance to run `resume` or `abandon`. Requires `--key-file`. |
+| `sum-node resume <merkle_root_hex> <path>` | Re-run only the residual V2 work for a `Pending` file. Re-chunks the path and asserts its computed root matches the explicit `merkle_root_hex`. Detects already-`Active` (no-op) and `Abandoned` (terminal) states. Requires `--key-file`. |
+| `sum-node abandon <merkle_root_hex>` | Submit `AbandonFileV2`. Pre-checks lifecycle == Pending AND `current_height > created_at + activation_grace_blocks` before burning a tx fee; rejects in-process otherwise. Chain-only — does not require libp2p connectivity. Requires `--key-file`. |
+
 **Key flags:**
 - `--client` — Run in client mode. Ingest pushes to R=3 and exits (no serving). Listen is not available.
-- `--key-file <path>` — Ed25519 private key seed (hex-encoded). Without it, generates a random keypair (dev mode, PoR disabled).
+- `--key-file <path>` — Ed25519 private key seed (hex-encoded). Without it, generates a random keypair (dev mode, PoR + V2 ingest/resume/abandon disabled).
+- `--profile <production|dev>` — fail-closed (production) vs fail-open (dev) policy on chain RPC errors. Production refuses to fall back to hardcoded `IngestParams` if `chain_getChainParams` fails; dev allows defaults with a warning.
 - `--rpc-url <url>` — SUM Chain L1 JSON-RPC endpoint (default `http://127.0.0.1:9944`)
-- `--upload-timeout <seconds>` — time to wait for R=3 push confirmations during ingest (default 120)
+- `--chain-id <u64>` — chain id used to sign V1 + V2 transactions (must match the chain's `chain_id`).
+- `--attest-fee <koppa>` — fee per V2 tx (RegisterFilePendingV2 / ActivateFileV2 / AbandonFileV2 / AcceptAssignmentV2). Must be ≥ chain `min_fee`.
+- `--push-wait-secs <secs>` — V2 ingest S2 push-wave wall-clock timeout (default 120).
+- `--manifest-push-wait-secs <secs>` — V2 ingest S3 manifest-push wall-clock timeout (default 60).
+- `--activation-wait-secs <secs>` — V2 ingest S4 coverage-poll wall-clock timeout (default 300). NOT `activation_grace_blocks` — that's a chain-side parameter for `AbandonFileV2` admissibility, not for ingest progression.
+- `--upload-timeout <seconds>` — time to wait for R=3 push confirmations during V1 ingest (default 120)
 - `--gc-grace-secs <seconds>` — how long to keep unassigned chunks before garbage collection deletes them (default 3600 = 1 hour)
 - `--max-concurrent <n>` — maximum parallel chunk fetches during download (default 10)
 - `--enable-wan` — enable Kademlia DHT + TCP transport for internet-wide peer discovery
 - `--bootstrap-peer <multiaddr>` — bootstrap peer for Kademlia (repeatable or comma-separated)
 - `--tcp-port <port>` — TCP listen port for WAN connections (default 0 = OS-assigned)
+- `--relay-server` — opt in to advertising this node as a libp2p Circuit Relay v2 server (only meaningful with `--enable-wan` and on a publicly-reachable host).
 
 ---
 
@@ -601,4 +673,4 @@ sum-node --enable-wan --tcp-port 4001 \
 
 **Firewall requirements:** TCP port (default OS-assigned, or set via `--tcp-port`) must be reachable for inbound WAN connections. QUIC/UDP port should also be open for optimal performance.
 
-**Future:** AutoNAT for detecting NAT type and DCUtR for hole-punching behind symmetric NATs. See `docs/WAN-DISCOVERY-AND-HARDENING.md`.
+**NAT traversal (shipped):** AutoNAT detects whether this node is publicly reachable; nodes behind symmetric NATs reserve a slot on a Circuit Relay v2 (a publicly-reachable peer that's started with `--relay-server`) and DCUtR hole-punches the relay circuit into a direct QUIC connection. See `docs/WAN-DISCOVERY-AND-HARDENING.md` for the full state machine.

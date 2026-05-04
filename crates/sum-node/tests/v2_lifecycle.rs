@@ -334,6 +334,7 @@ fn make_manifest(n: u32, salt: u8) -> (DataManifest, Vec<Vec<u8>>, MerkleTree) {
                 size,
                 blake3_hash: *h.as_bytes(),
                 cid: sum_store::content_id::cid_from_blake3_hash(h),
+                plaintext_blake3_hash: None,
             };
             offset += size;
             d

@@ -38,6 +38,28 @@ pub fn build_submit_proof_tx(
     sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
 }
 
+/// Build a hex-encoded `SignedTransaction` for
+/// `NodeRegistryV2::RegisterEncryptionKey` (chain plan v3.2 §3.3).
+///
+/// Used by Phase 4a (Private files) so that other accounts can wrap a
+/// file's `K_file` for this account's X25519 public key. The chain
+/// rejects 7 known low-order points with `Failed(22)`; callers should
+/// derive `encryption_pubkey` from a real X25519 secret (e.g. via
+/// `sum_crypto::x25519_keypair_from_ed25519_seed`) rather than passing
+/// arbitrary bytes.
+pub fn build_register_encryption_key_tx(
+    ed25519_seed: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+    fee: u128,
+    encryption_pubkey: [u8; 32],
+) -> Result<String> {
+    let payload = TxPayloadMirror::NodeRegistryV2(NodeRegistryV2TxDataMirror {
+        operation: NodeRegistryOperationV2Mirror::RegisterEncryptionKey { encryption_pubkey },
+    });
+    sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
+}
+
 /// Build a hex-encoded `SignedTransaction` for `NodeRegistry::Register(ArchiveNode)`.
 pub fn build_register_archive_node_tx(
     ed25519_seed: &[u8; 32],
@@ -601,6 +623,35 @@ mod tests {
             &seed, 1, 0, 100, [0; 32], [1; 32], 0, [2; 32], vec![],
         ).unwrap();
         assert_eq!(hex1, hex2, "same inputs must produce same tx hex");
+    }
+
+    #[test]
+    fn build_and_verify_register_encryption_key_tx() {
+        let seed = [11u8; 32];
+        let pubkey = [0xAB; 32];
+        let hex = build_register_encryption_key_tx(&seed, 1337, 7, 250_000, pubkey).unwrap();
+
+        let bytes = hex::decode(&hex).unwrap();
+        let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
+
+        match signed.inner {
+            TxInnerMirror::V2(tx) => {
+                assert_eq!(tx.chain_id, 1337);
+                assert_eq!(tx.nonce, 7);
+                assert_eq!(tx.fee, 250_000);
+                match tx.payload {
+                    TxPayloadMirror::NodeRegistryV2(data) => match data.operation {
+                        NodeRegistryOperationV2Mirror::RegisterEncryptionKey {
+                            encryption_pubkey,
+                        } => {
+                            assert_eq!(encryption_pubkey, pubkey);
+                        }
+                    },
+                    _ => panic!("wrong payload variant — expected NodeRegistryV2"),
+                }
+            }
+            _ => panic!("wrong TxInner variant"),
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -173,6 +173,21 @@ enum Command {
         /// for `AbandonFileV2` admissibility, not for ingest progression.
         #[arg(long, default_value = "300")]
         activation_wait_secs: u64,
+        /// File visibility on chain. `public` (default) leaves chunks /
+        /// manifest unencrypted; `private` (Phase 4a) generates a fresh
+        /// `K_file`, encrypts every chunk + the manifest, and wraps
+        /// `K_file` for each recipient (the owner is auto-added).
+        #[arg(long, default_value = "public", value_parser = ["public", "private"])]
+        visibility: String,
+        /// Recipient for a Private file: `<base58 L1 addr>` or
+        /// `<base58 L1 addr>:<expires_at_height>`. Repeatable. The owner
+        /// is auto-added; supplying recipients here makes the file
+        /// "owner-shared". Each recipient's X25519 pubkey is fetched
+        /// from chain via `account_getEncryptionPublicKey` — recipients
+        /// without a registered key cause ingest to abort BEFORE any
+        /// chain state is created.
+        #[arg(long = "recipient")]
+        recipients: Vec<String>,
     },
 
     /// Fetch a chunk by CID from a LAN peer.
@@ -226,6 +241,15 @@ enum Command {
         /// Hex-encoded 32-byte merkle root of the pending file.
         merkle_root: String,
     },
+
+    /// Phase 4a — register an X25519 encryption public key on chain so
+    /// other accounts can wrap private-file `K_file`s for this account.
+    ///
+    /// Derives the X25519 keypair deterministically from the Ed25519 seed
+    /// in `--key-file` via HKDF (domain `snip-x25519-encryption-key-v1`),
+    /// signs `NodeRegistryV2::RegisterEncryptionKey`, submits, and waits
+    /// for finality. Re-runs are idempotent (chain overwrites the slot).
+    RegisterEncryptionKey,
 
     /// Discover a peer on the LAN, publish a test message, then exit.
     Send {
@@ -313,12 +337,22 @@ async fn main() -> Result<()> {
             push_wait_secs,
             manifest_push_wait_secs,
             activation_wait_secs,
+            visibility,
+            recipients,
         } => {
             let seed = seed.ok_or_else(|| {
                 anyhow::anyhow!(
                     "ingest-v2 requires --key-file (V2 register/activate transactions need a signing key)"
                 )
             })?;
+            // Reject `--recipient` on Public ingest BEFORE any chain
+            // RPC — passing it would silently be ignored otherwise.
+            if visibility == "public" && !recipients.is_empty() {
+                anyhow::bail!(
+                    "--recipient is meaningful only with --visibility private; got {} recipients on a public ingest",
+                    recipients.len()
+                );
+            }
             run_ingest_v2(
                 keypair,
                 seed,
@@ -331,6 +365,8 @@ async fn main() -> Result<()> {
                 push_wait_secs,
                 manifest_push_wait_secs,
                 activation_wait_secs,
+                visibility,
+                recipients,
             )
             .await
         }
@@ -373,6 +409,21 @@ async fn main() -> Result<()> {
                 cli.profile,
                 net_config,
                 merkle_root,
+            )
+            .await
+        }
+        Command::RegisterEncryptionKey => {
+            let seed = seed.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "register-encryption-key requires --key-file (NodeRegistryV2 needs a signing key)"
+                )
+            })?;
+            run_register_encryption_key(
+                keypair,
+                seed,
+                cli.rpc_url.clone(),
+                cli.chain_id,
+                cli.attest_fee,
             )
             .await
         }
@@ -1090,6 +1141,8 @@ async fn run_ingest_v2(
     push_wait_secs: u64,
     manifest_push_wait_secs: u64,
     activation_wait_secs: u64,
+    visibility: String,
+    recipient_specs: Vec<String>,
 ) -> Result<()> {
     let l1_addr = identity::l1_address_from_keypair(&keypair);
     let net = Arc::new(SumNet::new(net_config, keypair).await?);
@@ -1209,7 +1262,7 @@ async fn run_ingest_v2(
     // ── Construct pipeline ─────────────────────────────────────────
     let resolver = Arc::new(sum_node::ingest_v2::MapPeerResolver::new(peer_addresses));
     let pipeline = sum_node::ingest_v2::IngestPipeline::new(
-        rpc,
+        rpc.clone(),
         net.clone(),
         resolver,
         seed,
@@ -1217,8 +1270,16 @@ async fn run_ingest_v2(
         params,
     );
 
-    // ── Run ────────────────────────────────────────────────────────
-    let outcome = pipeline.run(&path).await;
+    // ── Run (Public or Private dispatch) ───────────────────────────
+    let outcome = match visibility.as_str() {
+        "public" => pipeline.run(&path).await,
+        "private" => {
+            let spec = build_private_ingest_spec(&rpc, &seed, l1_addr, &recipient_specs).await?;
+            pipeline.run_private(&path, spec).await
+        }
+        // Unreachable: clap value_parser already restricts to {public, private}.
+        other => anyhow::bail!("unsupported --visibility {other}"),
+    };
     match &outcome {
         sum_node::ingest_v2::IngestOutcome::Activated {
             merkle_root,
@@ -1530,6 +1591,220 @@ async fn run_abandon_v2(
             warn!(%source, "ABANDON failed");
         }
     }
+    Ok(())
+}
+
+// ── Private ingest helpers (Phase 4a) ─────────────────────────────────────────
+
+/// Parse one `--recipient` value: `<addr_b58>` or
+/// `<addr_b58>:<expires_at_height>`. Anything else (multiple `:`, empty
+/// halves, non-base58, non-numeric expires) is rejected — silently
+/// dropping a malformed recipient could surprise the operator who
+/// expects shared access.
+fn parse_recipient_spec(s: &str) -> Result<([u8; 20], Option<u64>)> {
+    let (addr_str, expires) = match s.split_once(':') {
+        Some((a, e)) => {
+            let h: u64 = e
+                .parse()
+                .map_err(|_| anyhow::anyhow!("recipient {s:?}: expires_at must be a u64 block height"))?;
+            (a, Some(h))
+        }
+        None => (s, None),
+    };
+    if addr_str.is_empty() {
+        anyhow::bail!("recipient {s:?}: empty L1 address");
+    }
+    let addr = sum_net::l1_address_from_base58(addr_str)
+        .map_err(|e| anyhow::anyhow!("recipient {s:?}: {e}"))?;
+    Ok((addr, expires))
+}
+
+/// Build a [`PrivateIngestSpec`](sum_node::ingest_v2::PrivateIngestSpec)
+/// from a list of CLI recipient specs. Looks up each recipient's
+/// X25519 pubkey via `account_getEncryptionPublicKey` and aborts the
+/// ingest if any recipient lacks a registered key — silently dropping
+/// such recipients would leave the operator with a less-shared file
+/// than they asked for.
+async fn build_private_ingest_spec(
+    rpc: &sum_node::rpc_client::L1RpcClient,
+    seed: &[u8; 32],
+    owner_l1_address: [u8; 20],
+    specs: &[String],
+) -> Result<sum_node::ingest_v2::PrivateIngestSpec> {
+    use sum_node::ingest_v2::{PrivateIngestSpec, PrivateRecipient};
+
+    let (_x25519_secret, owner_x25519_pubkey) =
+        sum_crypto::x25519_keypair_from_ed25519_seed(seed);
+
+    // Defense in depth: warn (but don't abort) if the owner's derived
+    // pubkey is not registered on chain. A Private file with an
+    // owner-only access list is still useful — the owner's bundle is
+    // built from the *derived* pubkey here, not from chain — but if
+    // the chain doesn't know about it, no other account can ever wrap
+    // K_file FOR the owner from a future share. Worth surfacing.
+    let owner_b58 = sum_net::l1_address_base58(&owner_l1_address);
+    match rpc.account_get_encryption_public_key(&owner_b58).await {
+        Ok(Some(chain_pk)) if chain_pk == owner_x25519_pubkey => {}
+        Ok(Some(chain_pk)) => {
+            warn!(
+                addr = %owner_b58,
+                derived = %hex::encode(owner_x25519_pubkey),
+                on_chain = %hex::encode(chain_pk),
+                "owner's derived X25519 pubkey differs from the on-chain registered key — your bundle will be sealed against the derived key, not the chain key"
+            );
+        }
+        Ok(None) => {
+            warn!(
+                addr = %owner_b58,
+                "owner has no encryption pubkey on chain — run `sum-node register-encryption-key` first if you want others to be able to share future Private files with you"
+            );
+        }
+        Err(e) => warn!(addr = %owner_b58, %e, "could not pre-check owner's chain encryption key"),
+    }
+
+    let mut recipients: Vec<PrivateRecipient> = Vec::with_capacity(specs.len());
+    for raw in specs {
+        let (addr, expires_at) = parse_recipient_spec(raw)?;
+        let addr_b58 = sum_net::l1_address_base58(&addr);
+        let pk = rpc
+            .account_get_encryption_public_key(&addr_b58)
+            .await
+            .with_context(|| format!("recipient {raw:?}: account_getEncryptionPublicKey failed"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "recipient {raw:?} ({addr_b58}) has no encryption pubkey registered on chain — \
+                     ask them to run `sum-node register-encryption-key` first, or remove from --recipient"
+                )
+            })?;
+        recipients.push(PrivateRecipient {
+            l1_address: addr,
+            x25519_pubkey: pk,
+            expires_at,
+        });
+    }
+
+    Ok(PrivateIngestSpec {
+        owner_l1_address,
+        owner_x25519_pubkey,
+        recipients,
+    })
+}
+
+// ── Register-encryption-key (Phase 4a) ───────────────────────────────────────
+
+/// Submit `NodeRegistryV2::RegisterEncryptionKey` for this account's
+/// derived X25519 pubkey, then wait for finality.
+///
+/// Idempotent on chain: re-running with the same seed re-derives the
+/// same X25519 pubkey, so a second submission is a (fee-burning) no-op
+/// at the storage layer. We still warn rather than skip if the chain
+/// already has a key registered; the operator may be rotating keys (a
+/// future feature), and silently dropping the tx would be surprising.
+async fn run_register_encryption_key(
+    keypair: Keypair,
+    seed: [u8; 32],
+    rpc_url: String,
+    chain_id: u64,
+    fee: u128,
+) -> Result<()> {
+    use sum_node::tx_builder::build_register_encryption_key_tx;
+    use sum_node::tx_wait::{wait_for_finalized, TxWaitError};
+
+    let l1_addr = identity::l1_address_from_keypair(&keypair);
+    let l1_b58 = identity::l1_address_base58(&l1_addr);
+    let rpc = L1RpcClient::new(rpc_url);
+
+    // V2-enabled gate: RegisterEncryptionKey is a NodeRegistryV2 op
+    // and would be rejected (fee burned) before the chain has
+    // activated V2. Read live params and the finalized head; refuse
+    // up front when V2 is disabled (`v2_enabled_from_height = null`)
+    // or scheduled for a future height.
+    let cp = rpc.chain_get_chain_params().await?;
+    let head = rpc.chain_get_block_height().await?;
+    match cp.v2_enabled_from_height {
+        None => anyhow::bail!(
+            "V2 disabled on this chain (chain_getChainParams.v2_enabled_from_height = null) — \
+             refusing to submit RegisterEncryptionKey; the chain would reject it"
+        ),
+        Some(enabled_at) if head.height < enabled_at => anyhow::bail!(
+            "V2 not enabled yet: finalized height {} < v2_enabled_from_height {} \
+             ({} blocks remaining); refusing to submit RegisterEncryptionKey — \
+             the chain would burn the fee",
+            head.height,
+            enabled_at,
+            enabled_at - head.height,
+        ),
+        Some(_) => {}
+    }
+
+    // Derive the X25519 pubkey deterministically from the Ed25519 seed.
+    let (_x25519_secret, x25519_pubkey) =
+        sum_crypto::x25519_keypair_from_ed25519_seed(&seed);
+
+    // Read-before-write: log whether we're registering fresh or
+    // overwriting. Don't fail on a mismatched-pubkey overwrite — the
+    // user might be rotating a leaked secret. Do fail on RPC errors
+    // other than "no key registered".
+    match rpc.account_get_encryption_public_key(&l1_b58).await {
+        Ok(None) => info!(addr = %l1_b58, "no encryption key on chain — registering fresh"),
+        Ok(Some(existing)) if existing == x25519_pubkey => {
+            info!(
+                addr = %l1_b58,
+                pubkey = %hex::encode(x25519_pubkey),
+                "encryption key already registered with the derived pubkey — re-submitting will be a no-op overwrite (fees will still be burned)"
+            );
+        }
+        Ok(Some(existing)) => {
+            warn!(
+                addr = %l1_b58,
+                existing_pubkey = %hex::encode(existing),
+                derived_pubkey = %hex::encode(x25519_pubkey),
+                "encryption key on chain differs from the derived key — overwriting (key rotation)"
+            );
+        }
+        Err(e) => warn!(addr = %l1_b58, err = %e, "could not pre-check encryption key on chain — proceeding anyway"),
+    }
+
+    let nonce = rpc.get_nonce(&l1_b58).await?;
+    let tx_hex = build_register_encryption_key_tx(&seed, chain_id, nonce, fee, x25519_pubkey)?;
+    let tx_hash_value = rpc.send_raw_transaction(&tx_hex).await?;
+    let tx_hash = tx_hash_value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("send_raw_transaction returned non-string tx hash: {tx_hash_value}"))?
+        .to_string();
+
+    info!(
+        %tx_hash,
+        addr = %l1_b58,
+        pubkey = %hex::encode(x25519_pubkey),
+        "RegisterEncryptionKey submitted, waiting for finality"
+    );
+
+    let height = wait_for_finalized(
+        &rpc,
+        &tx_hash,
+        sum_node::tx_wait::DEFAULT_POLL_INTERVAL,
+        Duration::from_secs(120),
+    )
+    .await
+    .map_err(|e| match e {
+        TxWaitError::Failed { reason, block_height } => {
+            anyhow::anyhow!("RegisterEncryptionKey failed at height {block_height:?}: {reason}")
+        }
+        TxWaitError::Dropped => anyhow::anyhow!("RegisterEncryptionKey dropped from mempool — re-run with a fresh nonce"),
+        TxWaitError::Timeout { last_status } => {
+            anyhow::anyhow!("RegisterEncryptionKey timed out (last status: {last_status:?})")
+        }
+        TxWaitError::Rpc(e) => e,
+    })?;
+
+    info!(
+        %tx_hash,
+        height,
+        addr = %l1_b58,
+        pubkey = %hex::encode(x25519_pubkey),
+        "RegisterEncryptionKey finalized — this account can now receive private files"
+    );
     Ok(())
 }
 

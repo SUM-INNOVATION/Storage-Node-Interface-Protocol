@@ -8,6 +8,7 @@ target/
 # Editor / IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
@@ -27,3 +28,5 @@ SNIP_*.txt
 SNIP-V2-CHAIN-PLAN.md
 SNIP-V2-TESTNET-DEPLOYMENT-PREP.md
 SNIP-V2-RPC-CHEATSHEET.md
+
+.claude/
