@@ -44,6 +44,10 @@ zeroize            = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Minimal HTTP mock server for wire-shape regression tests. Used only
+# by the e2e_helper `smoke` subcommand tests to drive the actual HTTP
+# code path against scripted JSON responses.
+httpmock = "0.7"
 
 [lints]
 workspace = true

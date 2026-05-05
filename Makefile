@@ -3,7 +3,7 @@
 # Run `make` (no args) to print this help.
 
 .DEFAULT_GOAL := help
-.PHONY: help fmt lint lint-strict test build release-check
+.PHONY: help fmt lint lint-strict test build release-check smoke
 
 help:
 	@printf "Targets:\n"
@@ -13,6 +13,7 @@ help:
 	@printf "  lint-strict    cargo clippy --workspace --all-targets -- -D warnings\n"
 	@printf "  build          cargo build --release -p sum-node\n"
 	@printf "  release-check  fmt + lint-strict + test + build (run before tagging a release)\n"
+	@printf "  smoke RPC=URL  read-only chain smoke against RPC (e.g. RPC=http://localhost:8545)\n"
 
 fmt:
 	cargo fmt --check
@@ -31,3 +32,10 @@ build:
 
 release-check: fmt lint-strict test build
 	@printf "release-check: ok\n"
+
+smoke:
+	@if [ -z "$(RPC)" ]; then \
+		printf "usage: make smoke RPC=<rpc-url>\n  e.g. make smoke RPC=http://localhost:8545\n" >&2; \
+		exit 2; \
+	fi
+	cargo run -p sum-node --bin e2e-helper -- smoke --rpc-url "$(RPC)"
