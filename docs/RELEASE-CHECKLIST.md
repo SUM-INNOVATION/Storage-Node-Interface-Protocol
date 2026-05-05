@@ -10,6 +10,38 @@ Anything that fails blocks the release; anything that warns goes in
 > environment. Real RPC URLs, validator hostnames, funded addresses,
 > and internal chain commits MUST NOT appear in this file.
 
+## 0. CI gate (one-time setup, then automated)
+
+Every PR runs `make release-check` on `ubuntu-24.04` via
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml). The job
+is named exactly `release-check (linux)` so a GitHub branch-
+protection rule can require it by stable name.
+
+One-time setup:
+
+- [ ] In GitHub: **Settings → Branches → main** (Branch protection
+      rule). Require status check `release-check (linux)` to pass
+      before merging. Enable "Require branches to be up to date
+      before merging" so the gate runs against the merge result,
+      not a stale base.
+- [ ] Confirm a freshly opened PR shows the `release-check (linux)`
+      check as required (not "expected") — the rule only applies
+      after at least one run completes on `main`.
+
+What CI runs:
+
+- `make release-check` — `fmt` + `lint-strict` + `test` + `build` +
+  `audit-logs`. Same chain operators run locally.
+
+What CI does NOT run:
+
+- **Live-chain smoke** (`make smoke RPC=…`) — manual only. CI has
+  no chain RPC URL and no chain secrets. Run before tagging
+  (see § 4 below).
+- Release artifact builds, coverage, macOS matrix — explicitly out
+  of scope for the merge gate. Add later in separate workflows
+  once the linux gate is stable in production.
+
 ## 1. Workspace hygiene
 
 - [ ] `git status` — no uncommitted changes, no untracked files
