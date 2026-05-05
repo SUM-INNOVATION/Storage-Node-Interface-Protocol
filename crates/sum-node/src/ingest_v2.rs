@@ -3798,7 +3798,7 @@ mod tests {
         assert_eq!(net.push_count(), 6, "S2 must push only missing chunks");
         // Manifest sent to the full distinct-assigned archive set.
         assert_eq!(
-            net.manifest_push_count() as usize,
+            net.manifest_push_count(),
             full_assigned.len(),
             "S3 must re-push manifest to all distinct assigned archives"
         );
@@ -4312,22 +4312,9 @@ mod tests {
         let my_addr = snapshot[0];
         let merkle_root = [0x02; 32];
 
-        // current_height = 149 (created_at=100, grace=50 → admissible at 151)
-        struct CurrentHeightRpc {
-            inner: Arc<MockRpc>,
-            current_height: u64,
-        }
-        // For these grace tests we override chain_get_block_height by
-        // constructing a custom adapter; instead, just monkey-patch the
-        // MockRpc default which returns 1000. We need height < 151, so
-        // create a custom MockRpc impl below... actually easier: set
-        // info.created_at=999_999, grace=50 → earliest=1_000_050;
-        // MockRpc::chain_get_block_height returns 1000 → 1000 < 1_000_050.
-        let _ = CurrentHeightRpc {
-            inner: Arc::new(MockRpc::default()),
-            current_height: 0,
-        };
-
+        // MockRpc::chain_get_block_height returns 1000. To exercise the
+        // pre-grace path, set created_at=999_900 + grace=50 →
+        // earliest_admissible=1_000_051, so 1000 < earliest → NotAdmissible.
         let rpc = Arc::new(MockRpc::default());
         rpc.add_file(
             &format!("0x{}", hex::encode(merkle_root)),

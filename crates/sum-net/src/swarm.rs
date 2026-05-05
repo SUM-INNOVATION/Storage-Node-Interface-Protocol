@@ -397,8 +397,8 @@ impl SumSwarm {
                         }
                         Some(SwarmCommand::SendShardResponseV2 { channel_id, response }) => {
                             if let Some((channel, _inserted)) = self.pending_shard_channels.remove(&channel_id) {
-                                if let Err(_) = self.inner.behaviour_mut().shard_xfer
-                                    .send_response(channel, ShardResponseVersioned::V2(response))
+                                if self.inner.behaviour_mut().shard_xfer
+                                    .send_response(channel, ShardResponseVersioned::V2(response)).is_err()
                                 {
                                     warn!(channel_id, "failed to send V2 response — channel closed");
                                 }

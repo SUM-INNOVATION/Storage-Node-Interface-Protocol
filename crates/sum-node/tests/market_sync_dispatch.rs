@@ -181,7 +181,7 @@ async fn market_sync_dispatch_failure_clears_active_no_disk_write() {
 /// first response is incomplete, and reaches `Complete` after the second.
 #[tokio::test]
 async fn market_sync_dispatch_windowed_transfer_completes_via_followup() {
-    let (_dir, mut store) = build_store();
+    let (_dir, _store) = build_store();
 
     // Force a small per-message window so a 2KB chunk needs 2 round-trips.
     let config = StoreConfig {

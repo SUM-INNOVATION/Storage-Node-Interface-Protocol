@@ -92,7 +92,7 @@ pub async fn wait_for_finalized<S: TxStatusSource + ?Sized>(
     timeout: Duration,
 ) -> Result<u64, TxWaitError> {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut last_status = TxStatusV2::Unknown;
+    let mut last_status;
 
     loop {
         let status = rpc.get_transaction_status(tx_hash).await?;

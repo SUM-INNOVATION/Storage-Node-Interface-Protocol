@@ -624,9 +624,14 @@ struct TransactionV2Mirror {
     payload: TxPayloadMirror,
 }
 
-/// Mirror of `TxInner`.
+/// Mirror of `TxInner`. The variant size disparity (Legacy is a Vec
+/// pointer; V2 holds a full TransactionV2Mirror inline) is required by
+/// the chain wire format — bincode v1 serializes the variant tag + the
+/// inner bytes verbatim, so boxing the inner type would change the
+/// serialized shape and break compatibility. Disable the
+/// large_enum_variant lint locally rather than refactoring.
 #[derive(Debug, Serialize, Deserialize)]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::large_enum_variant)]
 enum TxInnerMirror {
     Legacy(Vec<u8>),           // 0
     V2(TransactionV2Mirror),   // 1

@@ -186,7 +186,7 @@ impl MarketSyncWorker {
             .ok_or_else(|| anyhow::anyhow!("invalid merkle_root hex"))?;
 
         // Compute chunk count
-        let chunk_count = (file.total_size_bytes + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let chunk_count = file.total_size_bytes.div_ceil(CHUNK_SIZE);
         if chunk_count == 0 {
             return Ok(());
         }
@@ -312,7 +312,7 @@ impl MarketSyncWorker {
             let root_hex = file.merkle_root.strip_prefix("0x").unwrap_or(&file.merkle_root);
             let Some(root_bytes) = hex_to_32(root_hex) else { continue };
 
-            let chunk_count = (file.total_size_bytes + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            let chunk_count = file.total_size_bytes.div_ceil(CHUNK_SIZE);
             if chunk_count == 0 { continue; }
 
             let assignment = compute_chunk_assignment(

@@ -822,7 +822,7 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli, net_con
                             let mut store_guard = store.write().await;
                             let store_mut: &mut SumStore = &mut store_guard;
                             let outcome = store_mut.fetcher
-                                .on_chunk_received(net.as_ref(), &store_mut.local, &response)
+                                .on_chunk_received(net.as_ref(), &store_mut.local, response)
                                 .await;
                             drop(store_guard);
                             match outcome {
@@ -948,7 +948,7 @@ async fn run_ingest(
     );
 
     // Strict success criterion: every chunk must reach R replicas.
-    if let Err(failure) = upload_result.check_success(sum_types::storage::REPLICATION_FACTOR as u32)
+    if let Err(failure) = upload_result.check_success(sum_types::storage::REPLICATION_FACTOR)
     {
         // Surface every failed push for operator triage.
         for f in &upload_result.failed {

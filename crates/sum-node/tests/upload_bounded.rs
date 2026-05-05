@@ -36,8 +36,11 @@ use sum_types::storage::{ChunkDescriptor, DataManifest, REPLICATION_FACTOR};
 
 // ── MockUploadNet ────────────────────────────────────────────────────────────
 
-/// One observed push call.
+/// One observed push call. `peer_id` is captured for diagnostic purposes
+/// during recording but no assertion currently reads it; keep the field
+/// so the recorder can route by peer in future tests without redesign.
 #[derive(Clone)]
+#[allow(dead_code)]
 struct PushRecord {
     cid: String,
     peer_id: PeerId,

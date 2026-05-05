@@ -650,7 +650,7 @@ impl DownloadOrchestrator {
             warn!(
                 "merkle root mismatch! computed={} expected={}",
                 hex::encode(computed_root.as_bytes()),
-                hex::encode(&manifest.merkle_root),
+                hex::encode(manifest.merkle_root),
             );
         }
 

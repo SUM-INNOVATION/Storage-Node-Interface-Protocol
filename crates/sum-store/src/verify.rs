@@ -216,9 +216,9 @@ mod tests {
             let tree = MerkleTree::build(&leaves);
             let root_bytes: [u8; 32] = *tree.root().as_bytes();
 
-            for i in 0..size {
+            for (i, leaf) in leaves.iter().enumerate() {
                 let proof_bytes = tree.proof_bytes(i as u32);
-                let leaf_bytes: [u8; 32] = *leaves[i].as_bytes();
+                let leaf_bytes: [u8; 32] = *leaf.as_bytes();
                 assert!(
                     verify_merkle_proof_bytes(&leaf_bytes, i as u32, &proof_bytes, &root_bytes),
                     "verify failed for size={size} index={i} (proof_len={})",
@@ -318,11 +318,11 @@ mod tests {
         let leaves: Vec<blake3::Hash> = (0..5).map(|i| blake3::hash(&[i as u8; 16])).collect();
         let tree = MerkleTree::build(&leaves);
         let root: [u8; 32] = *tree.root().as_bytes();
-        for i in 0..5 {
+        for (i, leaf) in leaves.iter().enumerate() {
             let proof = tree.proof_bytes(i as u32);
-            let leaf: [u8; 32] = *leaves[i].as_bytes();
+            let leaf_bytes: [u8; 32] = *leaf.as_bytes();
             assert!(
-                verify_merkle_proof_bytes_for_tree(&leaf, i as u32, &proof, &root, 5),
+                verify_merkle_proof_bytes_for_tree(&leaf_bytes, i as u32, &proof, &root, 5),
                 "5-leaf tree index {i} must verify via strict path"
             );
         }

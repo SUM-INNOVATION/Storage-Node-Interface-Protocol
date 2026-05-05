@@ -115,3 +115,27 @@ sum-net    = { path = "crates/sum-net" }
 sum-store  = { path = "crates/sum-store" }
 sum-node   = { path = "crates/sum-node" }
 sum-crypto = { path = "crates/sum-crypto" }
+
+# ─── Workspace lints ──────────────────────────────────────────────────────────
+#
+# Project-level lint policy. Crates inherit via `[lints] workspace = true`.
+# Behavioral / correctness lints stay at clippy default ("warn"); the
+# entries below are deliberate exemptions with stated rationale.
+[workspace.lints.clippy]
+# `run_*` orchestration entry points (download, ingest, share, etc.)
+# take ~8 args by design — chain RPC handle, network handle, key
+# material, config, output path, timeout, concurrency cap. Folding
+# into a config struct hides the argument list at the cost of a
+# larger surface for every test caller. Not worth refactoring; treat
+# 7+ args as expected for orchestration.
+too_many_arguments = "allow"
+# Some test fixtures and bookkeeping types use compound generic types
+# (`HashMap<K, Vec<(A, B)>>`) where introducing a type alias would
+# obscure the type at the use site. Prefer the explicit form.
+type_complexity = "allow"
+# Doc comments use a hanging-indent style (continuation lines
+# aligned with bullet text) for readability. Clippy's flat 4-space
+# form makes multi-line bullets harder to scan in source. The
+# rendered output is unaffected.
+doc_overindented_list_items = "allow"
+doc_lazy_continuation = "allow"

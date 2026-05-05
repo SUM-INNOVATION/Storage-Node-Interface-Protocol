@@ -32,7 +32,7 @@ impl MerkleTree {
         let mut current = leaf_hashes.to_vec();
 
         while current.len() > 1 {
-            let mut next = Vec::with_capacity((current.len() + 1) / 2);
+            let mut next = Vec::with_capacity(current.len().div_ceil(2));
             for pair in current.chunks(2) {
                 let left = &pair[0];
                 let right = pair.get(1).unwrap_or(left); // duplicate last if odd
