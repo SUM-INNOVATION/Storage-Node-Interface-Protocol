@@ -530,8 +530,7 @@ mod tests {
                     v
                 })
                 .collect();
-            let leaves: Vec<blake3::Hash> =
-                chunks.iter().map(|c| blake3::hash(c)).collect();
+            let leaves: Vec<blake3::Hash> = chunks.iter().map(|c| blake3::hash(c)).collect();
             let tree = MerkleTree::build(&leaves);
             let root: [u8; 32] = *tree.root().as_bytes();
             Self {
@@ -621,7 +620,11 @@ mod tests {
             chunk_count,
             fee_pool: 1000,
             created_at: 100,
-            activated_at_height: if lifecycle.is_active() { Some(150) } else { None },
+            activated_at_height: if lifecycle.is_active() {
+                Some(150)
+            } else {
+                None
+            },
             abandoned_at_height: None,
             assignment_height,
             visibility: VisibilityV2::PUBLIC,
@@ -724,8 +727,10 @@ mod tests {
             .validate_push(tree.root, 0, tree.data(0), &tree.proof(0))
             .await
             .expect_err("unregistered root must reject");
-        assert!(matches!(err, PushReject::UnknownRoot(_)),
-                "got {err:?}, expected UnknownRoot");
+        assert!(
+            matches!(err, PushReject::UnknownRoot(_)),
+            "got {err:?}, expected UnknownRoot"
+        );
     }
 
     #[tokio::test]
@@ -751,7 +756,10 @@ mod tests {
             .await
             .expect_err("chunk_index >= chunk_count must reject");
         match err {
-            PushReject::OutOfRange { chunk_index, chunk_count } => {
+            PushReject::OutOfRange {
+                chunk_index,
+                chunk_count,
+            } => {
                 assert_eq!(chunk_index, bad_index);
                 assert_eq!(chunk_count, fx.tree.chunk_count);
             }
@@ -869,12 +877,7 @@ mod tests {
 
         let err = fx
             .validator
-            .validate_push(
-                other_tree.root,
-                0,
-                other_tree.data(0),
-                &other_tree.proof(0),
-            )
+            .validate_push(other_tree.root, 0, other_tree.data(0), &other_tree.proof(0))
             .await
             .expect_err("wire root not registered → reject");
         assert!(matches!(err, PushReject::UnknownRoot(_)), "got {err:?}");

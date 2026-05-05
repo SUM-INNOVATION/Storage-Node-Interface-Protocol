@@ -30,7 +30,10 @@ use sum_node::rpc_client::L1RpcClient;
 use sum_node::tx_builder;
 
 #[derive(Parser)]
-#[command(name = "e2e-helper", about = "E2E test helper for SUM Chain L1 interactions")]
+#[command(
+    name = "e2e-helper",
+    about = "E2E test helper for SUM Chain L1 interactions"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -474,10 +477,7 @@ impl std::fmt::Display for V2State {
 /// `--allow-live-chain-write` to authorize the write.
 fn is_local_rpc_url(url: &str) -> bool {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let host_with_port = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("");
+    let host_with_port = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
     // IPv6 hosts are bracketed: "[::1]:8545" → "::1".
     let host = if let Some(stripped) = host_with_port.strip_prefix('[') {
         stripped.split(']').next().unwrap_or("")
@@ -731,7 +731,12 @@ mod tests {
     #[test]
     fn classify_v2_state_some_zero_is_enabled_from_genesis() {
         let s = classify_v2_state(Some(0), 100);
-        assert_eq!(s, V2State::EnabledFromGenesis { finalized_height: 100 });
+        assert_eq!(
+            s,
+            V2State::EnabledFromGenesis {
+                finalized_height: 100
+            }
+        );
         assert!(s.is_enabled());
     }
 
@@ -917,26 +922,33 @@ mod tests {
         // The real `L1RpcClient::call` posts a JSON-RPC envelope and
         // expects `{ jsonrpc, id, result }` back. The mock dispatches
         // by method name in the request body.
-        server.mock_async(|when, then| {
-            when.method(POST)
-                .path("/")
-                .body_contains("chain_getChainParams");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(jsonrpc_response(1, make_chain_params_json(serde_json::json!(0))));
-        }).await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains("chain_getChainParams");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(jsonrpc_response(
+                        1,
+                        make_chain_params_json(serde_json::json!(0)),
+                    ));
+            })
+            .await;
 
-        server.mock_async(|when, then| {
-            when.method(POST)
-                .path("/")
-                .body_contains("chain_getBlockHeight");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(jsonrpc_response(
-                    2,
-                    serde_json::json!({"height": 12345, "finality": "finalized"}),
-                ));
-        }).await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains("chain_getBlockHeight");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(jsonrpc_response(
+                        2,
+                        serde_json::json!({"height": 12345, "finality": "finalized"}),
+                    ));
+            })
+            .await;
 
         let rpc_url = server.base_url();
         let rpc = L1RpcClient::new(rpc_url.clone());
@@ -967,26 +979,33 @@ mod tests {
     async fn smoke_height_zero_with_finalized_passes() {
         let server = MockServer::start_async().await;
 
-        server.mock_async(|when, then| {
-            when.method(POST)
-                .path("/")
-                .body_contains("chain_getChainParams");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(jsonrpc_response(1, make_chain_params_json(serde_json::json!(0))));
-        }).await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains("chain_getChainParams");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(jsonrpc_response(
+                        1,
+                        make_chain_params_json(serde_json::json!(0)),
+                    ));
+            })
+            .await;
 
-        server.mock_async(|when, then| {
-            when.method(POST)
-                .path("/")
-                .body_contains("chain_getBlockHeight");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(jsonrpc_response(
-                    2,
-                    serde_json::json!({"height": 0, "finality": "finalized"}),
-                ));
-        }).await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains("chain_getBlockHeight");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(jsonrpc_response(
+                        2,
+                        serde_json::json!({"height": 0, "finality": "finalized"}),
+                    ));
+            })
+            .await;
 
         let rpc_url = server.base_url();
         let rpc = L1RpcClient::new(rpc_url.clone());
@@ -1013,26 +1032,33 @@ mod tests {
     async fn smoke_finality_not_finalized_fails() {
         let server = MockServer::start_async().await;
 
-        server.mock_async(|when, then| {
-            when.method(POST)
-                .path("/")
-                .body_contains("chain_getChainParams");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(jsonrpc_response(1, make_chain_params_json(serde_json::json!(0))));
-        }).await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains("chain_getChainParams");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(jsonrpc_response(
+                        1,
+                        make_chain_params_json(serde_json::json!(0)),
+                    ));
+            })
+            .await;
 
-        server.mock_async(|when, then| {
-            when.method(POST)
-                .path("/")
-                .body_contains("chain_getBlockHeight");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(jsonrpc_response(
-                    2,
-                    serde_json::json!({"height": 100, "finality": "latest"}),
-                ));
-        }).await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains("chain_getBlockHeight");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(jsonrpc_response(
+                        2,
+                        serde_json::json!({"height": 100, "finality": "latest"}),
+                    ));
+            })
+            .await;
 
         let rpc_url = server.base_url();
         let rpc = L1RpcClient::new(rpc_url.clone());
@@ -1071,17 +1097,19 @@ mod tests {
     async fn smoke_malformed_v2_enabled_from_height_fails_decode() {
         let server = MockServer::start_async().await;
 
-        server.mock_async(|when, then| {
-            when.method(POST)
-                .path("/")
-                .body_contains("chain_getChainParams");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(jsonrpc_response(
-                    1,
-                    make_chain_params_json(serde_json::json!("oops_a_string")),
-                ));
-        }).await;
+        server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/")
+                    .body_contains("chain_getChainParams");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(jsonrpc_response(
+                        1,
+                        make_chain_params_json(serde_json::json!("oops_a_string")),
+                    ));
+            })
+            .await;
 
         let rpc_url = server.base_url();
         let rpc = L1RpcClient::new(rpc_url.clone());

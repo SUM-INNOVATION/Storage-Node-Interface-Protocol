@@ -27,15 +27,15 @@
 //! chain-side validation already enforces address ↔ bundle pairing).
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
 use rand_core::{OsRng, RngCore};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
 use crate::errors::CryptoError;
-use crate::kdf::{hkdf_expand, RECIPIENT_KEK_INFO, X25519_DERIVATION_INFO};
+use crate::kdf::{RECIPIENT_KEK_INFO, X25519_DERIVATION_INFO, hkdf_expand};
 
 /// Constant-time check that an X25519 ECDH output is non-zero.
 ///
@@ -79,9 +79,7 @@ pub const RECIPIENT_BUNDLE_SIZE: usize = 80;
 /// use with `x25519_dalek::StaticSecret`), and the public key is its
 /// scalar-base-multiple — the value to register on chain via
 /// `RegisterEncryptionKey`.
-pub fn x25519_keypair_from_ed25519_seed(
-    ed25519_seed: &[u8; 32],
-) -> ([u8; 32], [u8; 32]) {
+pub fn x25519_keypair_from_ed25519_seed(ed25519_seed: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let derived = hkdf_expand::<32>(&[], ed25519_seed, X25519_DERIVATION_INFO);
     let secret = StaticSecret::from(derived);
     let public = PublicKey::from(&secret);

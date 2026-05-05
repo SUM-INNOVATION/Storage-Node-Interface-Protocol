@@ -32,16 +32,14 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use sum_net::{l1_address_base58, Keypair, PeerId, ShardRequestV2, ShardResponseV2};
+use sum_net::{Keypair, PeerId, ShardRequestV2, ShardResponseV2, l1_address_base58};
 use sum_node::assignment_attestor::{AssignmentAttestor, AttestorRpc};
-use sum_node::inbound_v2::{
-    AccessChecker, AttestTriggerRpc, FileShape, RespondNet, V2Dispatcher,
-};
+use sum_node::inbound_v2::{AccessChecker, AttestTriggerRpc, FileShape, RespondNet, V2Dispatcher};
 use sum_node::push_validator::{PushValidator, V2Params, V2RpcClient};
 use sum_node::tx_wait::TxStatusSource;
-use sum_store::merkle::MerkleTree;
-use sum_store::manifest_index::ManifestIndex;
 use sum_store::SumStore;
+use sum_store::manifest_index::ManifestIndex;
+use sum_store::merkle::MerkleTree;
 use sum_types::config::StoreConfig;
 use sum_types::rpc_types::{
     LifecycleV2, NodeRecordInfo, StorageFileInfoV2, TxStatusV2, VisibilityV2,
@@ -69,11 +67,7 @@ impl CapturingNet {
 
 #[async_trait]
 impl RespondNet for CapturingNet {
-    async fn respond_shard_v2(
-        &self,
-        channel_id: u64,
-        response: ShardResponseV2,
-    ) -> Result<()> {
+    async fn respond_shard_v2(&self, channel_id: u64, response: ShardResponseV2) -> Result<()> {
         self.responses.lock().unwrap().insert(channel_id, response);
         Ok(())
     }
@@ -94,11 +88,17 @@ struct MockRpc {
 
 impl MockRpc {
     fn add_file(&self, root_hex: &str, info: StorageFileInfoV2) {
-        self.files.lock().unwrap().insert(root_hex.to_string(), info);
+        self.files
+            .lock()
+            .unwrap()
+            .insert(root_hex.to_string(), info);
     }
     fn add_snapshot(&self, height: u64, nodes: Vec<NodeRecordInfo>, decoded: Vec<[u8; 20]>) {
         self.snapshots.lock().unwrap().insert(height, nodes);
-        self.decoded_snapshots.lock().unwrap().insert(height, decoded);
+        self.decoded_snapshots
+            .lock()
+            .unwrap()
+            .insert(height, decoded);
     }
     fn enqueue_send(&self, hash: &str) {
         self.send_responses
@@ -119,10 +119,7 @@ impl MockRpc {
 
 #[async_trait]
 impl V2RpcClient for MockRpc {
-    async fn storage_get_file_info_v2(
-        &self,
-        merkle_root_hex: &str,
-    ) -> Result<StorageFileInfoV2> {
+    async fn storage_get_file_info_v2(&self, merkle_root_hex: &str) -> Result<StorageFileInfoV2> {
         self.files
             .lock()
             .unwrap()
@@ -130,10 +127,7 @@ impl V2RpcClient for MockRpc {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown root: {merkle_root_hex}"))
     }
-    async fn storage_get_active_nodes_at_height(
-        &self,
-        height: u64,
-    ) -> Result<Vec<NodeRecordInfo>> {
+    async fn storage_get_active_nodes_at_height(&self, height: u64) -> Result<Vec<NodeRecordInfo>> {
         self.snapshots
             .lock()
             .unwrap()
@@ -212,16 +206,10 @@ struct ArcRpc(Arc<MockRpc>);
 
 #[async_trait]
 impl V2RpcClient for ArcRpc {
-    async fn storage_get_file_info_v2(
-        &self,
-        merkle_root_hex: &str,
-    ) -> Result<StorageFileInfoV2> {
+    async fn storage_get_file_info_v2(&self, merkle_root_hex: &str) -> Result<StorageFileInfoV2> {
         self.0.storage_get_file_info_v2(merkle_root_hex).await
     }
-    async fn storage_get_active_nodes_at_height(
-        &self,
-        height: u64,
-    ) -> Result<Vec<NodeRecordInfo>> {
+    async fn storage_get_active_nodes_at_height(&self, height: u64) -> Result<Vec<NodeRecordInfo>> {
         self.0.storage_get_active_nodes_at_height(height).await
     }
 }
@@ -295,7 +283,11 @@ fn node_record(addr: &[u8; 20]) -> NodeRecordInfo {
     }
 }
 
-fn file_info_active(root: &[u8; 32], chunk_count: u32, assignment_height: u64) -> StorageFileInfoV2 {
+fn file_info_active(
+    root: &[u8; 32],
+    chunk_count: u32,
+    assignment_height: u64,
+) -> StorageFileInfoV2 {
     StorageFileInfoV2 {
         merkle_root: format!("0x{}", hex::encode(root)),
         owner: l1_address_base58(&[0x01; 20]),
@@ -402,11 +394,11 @@ fn build_archive(acl_allows: bool) -> ArchiveFixture {
         },
     ));
     let trigger = Arc::new(ArcRpcTrigger(rpc.clone()));
-    let acl: Arc<dyn AccessChecker> = Arc::new(ToggleAcl { allow_default: acl_allows });
-    let dispatcher = V2Dispatcher::new(
-        validator, attestor, trigger, store.clone(), acl, my_addr,
-    )
-    .with_attest_timing(Duration::from_millis(10), Duration::from_secs(2));
+    let acl: Arc<dyn AccessChecker> = Arc::new(ToggleAcl {
+        allow_default: acl_allows,
+    });
+    let dispatcher = V2Dispatcher::new(validator, attestor, trigger, store.clone(), acl, my_addr)
+        .with_attest_timing(Duration::from_millis(10), Duration::from_secs(2));
 
     ArchiveFixture {
         dispatcher,
@@ -449,9 +441,7 @@ async fn v2_push_handle_validates_persists_and_acks() {
     let r = V2Params::DEFAULTS.assignment_replication_factor;
     let mut good = None;
     for i in 0..manifest.chunk_count {
-        let assigned = sum_store::assignment_v2::assigned_archives(
-            &root, &arch.snapshot, i, r,
-        );
+        let assigned = sum_store::assignment_v2::assigned_archives(&root, &arch.snapshot, i, r);
         if assigned.contains(&arch.my_addr) {
             good = Some(i);
             break;
@@ -527,9 +517,7 @@ async fn v2_push_handle_bad_proof_returns_typed_pushack_error() {
     let r = V2Params::DEFAULTS.assignment_replication_factor;
     let mut good = None;
     for i in 0..manifest.chunk_count {
-        let assigned = sum_store::assignment_v2::assigned_archives(
-            &root, &arch.snapshot, i, r,
-        );
+        let assigned = sum_store::assignment_v2::assigned_archives(&root, &arch.snapshot, i, r);
         if assigned.contains(&arch.my_addr) {
             good = Some(i);
             break;
@@ -596,13 +584,14 @@ async fn v2_manifest_pull_handle_acl_denied_returns_access_denied() {
         let mut s = arch.store.write().await;
         s.manifest_idx.insert(&manifest).unwrap();
     }
-    assert!(arch
-        .store
-        .read()
-        .await
-        .manifest_idx
-        .get_by_merkle_root(&root)
-        .is_some());
+    assert!(
+        arch.store
+            .read()
+            .await
+            .manifest_idx
+            .get_by_merkle_root(&root)
+            .is_some()
+    );
 
     let net = CapturingNet::new();
     let request = ShardRequestV2::ManifestPull { merkle_root: root };
@@ -674,9 +663,7 @@ async fn v2_manifest_push_acks_before_attestation_completes() {
     let r = V2Params::DEFAULTS.assignment_replication_factor;
     let mut good = None;
     for i in 0..manifest.chunk_count {
-        let assigned = sum_store::assignment_v2::assigned_archives(
-            &root, &arch.snapshot, i, r,
-        );
+        let assigned = sum_store::assignment_v2::assigned_archives(&root, &arch.snapshot, i, r);
         if assigned.contains(&arch.my_addr) {
             good = Some(i);
             break;

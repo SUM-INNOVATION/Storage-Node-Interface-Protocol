@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use sum_net::{Keypair, PeerId, SumNetEvent};
 use sum_net::{l1_address_from_keypair, peer_id_from_keypair};
-use sum_node::peer_state::{apply_peer_event, PeerMapChange};
+use sum_node::peer_state::{PeerMapChange, apply_peer_event};
 
 /// Generate a unique (PeerId, L1 address) pair from a fresh Ed25519 keypair.
 fn random_peer() -> (PeerId, [u8; 20]) {
@@ -27,7 +27,10 @@ fn peer_identified_inserts_into_map() {
 
     let change = apply_peer_event(
         &mut map,
-        &SumNetEvent::PeerIdentified { peer_id: pid, l1_address: addr },
+        &SumNetEvent::PeerIdentified {
+            peer_id: pid,
+            l1_address: addr,
+        },
     );
     assert_eq!(change, PeerMapChange::Inserted);
     assert_eq!(map.len(), 1);
@@ -39,7 +42,13 @@ fn peer_disconnected_removes_from_map() {
     let mut map = HashMap::new();
     let (pid, addr) = random_peer();
 
-    apply_peer_event(&mut map, &SumNetEvent::PeerIdentified { peer_id: pid, l1_address: addr });
+    apply_peer_event(
+        &mut map,
+        &SumNetEvent::PeerIdentified {
+            peer_id: pid,
+            l1_address: addr,
+        },
+    );
     assert_eq!(map.len(), 1);
 
     let change = apply_peer_event(&mut map, &SumNetEvent::PeerDisconnected { peer_id: pid });
@@ -52,13 +61,23 @@ fn peer_expired_does_not_remove_from_map() {
     let mut map = HashMap::new();
     let (pid, addr) = random_peer();
 
-    apply_peer_event(&mut map, &SumNetEvent::PeerIdentified { peer_id: pid, l1_address: addr });
+    apply_peer_event(
+        &mut map,
+        &SumNetEvent::PeerIdentified {
+            peer_id: pid,
+            l1_address: addr,
+        },
+    );
     assert_eq!(map.len(), 1);
 
     // PeerExpired must NOT remove the entry.
     let change = apply_peer_event(&mut map, &SumNetEvent::PeerExpired { peer_id: pid });
     assert_eq!(change, PeerMapChange::Unchanged);
-    assert_eq!(map.len(), 1, "PeerExpired must not remove the identity mapping");
+    assert_eq!(
+        map.len(),
+        1,
+        "PeerExpired must not remove the identity mapping"
+    );
     assert_eq!(map.get(&pid), Some(&addr));
 }
 
@@ -68,10 +87,19 @@ fn rapid_churn_map_stays_bounded() {
 
     for _ in 0..200 {
         let (pid, addr) = random_peer();
-        apply_peer_event(&mut map, &SumNetEvent::PeerIdentified { peer_id: pid, l1_address: addr });
+        apply_peer_event(
+            &mut map,
+            &SumNetEvent::PeerIdentified {
+                peer_id: pid,
+                l1_address: addr,
+            },
+        );
         apply_peer_event(&mut map, &SumNetEvent::PeerDisconnected { peer_id: pid });
     }
-    assert!(map.is_empty(), "map must be empty after all peers disconnect");
+    assert!(
+        map.is_empty(),
+        "map must be empty after all peers disconnect"
+    );
 }
 
 #[test]
@@ -81,7 +109,13 @@ fn interleaved_churn_map_bounded() {
     // Phase 1: 100 peers join.
     let peers: Vec<_> = (0..100).map(|_| random_peer()).collect();
     for &(pid, addr) in &peers {
-        apply_peer_event(&mut map, &SumNetEvent::PeerIdentified { peer_id: pid, l1_address: addr });
+        apply_peer_event(
+            &mut map,
+            &SumNetEvent::PeerIdentified {
+                peer_id: pid,
+                l1_address: addr,
+            },
+        );
     }
     assert_eq!(map.len(), 100);
 
@@ -95,7 +129,10 @@ fn interleaved_churn_map_bounded() {
     for &(pid, _) in &peers {
         apply_peer_event(&mut map, &SumNetEvent::PeerDisconnected { peer_id: pid });
     }
-    assert!(map.is_empty(), "map must be empty after all peers disconnect");
+    assert!(
+        map.is_empty(),
+        "map must be empty after all peers disconnect"
+    );
 }
 
 #[test]
@@ -114,10 +151,22 @@ fn re_identify_updates_address() {
     let (pid, addr1) = random_peer();
     let addr2 = [0xBB; 20];
 
-    apply_peer_event(&mut map, &SumNetEvent::PeerIdentified { peer_id: pid, l1_address: addr1 });
+    apply_peer_event(
+        &mut map,
+        &SumNetEvent::PeerIdentified {
+            peer_id: pid,
+            l1_address: addr1,
+        },
+    );
     assert_eq!(map.get(&pid), Some(&addr1));
 
-    apply_peer_event(&mut map, &SumNetEvent::PeerIdentified { peer_id: pid, l1_address: addr2 });
+    apply_peer_event(
+        &mut map,
+        &SumNetEvent::PeerIdentified {
+            peer_id: pid,
+            l1_address: addr2,
+        },
+    );
     assert_eq!(map.len(), 1);
     assert_eq!(map.get(&pid), Some(&addr2));
 }
@@ -129,7 +178,13 @@ fn sustained_churn_with_mixed_events() {
 
     for _ in 0..500 {
         let (pid, addr) = random_peer();
-        apply_peer_event(&mut map, &SumNetEvent::PeerIdentified { peer_id: pid, l1_address: addr });
+        apply_peer_event(
+            &mut map,
+            &SumNetEvent::PeerIdentified {
+                peer_id: pid,
+                l1_address: addr,
+            },
+        );
 
         if map.len() > high_water {
             high_water = map.len();

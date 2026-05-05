@@ -66,10 +66,7 @@ pub enum SumNetEvent {
 
     /// An outbound chunk request failed (V1 OR V2 — covers both since
     /// the libp2p outbound failure is protocol-agnostic).
-    ShardRequestFailed {
-        peer_id: PeerId,
-        error: String,
-    },
+    ShardRequestFailed { peer_id: PeerId, error: String },
 
     /// A peer's L1 address was identified via the libp2p identify protocol.
     /// Used by the ACL checker to map PeerId -> L1 Address.
@@ -96,8 +93,5 @@ pub enum SumNetEvent {
     HolePunchSucceeded { peer_id: PeerId },
 
     /// DCUtR hole-punch failed — the relay circuit remains the data path.
-    HolePunchFailed {
-        peer_id: PeerId,
-        error: String,
-    },
+    HolePunchFailed { peer_id: PeerId, error: String },
 }

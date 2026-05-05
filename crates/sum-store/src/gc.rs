@@ -82,7 +82,10 @@ impl GarbageCollector {
                 elapsed_secs = last_l1_poll.elapsed().as_secs(),
                 "gc skipped: last L1 poll too old (> 5 min)"
             );
-            return Ok(GcResult { skipped: true, ..Default::default() });
+            return Ok(GcResult {
+                skipped: true,
+                ..Default::default()
+            });
         }
 
         let all_cids = store.list_all_cids()?;
@@ -90,7 +93,8 @@ impl GarbageCollector {
         let mut result = GcResult::default();
 
         // Remove from tracking any CIDs that are now assigned (re-assigned)
-        self.unassigned_since.retain(|cid, _| !assigned_cids.contains(cid));
+        self.unassigned_since
+            .retain(|cid, _| !assigned_cids.contains(cid));
 
         for cid in &all_cids {
             if assigned_cids.contains(cid) {
@@ -99,9 +103,7 @@ impl GarbageCollector {
             }
 
             // Mark as unassigned if not already tracked
-            let first_seen = *self.unassigned_since
-                .entry(cid.clone())
-                .or_insert(now);
+            let first_seen = *self.unassigned_since.entry(cid.clone()).or_insert(now);
 
             let unassigned_duration = now.duration_since(first_seen);
 
@@ -174,7 +176,9 @@ mod tests {
         assigned.insert("cid_a".to_string());
 
         let mut gc = GarbageCollector::new(Duration::from_secs(0)); // 0 grace
-        let result = gc.mark_and_sweep(&store, &assigned, Instant::now()).unwrap();
+        let result = gc
+            .mark_and_sweep(&store, &assigned, Instant::now())
+            .unwrap();
 
         assert_eq!(result.chunks_deleted, 0);
         assert!(store.has("cid_a"));
@@ -188,7 +192,9 @@ mod tests {
         let assigned: HashSet<String> = HashSet::new(); // cid_b not assigned
 
         let mut gc = GarbageCollector::new(Duration::from_secs(3600)); // 1 hour grace
-        let result = gc.mark_and_sweep(&store, &assigned, Instant::now()).unwrap();
+        let result = gc
+            .mark_and_sweep(&store, &assigned, Instant::now())
+            .unwrap();
 
         assert_eq!(result.chunks_deleted, 0);
         assert_eq!(result.chunks_retained, 1);
@@ -203,7 +209,9 @@ mod tests {
         let assigned: HashSet<String> = HashSet::new();
 
         let mut gc = GarbageCollector::new(Duration::from_secs(0)); // 0 grace = delete immediately
-        let result = gc.mark_and_sweep(&store, &assigned, Instant::now()).unwrap();
+        let result = gc
+            .mark_and_sweep(&store, &assigned, Instant::now())
+            .unwrap();
 
         assert_eq!(result.chunks_deleted, 1);
         assert!(result.bytes_freed > 0);
@@ -227,7 +235,9 @@ mod tests {
         let mut assigned = HashSet::new();
         assigned.insert("cid_d".to_string());
 
-        let r2 = gc.mark_and_sweep(&store, &assigned, Instant::now()).unwrap();
+        let r2 = gc
+            .mark_and_sweep(&store, &assigned, Instant::now())
+            .unwrap();
         assert_eq!(r2.chunks_deleted, 0);
         assert_eq!(gc.tracked_count(), 0); // no longer tracked
         assert!(store.has("cid_d")); // still on disk
@@ -263,7 +273,9 @@ mod tests {
         assigned.insert("file_c_chunk".to_string());
 
         let mut gc = GarbageCollector::new(Duration::from_secs(0));
-        let result = gc.mark_and_sweep(&store, &assigned, Instant::now()).unwrap();
+        let result = gc
+            .mark_and_sweep(&store, &assigned, Instant::now())
+            .unwrap();
 
         assert_eq!(result.chunks_deleted, 1); // only file B's chunk
         assert!(store.has("file_a_chunk"));
@@ -279,7 +291,9 @@ mod tests {
 
         let assigned: HashSet<String> = HashSet::new();
         let mut gc = GarbageCollector::new(Duration::from_secs(0));
-        let result = gc.mark_and_sweep(&store, &assigned, Instant::now()).unwrap();
+        let result = gc
+            .mark_and_sweep(&store, &assigned, Instant::now())
+            .unwrap();
 
         assert_eq!(result.chunks_deleted, 1);
         assert_eq!(result.bytes_freed, 4096);

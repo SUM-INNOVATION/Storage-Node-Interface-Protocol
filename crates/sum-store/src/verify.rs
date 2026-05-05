@@ -239,9 +239,13 @@ mod tests {
             "total_leaves=0 must always reject"
         );
         // Even with a "valid-looking" chunk_index and root, must reject.
-        assert!(
-            !verify_merkle_proof_bytes_for_tree(&any_hash, 5, &[any_hash], &any_hash, 0)
-        );
+        assert!(!verify_merkle_proof_bytes_for_tree(
+            &any_hash,
+            5,
+            &[any_hash],
+            &any_hash,
+            0
+        ));
     }
 
     /// Reviewer-required: chunk_index out of range → reject.
@@ -337,24 +341,28 @@ mod tests {
         let other: [u8; 32] = *blake3::hash(b"other").as_bytes();
 
         // Happy path: 1-leaf tree, root == leaf, empty proof.
-        assert!(
-            verify_merkle_proof_bytes_for_tree(&leaf, 0, &[], &leaf, 1)
-        );
+        assert!(verify_merkle_proof_bytes_for_tree(&leaf, 0, &[], &leaf, 1));
 
         // Wrong root → reject.
-        assert!(
-            !verify_merkle_proof_bytes_for_tree(&leaf, 0, &[], &other, 1)
-        );
+        assert!(!verify_merkle_proof_bytes_for_tree(
+            &leaf,
+            0,
+            &[],
+            &other,
+            1
+        ));
 
         // Non-empty proof against single-leaf tree → reject (depth must be 0).
-        assert!(
-            !verify_merkle_proof_bytes_for_tree(&leaf, 0, &[other], &leaf, 1)
-        );
+        assert!(!verify_merkle_proof_bytes_for_tree(
+            &leaf,
+            0,
+            &[other],
+            &leaf,
+            1
+        ));
 
         // chunk_index >= total_leaves=1 → reject.
-        assert!(
-            !verify_merkle_proof_bytes_for_tree(&leaf, 1, &[], &leaf, 1)
-        );
+        assert!(!verify_merkle_proof_bytes_for_tree(&leaf, 1, &[], &leaf, 1));
     }
 
     /// Sanity: the depth helper agrees with `MerkleTree::depth()` across
@@ -367,8 +375,7 @@ mod tests {
 
         // depth(0) is undefined for proof purposes; skip 0 (caller rejects).
         for n in [1usize, 2, 3, 4, 5, 7, 8, 9, 16, 17, 33, 1024] {
-            let leaves: Vec<blake3::Hash> =
-                (0..n).map(|i| blake3::hash(&[i as u8; 4])).collect();
+            let leaves: Vec<blake3::Hash> = (0..n).map(|i| blake3::hash(&[i as u8; 4])).collect();
             let tree = MerkleTree::build(&leaves);
             let canonical_depth = tree.depth();
             let strict_depth = expected_proof_depth(n as u32);
@@ -392,26 +399,51 @@ mod tests {
         let leaf_bytes: [u8; 32] = *leaves[2].as_bytes();
 
         // Sanity: untouched proof verifies.
-        assert!(verify_merkle_proof_bytes(&leaf_bytes, 2, &proof_bytes, &root_bytes));
+        assert!(verify_merkle_proof_bytes(
+            &leaf_bytes,
+            2,
+            &proof_bytes,
+            &root_bytes
+        ));
 
         // Flip a bit in the leaf.
         let mut bad_leaf = leaf_bytes;
         bad_leaf[0] ^= 0x01;
-        assert!(!verify_merkle_proof_bytes(&bad_leaf, 2, &proof_bytes, &root_bytes));
+        assert!(!verify_merkle_proof_bytes(
+            &bad_leaf,
+            2,
+            &proof_bytes,
+            &root_bytes
+        ));
 
         // Flip a bit in the root.
         let mut bad_root = root_bytes;
         bad_root[0] ^= 0x01;
-        assert!(!verify_merkle_proof_bytes(&leaf_bytes, 2, &proof_bytes, &bad_root));
+        assert!(!verify_merkle_proof_bytes(
+            &leaf_bytes,
+            2,
+            &proof_bytes,
+            &bad_root
+        ));
 
         // Flip a bit in the proof's first sibling.
         if !proof_bytes.is_empty() {
             let mut bad_proof = proof_bytes.clone();
             bad_proof[0][0] ^= 0x01;
-            assert!(!verify_merkle_proof_bytes(&leaf_bytes, 2, &bad_proof, &root_bytes));
+            assert!(!verify_merkle_proof_bytes(
+                &leaf_bytes,
+                2,
+                &bad_proof,
+                &root_bytes
+            ));
         }
 
         // Wrong chunk_index must fail too.
-        assert!(!verify_merkle_proof_bytes(&leaf_bytes, 3, &proof_bytes, &root_bytes));
+        assert!(!verify_merkle_proof_bytes(
+            &leaf_bytes,
+            3,
+            &proof_bytes,
+            &root_bytes
+        ));
     }
 }

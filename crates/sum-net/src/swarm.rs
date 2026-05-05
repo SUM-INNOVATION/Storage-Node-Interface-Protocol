@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
-    dcutr, gossipsub, identify, kad, mdns,
+    Multiaddr, PeerId, SwarmBuilder, dcutr, gossipsub, identify,
     identity::Keypair,
+    kad, mdns,
     multiaddr::Protocol,
     request_response::{self, ProtocolSupport, ResponseChannel},
     swarm::SwarmEvent,
-    Multiaddr, PeerId, SwarmBuilder,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -20,9 +20,9 @@ use sum_types::config::NetConfig;
 use crate::{
     behaviour::{LocalMeshBehaviour, LocalMeshBehaviourEvent},
     codec::{
-        ShardRequest, ShardRequestV2, ShardRequestVersioned, ShardResponse,
-        ShardResponseV2, ShardResponseVersioned, VersionedShardCodec,
-        SHARD_XFER_PROTOCOL_V1, SHARD_XFER_PROTOCOL_V2,
+        SHARD_XFER_PROTOCOL_V1, SHARD_XFER_PROTOCOL_V2, ShardRequest, ShardRequestV2,
+        ShardRequestVersioned, ShardResponse, ShardResponseV2, ShardResponseVersioned,
+        VersionedShardCodec,
     },
     discovery,
     events::SumNetEvent,
@@ -52,7 +52,10 @@ pub enum SwarmCommand {
     Publish { topic: String, data: Vec<u8> },
 
     /// Send a V1 chunk request to a remote peer.
-    RequestShard { peer_id: PeerId, request: ShardRequest },
+    RequestShard {
+        peer_id: PeerId,
+        request: ShardRequest,
+    },
 
     /// Send a V2 request (Pull / Push / ManifestPush / ManifestPull) to
     /// a remote peer. Carries the chain-plan-v3.2 request shape directly.
@@ -74,7 +77,10 @@ pub enum SwarmCommand {
     },
 
     /// Send a V1 response on a stored V1 response channel.
-    SendShardResponse { channel_id: u64, response: ShardResponse },
+    SendShardResponse {
+        channel_id: u64,
+        response: ShardResponse,
+    },
 
     /// Send a V2 response on a stored V2 response channel.
     SendShardResponseV2 {
@@ -91,7 +97,7 @@ pub enum SwarmCommand {
 /// Owns the [`libp2p::Swarm`] and the [`GossipManager`].
 /// Constructed by [`SumSwarm::build`] and consumed by [`SumSwarm::run`].
 pub struct SumSwarm {
-    inner:  libp2p::Swarm<LocalMeshBehaviour>,
+    inner: libp2p::Swarm<LocalMeshBehaviour>,
     gossip: GossipManager,
 
     /// Stores response channels received from inbound chunk requests,
@@ -170,95 +176,90 @@ impl SumSwarm {
             )?
             .with_quic()
             .with_dns()?
-            .with_relay_client(
-                libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
+            .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
+            .with_behaviour(
+                |key,
+                 relay_client|
+                 -> std::result::Result<
+                    LocalMeshBehaviour,
+                    Box<dyn std::error::Error + Send + Sync>,
+                > {
+                    let local_peer_id = key.public().to_peer_id();
+
+                    let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+
+                    let gossipsub_behaviour = gossipsub::Behaviour::new(
+                        gossipsub::MessageAuthenticity::Signed(key.clone()),
+                        gossip_cfg.clone(),
+                    )
+                    .map_err(|msg| -> Box<dyn std::error::Error + Send + Sync> { msg.into() })?;
+
+                    let identify = identify::Behaviour::new(identify::Config::new(
+                        "/sum-node/0.1.0".into(),
+                        key.public(),
+                    ));
+
+                    // Register V2 first so libp2p prefers V2 when both peers
+                    // support both protocols. Order matters here: libp2p's
+                    // request_response negotiation picks the FIRST protocol
+                    // mutually supported in the iterator order. V1 stays
+                    // listed (Full) so legacy peers continue to flow.
+                    //
+                    // Both protocols share one `VersionedShardCodec` instance
+                    // — the codec dispatches on the negotiated protocol name
+                    // passed to each `read_*`/`write_*` call. See
+                    // `crate::codec::VersionedShardCodec`.
+                    let shard_xfer = request_response::Behaviour::with_codec(
+                        VersionedShardCodec::default(),
+                        [
+                            (SHARD_XFER_PROTOCOL_V2.to_string(), ProtocolSupport::Full),
+                            (SHARD_XFER_PROTOCOL_V1.to_string(), ProtocolSupport::Full),
+                        ],
+                        request_response::Config::default()
+                            .with_request_timeout(Duration::from_secs(120)),
+                    );
+
+                    let kademlia = discovery::build_kademlia(local_peer_id);
+                    let autonat = nat::build_autonat(local_peer_id);
+                    let relay = nat::build_relay_server(local_peer_id, relay_server_enabled);
+                    let dcutr = dcutr::Behaviour::new(local_peer_id);
+
+                    Ok(LocalMeshBehaviour {
+                        mdns,
+                        gossipsub: gossipsub_behaviour,
+                        identify,
+                        shard_xfer,
+                        kademlia,
+                        autonat,
+                        relay,
+                        relay_client,
+                        dcutr,
+                    })
+                },
             )?
-            .with_behaviour(|key, relay_client| -> std::result::Result<LocalMeshBehaviour, Box<dyn std::error::Error + Send + Sync>> {
-                let local_peer_id = key.public().to_peer_id();
-
-                let mdns = mdns::tokio::Behaviour::new(
-                    mdns::Config::default(),
-                    local_peer_id,
-                )?;
-
-                let gossipsub_behaviour = gossipsub::Behaviour::new(
-                    gossipsub::MessageAuthenticity::Signed(key.clone()),
-                    gossip_cfg.clone(),
-                )
-                .map_err(|msg| -> Box<dyn std::error::Error + Send + Sync> {
-                    msg.into()
-                })?;
-
-                let identify = identify::Behaviour::new(identify::Config::new(
-                    "/sum-node/0.1.0".into(),
-                    key.public(),
-                ));
-
-                // Register V2 first so libp2p prefers V2 when both peers
-                // support both protocols. Order matters here: libp2p's
-                // request_response negotiation picks the FIRST protocol
-                // mutually supported in the iterator order. V1 stays
-                // listed (Full) so legacy peers continue to flow.
-                //
-                // Both protocols share one `VersionedShardCodec` instance
-                // — the codec dispatches on the negotiated protocol name
-                // passed to each `read_*`/`write_*` call. See
-                // `crate::codec::VersionedShardCodec`.
-                let shard_xfer = request_response::Behaviour::with_codec(
-                    VersionedShardCodec::default(),
-                    [
-                        (SHARD_XFER_PROTOCOL_V2.to_string(), ProtocolSupport::Full),
-                        (SHARD_XFER_PROTOCOL_V1.to_string(), ProtocolSupport::Full),
-                    ],
-                    request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(120)),
-                );
-
-                let kademlia = discovery::build_kademlia(local_peer_id);
-                let autonat  = nat::build_autonat(local_peer_id);
-                let relay    = nat::build_relay_server(local_peer_id, relay_server_enabled);
-                let dcutr    = dcutr::Behaviour::new(local_peer_id);
-
-                Ok(LocalMeshBehaviour {
-                    mdns,
-                    gossipsub: gossipsub_behaviour,
-                    identify,
-                    shard_xfer,
-                    kademlia,
-                    autonat,
-                    relay,
-                    relay_client,
-                    dcutr,
-                })
-            })?
-            .with_swarm_config(|c| {
-                c.with_idle_connection_timeout(Duration::from_secs(60))
-            })
+            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
         // QUIC listener (always)
-        let quic_addr: Multiaddr =
-            format!("/ip4/0.0.0.0/udp/{}/quic-v1", config.udp_listen_port)
-                .parse()
-                .context("invalid QUIC listen multiaddr")?;
+        let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", config.udp_listen_port)
+            .parse()
+            .context("invalid QUIC listen multiaddr")?;
         swarm
             .listen_on(quic_addr)
             .context("failed to bind QUIC listener")?;
 
         // TCP listener (WAN mode only)
         if config.enable_wan {
-            let tcp_addr: Multiaddr =
-                format!("/ip4/0.0.0.0/tcp/{}", config.tcp_listen_port)
-                    .parse()
-                    .context("invalid TCP listen multiaddr")?;
+            let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", config.tcp_listen_port)
+                .parse()
+                .context("invalid TCP listen multiaddr")?;
             swarm
                 .listen_on(tcp_addr)
                 .context("failed to bind TCP listener")?;
         }
 
         Ok(Self {
-            inner:  swarm,
+            inner: swarm,
             gossip: GossipManager::new(),
             pending_shard_channels: HashMap::new(),
             next_channel_id: 0,
@@ -275,11 +276,13 @@ impl SumSwarm {
     /// bootstrap peers and initiates a Kademlia bootstrap query.
     pub fn bootstrap_kademlia(&mut self, bootstrap_peers: &[String]) -> Result<()> {
         for addr_str in bootstrap_peers {
-            let addr: Multiaddr = addr_str.parse()
+            let addr: Multiaddr = addr_str
+                .parse()
                 .context(format!("invalid bootstrap multiaddr: {addr_str}"))?;
 
             // Extract PeerId from the last /p2p/<peer_id> component.
-            let peer_id = addr.iter()
+            let peer_id = addr
+                .iter()
                 .find_map(|proto| {
                     if let libp2p::multiaddr::Protocol::P2p(pid) = proto {
                         Some(pid)
@@ -287,9 +290,13 @@ impl SumSwarm {
                         None
                     }
                 })
-                .ok_or_else(|| anyhow::anyhow!("bootstrap addr missing /p2p/ component: {addr_str}"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("bootstrap addr missing /p2p/ component: {addr_str}")
+                })?;
 
-            self.inner.behaviour_mut().kademlia
+            self.inner
+                .behaviour_mut()
+                .kademlia
                 .add_address(&peer_id, addr.clone());
 
             // Stash the bootstrap address as an UNCONFIRMED relay candidate.
@@ -311,9 +318,15 @@ impl SumSwarm {
         }
 
         if !bootstrap_peers.is_empty() {
-            self.inner.behaviour_mut().kademlia.bootstrap()
+            self.inner
+                .behaviour_mut()
+                .kademlia
+                .bootstrap()
                 .map_err(|e| anyhow::anyhow!("Kademlia bootstrap failed: {e}"))?;
-            info!(peers = bootstrap_peers.len(), "Kademlia bootstrap initiated");
+            info!(
+                peers = bootstrap_peers.len(),
+                "Kademlia bootstrap initiated"
+            );
         }
 
         Ok(())
@@ -335,7 +348,7 @@ impl SumSwarm {
     /// The core async event loop.
     pub async fn run(
         mut self,
-        event_tx:   mpsc::Sender<SumNetEvent>,
+        event_tx: mpsc::Sender<SumNetEvent>,
         mut cmd_rx: mpsc::Receiver<SwarmCommand>,
     ) -> Result<()> {
         let mut reaper_interval = tokio::time::interval(REAPER_INTERVAL);
@@ -424,12 +437,13 @@ impl SumSwarm {
     /// [`PENDING_CHANNEL_TIMEOUT`]. Dropping the `ResponseChannel` causes
     /// libp2p to signal a timeout to the requester.
     fn reap_orphaned_channels(&mut self) {
-        let reaped = reap_stale_entries(
-            &mut self.pending_shard_channels,
-            PENDING_CHANNEL_TIMEOUT,
-        );
+        let reaped = reap_stale_entries(&mut self.pending_shard_channels, PENDING_CHANNEL_TIMEOUT);
         if reaped > 0 {
-            info!(reaped, remaining = self.pending_shard_channels.len(), "orphaned channel cleanup");
+            info!(
+                reaped,
+                remaining = self.pending_shard_channels.len(),
+                "orphaned channel cleanup"
+            );
         }
     }
 
@@ -437,7 +451,7 @@ impl SumSwarm {
 
     fn handle_swarm_event(
         &mut self,
-        event:    SwarmEvent<LocalMeshBehaviourEvent>,
+        event: SwarmEvent<LocalMeshBehaviourEvent>,
         event_tx: &mpsc::Sender<SumNetEvent>,
     ) {
         match event {
@@ -459,7 +473,7 @@ impl SumSwarm {
                 },
             )) => {
                 let topic = message.topic.to_string();
-                let data  = message.data;
+                let data = message.data;
                 info!(
                     from  = %propagation_source,
                     %topic,
@@ -467,7 +481,7 @@ impl SumSwarm {
                     "gossipsub message received"
                 );
                 if let Err(e) = event_tx.try_send(SumNetEvent::MessageReceived {
-                    from:  propagation_source,
+                    from: propagation_source,
                     topic,
                     data,
                 }) {
@@ -481,7 +495,7 @@ impl SumSwarm {
 
             // ── Identify ──────────────────────────────────────────────────────
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Identify(
-                identify::Event::Received { peer_id, info, .. }
+                identify::Event::Received { peer_id, info, .. },
             )) => {
                 debug!(%peer_id, "identify received");
                 if let Some(l1_addr) =
@@ -505,10 +519,7 @@ impl SumSwarm {
                 // when AutoNAT determines we are Private. The relay hop
                 // protocol string contains "relay" — matching works across
                 // minor version bumps.
-                let supports_relay = info
-                    .protocols
-                    .iter()
-                    .any(|p| p.as_ref().contains("relay"));
+                let supports_relay = info.protocols.iter().any(|p| p.as_ref().contains("relay"));
                 if supports_relay {
                     // Identify has confirmed this peer advertises the relay
                     // hop protocol — flip `confirmed = true` so the AutoNAT
@@ -536,7 +547,9 @@ impl SumSwarm {
                 // Feed identified peer's listen addresses into Kademlia
                 // so the DHT routing table populates beyond bootstrap nodes.
                 for addr in &info.listen_addrs {
-                    self.inner.behaviour_mut().kademlia
+                    self.inner
+                        .behaviour_mut()
+                        .kademlia
                         .add_address(&peer_id, addr.clone());
                 }
 
@@ -569,10 +582,15 @@ impl SumSwarm {
 
             // ── Kademlia DHT ─────────────────────────────────────────────────
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Kademlia(
-                kad::Event::RoutingUpdated { peer, addresses, .. }
+                kad::Event::RoutingUpdated {
+                    peer, addresses, ..
+                },
             )) => {
                 // Wire Kademlia-discovered peers into gossipsub (same as mDNS).
-                self.inner.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                self.inner
+                    .behaviour_mut()
+                    .gossipsub
+                    .add_explicit_peer(&peer);
                 let addrs: Vec<Multiaddr> = addresses.iter().cloned().collect();
                 info!(%peer, addr_count = addrs.len(), "Kademlia peer discovered");
                 if let Err(e) = event_tx.try_send(SumNetEvent::PeerDiscovered {
@@ -583,7 +601,7 @@ impl SumSwarm {
                 }
             }
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Kademlia(
-                kad::Event::OutboundQueryProgressed { result, .. }
+                kad::Event::OutboundQueryProgressed { result, .. },
             )) => {
                 debug!(?result, "Kademlia query progress");
             }
@@ -619,75 +637,74 @@ impl SumSwarm {
             // and per-version dispatch (PushValidator, AssignmentAttestor
             // for V2) can stay typed.
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
-                request_response::Event::Message { peer, message, .. }
-            )) => {
-                match message {
-                    request_response::Message::Request { request, channel, .. } => {
-                        let channel_id = self.next_channel_id;
-                        self.next_channel_id += 1;
-                        self.pending_shard_channels.insert(channel_id, (channel, Instant::now()));
-                        match request {
-                            ShardRequestVersioned::V1(req) => {
-                                info!(%peer, cid = %req.cid, channel_id, "inbound V1 chunk request");
-                                if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequested {
-                                    peer_id: peer,
-                                    request: req,
-                                    channel_id,
-                                }) {
-                                    self.pending_shard_channels.remove(&channel_id);
-                                    warn!(%e, channel_id, "event channel full — dropping V1 ShardRequested and cleaning up pending channel");
-                                }
-                            }
-                            ShardRequestVersioned::V2(req) => {
-                                info!(%peer, channel_id, kind = v2_request_kind(&req), "inbound V2 chunk request");
-                                if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequestedV2 {
-                                    peer_id: peer,
-                                    request: req,
-                                    channel_id,
-                                }) {
-                                    self.pending_shard_channels.remove(&channel_id);
-                                    warn!(%e, channel_id, "event channel full — dropping V2 ShardRequested and cleaning up pending channel");
-                                }
+                request_response::Event::Message { peer, message, .. },
+            )) => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    let channel_id = self.next_channel_id;
+                    self.next_channel_id += 1;
+                    self.pending_shard_channels
+                        .insert(channel_id, (channel, Instant::now()));
+                    match request {
+                        ShardRequestVersioned::V1(req) => {
+                            info!(%peer, cid = %req.cid, channel_id, "inbound V1 chunk request");
+                            if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequested {
+                                peer_id: peer,
+                                request: req,
+                                channel_id,
+                            }) {
+                                self.pending_shard_channels.remove(&channel_id);
+                                warn!(%e, channel_id, "event channel full — dropping V1 ShardRequested and cleaning up pending channel");
                             }
                         }
-                    }
-                    request_response::Message::Response { response, .. } => {
-                        match response {
-                            ShardResponseVersioned::V1(resp) => {
-                                info!(
-                                    %peer,
-                                    cid = %resp.cid,
-                                    offset = resp.offset,
-                                    bytes = resp.data.len(),
-                                    "V1 chunk data received"
-                                );
-                                if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceived {
-                                    peer_id: peer,
-                                    response: resp,
-                                }) {
-                                    warn!(%e, "event channel full — dropping V1 ShardReceived");
-                                }
-                            }
-                            ShardResponseVersioned::V2(resp) => {
-                                info!(
-                                    %peer,
-                                    kind = v2_response_kind(&resp),
-                                    "V2 response received"
-                                );
-                                if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceivedV2 {
-                                    peer_id: peer,
-                                    response: resp,
-                                }) {
-                                    warn!(%e, "event channel full — dropping V2 ShardReceived");
-                                }
+                        ShardRequestVersioned::V2(req) => {
+                            info!(%peer, channel_id, kind = v2_request_kind(&req), "inbound V2 chunk request");
+                            if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequestedV2 {
+                                peer_id: peer,
+                                request: req,
+                                channel_id,
+                            }) {
+                                self.pending_shard_channels.remove(&channel_id);
+                                warn!(%e, channel_id, "event channel full — dropping V2 ShardRequested and cleaning up pending channel");
                             }
                         }
                     }
                 }
-            }
+                request_response::Message::Response { response, .. } => match response {
+                    ShardResponseVersioned::V1(resp) => {
+                        info!(
+                            %peer,
+                            cid = %resp.cid,
+                            offset = resp.offset,
+                            bytes = resp.data.len(),
+                            "V1 chunk data received"
+                        );
+                        if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceived {
+                            peer_id: peer,
+                            response: resp,
+                        }) {
+                            warn!(%e, "event channel full — dropping V1 ShardReceived");
+                        }
+                    }
+                    ShardResponseVersioned::V2(resp) => {
+                        info!(
+                            %peer,
+                            kind = v2_response_kind(&resp),
+                            "V2 response received"
+                        );
+                        if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceivedV2 {
+                            peer_id: peer,
+                            response: resp,
+                        }) {
+                            warn!(%e, "event channel full — dropping V2 ShardReceived");
+                        }
+                    }
+                },
+            },
 
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
-                request_response::Event::OutboundFailure { peer, error, .. }
+                request_response::Event::OutboundFailure { peer, error, .. },
             )) => {
                 warn!(%peer, %error, "chunk request outbound failure");
                 if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequestFailed {
@@ -699,13 +716,13 @@ impl SumSwarm {
             }
 
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
-                request_response::Event::InboundFailure { peer, error, .. }
+                request_response::Event::InboundFailure { peer, error, .. },
             )) => {
                 debug!(%peer, %error, "chunk request inbound failure");
             }
 
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
-                request_response::Event::ResponseSent { peer, .. }
+                request_response::Event::ResponseSent { peer, .. },
             )) => {
                 debug!(%peer, "chunk response sent");
             }
@@ -738,7 +755,9 @@ impl SumSwarm {
             // relay candidate. Without this, a one-time denial wedges the
             // node into `Pending(peer)` forever and it never reaches out
             // again.
-            SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+            SwarmEvent::ListenerClosed {
+                addresses, reason, ..
+            } => {
                 debug!(?addresses, ?reason, "listener closed");
                 nat::handle_listener_closed_for_reservation(
                     &addresses,
@@ -746,7 +765,9 @@ impl SumSwarm {
                 );
             }
 
-            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
                 let relayed = endpoint.is_relayed();
                 if !relayed {
                     *self.direct_connections.entry(peer_id).or_insert(0) += 1;
@@ -757,7 +778,12 @@ impl SumSwarm {
                 }
             }
 
-            SwarmEvent::ConnectionClosed { peer_id, endpoint, cause, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                endpoint,
+                cause,
+                ..
+            } => {
                 let relayed = endpoint.is_relayed();
                 if !relayed {
                     if let std::collections::hash_map::Entry::Occupied(mut e) =
@@ -806,37 +832,56 @@ pub(crate) fn is_dialable_over_wan(addr: &Multiaddr) -> bool {
         match proto {
             Protocol::Ip4(ip) => {
                 // Loopback 127.0.0.0/8
-                if ip.is_loopback() { return false; }
+                if ip.is_loopback() {
+                    return false;
+                }
                 // Link-local 169.254.0.0/16
-                if ip.is_link_local() { return false; }
+                if ip.is_link_local() {
+                    return false;
+                }
                 // Unspecified 0.0.0.0
-                if ip.is_unspecified() { return false; }
+                if ip.is_unspecified() {
+                    return false;
+                }
                 // RFC1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
                 let octets = ip.octets();
-                if octets[0] == 10 { return false; }
-                if octets[0] == 172 && (16..=31).contains(&octets[1]) { return false; }
-                if octets[0] == 192 && octets[1] == 168 { return false; }
+                if octets[0] == 10 {
+                    return false;
+                }
+                if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+                    return false;
+                }
+                if octets[0] == 192 && octets[1] == 168 {
+                    return false;
+                }
                 // CGNAT 100.64.0.0/10
-                if octets[0] == 100 && (64..=127).contains(&octets[1]) { return false; }
+                if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+                    return false;
+                }
                 return true;
             }
             Protocol::Ip6(ip) => {
-                if ip.is_loopback() { return false; }
-                if ip.is_unspecified() { return false; }
+                if ip.is_loopback() {
+                    return false;
+                }
+                if ip.is_unspecified() {
+                    return false;
+                }
                 // Link-local fe80::/10
                 let segs = ip.segments();
-                if segs[0] & 0xffc0 == 0xfe80 { return false; }
+                if segs[0] & 0xffc0 == 0xfe80 {
+                    return false;
+                }
                 // ULA fc00::/7
-                if segs[0] & 0xfe00 == 0xfc00 { return false; }
+                if segs[0] & 0xfe00 == 0xfc00 {
+                    return false;
+                }
                 return true;
             }
             // DNS-backed host components. We can't cheaply validate where
             // they resolve; treating them as dialable lets operators point
             // peers at stable relay hostnames (the common production shape).
-            Protocol::Dns(_)
-            | Protocol::Dns4(_)
-            | Protocol::Dns6(_)
-            | Protocol::Dnsaddr(_) => {
+            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
                 return true;
             }
             _ => {}
@@ -996,7 +1041,9 @@ mod tests {
 
         // Loopback → not dialable.
         assert!(!is_dialable_over_wan(&ma("/ip4/127.0.0.1/tcp/4001")));
-        assert!(!is_dialable_over_wan(&ma("/ip4/127.1.2.3/udp/4001/quic-v1")));
+        assert!(!is_dialable_over_wan(&ma(
+            "/ip4/127.1.2.3/udp/4001/quic-v1"
+        )));
 
         // RFC1918 → not dialable.
         assert!(!is_dialable_over_wan(&ma("/ip4/10.0.0.1/tcp/4001")));
@@ -1044,9 +1091,15 @@ mod tests {
         // `/dns4/relay.example.com/tcp/4001`. Filtering these out at the
         // WAN helper drops them before the reservation logic ever sees
         // them — which is the entire defect we're guarding against here.
-        assert!(is_dialable_over_wan(&ma("/dns4/relay.example.com/tcp/4001")));
-        assert!(is_dialable_over_wan(&ma("/dns4/relay.example.com/udp/4001/quic-v1")));
-        assert!(is_dialable_over_wan(&ma("/dns6/relay.example.com/tcp/4001")));
+        assert!(is_dialable_over_wan(&ma(
+            "/dns4/relay.example.com/tcp/4001"
+        )));
+        assert!(is_dialable_over_wan(&ma(
+            "/dns4/relay.example.com/udp/4001/quic-v1"
+        )));
+        assert!(is_dialable_over_wan(&ma(
+            "/dns6/relay.example.com/tcp/4001"
+        )));
         assert!(is_dialable_over_wan(&ma("/dns/relay.example.com/tcp/4001")));
         assert!(is_dialable_over_wan(&ma("/dnsaddr/relay.example.com")));
 
@@ -1074,10 +1127,10 @@ mod tests {
     fn pick_direct_dial_returns_first_wan_addr_with_p2p_appended() {
         let peer = rand_peer();
         let addrs = vec![
-            ma("/ip4/127.0.0.1/tcp/4001"),                  // loopback — skip
-            ma("/ip4/192.168.1.5/tcp/4001"),                // RFC1918 — skip
-            ma("/ip4/8.8.8.8/tcp/4001"),                    // public — pick this
-            ma("/ip4/1.2.3.4/udp/4001/quic-v1"),            // also public — would also work
+            ma("/ip4/127.0.0.1/tcp/4001"),       // loopback — skip
+            ma("/ip4/192.168.1.5/tcp/4001"),     // RFC1918 — skip
+            ma("/ip4/8.8.8.8/tcp/4001"),         // public — pick this
+            ma("/ip4/1.2.3.4/udp/4001/quic-v1"), // also public — would also work
         ];
         let picked = pick_direct_dial_candidate(&addrs, peer).expect("should pick a candidate");
         // First WAN-dialable address wins.
@@ -1093,11 +1146,14 @@ mod tests {
         let relay = rand_peer();
         let addrs = vec![
             // Circuit address — must NOT be picked.
-            ma(&format!("/ip4/164.92.93.224/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{peer}")),
+            ma(&format!(
+                "/ip4/164.92.93.224/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{peer}"
+            )),
             // Direct WAN address — should be the choice.
             ma("/ip4/172.91.65.115/tcp/4001"),
         ];
-        let picked = pick_direct_dial_candidate(&addrs, peer).expect("should fall through to direct");
+        let picked =
+            pick_direct_dial_candidate(&addrs, peer).expect("should fall through to direct");
         assert_eq!(
             picked.to_string(),
             format!("/ip4/172.91.65.115/tcp/4001/p2p/{peer}")
@@ -1111,7 +1167,9 @@ mod tests {
         let addrs = vec![
             ma("/ip4/192.168.1.5/tcp/4001"),
             ma("/ip4/10.0.0.166/tcp/4001"),
-            ma(&format!("/ip4/164.92.93.224/tcp/4001/p2p/{relay}/p2p-circuit")),
+            ma(&format!(
+                "/ip4/164.92.93.224/tcp/4001/p2p/{relay}/p2p-circuit"
+            )),
         ];
         assert!(pick_direct_dial_candidate(&addrs, peer).is_none());
     }
@@ -1130,7 +1188,10 @@ mod tests {
             .filter(|p| matches!(p, Protocol::P2p(_)))
             .count();
         assert_eq!(p2p_count, 1);
-        assert_eq!(picked.to_string(), format!("/ip4/8.8.8.8/tcp/4001/p2p/{peer}"));
+        assert_eq!(
+            picked.to_string(),
+            format!("/ip4/8.8.8.8/tcp/4001/p2p/{peer}")
+        );
     }
 
     #[test]

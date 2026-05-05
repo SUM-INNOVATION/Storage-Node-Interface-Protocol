@@ -29,7 +29,8 @@ impl NodeMetrics {
     }
 
     pub fn inc_gc_deleted(&self, count: u32) {
-        self.gc_chunks_deleted.fetch_add(count as u64, Ordering::Relaxed);
+        self.gc_chunks_deleted
+            .fetch_add(count as u64, Ordering::Relaxed);
     }
 
     pub fn inc_peers(&self) {

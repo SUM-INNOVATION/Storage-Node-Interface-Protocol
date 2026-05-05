@@ -106,13 +106,7 @@ fn appendix_c_assignment_outputs() {
     // Pre-build the snapshot once. Note the chain plan emphasizes "any
     // order — assignment fn sorts internally", so we deliberately pass
     // the archives in the order Appendix C lists, NOT sorted by address.
-    let snapshot = vec![
-        archive(0),
-        archive(1),
-        archive(2),
-        archive(3),
-        archive(4),
-    ];
+    let snapshot = vec![archive(0), archive(1), archive(2), archive(3), archive(4)];
 
     // Each row from Appendix C: (file_idx, chunk_index, R, expected indices into archive())
     let cases: &[(usize, u32, u32, &[usize])] = &[

@@ -15,14 +15,16 @@ pub mod store;
 pub mod verify;
 
 pub use announce::{ChunkAnnouncement, decode_announcement, encode_announcement};
+pub use assignment::{
+    chunks_for_node, compute_chunk_assignment, compute_default_assignment, nodes_for_chunk,
+};
+pub use chunker::BinaryChunker;
 pub use content_id::cid_from_data;
 pub use error::StoreError;
 pub use fetch::{FetchManager, FetchNet, FetchOutcome};
-pub use store::ChunkStore;
-pub use chunker::BinaryChunker;
 pub use manifest_index::ManifestIndex;
 pub use merkle::MerkleTree;
-pub use assignment::{compute_chunk_assignment, compute_default_assignment, chunks_for_node, nodes_for_chunk};
+pub use store::ChunkStore;
 
 use std::path::Path;
 
@@ -47,7 +49,12 @@ impl SumStore {
         let local = ChunkStore::new(config.store_dir.clone())?;
         let fetcher = FetchManager::new(config.max_chunk_msg_bytes);
         let manifest_idx = ManifestIndex::load(&config.store_dir)?;
-        Ok(Self { config, local, fetcher, manifest_idx })
+        Ok(Self {
+            config,
+            local,
+            fetcher,
+            manifest_idx,
+        })
     }
 
     /// Ingest any file: chunk, compute Merkle tree, store chunks, build manifest.
@@ -87,12 +94,9 @@ impl SumStore {
     }
 
     /// Announce all chunks in a manifest via Gossipsub.
-    pub async fn announce_chunks(
-        &self,
-        net: &SumNet,
-        manifest: &DataManifest,
-    ) -> Result<()> {
-        let merkle_root_hex = manifest.merkle_root
+    pub async fn announce_chunks(&self, net: &SumNet, manifest: &DataManifest) -> Result<()> {
+        let merkle_root_hex = manifest
+            .merkle_root
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
@@ -229,7 +233,11 @@ mod tests {
         assert_eq!(report.chunk_count, 0);
         assert_eq!(report.manifest_count, 0);
         // disk_usage may include subdirectory entries (manifests/), so just check it's small
-        assert!(report.disk_usage_bytes < 1024, "expected minimal disk usage, got {}", report.disk_usage_bytes);
+        assert!(
+            report.disk_usage_bytes < 1024,
+            "expected minimal disk usage, got {}",
+            report.disk_usage_bytes
+        );
         assert!(report.store_dir_writable);
     }
 

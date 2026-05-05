@@ -19,12 +19,12 @@
 //! the AAD binding the chunk to its position.
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
 
 use crate::errors::CryptoError;
-use crate::kdf::{hkdf_expand, CHUNK_KEY_INFO, CHUNK_NONCE_INFO};
+use crate::kdf::{CHUNK_KEY_INFO, CHUNK_NONCE_INFO, hkdf_expand};
 
 /// Encrypt a single plaintext chunk. Returns `ciphertext || tag` ready
 /// to be hashed (blake3) and written to disk.

@@ -20,15 +20,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use sum_net::{SumNet, SumNetEvent, PeerId};
 use sum_net::identity;
-use sum_store::{
-    SumStore, compute_chunk_assignment, nodes_for_chunk,
-};
+use sum_net::{PeerId, SumNet, SumNetEvent};
+use sum_store::{SumStore, compute_chunk_assignment, nodes_for_chunk};
 use sum_types::storage::{DataManifest, REPLICATION_FACTOR};
 
 use crate::rpc_client::L1RpcClient;
@@ -43,12 +41,7 @@ pub trait UploadNet: Send + Sync {
     /// Send a push request for `cid` to `peer_id`, sharing the underlying
     /// buffer via `Arc<[u8]>`. Multiple replicas of the same chunk can clone
     /// the same `Arc<[u8]>` cheaply.
-    async fn push_chunk_shared(
-        &self,
-        peer_id: PeerId,
-        cid: String,
-        data: Arc<[u8]>,
-    ) -> Result<()>;
+    async fn push_chunk_shared(&self, peer_id: PeerId, cid: String, data: Arc<[u8]>) -> Result<()>;
 
     /// Pull the next network event from the swarm. Returns `None` when the
     /// underlying network has shut down.
@@ -57,12 +50,7 @@ pub trait UploadNet: Send + Sync {
 
 #[async_trait]
 impl UploadNet for SumNet {
-    async fn push_chunk_shared(
-        &self,
-        peer_id: PeerId,
-        cid: String,
-        data: Arc<[u8]>,
-    ) -> Result<()> {
+    async fn push_chunk_shared(&self, peer_id: PeerId, cid: String, data: Arc<[u8]>) -> Result<()> {
         SumNet::push_chunk_shared(self, peer_id, cid, data).await
     }
 
@@ -235,7 +223,8 @@ impl UploadOrchestrator {
             bail!("no active nodes on L1 — cannot upload");
         }
 
-        self.run_with_nodes(net, store, manifest, peer_addresses, &node_addrs).await
+        self.run_with_nodes(net, store, manifest, peer_addresses, &node_addrs)
+            .await
     }
 
     /// Run the upload pipeline against a precomputed list of active node
@@ -296,7 +285,9 @@ impl UploadOrchestrator {
                 };
 
                 // Single read from disk per chunk; wrap once in Arc<[u8]>.
-                let raw = store.local.get(&chunk.cid)
+                let raw = store
+                    .local
+                    .get(&chunk.cid)
                     .map_err(|e| anyhow::anyhow!("missing chunk {}: {e}", chunk.cid))?;
                 let data: Arc<[u8]> = Arc::from(raw.into_boxed_slice());
 
@@ -313,7 +304,10 @@ impl UploadOrchestrator {
 
                     // Cheap pointer-bump clone — all R replicas share the
                     // same backing buffer.
-                    match net.push_chunk_shared(peer_id, chunk.cid.clone(), Arc::clone(&data)).await {
+                    match net
+                        .push_chunk_shared(peer_id, chunk.cid.clone(), Arc::clone(&data))
+                        .await
+                    {
                         Ok(()) => {
                             slice_pending.insert((chunk.cid.clone(), peer_id));
                             total_pushes += 1;
@@ -529,8 +523,8 @@ mod tests {
     #[test]
     fn with_max_in_flight_clamps_zero_to_one() {
         let rpc = Arc::new(L1RpcClient::new("http://invalid".into()));
-        let orch = UploadOrchestrator::new(rpc, Duration::from_secs(1))
-            .with_max_in_flight_chunks(0);
+        let orch =
+            UploadOrchestrator::new(rpc, Duration::from_secs(1)).with_max_in_flight_chunks(0);
         assert_eq!(orch.max_in_flight_chunks, 1);
     }
 
@@ -604,7 +598,10 @@ mod tests {
     fn check_success_timeout_dominates() {
         let r = REPLICATION_FACTOR;
         let result = make_result(vec![r, r, 0, 0], true, vec![], r);
-        assert!(matches!(result.check_success(r), Err(UploadFailure::Timeout)));
+        assert!(matches!(
+            result.check_success(r),
+            Err(UploadFailure::Timeout)
+        ));
     }
 
     /// Any FailedPush in the result is fatal regardless of confirmation
@@ -668,9 +665,7 @@ mod tests {
     fn check_success_mixed_under_replication_indices() {
         let r = REPLICATION_FACTOR;
         // Chunks 0, 3, 8 are under-replicated.
-        let per_chunk = vec![
-            r - 1, r, r, r - 2, r, r, r, r, 0, r,
-        ];
+        let per_chunk = vec![r - 1, r, r, r - 2, r, r, r, r, 0, r];
         let result = make_result(per_chunk, false, vec![], r);
         match result.check_success(r) {
             Err(UploadFailure::IncompleteConfirmations {

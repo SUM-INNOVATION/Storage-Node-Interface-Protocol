@@ -25,12 +25,12 @@ pub enum PeerMapChange {
 /// Only `PeerIdentified` (insert) and `PeerDisconnected` (remove) mutate the
 /// map.  All other variants — including `PeerExpired` — are no-ops because an
 /// mDNS TTL expiry does not imply the transport connection has dropped.
-pub fn apply_peer_event(
-    map: &mut HashMap<PeerId, [u8; 20]>,
-    event: &SumNetEvent,
-) -> PeerMapChange {
+pub fn apply_peer_event(map: &mut HashMap<PeerId, [u8; 20]>, event: &SumNetEvent) -> PeerMapChange {
     match event {
-        SumNetEvent::PeerIdentified { peer_id, l1_address } => {
+        SumNetEvent::PeerIdentified {
+            peer_id,
+            l1_address,
+        } => {
             map.insert(*peer_id, *l1_address);
             PeerMapChange::Inserted
         }

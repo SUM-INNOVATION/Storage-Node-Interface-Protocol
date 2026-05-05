@@ -50,8 +50,7 @@ pub use chunk::{decrypt_chunk, encrypt_chunk};
 pub use errors::CryptoError;
 pub use manifest::{decrypt_manifest, encrypt_manifest};
 pub use recipient::{
-    unwrap_for_self, wrap_for_recipient, x25519_keypair_from_ed25519_seed,
-    RECIPIENT_BUNDLE_SIZE,
+    RECIPIENT_BUNDLE_SIZE, unwrap_for_self, wrap_for_recipient, x25519_keypair_from_ed25519_seed,
 };
 
 /// Length of the AEAD authentication tag in bytes (Poly1305 = 16).

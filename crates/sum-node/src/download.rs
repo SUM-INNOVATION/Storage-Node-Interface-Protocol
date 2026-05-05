@@ -10,17 +10,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use sum_net::{SumNet, SumNetEvent, PeerId};
+use sum_net::{PeerId, SumNet, SumNetEvent};
+use sum_store::manifest::deserialize_manifest_cbor;
 use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_store::{
-    compute_chunk_assignment, nodes_for_chunk,
-    FetchManager, FetchOutcome, MerkleTree,
+    FetchManager, FetchOutcome, MerkleTree, compute_chunk_assignment, nodes_for_chunk,
 };
-use sum_store::manifest::deserialize_manifest_cbor;
 use sum_types::storage::{DataManifest, REPLICATION_FACTOR};
 
 use crate::peer_state::apply_peer_event;
@@ -292,7 +291,11 @@ impl DownloadOrchestrator {
         // Store the manifest so we can read chunks back for assembly
         {
             let mut store_write = store.write().await;
-            if store_write.manifest_idx.get_by_merkle_root(&manifest.merkle_root).is_none() {
+            if store_write
+                .manifest_idx
+                .get_by_merkle_root(&manifest.merkle_root)
+                .is_none()
+            {
                 store_write.manifest_idx.insert(&manifest)?;
             }
         }
@@ -321,8 +324,10 @@ impl DownloadOrchestrator {
         if total_to_fetch == 0 {
             // All chunks already on disk — skip to assembly. No network
             // fetches happened, so peer attribution is empty.
-            return self.assemble(&store, &manifest).await.map(|total_bytes| {
-                DownloadResult {
+            return self
+                .assemble(&store, &manifest)
+                .await
+                .map(|total_bytes| DownloadResult {
                     chunks_fetched: 0,
                     chunks_skipped,
                     total_bytes,
@@ -331,8 +336,7 @@ impl DownloadOrchestrator {
                     peers_contacted: HashSet::new(),
                     started_at,
                     completed_at: SystemTime::now(),
-                }
-            });
+                });
         }
 
         // Build a peer map for chunk routing: try to use assignment
@@ -360,9 +364,15 @@ impl DownloadOrchestrator {
 
         // Fill initial batch
         self.fill_fetches(
-            &net, &mut fetcher, &mut remaining, &mut in_flight,
-            &manifest, &holder_map, &discovered_peers,
-        ).await;
+            &net,
+            &mut fetcher,
+            &mut remaining,
+            &mut in_flight,
+            &manifest,
+            &holder_map,
+            &discovered_peers,
+        )
+        .await;
 
         // Event loop: process responses, refill, until done
         loop {
@@ -501,7 +511,9 @@ impl DownloadOrchestrator {
         fallback_peers: &[PeerId],
     ) {
         while in_flight.len() < self.max_concurrent {
-            let Some(chunk_index) = remaining.pop_front() else { break };
+            let Some(chunk_index) = remaining.pop_front() else {
+                break;
+            };
             let chunk = &manifest.chunks[chunk_index as usize];
 
             if fetcher.is_active(&chunk.cid) {
@@ -511,7 +523,12 @@ impl DownloadOrchestrator {
             // Find a peer to fetch from: prefer assignment-based holders
             let peer = holder_map
                 .get(&chunk_index)
-                .and_then(|peers| peers.iter().find(|_p| !in_flight.contains_key(&chunk.cid)).copied())
+                .and_then(|peers| {
+                    peers
+                        .iter()
+                        .find(|_p| !in_flight.contains_key(&chunk.cid))
+                        .copied()
+                })
                 .or_else(|| fallback_peers.first().copied());
 
             let Some(peer_id) = peer else {
@@ -612,12 +629,14 @@ impl DownloadOrchestrator {
         );
 
         let store_read = store.read().await;
-        let mut file = std::fs::File::create(&self.output_path)
-            .context("failed to create output file")?;
+        let mut file =
+            std::fs::File::create(&self.output_path).context("failed to create output file")?;
 
         let mut total_bytes: u64 = 0;
         for chunk in &manifest.chunks {
-            let data = store_read.local.get(&chunk.cid)
+            let data = store_read
+                .local
+                .get(&chunk.cid)
                 .map_err(|e| anyhow::anyhow!("missing chunk {}: {e}", chunk.cid))?;
             file.write_all(&data)?;
             total_bytes += data.len() as u64;
@@ -627,7 +646,8 @@ impl DownloadOrchestrator {
         drop(store_read);
 
         // Verify merkle root
-        let leaf_hashes: Vec<blake3::Hash> = manifest.chunks
+        let leaf_hashes: Vec<blake3::Hash> = manifest
+            .chunks
             .iter()
             .map(|c| {
                 let mut h = [0u8; 32];

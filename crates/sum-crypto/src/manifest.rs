@@ -24,12 +24,12 @@
 //! multiple messages, which doesn't happen here.
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
 
 use crate::errors::CryptoError;
-use crate::kdf::{hkdf_expand, MANIFEST_KEY_INFO};
+use crate::kdf::{MANIFEST_KEY_INFO, hkdf_expand};
 
 /// Domain-separation tag for manifest AEAD AAD. Distinct from chunk AAD.
 const MANIFEST_AAD: &[u8] = b"snip-manifest-v1";

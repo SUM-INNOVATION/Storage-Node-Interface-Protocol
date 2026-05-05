@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeCapability {
-    pub peer_id:   String,
+    pub peer_id: String,
     pub ram_bytes: u64,
-    pub platform:  Platform,
+    pub platform: Platform,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

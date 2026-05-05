@@ -37,8 +37,8 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use sum_crypto::{
-    decrypt_chunk, decrypt_manifest, unwrap_for_self,
-    x25519_keypair_from_ed25519_seed, RECIPIENT_BUNDLE_SIZE,
+    RECIPIENT_BUNDLE_SIZE, decrypt_chunk, decrypt_manifest, unwrap_for_self,
+    x25519_keypair_from_ed25519_seed,
 };
 use sum_net::{Keypair, PeerId, SumNet, SumNetEvent};
 use sum_store::manifest::deserialize_manifest_cbor;
@@ -76,9 +76,7 @@ pub enum PrivateDownloadError {
     )]
     NoBundle,
 
-    #[error(
-        "access expired: expires_at={expires_at} (finalized height {current} > expires_at)"
-    )]
+    #[error("access expired: expires_at={expires_at} (finalized height {current} > expires_at)")]
     AccessExpired { expires_at: u64, current: u64 },
 
     #[error(
@@ -122,9 +120,7 @@ pub enum PrivateDownloadError {
         last_reason: String,
     },
 
-    #[error(
-        "manifest decryption failed (wrong K_file? tampered manifest?): {0}"
-    )]
+    #[error("manifest decryption failed (wrong K_file? tampered manifest?): {0}")]
     ManifestDecrypt(#[source] sum_crypto::CryptoError),
 
     #[error("manifest CBOR parse failed: {0}")]
@@ -274,9 +270,15 @@ pub fn parse_bundle_hex(s: &str) -> Result<[u8; RECIPIENT_BUNDLE_SIZE], PrivateD
     let bytes = hex::decode(stripped).map_err(|e| PrivateDownloadError::BundleHex {
         reason: format!("not valid hex: {e}"),
     })?;
-    bytes.as_slice().try_into().map_err(|_| PrivateDownloadError::BundleHex {
-        reason: format!("expected {RECIPIENT_BUNDLE_SIZE} bytes, got {}", bytes.len()),
-    })
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| PrivateDownloadError::BundleHex {
+            reason: format!(
+                "expected {RECIPIENT_BUNDLE_SIZE} bytes, got {}",
+                bytes.len()
+            ),
+        })
 }
 
 /// Decrypt the on-disk manifest blob and verify its root matches the
@@ -292,8 +294,8 @@ pub fn decrypt_and_verify_manifest(
     encrypted_bytes: &[u8],
     chain_root: [u8; 32],
 ) -> Result<DataManifest, PrivateDownloadError> {
-    let plaintext = decrypt_manifest(k_file, encrypted_bytes)
-        .map_err(PrivateDownloadError::ManifestDecrypt)?;
+    let plaintext =
+        decrypt_manifest(k_file, encrypted_bytes).map_err(PrivateDownloadError::ManifestDecrypt)?;
     let manifest = deserialize_manifest_cbor(&plaintext)
         .map_err(|e| PrivateDownloadError::ManifestParse(e.to_string()))?;
     if manifest.merkle_root != chain_root {
@@ -328,11 +330,12 @@ pub fn decrypt_and_verify_chunk(
             source: e,
         }
     })?;
-    let expected_pt_hash = descriptor
-        .plaintext_blake3_hash
-        .ok_or(PrivateDownloadError::MissingPlaintextHash {
-            idx: descriptor.chunk_index,
-        })?;
+    let expected_pt_hash =
+        descriptor
+            .plaintext_blake3_hash
+            .ok_or(PrivateDownloadError::MissingPlaintextHash {
+                idx: descriptor.chunk_index,
+            })?;
     let actual_pt_hash = *blake3::hash(&plaintext).as_bytes();
     if actual_pt_hash != expected_pt_hash {
         return Err(PrivateDownloadError::PlaintextHashMismatch {
@@ -344,10 +347,7 @@ pub fn decrypt_and_verify_chunk(
 
 /// Verify the assembled output's whole-file plaintext hash matches
 /// the manifest's `file_hash`.
-pub fn check_file_hash(
-    output_path: &Path,
-    expected: [u8; 32],
-) -> Result<(), PrivateDownloadError> {
+pub fn check_file_hash(output_path: &Path, expected: [u8; 32]) -> Result<(), PrivateDownloadError> {
     let mut hasher = blake3::Hasher::new();
     let mut f = std::fs::File::open(output_path)?;
     std::io::copy(&mut f, &mut hasher)?;
@@ -469,14 +469,15 @@ pub async fn run_download_private(
     let mut out = std::fs::File::create(&output).map_err(PrivateDownloadError::Io)?;
     use std::io::Write;
     for cd in manifest.chunks.iter() {
-        let ct = ciphertext_chunks
-            .get(&cd.chunk_index)
-            .ok_or_else(|| PrivateDownloadError::ChunkFetch {
+        let ct = ciphertext_chunks.get(&cd.chunk_index).ok_or_else(|| {
+            PrivateDownloadError::ChunkFetch {
                 idx: cd.chunk_index,
                 source: anyhow::anyhow!("chunk fetch returned no bytes for index"),
-            })?;
+            }
+        })?;
         let plaintext = decrypt_and_verify_chunk(&k_file, cd, ct)?;
-        out.write_all(&plaintext).map_err(PrivateDownloadError::Io)?;
+        out.write_all(&plaintext)
+            .map_err(PrivateDownloadError::Io)?;
     }
     out.flush().map_err(PrivateDownloadError::Io)?;
     drop(out);
@@ -586,12 +587,9 @@ async fn fetch_manifest_v2(
             info.assignment_height
         )));
     }
-    let chain_params = rpc
-        .chain_get_chain_params()
-        .await
-        .map_err(|e| {
-            PrivateDownloadError::ManifestFetch(anyhow::anyhow!("chain_getChainParams: {e}"))
-        })?;
+    let chain_params = rpc.chain_get_chain_params().await.map_err(|e| {
+        PrivateDownloadError::ManifestFetch(anyhow::anyhow!("chain_getChainParams: {e}"))
+    })?;
     let r = chain_params.assignment_replication_factor;
 
     let mut distinct_assigned: BTreeSet<[u8; 20]> = BTreeSet::new();
@@ -722,7 +720,11 @@ async fn fetch_manifest_v2(
                 .iter()
                 .map(|(p, a)| (*a, *p))
                 .collect();
-            return Err(build_all_failed(&archive_status, &addr_to_peer, last_reason));
+            return Err(build_all_failed(
+                &archive_status,
+                &addr_to_peer,
+                last_reason,
+            ));
         }
 
         let event = tokio::select! {
@@ -924,12 +926,8 @@ async fn fetch_all_ciphertext_chunks_v2(
     let merkle_root = manifest.merkle_root;
     let mut state: HashMap<u32, ChunkFetchState> = HashMap::with_capacity(manifest.chunks.len());
     for cd in &manifest.chunks {
-        let assigned = sum_store::assignment_v2::assigned_archives(
-            &merkle_root,
-            &snapshot,
-            cd.chunk_index,
-            r,
-        );
+        let assigned =
+            sum_store::assignment_v2::assigned_archives(&merkle_root, &snapshot, cd.chunk_index, r);
         if assigned.is_empty() {
             return Err((
                 cd.chunk_index,
@@ -991,18 +989,12 @@ async fn fetch_all_ciphertext_chunks_v2(
                 .expect("idx came from manifest")
                 .cid
                 .clone();
-            if let Err(e) = net
-                .request_shard_chunk(d.peer_id, cid, None, None)
-                .await
-            {
+            if let Err(e) = net.request_shard_chunk(d.peer_id, cid, None, None).await {
                 // Send-side failure: surface the error. State is
                 // unchanged (we haven't marked in_flight_to yet), so
                 // a future dispatch attempt can retry the same
                 // (chunk, archive) pair without burning the archive.
-                return Err((
-                    d.chunk_index,
-                    anyhow::anyhow!("request_shard_chunk: {e}"),
-                ));
+                return Err((d.chunk_index, anyhow::anyhow!("request_shard_chunk: {e}")));
             }
             // Mark in-flight ONLY after the wire send succeeded so a
             // failed `request_shard_chunk` doesn't burn an archive
@@ -1138,10 +1130,7 @@ async fn fetch_all_ciphertext_chunks_v2(
                     .map(|c| c.chunk_index)
                     .find(|i| state.get(i).is_some_and(|s| s.received.is_none()))
                     .unwrap_or(0);
-                return Err((
-                    next_missing,
-                    anyhow::anyhow!("network shut down mid-fetch"),
-                ));
+                return Err((next_missing, anyhow::anyhow!("network shut down mid-fetch")));
             }
             _ => {}
         }
@@ -1623,9 +1612,8 @@ mod tests {
     #[tokio::test]
     async fn find_my_access_entry_paginates_when_full_first_page() {
         // 256 entries on page 0 (full), target on page 1.
-        let mut page0: Vec<AccessEntryV2> = (0..256)
-            .map(|i| entry(&format!("u{i:03}"), None))
-            .collect();
+        let mut page0: Vec<AccessEntryV2> =
+            (0..256).map(|i| entry(&format!("u{i:03}"), None)).collect();
         // Make sure target isn't on page 0.
         for e in &mut page0 {
             assert_ne!(e.address, "target");
@@ -1823,12 +1811,8 @@ mod tests {
         let mut all_assigned: Vec<Vec<[u8; 20]>> = Vec::new();
         let mut union: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
         for &idx in &chunk_indices {
-            let assigned = sum_store::assignment_v2::assigned_archives(
-                &merkle_root,
-                &snapshot,
-                idx,
-                r,
-            );
+            let assigned =
+                sum_store::assignment_v2::assigned_archives(&merkle_root, &snapshot, idx, r);
             assert_eq!(
                 assigned.len(),
                 r as usize,
@@ -1855,12 +1839,8 @@ mod tests {
         // Determinism: re-running with the same inputs yields the
         // same per-chunk lists.
         for (i, expected) in all_assigned.iter().enumerate() {
-            let again = sum_store::assignment_v2::assigned_archives(
-                &merkle_root,
-                &snapshot,
-                i as u32,
-                r,
-            );
+            let again =
+                sum_store::assignment_v2::assigned_archives(&merkle_root, &snapshot, i as u32, r);
             assert_eq!(&again, expected, "chunk {i} routing must be deterministic");
         }
     }
@@ -1874,8 +1854,7 @@ mod tests {
         let snapshot: Vec<[u8; 20]> = (1u8..=3).map(|i| [i; 20]).collect();
         let merkle_root = [0xAB; 32];
         // R = 7 against 3-archive snapshot → clamped to 3.
-        let assigned =
-            sum_store::assignment_v2::assigned_archives(&merkle_root, &snapshot, 0, 7);
+        let assigned = sum_store::assignment_v2::assigned_archives(&merkle_root, &snapshot, 0, 7);
         assert_eq!(assigned.len(), 3);
     }
 
@@ -1912,10 +1891,7 @@ mod tests {
     fn synth_state(
         n: u32,
         archives_per_chunk: &[[u8; 20]],
-    ) -> (
-        HashMap<u32, ChunkFetchState>,
-        HashMap<[u8; 20], PeerId>,
-    ) {
+    ) -> (HashMap<u32, ChunkFetchState>, HashMap<[u8; 20], PeerId>) {
         let state: HashMap<u32, ChunkFetchState> = (0..n)
             .map(|i| {
                 (
@@ -1966,8 +1942,7 @@ mod tests {
         let (state, addr_to_peer) = synth_state(10, &archives);
 
         for n in [1usize, 2, 3, 5, 10] {
-            let dispatches =
-                select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, n);
+            let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, n);
             assert_eq!(dispatches.len(), n, "max_concurrent={n}");
             // Ascending chunk-index order.
             for (k, d) in dispatches.iter().enumerate() {
@@ -2024,10 +1999,22 @@ mod tests {
         let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 3);
         assert_eq!(dispatches.len(), 2);
 
-        let chunk0 = dispatches.iter().find(|d| d.chunk_index == 0).expect("chunk 0");
-        assert_eq!(chunk0.archive_addr, [0xA2u8; 20], "chunk 0 must retry on archive 1");
-        let chunk2 = dispatches.iter().find(|d| d.chunk_index == 2).expect("chunk 2");
-        assert_eq!(chunk2.archive_addr, [0xA1u8; 20], "chunk 2 untouched, tries archive 0");
+        let chunk0 = dispatches
+            .iter()
+            .find(|d| d.chunk_index == 0)
+            .expect("chunk 0");
+        assert_eq!(
+            chunk0.archive_addr, [0xA2u8; 20],
+            "chunk 0 must retry on archive 1"
+        );
+        let chunk2 = dispatches
+            .iter()
+            .find(|d| d.chunk_index == 2)
+            .expect("chunk 2");
+        assert_eq!(
+            chunk2.archive_addr, [0xA1u8; 20],
+            "chunk 2 untouched, tries archive 0"
+        );
     }
 
     /// Wrong-hash failures take the same code path as peer-error
@@ -2149,7 +2136,11 @@ mod tests {
 
         let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 8);
         let indices: Vec<u32> = dispatches.iter().map(|d| d.chunk_index).collect();
-        assert_eq!(indices, vec![0, 2], "chunk 1 already done; dispatch 0 and 2");
+        assert_eq!(
+            indices,
+            vec![0, 2],
+            "chunk 1 already done; dispatch 0 and 2"
+        );
     }
 
     // ── Phase 4d manifest fan-out: compute_manifest_fanout ─────────
@@ -2273,7 +2264,11 @@ mod tests {
         status.insert([2u8; 20], ManifestArchiveStatus::Dispatched);
 
         let dispatches = select_manifest_dispatch(&status, &addr_to_peer, 3);
-        assert_eq!(dispatches.len(), 1, "2 already dispatched, fanout 3 → 1 more");
+        assert_eq!(
+            dispatches.len(),
+            1,
+            "2 already dispatched, fanout 3 → 1 more"
+        );
         // The remaining slot goes to the lowest-address Untried (3).
         assert_eq!(dispatches[0].archive_addr, [3u8; 20]);
     }
@@ -2356,4 +2351,3 @@ mod tests {
         assert_eq!(first[2].archive_addr, [0x80u8; 20]);
     }
 }
-

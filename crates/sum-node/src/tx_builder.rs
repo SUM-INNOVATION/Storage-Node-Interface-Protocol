@@ -248,7 +248,10 @@ pub fn build_remove_access_v2_tx(
     address: [u8; 20],
 ) -> Result<String> {
     let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
-        operation: StorageMetadataOperationV2Mirror::RemoveAccessV2 { merkle_root, address },
+        operation: StorageMetadataOperationV2Mirror::RemoveAccessV2 {
+            merkle_root,
+            address,
+        },
     });
     sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
 }
@@ -379,11 +382,11 @@ enum NodeRegistryOperationMirror {
     Register {
         role: NodeRoleMirror,
         stake: u64,
-    },              // 0
+    }, // 0
     UpdateStatus {
         target: [u8; 20],
         new_status: NodeStatusMirror,
-    },              // 1
+    }, // 1
 }
 
 /// Mirror of `NodeRegistryTxData`.
@@ -430,30 +433,30 @@ enum StorageMetadataOperationMirror {
         total_size_bytes: u64,
         access_list: Vec<[u8; 20]>,
         fee_deposit: u64,
-    },                                    // index 0
+    }, // index 0
     UpdateAccessList {
         merkle_root: [u8; 32],
         new_access_list: Vec<[u8; 20]>,
-    },                                    // index 1
+    }, // index 1
     AddAccess {
         merkle_root: [u8; 32],
         address: [u8; 20],
-    },                                    // index 2
+    }, // index 2
     RemoveAccess {
         merkle_root: [u8; 32],
         address: [u8; 20],
-    },                                    // index 3
+    }, // index 3
     TopUpFeePool {
         merkle_root: [u8; 32],
         amount: u64,
-    },                                    // index 4
+    }, // index 4
     SubmitStorageProof {
         challenge_id: [u8; 32],
         merkle_root: [u8; 32],
         chunk_index: u32,
         chunk_hash: [u8; 32],
         merkle_path: Vec<[u8; 32]>,
-    },                                    // index 5
+    }, // index 5
 }
 
 /// Mirror of `StorageMetadataTxData`.
@@ -537,26 +540,30 @@ enum StorageMetadataOperationV2Mirror {
         fee_deposit: u64,
         visibility: u8,
         initial_access: Vec<AccessEntryV2Mirror>,
-    },                                                                              // 0
-    ActivateFileV2 { merkle_root: [u8; 32] },                                       // 1
-    AbandonFileV2 { merkle_root: [u8; 32] },                                        // 2
+    }, // 0
+    ActivateFileV2 {
+        merkle_root: [u8; 32],
+    }, // 1
+    AbandonFileV2 {
+        merkle_root: [u8; 32],
+    }, // 2
     AcceptAssignmentV2 {
         merkle_root: [u8; 32],
         chunk_indices: Vec<u32>,
-    },                                                                              // 3 — chain final ordering
+    }, // 3 — chain final ordering
     AddAccessV2 {
         merkle_root: [u8; 32],
         entry: AccessEntryV2Mirror,
-    },                                                                              // 4
+    }, // 4
     RemoveAccessV2 {
         merkle_root: [u8; 32],
         address: [u8; 20],
-    },                                                                              // 5
+    }, // 5
     UpdateAccessV2 {
         merkle_root: [u8; 32],
         address: [u8; 20],
         new_entry: AccessEntryV2Mirror,
-    },                                                                              // 6
+    }, // 6
 }
 
 /// Mirror of `StorageMetadataV2TxData` (paired payload wrapper).
@@ -591,27 +598,27 @@ struct StorageMetadataV2TxDataMirror {
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 enum TxPayloadMirror {
-    Transfer { to: [u8; 20], amount: u128 },             // 0
-    Nft(Vec<u8>),                                        // 1
-    Token(Vec<u8>),                                      // 2
-    ContractDeploy(Vec<u8>),                             // 3
-    ContractCall(Vec<u8>),                               // 4
-    Staking(Vec<u8>),                                    // 5
-    Messaging(Vec<u8>),                                  // 6
-    DocClass(Vec<u8>),                                   // 7
-    Tax(Vec<u8>),                                        // 8
-    Equity(Vec<u8>),                                     // 9
-    Agreement(Vec<u8>),                                  // 10
-    Legal(Vec<u8>),                                      // 11
-    Property(Vec<u8>),                                   // 12
-    Healthcare(Vec<u8>),                                 // 13
-    Employment(Vec<u8>),                                 // 14
-    Finance(Vec<u8>),                                    // 15
-    PolicyAccount(Vec<u8>),                              // 16
-    NodeRegistry(NodeRegistryTxDataMirror),              // 17
-    StorageMetadata(StorageMetadataTxDataMirror),        // 18
-    NodeRegistryV2(NodeRegistryV2TxDataMirror),          // 19 — placeholder for Phase 4
-    StorageMetadataV2(StorageMetadataV2TxDataMirror),    // 20 — Phase 0b builders target this
+    Transfer { to: [u8; 20], amount: u128 },          // 0
+    Nft(Vec<u8>),                                     // 1
+    Token(Vec<u8>),                                   // 2
+    ContractDeploy(Vec<u8>),                          // 3
+    ContractCall(Vec<u8>),                            // 4
+    Staking(Vec<u8>),                                 // 5
+    Messaging(Vec<u8>),                               // 6
+    DocClass(Vec<u8>),                                // 7
+    Tax(Vec<u8>),                                     // 8
+    Equity(Vec<u8>),                                  // 9
+    Agreement(Vec<u8>),                               // 10
+    Legal(Vec<u8>),                                   // 11
+    Property(Vec<u8>),                                // 12
+    Healthcare(Vec<u8>),                              // 13
+    Employment(Vec<u8>),                              // 14
+    Finance(Vec<u8>),                                 // 15
+    PolicyAccount(Vec<u8>),                           // 16
+    NodeRegistry(NodeRegistryTxDataMirror),           // 17
+    StorageMetadata(StorageMetadataTxDataMirror),     // 18
+    NodeRegistryV2(NodeRegistryV2TxDataMirror),       // 19 — placeholder for Phase 4
+    StorageMetadataV2(StorageMetadataV2TxDataMirror), // 20 — Phase 0b builders target this
 }
 
 /// Mirror of `TransactionV2`.
@@ -633,8 +640,8 @@ struct TransactionV2Mirror {
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code, clippy::large_enum_variant)]
 enum TxInnerMirror {
-    Legacy(Vec<u8>),           // 0
-    V2(TransactionV2Mirror),   // 1
+    Legacy(Vec<u8>),         // 0
+    V2(TransactionV2Mirror), // 1
 }
 
 /// Mirror of `SignedTransaction`.
@@ -656,8 +663,14 @@ mod tests {
     fn build_and_verify_proof_tx() {
         let seed = [42u8; 32];
         let hex = build_submit_proof_tx(
-            &seed, 1, 0, 1_000_000,
-            [0xAA; 32], [0xBB; 32], 5, [0xCC; 32],
+            &seed,
+            1,
+            0,
+            1_000_000,
+            [0xAA; 32],
+            [0xBB; 32],
+            5,
+            [0xCC; 32],
             vec![[0xDD; 32], [0xEE; 32]],
         )
         .unwrap();
@@ -676,7 +689,11 @@ mod tests {
                 match tx.payload {
                     TxPayloadMirror::StorageMetadata(data) => match data.operation {
                         StorageMetadataOperationMirror::SubmitStorageProof {
-                            challenge_id, merkle_root, chunk_index, chunk_hash, merkle_path,
+                            challenge_id,
+                            merkle_root,
+                            chunk_index,
+                            chunk_hash,
+                            merkle_path,
                         } => {
                             assert_eq!(challenge_id, [0xAA; 32]);
                             assert_eq!(merkle_root, [0xBB; 32]);
@@ -699,12 +716,10 @@ mod tests {
     #[test]
     fn deterministic_tx_hex() {
         let seed = [1u8; 32];
-        let hex1 = build_submit_proof_tx(
-            &seed, 1, 0, 100, [0; 32], [1; 32], 0, [2; 32], vec![],
-        ).unwrap();
-        let hex2 = build_submit_proof_tx(
-            &seed, 1, 0, 100, [0; 32], [1; 32], 0, [2; 32], vec![],
-        ).unwrap();
+        let hex1 =
+            build_submit_proof_tx(&seed, 1, 0, 100, [0; 32], [1; 32], 0, [2; 32], vec![]).unwrap();
+        let hex2 =
+            build_submit_proof_tx(&seed, 1, 0, 100, [0; 32], [1; 32], 0, [2; 32], vec![]).unwrap();
         assert_eq!(hex1, hex2, "same inputs must produce same tx hex");
     }
 
@@ -740,9 +755,7 @@ mod tests {
     #[test]
     fn build_and_verify_register_node_tx() {
         let seed = [10u8; 32];
-        let hex = build_register_archive_node_tx(
-            &seed, 1337, 0, 1_000_000, 1_000_000_000,
-        ).unwrap();
+        let hex = build_register_archive_node_tx(&seed, 1337, 0, 1_000_000, 1_000_000_000).unwrap();
 
         let bytes = hex::decode(&hex).unwrap();
         let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
@@ -785,8 +798,8 @@ mod tests {
         }];
         let hex = build_register_file_pending_v2_tx(
             &seed,
-            1337, // chain_id
-            5,    // nonce
+            1337,      // chain_id
+            5,         // nonce
             1_000_000, // fee
             merkle_root,
             10_485_760, // plaintext_size_bytes
@@ -849,16 +862,19 @@ mod tests {
             let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
             match signed.inner {
                 TxInnerMirror::V2(tx) => match tx.payload {
-                    TxPayloadMirror::StorageMetadataV2(data) => match (builder_label, data.operation)
-                    {
-                        ("activate", StorageMetadataOperationV2Mirror::ActivateFileV2 {
-                            merkle_root: r,
-                        }) => assert_eq!(r, root),
-                        ("abandon", StorageMetadataOperationV2Mirror::AbandonFileV2 {
-                            merkle_root: r,
-                        }) => assert_eq!(r, root),
-                        (lbl, op) => panic!("wrong variant for {lbl}: {op:?}"),
-                    },
+                    TxPayloadMirror::StorageMetadataV2(data) => {
+                        match (builder_label, data.operation) {
+                            (
+                                "activate",
+                                StorageMetadataOperationV2Mirror::ActivateFileV2 { merkle_root: r },
+                            ) => assert_eq!(r, root),
+                            (
+                                "abandon",
+                                StorageMetadataOperationV2Mirror::AbandonFileV2 { merkle_root: r },
+                            ) => assert_eq!(r, root),
+                            (lbl, op) => panic!("wrong variant for {lbl}: {op:?}"),
+                        }
+                    }
                     _ => panic!("expected StorageMetadataV2 payload"),
                 },
                 _ => panic!("wrong TxInner variant"),
@@ -909,7 +925,10 @@ mod tests {
     fn payload_v2_variant_indices_are_stable() {
         fn variant_index(p: TxPayloadMirror) -> u32 {
             let bytes = bincode1::serialize(&p).unwrap();
-            assert!(bytes.len() >= 4, "expected at least 4 bytes for payload tag");
+            assert!(
+                bytes.len() >= 4,
+                "expected at least 4 bytes for payload tag"
+            );
             u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
         }
 
@@ -927,14 +946,16 @@ mod tests {
             "V1 NodeRegistry payload index drift"
         );
         assert_eq!(
-            variant_index(TxPayloadMirror::StorageMetadata(StorageMetadataTxDataMirror {
-                operation: StorageMetadataOperationMirror::RegisterFile {
-                    merkle_root: [0; 32],
-                    total_size_bytes: 0,
-                    access_list: vec![],
-                    fee_deposit: 0,
-                },
-            })),
+            variant_index(TxPayloadMirror::StorageMetadata(
+                StorageMetadataTxDataMirror {
+                    operation: StorageMetadataOperationMirror::RegisterFile {
+                        merkle_root: [0; 32],
+                        total_size_bytes: 0,
+                        access_list: vec![],
+                        fee_deposit: 0,
+                    },
+                }
+            )),
             18,
             "V1 StorageMetadata payload index drift"
         );
@@ -942,20 +963,24 @@ mod tests {
         // V2 placements per chain plan v3.2 schema-text ordering:
         // NodeRegistryV2 at 19, StorageMetadataV2 at 20.
         assert_eq!(
-            variant_index(TxPayloadMirror::NodeRegistryV2(NodeRegistryV2TxDataMirror {
-                operation: NodeRegistryOperationV2Mirror::RegisterEncryptionKey {
-                    encryption_pubkey: [0; 32],
-                },
-            })),
+            variant_index(TxPayloadMirror::NodeRegistryV2(
+                NodeRegistryV2TxDataMirror {
+                    operation: NodeRegistryOperationV2Mirror::RegisterEncryptionKey {
+                        encryption_pubkey: [0; 32],
+                    },
+                }
+            )),
             19,
             "NodeRegistryV2 payload index must be 19"
         );
         assert_eq!(
-            variant_index(TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
-                operation: StorageMetadataOperationV2Mirror::ActivateFileV2 {
-                    merkle_root: [0; 32],
-                },
-            })),
+            variant_index(TxPayloadMirror::StorageMetadataV2(
+                StorageMetadataV2TxDataMirror {
+                    operation: StorageMetadataOperationV2Mirror::ActivateFileV2 {
+                        merkle_root: [0; 32],
+                    },
+                }
+            )),
             20,
             "StorageMetadataV2 payload index must be 20 — \
              slot 19 is reserved for NodeRegistryV2"
@@ -975,7 +1000,10 @@ mod tests {
         // variant tag as little-endian u32 (4 bytes).
         fn variant_index(op: StorageMetadataOperationV2Mirror) -> u32 {
             let bytes = bincode1::serialize(&op).unwrap();
-            assert!(bytes.len() >= 4, "expected at least 4 bytes for variant tag");
+            assert!(
+                bytes.len() >= 4,
+                "expected at least 4 bytes for variant tag"
+            );
             u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
         }
         assert_eq!(
@@ -1085,8 +1113,7 @@ mod tests {
     #[test]
     fn fixture_register_encryption_key_bytes() {
         // Variant 0: tag=00000000, then 32 bytes of 0x11.
-        let expected = "00000000".to_string()
-            + &"11".repeat(32);
+        let expected = "00000000".to_string() + &"11".repeat(32);
         let actual = nr_op_hex(NodeRegistryOperationV2Mirror::RegisterEncryptionKey {
             encryption_pubkey: FIXTURE_ENCRYPTION_PUBKEY,
         });
@@ -1182,7 +1209,7 @@ mod tests {
             + "0300000000000000" // length = 3 (u64 LE)
             + "01000000"          // 1 u32 LE
             + "02000000"          // 2 u32 LE
-            + "03000000";         // 3 u32 LE
+            + "03000000"; // 3 u32 LE
         assert_eq!(
             actual, expected,
             "AcceptAssignmentV2 wire bytes diverged from chain fixture"
@@ -1202,9 +1229,7 @@ mod tests {
         // Outer TxPayload variant=19 → 0x13000000.
         // Inner NodeRegistryOperationV2 variant=0 → 0x00000000.
         // Then 32 bytes of 0x11.
-        let expected = "13000000".to_string()
-            + "00000000"
-            + &"11".repeat(32);
+        let expected = "13000000".to_string() + "00000000" + &"11".repeat(32);
         assert_eq!(actual, expected, "TxPayload::NodeRegistryV2 != index 19");
     }
 
@@ -1254,13 +1279,10 @@ mod tests {
                 "abandon",
             ),
         ] {
-            let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
-                operation: op,
-            });
+            let payload =
+                TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror { operation: op });
             let actual = hex::encode(bincode1::serialize(&payload).unwrap());
-            let expected = "14000000".to_string()
-                + inner_tag
-                + &"42".repeat(32);
+            let expected = "14000000".to_string() + inner_tag + &"42".repeat(32);
             assert_eq!(actual, expected, "{label} wrapper bytes diverged");
         }
     }
@@ -1317,9 +1339,7 @@ mod tests {
             address: FIXTURE_RECIPIENT_ADDR,
         });
         // Variant 5: tag = 05000000, then merkle_root, then address.
-        let expected = "05000000".to_string()
-            + &"42".repeat(32)
-            + &"55".repeat(20);
+        let expected = "05000000".to_string() + &"42".repeat(32) + &"55".repeat(20);
         assert_eq!(actual, expected);
     }
 
@@ -1412,9 +1432,8 @@ mod tests {
                 "update",
             ),
         ] {
-            let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
-                operation: op,
-            });
+            let payload =
+                TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror { operation: op });
             let actual = hex::encode(bincode1::serialize(&payload).unwrap());
             assert!(
                 actual.starts_with(&format!("14000000{inner_tag}")),
@@ -1431,15 +1450,9 @@ mod tests {
             encrypted_key_bundle: Some(Bundle80(FIXTURE_BUNDLE)),
             expires_at: Some(FIXTURE_EXPIRES_AT),
         };
-        let hex_str = build_add_access_v2_tx(
-            &seed,
-            1337,
-            5,
-            500_000,
-            FIXTURE_MERKLE_ROOT,
-            entry.clone(),
-        )
-        .unwrap();
+        let hex_str =
+            build_add_access_v2_tx(&seed, 1337, 5, 500_000, FIXTURE_MERKLE_ROOT, entry.clone())
+                .unwrap();
         let bytes = hex::decode(&hex_str).unwrap();
         let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
         match signed.inner {
@@ -1546,12 +1559,16 @@ mod tests {
     fn build_and_verify_register_file_tx() {
         let seed = [20u8; 32];
         let hex = build_register_file_tx(
-            &seed, 1337, 1, 1_000_000,
-            [0xFF; 32],     // merkle_root
-            2_097_152,      // total_size_bytes (2 MB)
-            vec![],         // empty access_list (public)
-            100_000_000,    // fee_deposit
-        ).unwrap();
+            &seed,
+            1337,
+            1,
+            1_000_000,
+            [0xFF; 32],  // merkle_root
+            2_097_152,   // total_size_bytes (2 MB)
+            vec![],      // empty access_list (public)
+            100_000_000, // fee_deposit
+        )
+        .unwrap();
 
         let bytes = hex::decode(&hex).unwrap();
         let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
@@ -1563,7 +1580,10 @@ mod tests {
                 match tx.payload {
                     TxPayloadMirror::StorageMetadata(data) => match data.operation {
                         StorageMetadataOperationMirror::RegisterFile {
-                            merkle_root, total_size_bytes, access_list, fee_deposit,
+                            merkle_root,
+                            total_size_bytes,
+                            access_list,
+                            fee_deposit,
                         } => {
                             assert_eq!(merkle_root, [0xFF; 32]);
                             assert_eq!(total_size_bytes, 2_097_152);

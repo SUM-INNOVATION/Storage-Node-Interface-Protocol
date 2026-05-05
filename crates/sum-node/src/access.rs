@@ -52,17 +52,17 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use sum_crypto::{
-    unwrap_for_self, wrap_for_recipient, x25519_keypair_from_ed25519_seed, RECIPIENT_BUNDLE_SIZE,
+    RECIPIENT_BUNDLE_SIZE, unwrap_for_self, wrap_for_recipient, x25519_keypair_from_ed25519_seed,
 };
-use sum_net::{identity, Keypair};
+use sum_net::{Keypair, identity};
 use sum_types::rpc_types::{AccessEntryV2, StorageFileInfoV2};
 
 use crate::rpc_client::L1RpcClient;
 use crate::tx_builder::{
-    build_add_access_v2_tx, build_remove_access_v2_tx, build_update_access_v2_tx,
-    AccessEntryV2Mirror, Bundle80,
+    AccessEntryV2Mirror, Bundle80, build_add_access_v2_tx, build_remove_access_v2_tx,
+    build_update_access_v2_tx,
 };
-use crate::tx_wait::{wait_for_finalized, TxWaitError, DEFAULT_POLL_INTERVAL};
+use crate::tx_wait::{DEFAULT_POLL_INTERVAL, TxWaitError, wait_for_finalized};
 
 /// Pagination chunk size for access-list scans. Matches the chain's
 /// default per-page limit.
@@ -79,7 +79,9 @@ const FINALITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120
 
 #[derive(Debug, Error)]
 pub enum AccessOpError {
-    #[error("file is not Private V2 (visibility={visibility}, lifecycle={lifecycle}); access mutations apply only to V2 Private files")]
+    #[error(
+        "file is not Private V2 (visibility={visibility}, lifecycle={lifecycle}); access mutations apply only to V2 Private files"
+    )]
     NotV2Private { visibility: u8, lifecycle: u8 },
 
     #[error(
@@ -132,7 +134,9 @@ pub enum AccessOpError {
     )]
     OwnerBundleMissing,
 
-    #[error("access bundle wire shape invalid (expected {RECIPIENT_BUNDLE_SIZE}-byte hex): {reason}")]
+    #[error(
+        "access bundle wire shape invalid (expected {RECIPIENT_BUNDLE_SIZE}-byte hex): {reason}"
+    )]
     BundleHex { reason: String },
 
     #[error("failed to unwrap K_file from owner bundle: {0}")]
@@ -211,9 +215,7 @@ pub fn parse_recipient_spec(s: &str) -> Result<RecipientSpec, AccessOpError> {
         Some((a, "none")) | Some((a, "None")) | Some((a, "NONE")) => (a, ExpiryDirective::Clear),
         Some((a, rest)) => {
             let h: u64 = rest.parse().map_err(|_| AccessOpError::BundleHex {
-                reason: format!(
-                    "expiry segment {rest:?} is neither `none` nor a u64 block height"
-                ),
+                reason: format!("expiry segment {rest:?} is neither `none` nor a u64 block height"),
             })?;
             (a, ExpiryDirective::SetTo(h))
         }
@@ -223,10 +225,16 @@ pub fn parse_recipient_spec(s: &str) -> Result<RecipientSpec, AccessOpError> {
             reason: "empty L1 address".into(),
         });
     }
-    let addr = identity::l1_address_from_base58(addr_str)
-        .map_err(|e| AccessOpError::BundleHex { reason: format!("bad base58: {e}") })?;
+    let addr =
+        identity::l1_address_from_base58(addr_str).map_err(|e| AccessOpError::BundleHex {
+            reason: format!("bad base58: {e}"),
+        })?;
     let addr_b58 = identity::l1_address_base58(&addr);
-    Ok(RecipientSpec { addr, addr_b58, expiry })
+    Ok(RecipientSpec {
+        addr,
+        addr_b58,
+        expiry,
+    })
 }
 
 /// Add a new recipient to a Private V2 file's access list. See module
@@ -259,8 +267,8 @@ pub async fn run_share(
     let info = require_private_v2_owner(rpc.as_ref(), &root_hex, &operator_b58).await?;
 
     // 3. Recipient pre-checks.
-    if let Some(_existing) = find_access_entry(rpc.as_ref(), &root_hex, &recipient.addr_b58, &info)
-        .await?
+    if let Some(_existing) =
+        find_access_entry(rpc.as_ref(), &root_hex, &recipient.addr_b58, &info).await?
     {
         return Err(AccessOpError::AlreadyInAccessList {
             addr_b58: recipient.addr_b58,
@@ -423,7 +431,10 @@ pub async fn run_update_access(
             addr_b58: target.addr_b58.clone(),
         })?;
     if existing.expires_at == new_expires_at {
-        return Err(AccessOpError::UpdateNoOp { requested: new_expires_at }.into());
+        return Err(AccessOpError::UpdateNoOp {
+            requested: new_expires_at,
+        }
+        .into());
     }
 
     // Preserve the existing encrypted bundle byte-for-byte. Re-wrapping
@@ -684,9 +695,15 @@ pub(crate) fn parse_bundle_hex(s: &str) -> Result<[u8; RECIPIENT_BUNDLE_SIZE], A
     let bytes = hex::decode(stripped).map_err(|e| AccessOpError::BundleHex {
         reason: format!("not valid hex: {e}"),
     })?;
-    bytes.as_slice().try_into().map_err(|_| AccessOpError::BundleHex {
-        reason: format!("expected {RECIPIENT_BUNDLE_SIZE} bytes, got {}", bytes.len()),
-    })
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AccessOpError::BundleHex {
+            reason: format!(
+                "expected {RECIPIENT_BUNDLE_SIZE} bytes, got {}",
+                bytes.len()
+            ),
+        })
 }
 
 /// Common send-and-wait wrapper: get nonce, build tx via the supplied
@@ -704,9 +721,13 @@ async fn submit_and_wait<F>(
 where
     F: FnOnce(u64) -> Result<String>,
 {
-    let nonce = rpc.get_nonce(operator_b58).await.map_err(AccessOpError::Rpc)?;
-    let tx_hex =
-        build_tx(nonce).context("tx build failed").map_err(AccessOpError::TxSubmit)?;
+    let nonce = rpc
+        .get_nonce(operator_b58)
+        .await
+        .map_err(AccessOpError::Rpc)?;
+    let tx_hex = build_tx(nonce)
+        .context("tx build failed")
+        .map_err(AccessOpError::TxSubmit)?;
     let tx_hash_value = rpc
         .send_raw_transaction(&tx_hex)
         .await
@@ -724,9 +745,15 @@ where
     let height = wait_for_finalized(rpc, &tx_hash, DEFAULT_POLL_INTERVAL, FINALITY_TIMEOUT)
         .await
         .map_err(|e| match e {
-            TxWaitError::Failed { reason, block_height } => {
+            TxWaitError::Failed {
+                reason,
+                block_height,
+            } => {
                 warn!(label, ?block_height, %reason, "tx failed at finality");
-                AccessOpError::TxWait(TxWaitError::Failed { reason, block_height })
+                AccessOpError::TxWait(TxWaitError::Failed {
+                    reason,
+                    block_height,
+                })
             }
             other => AccessOpError::TxWait(other),
         })?;
@@ -831,8 +858,7 @@ mod tests {
         // 3. The owner's access bundle on chain (Phase 4a auto-adds
         //    the owner with a bundle wrapped against their own
         //    X25519 key).
-        let bundle =
-            wrap_for_recipient(&k_file_plain, &owner_addr, &owner_x25519_pk).unwrap();
+        let bundle = wrap_for_recipient(&k_file_plain, &owner_addr, &owner_x25519_pk).unwrap();
         let bundle_hex = format!("0x{}", hex::encode(bundle));
 
         // 4. Synthetic V2 row with just the owner entry. `share`
@@ -908,12 +934,7 @@ mod tests {
         };
         let rpc = L1RpcClient::new("http://127.0.0.1:0".into());
         let err = recover_k_file_from_owner_bundle(
-            &rpc,
-            &[0u8; 32],
-            owner_addr,
-            &owner_b58,
-            &info,
-            "0xroot",
+            &rpc, &[0u8; 32], owner_addr, &owner_b58, &info, "0xroot",
         )
         .await
         .unwrap_err();
@@ -951,12 +972,7 @@ mod tests {
         };
         let rpc = L1RpcClient::new("http://127.0.0.1:0".into());
         let err = recover_k_file_from_owner_bundle(
-            &rpc,
-            &[0u8; 32],
-            owner_addr,
-            &owner_b58,
-            &info,
-            "0xroot",
+            &rpc, &[0u8; 32], owner_addr, &owner_b58, &info, "0xroot",
         )
         .await
         .unwrap_err();
@@ -1031,11 +1047,7 @@ mod tests {
         let owner_addr = [0x33u8; 20];
         let owner_b58 = identity::l1_address_base58(&owner_addr);
         let root_hex = format!("0x{}", "42".repeat(32));
-        let body = private_v2_info_with_lifecycle(
-            &owner_b58,
-            &root_hex,
-            0, /* Pending */
-        );
+        let body = private_v2_info_with_lifecycle(&owner_b58, &root_hex, 0 /* Pending */);
         let url = one_shot_rpc(body).await;
         let rpc = L1RpcClient::new(url);
 
@@ -1055,11 +1067,7 @@ mod tests {
         let owner_addr = [0x44u8; 20];
         let owner_b58 = identity::l1_address_base58(&owner_addr);
         let root_hex = format!("0x{}", "55".repeat(32));
-        let body = private_v2_info_with_lifecycle(
-            &owner_b58,
-            &root_hex,
-            2, /* Abandoned */
-        );
+        let body = private_v2_info_with_lifecycle(&owner_b58, &root_hex, 2 /* Abandoned */);
         let url = one_shot_rpc(body).await;
         let rpc = L1RpcClient::new(url);
 
@@ -1082,11 +1090,7 @@ mod tests {
         let owner_addr = [0x55u8; 20];
         let owner_b58 = identity::l1_address_base58(&owner_addr);
         let root_hex = format!("0x{}", "66".repeat(32));
-        let body = private_v2_info_with_lifecycle(
-            &owner_b58,
-            &root_hex,
-            1, /* Active */
-        );
+        let body = private_v2_info_with_lifecycle(&owner_b58, &root_hex, 1 /* Active */);
         let url = one_shot_rpc(body).await;
         let rpc = L1RpcClient::new(url);
 
@@ -1109,11 +1113,7 @@ mod tests {
         let stranger_addr = [0xBBu8; 20];
         let stranger_b58 = identity::l1_address_base58(&stranger_addr);
         let root_hex = format!("0x{}", "77".repeat(32));
-        let body = private_v2_info_with_lifecycle(
-            &real_owner_b58,
-            &root_hex,
-            0, /* Pending */
-        );
+        let body = private_v2_info_with_lifecycle(&real_owner_b58, &root_hex, 0 /* Pending */);
         let url = one_shot_rpc(body).await;
         let rpc = L1RpcClient::new(url);
 
@@ -1136,9 +1136,7 @@ mod tests {
     /// chain RPC.
     #[tokio::test]
     async fn share_e2e_recipient_can_unwrap_k_file_from_owner_built_bundle() {
-        use sum_crypto::{
-            unwrap_for_self, wrap_for_recipient, x25519_keypair_from_ed25519_seed,
-        };
+        use sum_crypto::{unwrap_for_self, wrap_for_recipient, x25519_keypair_from_ed25519_seed};
         use sum_types::rpc_types::{LifecycleV2, VisibilityV2};
 
         // Owner setup.
@@ -1149,14 +1147,12 @@ mod tests {
 
         // Recipient setup.
         let recipient_seed = [0xB2u8; 32];
-        let (recipient_sk, recipient_pk) =
-            x25519_keypair_from_ed25519_seed(&recipient_seed);
+        let (recipient_sk, recipient_pk) = x25519_keypair_from_ed25519_seed(&recipient_seed);
         let recipient_addr = [0x44u8; 20];
 
         // K_file used at ingest, wrapped for owner.
         let k_file_plain = [0xCDu8; 32];
-        let owner_bundle =
-            wrap_for_recipient(&k_file_plain, &owner_addr, &owner_pk).unwrap();
+        let owner_bundle = wrap_for_recipient(&k_file_plain, &owner_addr, &owner_pk).unwrap();
         let info = StorageFileInfoV2 {
             merkle_root: "0x".to_string() + &"42".repeat(32),
             owner: owner_b58.clone(),

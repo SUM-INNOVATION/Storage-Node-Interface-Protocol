@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use libp2p::PeerId;
-use sum_net::{SumNet, ShardResponse};
+use sum_net::{ShardResponse, SumNet};
 use tracing::{info, warn};
 
 use crate::error::{Result, StoreError};
@@ -122,7 +122,8 @@ impl FetchManager {
         peer_id: PeerId,
         cid: String,
     ) -> Result<()> {
-        self.start_fetch_with_expected_size(net, peer_id, cid, None).await
+        self.start_fetch_with_expected_size(net, peer_id, cid, None)
+            .await
     }
 
     /// Start fetching a chunk from a remote peer with a known expected size.
@@ -137,7 +138,9 @@ impl FetchManager {
         expected_size: Option<u64>,
     ) -> Result<()> {
         if self.active.contains_key(&cid) {
-            return Err(StoreError::Other(format!("fetch already in progress: {cid}")));
+            return Err(StoreError::Other(format!(
+                "fetch already in progress: {cid}"
+            )));
         }
 
         info!(%cid, %peer_id, ?expected_size, "starting chunk fetch");
@@ -146,13 +149,16 @@ impl FetchManager {
             .await
             .map_err(|e| StoreError::Other(e.to_string()))?;
 
-        self.active.insert(cid, FetchState {
-            peer_id,
-            total_bytes: None,
-            next_offset: 0,
-            buffer: Vec::new(),
-            expected_size,
-        });
+        self.active.insert(
+            cid,
+            FetchState {
+                peer_id,
+                total_bytes: None,
+                next_offset: 0,
+                buffer: Vec::new(),
+                expected_size,
+            },
+        );
 
         Ok(())
     }
@@ -229,12 +235,10 @@ impl FetchManager {
             let offset = state.next_offset;
             let chunk_size = self.chunk_size;
 
-            if let Err(e) = net.request_shard_chunk(
-                peer_id,
-                cid.clone(),
-                Some(offset),
-                Some(chunk_size),
-            ).await {
+            if let Err(e) = net
+                .request_shard_chunk(peer_id, cid.clone(), Some(offset), Some(chunk_size))
+                .await
+            {
                 self.active.remove(&cid);
                 return FetchOutcome::Failed {
                     cid,
@@ -444,8 +448,12 @@ mod tests {
     fn rejects_offset_mismatch() {
         // We expect next_offset = 100, but the peer sends offset = 200.
         let r = resp("c", 200, 1024, vec![0u8; 50]);
-        let err = validate_response_metadata(&r, 100, Some(1024), None, MAX_CHUNK_BYTES).unwrap_err();
-        assert!(err.contains("does not match expected next offset"), "got: {err}");
+        let err =
+            validate_response_metadata(&r, 100, Some(1024), None, MAX_CHUNK_BYTES).unwrap_err();
+        assert!(
+            err.contains("does not match expected next offset"),
+            "got: {err}"
+        );
     }
 
     // ── Negative: subsequent inconsistency ───────────────────────────────
@@ -454,8 +462,12 @@ mod tests {
     fn rejects_subsequent_total_bytes_change() {
         // First piece declared total = 1024; second piece claims 2048.
         let r = resp("c", 100, 2048, vec![0u8; 50]);
-        let err = validate_response_metadata(&r, 100, Some(1024), None, MAX_CHUNK_BYTES).unwrap_err();
-        assert!(err.contains("differs from previously declared"), "got: {err}");
+        let err =
+            validate_response_metadata(&r, 100, Some(1024), None, MAX_CHUNK_BYTES).unwrap_err();
+        assert!(
+            err.contains("differs from previously declared"),
+            "got: {err}"
+        );
     }
 
     // ── Negative: cumulative overflow ────────────────────────────────────
@@ -476,13 +488,17 @@ mod tests {
         // Total exceeds the bound, but the offset check fires first; either
         // way the response must be rejected. Use a high bound to force the
         // overflow path to win.
-        let err = validate_response_metadata(&r, u64::MAX - 1, Some(100), None, MAX_CHUNK_BYTES).unwrap_err();
+        let err = validate_response_metadata(&r, u64::MAX - 1, Some(100), None, MAX_CHUNK_BYTES)
+            .unwrap_err();
         // The first failure that triggers will be the offset/total_bytes check
         // (data_len 10 > total 100? no; total above bound? no; etc).
         // Specifically, offset != next_offset is fine here since they match.
         // Let's chase: total = 100 ok, expected = 100 ok, data_len = 10 ok,
         // offset = next_offset ok, then checked_add overflows.
-        assert!(err.contains("overflows u64") || err.contains("exceed"), "got: {err}");
+        assert!(
+            err.contains("overflows u64") || err.contains("exceed"),
+            "got: {err}"
+        );
     }
 
     // ── Positive: valid cases ────────────────────────────────────────────
@@ -547,7 +563,9 @@ mod tests {
     }
     impl MockFetchNet {
         fn new() -> Self {
-            Self { calls: StdMutex::new(Vec::new()) }
+            Self {
+                calls: StdMutex::new(Vec::new()),
+            }
         }
         fn call_count(&self) -> usize {
             self.calls.lock().unwrap().len()
@@ -562,7 +580,10 @@ mod tests {
             offset: Option<u64>,
             max_bytes: Option<u64>,
         ) -> anyhow::Result<()> {
-            self.calls.lock().unwrap().push((peer_id, cid, offset, max_bytes));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((peer_id, cid, offset, max_bytes));
             Ok(())
         }
     }
@@ -621,13 +642,19 @@ mod tests {
         let outcome = fm.on_chunk_received(&mock, &chunk_store, &response).await;
 
         match outcome {
-            FetchOutcome::Complete { cid: got_cid, size: got_size } => {
+            FetchOutcome::Complete {
+                cid: got_cid,
+                size: got_size,
+            } => {
                 assert_eq!(got_cid, cid);
                 assert_eq!(got_size, total);
             }
             other => panic!("expected Complete, got: {other:?}"),
         }
-        assert!(!fm.is_active(&cid), "active set must be cleared on completion");
+        assert!(
+            !fm.is_active(&cid),
+            "active set must be cleared on completion"
+        );
         assert!(chunk_store.has(&cid), "chunk must be persisted to disk");
         // No follow-up requests since the single piece covered total_bytes.
         assert_eq!(mock.call_count(), 1, "no follow-up requests expected");
@@ -656,8 +683,14 @@ mod tests {
         let outcome = fm.on_chunk_received(&mock, &chunk_store, &response).await;
 
         assert!(matches!(outcome, FetchOutcome::Failed { .. }));
-        assert!(!fm.is_active("cidF"), "active set must be cleared on failure");
-        assert!(!chunk_store.has("cidF"), "no chunk should be persisted on failure");
+        assert!(
+            !fm.is_active("cidF"),
+            "active set must be cleared on failure"
+        );
+        assert!(
+            !chunk_store.has("cidF"),
+            "no chunk should be persisted on failure"
+        );
     }
 
     #[tokio::test]
@@ -699,8 +732,10 @@ mod tests {
             }
             other => panic!("expected Failed, got: {other:?}"),
         }
-        assert!(!fm.is_active("cidX"), "active set must be cleared after validation reject");
+        assert!(
+            !fm.is_active("cidX"),
+            "active set must be cleared after validation reject"
+        );
         assert!(!chunk_store.has("cidX"));
     }
-
 }

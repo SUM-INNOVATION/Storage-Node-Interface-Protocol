@@ -42,9 +42,16 @@ pub fn compute_chunk_assignment(
             let hash_bytes = hash.as_bytes();
 
             let start_index = u64::from_be_bytes([
-                hash_bytes[0], hash_bytes[1], hash_bytes[2], hash_bytes[3],
-                hash_bytes[4], hash_bytes[5], hash_bytes[6], hash_bytes[7],
-            ]) as usize % n;
+                hash_bytes[0],
+                hash_bytes[1],
+                hash_bytes[2],
+                hash_bytes[3],
+                hash_bytes[4],
+                hash_bytes[5],
+                hash_bytes[6],
+                hash_bytes[7],
+            ]) as usize
+                % n;
 
             // Linear probe to find an unassigned node for this chunk.
             let mut idx = start_index;
@@ -64,10 +71,7 @@ pub fn compute_chunk_assignment(
 }
 
 /// Given a full assignment, return the chunk indices assigned to a specific node.
-pub fn chunks_for_node(
-    assignment: &[Vec<[u8; 20]>],
-    node_address: &[u8; 20],
-) -> Vec<u32> {
+pub fn chunks_for_node(assignment: &[Vec<[u8; 20]>], node_address: &[u8; 20]) -> Vec<u32> {
     assignment
         .iter()
         .enumerate()
@@ -77,10 +81,7 @@ pub fn chunks_for_node(
 }
 
 /// Given a full assignment, return the nodes assigned to a specific chunk.
-pub fn nodes_for_chunk(
-    assignment: &[Vec<[u8; 20]>],
-    chunk_index: u32,
-) -> Option<&Vec<[u8; 20]>> {
+pub fn nodes_for_chunk(assignment: &[Vec<[u8; 20]>], chunk_index: u32) -> Option<&Vec<[u8; 20]>> {
     assignment.get(chunk_index as usize)
 }
 
@@ -136,10 +137,7 @@ mod tests {
         for (i, chunk_nodes) in assignment.iter().enumerate() {
             let mut seen = std::collections::HashSet::new();
             for node in chunk_nodes {
-                assert!(
-                    seen.insert(node),
-                    "chunk {i} has duplicate node assignment"
-                );
+                assert!(seen.insert(node), "chunk {i} has duplicate node assignment");
             }
         }
     }
@@ -161,7 +159,10 @@ mod tests {
         let a1 = compute_chunk_assignment(&root1, 4, &nodes, 3);
         let a2 = compute_chunk_assignment(&root2, 4, &nodes, 3);
         // Not all chunks should map to the same nodes
-        assert_ne!(a1, a2, "different files should generally produce different assignments");
+        assert_ne!(
+            a1, a2,
+            "different files should generally produce different assignments"
+        );
     }
 
     #[test]
@@ -171,7 +172,11 @@ mod tests {
         let assignment = compute_chunk_assignment(&root, 4, &nodes, 3);
 
         for chunk_nodes in &assignment {
-            assert_eq!(chunk_nodes.len(), 2, "should use all available nodes when N < R");
+            assert_eq!(
+                chunk_nodes.len(),
+                2,
+                "should use all available nodes when N < R"
+            );
         }
     }
 
@@ -217,7 +222,10 @@ mod tests {
         // that's 30 slots across 5 nodes = ~6 per node on average)
         for node in &nodes {
             let chunks = chunks_for_node(&assignment, node);
-            assert!(!chunks.is_empty(), "every node should have at least one assigned chunk");
+            assert!(
+                !chunks.is_empty(),
+                "every node should have at least one assigned chunk"
+            );
         }
     }
 

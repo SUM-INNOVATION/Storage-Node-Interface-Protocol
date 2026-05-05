@@ -10,8 +10,8 @@
 //! * RFC 5869 Appendix A.1 — HKDF-SHA256 test case 1
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -71,31 +71,25 @@ fn kat_chacha20poly1305_rfc8439() {
 /// RFC 7748 §6.1. Tests X25519 scalar-multiplication produces the canonical shared secret.
 #[test]
 fn kat_x25519_rfc7748() {
-    let alice_priv: [u8; 32] = hex(
-        "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
-    )
-    .try_into()
-    .unwrap();
-    let alice_pub: [u8; 32] = hex(
-        "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
-    )
-    .try_into()
-    .unwrap();
-    let bob_priv: [u8; 32] = hex(
-        "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
-    )
-    .try_into()
-    .unwrap();
-    let bob_pub: [u8; 32] = hex(
-        "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
-    )
-    .try_into()
-    .unwrap();
-    let expected_shared: [u8; 32] = hex(
-        "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742",
-    )
-    .try_into()
-    .unwrap();
+    let alice_priv: [u8; 32] =
+        hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+            .try_into()
+            .unwrap();
+    let alice_pub: [u8; 32] =
+        hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+            .try_into()
+            .unwrap();
+    let bob_priv: [u8; 32] =
+        hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+            .try_into()
+            .unwrap();
+    let bob_pub: [u8; 32] = hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+        .try_into()
+        .unwrap();
+    let expected_shared: [u8; 32] =
+        hex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+            .try_into()
+            .unwrap();
 
     // Validate public-key derivation on both sides.
     let alice_sec = StaticSecret::from(alice_priv);
@@ -118,11 +112,9 @@ fn kat_hkdf_sha256_rfc5869_case1() {
     let ikm = hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
     let salt = hex("000102030405060708090a0b0c");
     let info = hex("f0f1f2f3f4f5f6f7f8f9");
-    let expected_okm = hex(
-        "3cb25f25faacd57a90434f64d0362f2a\
+    let expected_okm = hex("3cb25f25faacd57a90434f64d0362f2a\
          2d2d0a90cf1a5a4c5db02d56ecc4c5bf\
-         34007208d5b887185865",
-    );
+         34007208d5b887185865");
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);
     let mut okm = vec![0u8; expected_okm.len()];

@@ -82,9 +82,15 @@ impl LifecycleV2 {
     pub const ACTIVE: Self = Self(1);
     pub const ABANDONED: Self = Self(2);
 
-    pub fn is_pending(self) -> bool { self == Self::PENDING }
-    pub fn is_active(self) -> bool { self == Self::ACTIVE }
-    pub fn is_abandoned(self) -> bool { self == Self::ABANDONED }
+    pub fn is_pending(self) -> bool {
+        self == Self::PENDING
+    }
+    pub fn is_active(self) -> bool {
+        self == Self::ACTIVE
+    }
+    pub fn is_abandoned(self) -> bool {
+        self == Self::ABANDONED
+    }
 }
 
 /// File visibility on chain. Wire format: a plain `u8`.
@@ -99,8 +105,12 @@ impl VisibilityV2 {
     pub const PUBLIC: Self = Self(0);
     pub const PRIVATE: Self = Self(1);
 
-    pub fn is_public(self) -> bool { self == Self::PUBLIC }
-    pub fn is_private(self) -> bool { self == Self::PRIVATE }
+    pub fn is_public(self) -> bool {
+        self == Self::PUBLIC
+    }
+    pub fn is_private(self) -> bool {
+        self == Self::PRIVATE
+    }
 }
 
 /// One entry of a V2 access list (chain plan §3.1).
@@ -278,8 +288,12 @@ pub struct ChainParamsInfo {
 pub enum TxStatusV2 {
     Unknown,
     Pending,
-    Included { block_height: u64 },
-    Finalized { block_height: u64 },
+    Included {
+        block_height: u64,
+    },
+    Finalized {
+        block_height: u64,
+    },
     Failed {
         block_height: Option<u64>,
         reason: String,
@@ -413,26 +427,11 @@ mod tests {
     #[test]
     fn lifecycle_visibility_serialize_as_u8() {
         // Wire shape is a plain integer (not a string variant).
-        assert_eq!(
-            serde_json::to_string(&LifecycleV2::PENDING).unwrap(),
-            "0"
-        );
-        assert_eq!(
-            serde_json::to_string(&LifecycleV2::ACTIVE).unwrap(),
-            "1"
-        );
-        assert_eq!(
-            serde_json::to_string(&LifecycleV2::ABANDONED).unwrap(),
-            "2"
-        );
-        assert_eq!(
-            serde_json::to_string(&VisibilityV2::PUBLIC).unwrap(),
-            "0"
-        );
-        assert_eq!(
-            serde_json::to_string(&VisibilityV2::PRIVATE).unwrap(),
-            "1"
-        );
+        assert_eq!(serde_json::to_string(&LifecycleV2::PENDING).unwrap(), "0");
+        assert_eq!(serde_json::to_string(&LifecycleV2::ACTIVE).unwrap(), "1");
+        assert_eq!(serde_json::to_string(&LifecycleV2::ABANDONED).unwrap(), "2");
+        assert_eq!(serde_json::to_string(&VisibilityV2::PUBLIC).unwrap(), "0");
+        assert_eq!(serde_json::to_string(&VisibilityV2::PRIVATE).unwrap(), "1");
 
         // And the helper predicates round-trip.
         let lc: LifecycleV2 = serde_json::from_str("1").unwrap();
@@ -537,8 +536,10 @@ mod tests {
         }"#;
         let pre: StorageFileInfoV2 = serde_json::from_str(pre_v3_3).unwrap();
         assert!(pre.lifecycle.is_abandoned());
-        assert_eq!(pre.abandoned_at_height, None,
-            "pre-v3.3 chains omit the field; SNIP must default to None");
+        assert_eq!(
+            pre.abandoned_at_height, None,
+            "pre-v3.3 chains omit the field; SNIP must default to None"
+        );
 
         // Post-v3.3 chain: explicit value.
         let post_v3_3 = r#"{
@@ -611,7 +612,10 @@ mod tests {
             // Round-trip back to JSON and re-parse: must match original variant.
             let reserialized = serde_json::to_string(&actual).unwrap();
             let reparsed: TxStatusV2 = serde_json::from_str(&reserialized).unwrap();
-            assert_eq!(reparsed, expected, "re-parse round-trip mismatch on `{json}`");
+            assert_eq!(
+                reparsed, expected,
+                "re-parse round-trip mismatch on `{json}`"
+            );
         }
     }
 
@@ -650,12 +654,16 @@ mod tests {
             other => panic!("expected Pending, got {other:?}"),
         }
         // included — block_height required.
-        match serde_json::from_str::<TxStatusV2>(r#"{"kind":"included","block_height":42}"#).unwrap() {
+        match serde_json::from_str::<TxStatusV2>(r#"{"kind":"included","block_height":42}"#)
+            .unwrap()
+        {
             TxStatusV2::Included { block_height } => assert_eq!(block_height, 42),
             other => panic!("expected Included, got {other:?}"),
         }
         // finalized — block_height required.
-        match serde_json::from_str::<TxStatusV2>(r#"{"kind":"finalized","block_height":99}"#).unwrap() {
+        match serde_json::from_str::<TxStatusV2>(r#"{"kind":"finalized","block_height":99}"#)
+            .unwrap()
+        {
             TxStatusV2::Finalized { block_height } => assert_eq!(block_height, 99),
             other => panic!("expected Finalized, got {other:?}"),
         }
@@ -665,7 +673,10 @@ mod tests {
         )
         .unwrap()
         {
-            TxStatusV2::Failed { block_height, reason } => {
+            TxStatusV2::Failed {
+                block_height,
+                reason,
+            } => {
                 assert!(block_height.is_none());
                 assert_eq!(reason, "x");
             }

@@ -67,7 +67,7 @@ use tracing::{debug, info, warn};
 use crate::push_validator::V2Params;
 use crate::rpc_client::L1RpcClient;
 use crate::tx_builder::build_accept_assignment_v2_tx;
-use crate::tx_wait::{wait_for_finalized, TxStatusSource, TxWaitError};
+use crate::tx_wait::{TxStatusSource, TxWaitError, wait_for_finalized};
 
 /// Subset of the L1 RPC the attestor consumes. Composed with
 /// [`TxStatusSource`] (from `tx_wait`) so any production impl is
@@ -288,7 +288,8 @@ impl<R: AttestorRpc> AssignmentAttestor<R> {
                 batches: vec![],
                 error: Some(AttestError::BadParams {
                     reason: "max_chunk_indices_per_tx must be > 0 \
-                             (chain plan v3.2 default = 65,536)".into(),
+                             (chain plan v3.2 default = 65,536)"
+                        .into(),
                 }),
             };
         }
@@ -313,7 +314,10 @@ impl<R: AttestorRpc> AssignmentAttestor<R> {
                 held_count = req.held.len(),
                 "attest: nothing to do (empty intersection of assignment and held set)"
             );
-            return AttestSummary { batches: vec![], error: None };
+            return AttestSummary {
+                batches: vec![],
+                error: None,
+            };
         }
 
         info!(
@@ -374,28 +378,24 @@ impl<R: AttestorRpc> AssignmentAttestor<R> {
                 }
             };
 
-            let height = match wait_for_finalized(
-                &self.rpc,
-                &tx_hash,
-                req.poll_interval,
-                req.batch_timeout,
-            )
-            .await
-            {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(nonce, %tx_hash, err = %e, "attest: wait_for_finalized failed");
-                    return AttestSummary {
-                        batches,
-                        error: Some(AttestError::Wait {
-                            nonce,
-                            chunk_indices,
-                            tx_hash,
-                            source: e,
-                        }),
-                    };
-                }
-            };
+            let height =
+                match wait_for_finalized(&self.rpc, &tx_hash, req.poll_interval, req.batch_timeout)
+                    .await
+                {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(nonce, %tx_hash, err = %e, "attest: wait_for_finalized failed");
+                        return AttestSummary {
+                            batches,
+                            error: Some(AttestError::Wait {
+                                nonce,
+                                chunk_indices,
+                                tx_hash,
+                                source: e,
+                            }),
+                        };
+                    }
+                };
 
             debug!(
                 nonce,
@@ -418,7 +418,10 @@ impl<R: AttestorRpc> AssignmentAttestor<R> {
             batches_finalized = batches.len(),
             "attest: every batch finalized"
         );
-        AttestSummary { batches, error: None }
+        AttestSummary {
+            batches,
+            error: None,
+        }
     }
 }
 
@@ -481,7 +484,10 @@ mod tests {
     #[async_trait]
     impl AttestorRpc for MockRpc {
         async fn send_raw_transaction(&self, signed_tx_hex: &str) -> Result<String> {
-            self.sent_txs.lock().unwrap().push(signed_tx_hex.to_string());
+            self.sent_txs
+                .lock()
+                .unwrap()
+                .push(signed_tx_hex.to_string());
             let next = self
                 .send_responses
                 .lock()
@@ -513,7 +519,7 @@ mod tests {
             rpc,
             [42u8; 32], // signing seed
             my_addr,
-            1337,    // chain_id
+            1337,      // chain_id
             1_000_000, // fee
             V2Params {
                 assignment_replication_factor: 5,
@@ -591,7 +597,11 @@ mod tests {
             .attest(req([0xCC; 32], 4, snapshot, held, 50))
             .await;
 
-        assert!(summary.fully_attested(), "summary error: {:?}", summary.error);
+        assert!(
+            summary.fully_attested(),
+            "summary error: {:?}",
+            summary.error
+        );
         assert_eq!(summary.batches.len(), 1);
         let b = &summary.batches[0];
         assert_eq!(b.chunk_indices, vec![0, 1, 2, 3]);
@@ -644,7 +654,9 @@ mod tests {
             let rpc = MockRpc::new();
             for i in 0..3 {
                 rpc.enqueue_send_ok(&format!("0xt{i}"));
-                rpc.enqueue_status_ok(TxStatusV2::Finalized { block_height: 100 + i });
+                rpc.enqueue_status_ok(TxStatusV2::Finalized {
+                    block_height: 100 + i,
+                });
             }
             let attestor = make_attestor(rpc, my_addr, 4);
             // Insert held in deliberately non-sorted order.
@@ -688,7 +700,9 @@ mod tests {
         // counts asserted below.
         for i in 0..32 {
             rpc.enqueue_send_ok(&format!("0xb{i}"));
-            rpc.enqueue_status_ok(TxStatusV2::Finalized { block_height: 100 + i });
+            rpc.enqueue_status_ok(TxStatusV2::Finalized {
+                block_height: 100 + i,
+            });
         }
         let mut attestor = make_attestor(rpc, my_addr, 64);
         attestor.params.assignment_replication_factor = 1; // override
@@ -698,15 +712,10 @@ mod tests {
 
         // Compute the expected attest set externally to check the
         // attestor agrees byte-for-byte.
-        let expected: BTreeSet<u32> = chunks_for_archive_v2(
-            &[0x12; 32],
-            chunk_count,
-            &snapshot,
-            1,
-            &my_addr,
-        )
-        .into_iter()
-        .collect();
+        let expected: BTreeSet<u32> =
+            chunks_for_archive_v2(&[0x12; 32], chunk_count, &snapshot, 1, &my_addr)
+                .into_iter()
+                .collect();
 
         let summary = attestor
             .attest(req([0x12; 32], chunk_count, snapshot, held, 0))
@@ -748,7 +757,11 @@ mod tests {
         // here — the chain's nonce counter is unmoved.
         assert_eq!(summary.last_finalized_nonce(), None);
         match summary.error.expect("error must be set") {
-            AttestError::Submit { nonce, chunk_indices, source } => {
+            AttestError::Submit {
+                nonce,
+                chunk_indices,
+                source,
+            } => {
                 assert_eq!(nonce, 100);
                 assert_eq!(chunk_indices, vec![0, 1, 2, 3]);
                 assert!(source.to_string().contains("simulated mempool reject"));
@@ -773,7 +786,11 @@ mod tests {
             .attest(req([0x66; 32], 10, snapshot, held, 50))
             .await;
         assert!(!summary.fully_attested());
-        assert_eq!(summary.batches.len(), 1, "first batch must remain finalized");
+        assert_eq!(
+            summary.batches.len(),
+            1,
+            "first batch must remain finalized"
+        );
         assert_eq!(summary.batches[0].nonce, 50);
         // attempted = 51 (the failing batch); finalized = 50 (the
         // successful one). The two helpers must diverge here so the
@@ -781,7 +798,11 @@ mod tests {
         assert_eq!(summary.last_nonce_attempted(), Some(51));
         assert_eq!(summary.last_finalized_nonce(), Some(50));
         match summary.error.expect("error must be set") {
-            AttestError::Submit { nonce, chunk_indices, .. } => {
+            AttestError::Submit {
+                nonce,
+                chunk_indices,
+                ..
+            } => {
                 assert_eq!(nonce, 51);
                 assert_eq!(chunk_indices, vec![4, 5, 6, 7]);
             }
@@ -809,7 +830,12 @@ mod tests {
         assert!(!summary.fully_attested());
         assert_eq!(summary.batches.len(), 0);
         match summary.error.expect("error must be set") {
-            AttestError::Wait { nonce, tx_hash, source: TxWaitError::Failed { reason, .. }, .. } => {
+            AttestError::Wait {
+                nonce,
+                tx_hash,
+                source: TxWaitError::Failed { reason, .. },
+                ..
+            } => {
                 assert_eq!(nonce, 12);
                 assert_eq!(tx_hash, "0xtx-bad");
                 assert!(reason.contains("signature_invalid"));
@@ -828,11 +854,13 @@ mod tests {
         let attestor = make_attestor(rpc, my_addr, 4);
 
         let held: BTreeSet<u32> = (0..4).collect();
-        let summary = attestor
-            .attest(req([0x88; 32], 4, snapshot, held, 1))
-            .await;
+        let summary = attestor.attest(req([0x88; 32], 4, snapshot, held, 1)).await;
         match summary.error.expect("error must be set") {
-            AttestError::Wait { source: TxWaitError::Dropped, nonce, .. } => {
+            AttestError::Wait {
+                source: TxWaitError::Dropped,
+                nonce,
+                ..
+            } => {
                 assert_eq!(nonce, 1);
             }
             other => panic!("expected Wait::Dropped, got {other:?}"),

@@ -31,7 +31,6 @@ pub struct NetConfig {
     pub relay_server: bool,
 }
 
-
 // ── Storage ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

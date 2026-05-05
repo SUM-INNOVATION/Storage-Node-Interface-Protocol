@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
-use libp2p::{autonat, dcutr, multiaddr::Protocol, relay, Multiaddr, PeerId, Swarm};
+use libp2p::{Multiaddr, PeerId, Swarm, autonat, dcutr, multiaddr::Protocol, relay};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -340,10 +340,7 @@ fn request_relay_reservation(
 ///   reserving on the wrong peer when the caller's bookkeeping has a
 ///   stale/mismatched address.
 /// - **Already ending in `/p2p-circuit`**: returned unchanged (idempotent).
-pub(crate) fn build_circuit_listen_addr(
-    base: &Multiaddr,
-    relay_peer: PeerId,
-) -> Multiaddr {
+pub(crate) fn build_circuit_listen_addr(base: &Multiaddr, relay_peer: PeerId) -> Multiaddr {
     // Idempotent: already a circuit address? Return unchanged.
     if base.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
         return base.clone();
@@ -413,9 +410,7 @@ pub fn handle_relay_client_event(
     event_tx: &mpsc::Sender<SumNetEvent>,
 ) {
     match event {
-        relay::client::Event::ReservationReqAccepted {
-            relay_peer_id, ..
-        } => {
+        relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
             reservation_state.mark_active(relay_peer_id);
             info!(
                 %relay_peer_id,
@@ -472,10 +467,7 @@ pub fn handle_listener_closed_for_reservation(
 ///
 /// A successful upgrade means the relay circuit has been replaced with a
 /// direct QUIC connection via UDP hole-punching.
-pub fn handle_dcutr_event(
-    event: dcutr::Event,
-    event_tx: &mpsc::Sender<SumNetEvent>,
-) {
+pub fn handle_dcutr_event(event: dcutr::Event, event_tx: &mpsc::Sender<SumNetEvent>) {
     match event.result {
         Ok(_connection_id) => {
             info!(
@@ -550,8 +542,13 @@ mod tests {
         assert!(matches!(last, Protocol::P2pCircuit));
 
         // Must include /p2p/<peer> before the circuit component.
-        let has_matching_p2p = circuit.iter().any(|p| matches!(p, Protocol::P2p(pid) if pid == peer));
-        assert!(has_matching_p2p, "expected /p2p/<relay_peer> segment, got: {circuit}");
+        let has_matching_p2p = circuit
+            .iter()
+            .any(|p| matches!(p, Protocol::P2p(pid) if pid == peer));
+        assert!(
+            has_matching_p2p,
+            "expected /p2p/<relay_peer> segment, got: {circuit}"
+        );
 
         // Full string form check.
         let expected = format!("/ip4/1.2.3.4/tcp/4001/p2p/{peer}/p2p-circuit");
@@ -562,16 +559,17 @@ mod tests {
     fn circuit_from_tcp_with_p2p_base() {
         // Input already has /p2p/<peer>; helper must NOT append it again.
         let peer = PeerId::random();
-        let base: Multiaddr = format!("/ip4/1.2.3.4/tcp/4001/p2p/{peer}")
-            .parse()
-            .unwrap();
+        let base: Multiaddr = format!("/ip4/1.2.3.4/tcp/4001/p2p/{peer}").parse().unwrap();
         let circuit = build_circuit_listen_addr(&base, peer);
 
         let expected = format!("/ip4/1.2.3.4/tcp/4001/p2p/{peer}/p2p-circuit");
         assert_eq!(circuit.to_string(), expected);
 
         // There should be exactly one P2p component.
-        let p2p_count = circuit.iter().filter(|p| matches!(p, Protocol::P2p(_))).count();
+        let p2p_count = circuit
+            .iter()
+            .filter(|p| matches!(p, Protocol::P2p(_)))
+            .count();
         assert_eq!(p2p_count, 1);
     }
 
@@ -595,7 +593,10 @@ mod tests {
         // Must return unchanged — no duplicated /p2p-circuit suffix.
         assert_eq!(circuit, base);
 
-        let circuit_count = circuit.iter().filter(|p| matches!(p, Protocol::P2pCircuit)).count();
+        let circuit_count = circuit
+            .iter()
+            .filter(|p| matches!(p, Protocol::P2pCircuit))
+            .count();
         assert_eq!(circuit_count, 1);
     }
 
@@ -611,7 +612,10 @@ mod tests {
         assert_eq!(circuit.to_string(), expected);
 
         // Final component must still be /p2p-circuit regardless of base shape.
-        assert!(matches!(circuit.iter().last().unwrap(), Protocol::P2pCircuit));
+        assert!(matches!(
+            circuit.iter().last().unwrap(),
+            Protocol::P2pCircuit
+        ));
     }
 
     #[test]
@@ -658,7 +662,10 @@ mod tests {
 
     #[test]
     fn reservation_state_default_is_none() {
-        assert_eq!(RelayReservationState::default(), RelayReservationState::None);
+        assert_eq!(
+            RelayReservationState::default(),
+            RelayReservationState::None
+        );
         assert!(!RelayReservationState::default().is_busy());
         assert_eq!(RelayReservationState::default().peer(), None);
     }
@@ -693,10 +700,18 @@ mod tests {
         s.mark_pending(p1);
 
         s.mark_active(p2);
-        assert_eq!(s, RelayReservationState::Pending(p1), "mismatch must not upgrade");
+        assert_eq!(
+            s,
+            RelayReservationState::Pending(p1),
+            "mismatch must not upgrade"
+        );
 
         s.mark_active(p1);
-        assert_eq!(s, RelayReservationState::Active(p1), "matching peer upgrades");
+        assert_eq!(
+            s,
+            RelayReservationState::Active(p1),
+            "matching peer upgrades"
+        );
     }
 
     #[test]
@@ -762,14 +777,11 @@ mod tests {
         state.mark_pending(peer);
         assert!(state.is_busy());
 
-        let circuit_addr: Multiaddr =
-            format!("/ip4/1.2.3.4/tcp/4001/p2p/{peer}/p2p-circuit")
-                .parse()
-                .unwrap();
-        let changed = handle_listener_closed_for_reservation(
-            std::slice::from_ref(&circuit_addr),
-            &mut state,
-        );
+        let circuit_addr: Multiaddr = format!("/ip4/1.2.3.4/tcp/4001/p2p/{peer}/p2p-circuit")
+            .parse()
+            .unwrap();
+        let changed =
+            handle_listener_closed_for_reservation(std::slice::from_ref(&circuit_addr), &mut state);
         assert!(changed, "helper must report it reset the state");
         assert_eq!(state, RelayReservationState::None);
     }
@@ -784,10 +796,8 @@ mod tests {
         state.mark_active(peer);
 
         let tcp_addr: Multiaddr = "/ip4/0.0.0.0/tcp/4001".parse().unwrap();
-        let changed = handle_listener_closed_for_reservation(
-            std::slice::from_ref(&tcp_addr),
-            &mut state,
-        );
+        let changed =
+            handle_listener_closed_for_reservation(std::slice::from_ref(&tcp_addr), &mut state);
         assert!(!changed, "non-circuit listener close must not reset");
         assert_eq!(state, RelayReservationState::Active(peer));
     }
@@ -796,13 +806,12 @@ mod tests {
     fn handle_listener_closed_noop_when_state_already_none() {
         // Benign edge case: listener closes but we already reset — stay None.
         let mut state = RelayReservationState::None;
-        let circuit_addr: Multiaddr = format!("/ip4/1.2.3.4/tcp/4001/p2p/{}/p2p-circuit", PeerId::random())
-            .parse()
-            .unwrap();
-        let changed = handle_listener_closed_for_reservation(
-            std::slice::from_ref(&circuit_addr),
-            &mut state,
-        );
+        let circuit_addr: Multiaddr =
+            format!("/ip4/1.2.3.4/tcp/4001/p2p/{}/p2p-circuit", PeerId::random())
+                .parse()
+                .unwrap();
+        let changed =
+            handle_listener_closed_for_reservation(std::slice::from_ref(&circuit_addr), &mut state);
         assert!(!changed);
         assert_eq!(state, RelayReservationState::None);
     }

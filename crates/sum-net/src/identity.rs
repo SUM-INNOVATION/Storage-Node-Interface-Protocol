@@ -12,8 +12,8 @@
 //! The libp2p PeerId is derived differently (multihash of protobuf-encoded pubkey),
 //! but both use the **same underlying Ed25519 keypair**.
 
-use libp2p::identity::{self, ed25519, Keypair};
 use libp2p::PeerId;
+use libp2p::identity::{self, Keypair, ed25519};
 
 /// Derive a libp2p keypair from a raw Ed25519 private key seed (32 bytes).
 ///

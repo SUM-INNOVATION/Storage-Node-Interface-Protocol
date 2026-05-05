@@ -103,9 +103,15 @@ pub async fn wait_for_finalized<S: TxStatusSource + ?Sized>(
                 debug!(%tx_hash, block_height, "tx finalized");
                 return Ok(block_height);
             }
-            TxStatusV2::Failed { block_height, reason } => {
+            TxStatusV2::Failed {
+                block_height,
+                reason,
+            } => {
                 warn!(%tx_hash, ?block_height, %reason, "tx failed (terminal)");
-                return Err(TxWaitError::Failed { block_height, reason });
+                return Err(TxWaitError::Failed {
+                    block_height,
+                    reason,
+                });
             }
             TxStatusV2::Dropped => {
                 warn!(%tx_hash, "tx dropped from mempool (terminal, resubmittable)");
@@ -181,9 +187,14 @@ mod tests {
     #[tokio::test]
     async fn finalized_immediately_returns_height() {
         let src = ScriptedSource::new(vec![Ok(TxStatusV2::Finalized { block_height: 42 })]);
-        let height = wait_for_finalized(&src, "0xtx", Duration::from_millis(10), Duration::from_secs(60))
-            .await
-            .unwrap();
+        let height = wait_for_finalized(
+            &src,
+            "0xtx",
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
         assert_eq!(height, 42);
     }
 
@@ -197,9 +208,14 @@ mod tests {
             Ok(TxStatusV2::Pending),
             Ok(TxStatusV2::Finalized { block_height: 100 }),
         ]);
-        let height = wait_for_finalized(&src, "0xtx", Duration::from_millis(10), Duration::from_secs(60))
-            .await
-            .unwrap();
+        let height = wait_for_finalized(
+            &src,
+            "0xtx",
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
         assert_eq!(height, 100);
     }
 
@@ -215,9 +231,14 @@ mod tests {
             Ok(TxStatusV2::Included { block_height: 99 }),
             Ok(TxStatusV2::Finalized { block_height: 99 }),
         ]);
-        let height = wait_for_finalized(&src, "0xtx", Duration::from_millis(10), Duration::from_secs(60))
-            .await
-            .unwrap();
+        let height = wait_for_finalized(
+            &src,
+            "0xtx",
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
         assert_eq!(height, 99);
     }
 
@@ -232,9 +253,14 @@ mod tests {
             Ok(TxStatusV2::Unknown),
             Ok(TxStatusV2::Finalized { block_height: 7 }),
         ]);
-        let height = wait_for_finalized(&src, "0xtx", Duration::from_millis(10), Duration::from_secs(60))
-            .await
-            .unwrap();
+        let height = wait_for_finalized(
+            &src,
+            "0xtx",
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
         assert_eq!(height, 7);
     }
 
@@ -250,11 +276,19 @@ mod tests {
                 reason: "low-order x25519 public key rejected".into(),
             }),
         ]);
-        let err = wait_for_finalized(&src, "0xtx", Duration::from_millis(10), Duration::from_secs(60))
-            .await
-            .unwrap_err();
+        let err = wait_for_finalized(
+            &src,
+            "0xtx",
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
         match err {
-            TxWaitError::Failed { block_height, reason } => {
+            TxWaitError::Failed {
+                block_height,
+                reason,
+            } => {
                 assert_eq!(block_height, Some(50));
                 assert!(reason.contains("low-order"));
             }
@@ -268,9 +302,14 @@ mod tests {
     #[tokio::test]
     async fn dropped_is_terminal_resubmittable() {
         let src = ScriptedSource::new(vec![Ok(TxStatusV2::Pending), Ok(TxStatusV2::Dropped)]);
-        let err = wait_for_finalized(&src, "0xtx", Duration::from_millis(10), Duration::from_secs(60))
-            .await
-            .unwrap_err();
+        let err = wait_for_finalized(
+            &src,
+            "0xtx",
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, TxWaitError::Dropped));
     }
 
@@ -282,9 +321,14 @@ mod tests {
         // Pending forever — wait_for_finalized must time out and report
         // last_status = Pending.
         let src = ScriptedSource::new(vec![Ok(TxStatusV2::Pending)]);
-        let err = wait_for_finalized(&src, "0xtx", Duration::from_millis(10), Duration::from_millis(100))
-            .await
-            .unwrap_err();
+        let err = wait_for_finalized(
+            &src,
+            "0xtx",
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
         match err {
             TxWaitError::Timeout { last_status } => {
                 assert_eq!(last_status, TxStatusV2::Pending);
@@ -302,11 +346,18 @@ mod tests {
         // where the chain hasn't indexed the tx yet. Must NOT auto-fail
         // as Failed/Dropped; must time out so the caller can `resume`.
         let src = ScriptedSource::new(vec![Ok(TxStatusV2::Unknown)]);
-        let err = wait_for_finalized(&src, "0xtx", Duration::from_millis(10), Duration::from_millis(100))
-            .await
-            .unwrap_err();
+        let err = wait_for_finalized(
+            &src,
+            "0xtx",
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
         match err {
-            TxWaitError::Timeout { last_status: TxStatusV2::Unknown } => {}
+            TxWaitError::Timeout {
+                last_status: TxStatusV2::Unknown,
+            } => {}
             other => panic!("expected Timeout(Unknown), got {other:?}"),
         }
     }
@@ -317,9 +368,14 @@ mod tests {
     #[tokio::test]
     async fn rpc_error_propagates() {
         let src = ScriptedSource::new(vec![Err("network unreachable")]);
-        let err = wait_for_finalized(&src, "0xtx", Duration::from_millis(10), Duration::from_secs(60))
-            .await
-            .unwrap_err();
+        let err = wait_for_finalized(
+            &src,
+            "0xtx",
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
         match err {
             TxWaitError::Rpc(e) => assert!(e.to_string().contains("network unreachable")),
             other => panic!("expected Rpc, got {other:?}"),
