@@ -411,8 +411,13 @@ pub async fn run_download_private(
     );
 
     // ── Step 12: fetch ciphertext chunks (V2-assignment-aware) ──────
-    let _ = max_concurrent; // sequential per chunk for now; per-chunk
-                            // parallelism is left to Phase 4d polish.
+    //
+    // `max_concurrent` is the hard cap on simultaneous in-flight
+    // chunk requests. Phase 4d wires it through; Phase 4b accepted
+    // it but ignored it (sequential, one chunk at a time per peer).
+    // Clamp to >= 1 so a misconfigured `--max-concurrent 0` doesn't
+    // hang forever waiting for slot 0 to free up.
+    let max_in_flight = max_concurrent.max(1);
     let ciphertext_chunks = fetch_all_ciphertext_chunks_v2(
         net.as_ref(),
         rpc.as_ref(),
@@ -420,6 +425,7 @@ pub async fn run_download_private(
         &info,
         &manifest,
         timeout,
+        max_in_flight,
     )
     .await
     .map_err(|(idx, source)| PrivateDownloadError::ChunkFetch { idx, source })?;
@@ -548,9 +554,12 @@ async fn try_request_manifest(
 ///        Failed for that chunk and moves to the next assigned
 ///        archive (or fails the chunk if all are exhausted).
 ///
-/// Single-peer sequential fan-out within a chunk's assigned set is
-/// fine for first-cut Phase 4b; per-chunk concurrency is left to
-/// Phase 4d polish.
+/// Phase 4d enforces a per-fetch in-flight cap (`max_concurrent`):
+/// no more than that many chunks have outstanding requests at any
+/// moment. Within a chunk's assigned-archive set the fan-out is
+/// still sequential (try archive 0 → fail → try archive 1 → …);
+/// concurrency happens *across* chunks, not within a single chunk.
+/// `max_concurrent` is the cap on chunks-in-flight, not peers-in-use.
 async fn fetch_all_ciphertext_chunks_v2(
     net: &SumNet,
     rpc: &L1RpcClient,
@@ -558,6 +567,7 @@ async fn fetch_all_ciphertext_chunks_v2(
     info: &StorageFileInfoV2,
     manifest: &DataManifest,
     timeout: Duration,
+    max_concurrent: usize,
 ) -> std::result::Result<HashMap<u32, Vec<u8>>, (u32, anyhow::Error)> {
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -626,50 +636,63 @@ async fn fetch_all_ciphertext_chunks_v2(
         .map(|c| (c.cid.clone(), c.chunk_index))
         .collect();
 
-    // Helper: try to dispatch as many pending chunks as possible. A
-    // chunk is dispatchable when it is not yet `received`, has no
-    // outstanding `in_flight_to`, has at least one untried assigned
-    // archive, AND the next-untried archive is currently resolvable
-    // to a known PeerId.
+    // Helper: pick chunks to dispatch (subject to `max_concurrent`),
+    // call `request_shard_chunk` for each, and mark them in-flight.
+    // The pure selection logic lives in `select_chunks_to_dispatch`
+    // below so concurrency invariants can be tested without standing
+    // up a real `SumNet`.
     async fn try_dispatch_pending(
         net: &SumNet,
         peer_addresses: &RwLock<HashMap<PeerId, [u8; 20]>>,
         manifest: &DataManifest,
         state: &mut HashMap<u32, ChunkFetchState>,
+        max_concurrent: usize,
     ) -> Result<(), (u32, anyhow::Error)> {
-        let map = peer_addresses.read().await.clone();
-        for cd in &manifest.chunks {
-            let s = state.get_mut(&cd.chunk_index).expect("seeded above");
-            if s.received.is_some() || s.in_flight_to.is_some() {
-                continue;
+        // Snapshot the L1-addr → PeerId map ONCE per dispatch wave so
+        // selection is deterministic for this wave.
+        let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
+            .read()
+            .await
+            .iter()
+            .map(|(p, a)| (*a, *p))
+            .collect();
+
+        let dispatches =
+            select_chunks_to_dispatch(state, &manifest.chunks, &addr_to_peer, max_concurrent);
+
+        for d in dispatches {
+            // Find the chunk's CID — we already validated `idx` came
+            // from the manifest in `select_chunks_to_dispatch`.
+            let cid = manifest
+                .chunks
+                .iter()
+                .find(|c| c.chunk_index == d.chunk_index)
+                .expect("idx came from manifest")
+                .cid
+                .clone();
+            if let Err(e) = net
+                .request_shard_chunk(d.peer_id, cid, None, None)
+                .await
+            {
+                // Send-side failure: surface the error. State is
+                // unchanged (we haven't marked in_flight_to yet), so
+                // a future dispatch attempt can retry the same
+                // (chunk, archive) pair without burning the archive.
+                return Err((
+                    d.chunk_index,
+                    anyhow::anyhow!("request_shard_chunk: {e}"),
+                ));
             }
-            // Walk untried archives until we hit one we can resolve.
-            while s.next_attempt_idx < s.assigned.len() {
-                let target_addr = s.assigned[s.next_attempt_idx];
-                if let Some(peer_id) = map
-                    .iter()
-                    .find_map(|(p, a)| if a == &target_addr { Some(*p) } else { None })
-                {
-                    if let Err(e) = net
-                        .request_shard_chunk(peer_id, cd.cid.clone(), None, None)
-                        .await
-                    {
-                        // Send-side failure: don't burn an archive
-                        // attempt — surface the error.
-                        return Err((
-                            cd.chunk_index,
-                            anyhow::anyhow!("request_shard_chunk: {e}"),
-                        ));
-                    }
-                    s.in_flight_to = Some((peer_id, target_addr));
-                    s.next_attempt_idx += 1;
-                    break;
-                } else {
-                    // Unresolvable right now — leave alone; a future
-                    // PeerIdentified event will let us pick it up.
-                    break;
-                }
-            }
+            // Mark in-flight ONLY after the wire send succeeded so a
+            // failed `request_shard_chunk` doesn't burn an archive
+            // attempt. Burning the archive would force the chunk to
+            // skip a perfectly-good peer just because the local send
+            // queue was momentarily full.
+            let s = state
+                .get_mut(&d.chunk_index)
+                .expect("idx came from manifest");
+            s.in_flight_to = Some((d.peer_id, d.archive_addr));
+            s.next_attempt_idx += 1;
         }
         Ok(())
     }
@@ -677,7 +700,7 @@ async fn fetch_all_ciphertext_chunks_v2(
     // Initial dispatch attempt (peer_addresses may already have
     // entries from prior phases of `run_download_private`; usually
     // not, since the Private path hasn't done peer discovery yet).
-    try_dispatch_pending(net, peer_addresses, manifest, &mut state).await?;
+    try_dispatch_pending(net, peer_addresses, manifest, &mut state, max_concurrent).await?;
 
     // Main event loop.
     while state.values().any(|s| s.received.is_none()) {
@@ -719,7 +742,8 @@ async fn fetch_all_ciphertext_chunks_v2(
                 // A new PeerIdentified may have unlocked archives we
                 // couldn't resolve before. Dispatch any newly-eligible
                 // chunks.
-                try_dispatch_pending(net, peer_addresses, manifest, &mut state).await?;
+                try_dispatch_pending(net, peer_addresses, manifest, &mut state, max_concurrent)
+                    .await?;
             }
             Some(SumNetEvent::ShardReceived { peer_id, response }) => {
                 let Some(&idx) = cid_to_idx.get(&response.cid) else {
@@ -783,7 +807,8 @@ async fn fetch_all_ciphertext_chunks_v2(
                         ),
                     ));
                 }
-                try_dispatch_pending(net, peer_addresses, manifest, &mut state).await?;
+                try_dispatch_pending(net, peer_addresses, manifest, &mut state, max_concurrent)
+                    .await?;
             }
             None => {
                 let next_missing = manifest
@@ -819,6 +844,88 @@ struct ChunkFetchState {
     in_flight_to: Option<(PeerId, [u8; 20])>,
     /// Validated ciphertext bytes once received.
     received: Option<Vec<u8>>,
+}
+
+/// One scheduled dispatch produced by `select_chunks_to_dispatch`.
+/// The caller (production: `try_dispatch_pending` calling `SumNet`;
+/// tests: a recorder) is responsible for performing the actual
+/// network send and marking the corresponding `ChunkFetchState` as
+/// in-flight afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DispatchTarget {
+    chunk_index: u32,
+    peer_id: PeerId,
+    archive_addr: [u8; 20],
+}
+
+/// **Pure** concurrency selector for the per-chunk fetch loop. Given
+/// the current `state` map, the manifest's chunk descriptors (used
+/// only to drive deterministic iteration order over `chunk_index`),
+/// the L1-addr → PeerId resolution map, and a `max_concurrent` cap,
+/// returns the list of chunks that should be dispatched right now.
+///
+/// Selection rules:
+///   * Iterates chunks in `manifest.chunks` declaration order
+///     (chunk_index 0 first), so under low concurrency the lowest
+///     chunk indices fill in first — predictable for operators.
+///   * Skips chunks that already have a value in `received` or an
+///     outstanding `in_flight_to`. (Slow / stuck chunks therefore
+///     do NOT block other pending chunks from progressing — they
+///     simply hold one slot.)
+///   * For each pending chunk, walks `assigned[next_attempt_idx..]`
+///     and dispatches against the first archive resolvable to a
+///     known PeerId. Failed-archive retries are folded in here:
+///     the failure path elsewhere leaves `in_flight_to = None` and
+///     `next_attempt_idx` advanced past the failed archive, so this
+///     selector picks the next archive on the same chunk
+///     transparently while other chunks continue.
+///   * Stops as soon as the live in-flight count (existing in-flight
+///     plus the dispatches selected this wave) reaches
+///     `max_concurrent`.
+///
+/// Determinism is the load-bearing testability property: given the
+/// same inputs this returns the exact same dispatch list, so the
+/// concurrency invariants tested in
+/// `select_chunks_to_dispatch_*` reflect production behavior 1:1.
+fn select_chunks_to_dispatch(
+    state: &HashMap<u32, ChunkFetchState>,
+    manifest_chunks: &[ChunkDescriptor],
+    addr_to_peer: &HashMap<[u8; 20], PeerId>,
+    max_concurrent: usize,
+) -> Vec<DispatchTarget> {
+    let cap = max_concurrent.max(1);
+    let mut in_flight = state.values().filter(|s| s.in_flight_to.is_some()).count();
+    let mut out: Vec<DispatchTarget> = Vec::new();
+    for cd in manifest_chunks {
+        if in_flight >= cap {
+            break;
+        }
+        let Some(s) = state.get(&cd.chunk_index) else {
+            continue;
+        };
+        if s.received.is_some() || s.in_flight_to.is_some() {
+            continue;
+        }
+        // Try only the next-untried archive. If its PeerId is not
+        // resolvable yet, leave the chunk alone for this dispatch
+        // wave — a future PeerIdentified event will let us pick it
+        // up. We deliberately don't skip ahead to a later archive:
+        // dispatching out of order would let a later archive serve
+        // before an earlier one is given a chance.
+        let probe_idx = s.next_attempt_idx;
+        if probe_idx < s.assigned.len() {
+            let target_addr = s.assigned[probe_idx];
+            if let Some(&peer_id) = addr_to_peer.get(&target_addr) {
+                out.push(DispatchTarget {
+                    chunk_index: cd.chunk_index,
+                    peer_id,
+                    archive_addr: target_addr,
+                });
+                in_flight += 1;
+            }
+        }
+    }
+    out
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1273,6 +1380,279 @@ mod tests {
         let assigned =
             sum_store::assignment_v2::assigned_archives(&merkle_root, &snapshot, 0, 7);
         assert_eq!(assigned.len(), 3);
+    }
+
+    // ── Phase 4d per-chunk concurrency: select_chunks_to_dispatch ──
+
+    /// Build a synthetic manifest with `n` chunks. Chunk indices are
+    /// 0..n; chunk hashes / cids are placeholder bytes — the
+    /// concurrency selector only consults `chunk_index` for ordering,
+    /// so the synthetic shape is enough.
+    fn synth_manifest(n: u32) -> DataManifest {
+        let chunks: Vec<ChunkDescriptor> = (0..n)
+            .map(|i| ChunkDescriptor {
+                chunk_index: i,
+                offset: 0,
+                size: 0,
+                blake3_hash: [(i & 0xff) as u8; 32],
+                cid: format!("bafk_concurrency_{i}"),
+                plaintext_blake3_hash: Some([0xAA; 32]),
+            })
+            .collect();
+        DataManifest {
+            file_name: "concurrency-fixture.bin".into(),
+            file_hash: [0; 32],
+            total_size_bytes: 0,
+            chunk_count: n,
+            merkle_root: [0; 32],
+            chunks,
+        }
+    }
+
+    /// Build a `ChunkFetchState` map where every chunk has the same
+    /// assigned archive set, all archives are resolvable to fake
+    /// peers, and no chunk is yet in-flight or received.
+    fn synth_state(
+        n: u32,
+        archives_per_chunk: &[[u8; 20]],
+    ) -> (
+        HashMap<u32, ChunkFetchState>,
+        HashMap<[u8; 20], PeerId>,
+    ) {
+        let state: HashMap<u32, ChunkFetchState> = (0..n)
+            .map(|i| {
+                (
+                    i,
+                    ChunkFetchState {
+                        assigned: archives_per_chunk.to_vec(),
+                        next_attempt_idx: 0,
+                        in_flight_to: None,
+                        received: None,
+                    },
+                )
+            })
+            .collect();
+        let addr_to_peer: HashMap<[u8; 20], PeerId> = archives_per_chunk
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    sum_net::Keypair::generate_ed25519().public().to_peer_id(),
+                )
+            })
+            .collect();
+        (state, addr_to_peer)
+    }
+
+    /// `max_concurrent = 1` collapses the selector to one dispatch
+    /// per wave — the existing pre-Phase-4d behavior. Pinning this
+    /// guards against accidental concurrency leaks under operator
+    /// configurations that explicitly want sequential.
+    #[test]
+    fn select_chunks_to_dispatch_max_concurrent_one_is_sequential() {
+        let manifest = synth_manifest(5);
+        let archives = vec![[0xA1u8; 20]];
+        let (state, addr_to_peer) = synth_state(5, &archives);
+
+        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 1);
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].chunk_index, 0);
+    }
+
+    /// `max_concurrent = N` produces exactly N dispatches when N
+    /// pending chunks are eligible. Iteration order is by chunk
+    /// index ascending — operator-predictable.
+    #[test]
+    fn select_chunks_to_dispatch_max_concurrent_n_caps_in_flight() {
+        let manifest = synth_manifest(10);
+        let archives = vec![[0xA1u8; 20]];
+        let (state, addr_to_peer) = synth_state(10, &archives);
+
+        for n in [1usize, 2, 3, 5, 10] {
+            let dispatches =
+                select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, n);
+            assert_eq!(dispatches.len(), n, "max_concurrent={n}");
+            // Ascending chunk-index order.
+            for (k, d) in dispatches.iter().enumerate() {
+                assert_eq!(d.chunk_index as usize, k);
+            }
+        }
+    }
+
+    /// Existing in-flight dispatches count toward `max_concurrent`,
+    /// AND a slow / stuck chunk does NOT block other chunks from
+    /// proceeding — the selector simply skips it and dispatches the
+    /// remaining slots. This is the load-bearing concurrency
+    /// invariant the user's spec asked for.
+    #[test]
+    fn select_chunks_to_dispatch_slow_chunk_does_not_block_others() {
+        let manifest = synth_manifest(5);
+        let archives = vec![[0xA1u8; 20]];
+        let (mut state, addr_to_peer) = synth_state(5, &archives);
+
+        // Chunk 0 is in-flight ("slow"). Don't mark received.
+        let stuck_peer = addr_to_peer[&[0xA1u8; 20]];
+        state.get_mut(&0).unwrap().in_flight_to = Some((stuck_peer, [0xA1u8; 20]));
+        state.get_mut(&0).unwrap().next_attempt_idx = 1;
+
+        // With max_concurrent=3, we already have 1 in-flight (chunk 0)
+        // → selector should add 2 more (chunks 1 and 2).
+        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 3);
+        assert_eq!(dispatches.len(), 2);
+        let indices: Vec<u32> = dispatches.iter().map(|d| d.chunk_index).collect();
+        assert_eq!(indices, vec![1, 2]);
+    }
+
+    /// After a chunk's first archive fails (event loop sets
+    /// `in_flight_to = None` while leaving `next_attempt_idx`
+    /// advanced past the failed archive), the next selector wave
+    /// dispatches that chunk against archive 1 — without disturbing
+    /// other chunks already in flight.
+    #[test]
+    fn select_chunks_to_dispatch_failed_archive_retries_next_assigned() {
+        let manifest = synth_manifest(3);
+        let archives = vec![[0xA1u8; 20], [0xA2u8; 20], [0xA3u8; 20]];
+        let (mut state, addr_to_peer) = synth_state(3, &archives);
+
+        // Chunk 0: archive[0] tried and failed (in_flight_to=None,
+        // next_attempt_idx=1). Chunk 1: in-flight on archive[0].
+        state.get_mut(&0).unwrap().next_attempt_idx = 1;
+        let busy_peer = addr_to_peer[&[0xA1u8; 20]];
+        state.get_mut(&1).unwrap().in_flight_to = Some((busy_peer, [0xA1u8; 20]));
+        state.get_mut(&1).unwrap().next_attempt_idx = 1;
+
+        // max_concurrent=3: 1 already in-flight → selector adds up
+        // to 2 more. Chunk 0 should retry on archive[1]; chunk 2 on
+        // archive[0].
+        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 3);
+        assert_eq!(dispatches.len(), 2);
+
+        let chunk0 = dispatches.iter().find(|d| d.chunk_index == 0).expect("chunk 0");
+        assert_eq!(chunk0.archive_addr, [0xA2u8; 20], "chunk 0 must retry on archive 1");
+        let chunk2 = dispatches.iter().find(|d| d.chunk_index == 2).expect("chunk 2");
+        assert_eq!(chunk2.archive_addr, [0xA1u8; 20], "chunk 2 untouched, tries archive 0");
+    }
+
+    /// Wrong-hash failures take the same code path as peer-error
+    /// failures: the event loop clears `in_flight_to` and bumps
+    /// `next_attempt_idx`. So the selector behavior is identical to
+    /// the failed-archive case — verified explicitly here so a
+    /// future split between the two error paths can't silently
+    /// break wrong-hash retry routing for the failing chunk only.
+    #[test]
+    fn select_chunks_to_dispatch_wrong_hash_failure_isolated_to_failing_chunk() {
+        let manifest = synth_manifest(4);
+        let archives = vec![[0xA1u8; 20], [0xA2u8; 20]];
+        let (mut state, addr_to_peer) = synth_state(4, &archives);
+
+        // Chunk 0: archive[0] returned wrong-hash → cleared in-flight,
+        // advanced index. Chunks 1, 2: still in-flight on archive[0].
+        // Chunk 3: pending.
+        state.get_mut(&0).unwrap().next_attempt_idx = 1;
+        let p = addr_to_peer[&[0xA1u8; 20]];
+        state.get_mut(&1).unwrap().in_flight_to = Some((p, [0xA1u8; 20]));
+        state.get_mut(&1).unwrap().next_attempt_idx = 1;
+        state.get_mut(&2).unwrap().in_flight_to = Some((p, [0xA1u8; 20]));
+        state.get_mut(&2).unwrap().next_attempt_idx = 1;
+
+        // max_concurrent=4: 2 already in-flight → 2 more slots.
+        // Chunk 0 retries on archive[1]; chunk 3 picks up archive[0].
+        // Chunks 1 and 2 are NOT disturbed.
+        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 4);
+        assert_eq!(dispatches.len(), 2);
+        let chunk0 = dispatches.iter().find(|d| d.chunk_index == 0).unwrap();
+        assert_eq!(chunk0.archive_addr, [0xA2u8; 20]);
+        // Chunks 1, 2 must NOT appear in dispatches (they're already in-flight).
+        assert!(!dispatches.iter().any(|d| d.chunk_index == 1));
+        assert!(!dispatches.iter().any(|d| d.chunk_index == 2));
+    }
+
+    /// All archives for a chunk exhausted (next_attempt_idx ==
+    /// assigned.len()) → selector simply skips the chunk. The event
+    /// loop's failure-detection branch is what surfaces the typed
+    /// `ChunkFetch` error; the selector's job here is only to
+    /// confirm nothing dispatches for that chunk.
+    #[test]
+    fn select_chunks_to_dispatch_skips_exhausted_chunk() {
+        let manifest = synth_manifest(2);
+        let archives = vec![[0xA1u8; 20]];
+        let (mut state, addr_to_peer) = synth_state(2, &archives);
+
+        // Chunk 0: tried the only archive; exhausted.
+        state.get_mut(&0).unwrap().next_attempt_idx = 1;
+
+        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 4);
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].chunk_index, 1, "only chunk 1 dispatchable");
+    }
+
+    /// `max_concurrent = 0` is clamped to 1 — pin this so a misconfigured
+    /// `--max-concurrent 0` never hangs the download forever waiting
+    /// for slot 0 to free up.
+    #[test]
+    fn select_chunks_to_dispatch_zero_clamps_to_one() {
+        let manifest = synth_manifest(3);
+        let archives = vec![[0xA1u8; 20]];
+        let (state, addr_to_peer) = synth_state(3, &archives);
+
+        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 0);
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].chunk_index, 0);
+    }
+
+    /// Unresolvable archives don't dispatch and don't burn the
+    /// archive attempt — the selector waits for a future
+    /// PeerIdentified to arrive. Otherwise a temporary
+    /// PeerId-resolution gap would skip a perfectly-good archive
+    /// and could make a chunk fail that would have succeeded.
+    #[test]
+    fn select_chunks_to_dispatch_unresolvable_archive_waits_no_burn() {
+        let manifest = synth_manifest(2);
+        let archives = vec![[0xAAu8; 20]];
+        let mut state: HashMap<u32, ChunkFetchState> = (0..2)
+            .map(|i| {
+                (
+                    i,
+                    ChunkFetchState {
+                        assigned: archives.clone(),
+                        next_attempt_idx: 0,
+                        in_flight_to: None,
+                        received: None,
+                    },
+                )
+            })
+            .collect();
+        // Empty addr_to_peer → the assigned archive isn't resolvable.
+        let addr_to_peer: HashMap<[u8; 20], PeerId> = HashMap::new();
+
+        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 8);
+        assert!(
+            dispatches.is_empty(),
+            "no archives resolvable → no dispatches; got {dispatches:?}"
+        );
+        // next_attempt_idx must NOT have advanced — selector is
+        // pure, doesn't mutate state, but pin the precondition so a
+        // future refactor that "advances on probe failure" gets
+        // caught here.
+        for cd in &manifest.chunks {
+            assert_eq!(state.get_mut(&cd.chunk_index).unwrap().next_attempt_idx, 0);
+        }
+    }
+
+    /// Already-received chunks don't get re-dispatched even when
+    /// concurrency slots are open. The completion path is one-way.
+    #[test]
+    fn select_chunks_to_dispatch_skips_received_chunks() {
+        let manifest = synth_manifest(3);
+        let archives = vec![[0xA1u8; 20]];
+        let (mut state, addr_to_peer) = synth_state(3, &archives);
+
+        // Chunk 1 already received.
+        state.get_mut(&1).unwrap().received = Some(vec![0xCC; 64]);
+
+        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 8);
+        let indices: Vec<u32> = dispatches.iter().map(|d| d.chunk_index).collect();
+        assert_eq!(indices, vec![0, 2], "chunk 1 already done; dispatch 0 and 2");
     }
 }
 
