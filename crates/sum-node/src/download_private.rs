@@ -1663,6 +1663,79 @@ mod tests {
         assert_eq!(*rpc.calls.lock().unwrap(), calls_before);
     }
 
+    /// **Privacy-audit row #8 + #15 fail-closed pin.** When the
+    /// access-list pagination RPC fails (network error, malformed
+    /// response, JSON-RPC error), `find_my_access_entry` MUST surface
+    /// the failure as a typed RPC error — NEVER as `NoAccess`. A
+    /// silent degrade would conflate "not on the list" with "couldn't
+    /// determine," masking real auth state both ways: a transient
+    /// blip would deny a legitimate recipient, and an attacker
+    /// spoofing chain errors could pretend to be authoritative about
+    /// absence. Production profile must fail closed AND distinguish
+    /// the two failure modes.
+    #[tokio::test]
+    async fn find_my_access_entry_fails_closed_on_rpc_error() {
+        // First page returns a FULL access list (256 entries) without
+        // the target, so the function paginates. The second page call
+        // fails with a simulated RPC error — that's the branch under
+        // test.
+        struct FailingAccessRpc;
+
+        #[async_trait::async_trait]
+        impl AccessListSource for FailingAccessRpc {
+            async fn fetch_page(
+                &self,
+                _root_hex: &str,
+                offset: u32,
+                _limit: u32,
+            ) -> Result<StorageFileInfoV2> {
+                if offset == 0 {
+                    let full_page: Vec<AccessEntryV2> = (0..ACCESS_PAGE_SIZE)
+                        .map(|i| entry(&format!("u{i:03}"), None))
+                        .collect();
+                    Ok(StorageFileInfoV2 {
+                        merkle_root: "0x00".into(),
+                        owner: "owner".into(),
+                        plaintext_size_bytes: 0,
+                        stored_size_bytes: 0,
+                        chunk_count: 0,
+                        fee_pool: 0,
+                        created_at: 0,
+                        activated_at_height: None,
+                        abandoned_at_height: None,
+                        assignment_height: 0,
+                        visibility: sum_types::rpc_types::VisibilityV2::PRIVATE,
+                        lifecycle: sum_types::rpc_types::LifecycleV2::ACTIVE,
+                        access_list: full_page,
+                    })
+                } else {
+                    anyhow::bail!("simulated chain RPC failure on page offset={offset}")
+                }
+            }
+        }
+
+        let rpc = FailingAccessRpc;
+        let first_page = rpc.fetch_page("root", 0, ACCESS_PAGE_SIZE).await.unwrap();
+        let err = find_my_access_entry(&rpc, "root", "missing", &first_page)
+            .await
+            .expect_err("RPC failure during pagination must surface as Err");
+
+        // Load-bearing assertion: typed Rpc, NOT NoAccess.
+        match err {
+            PrivateDownloadError::Rpc(_) => {}
+            PrivateDownloadError::NoAccess { .. } => panic!(
+                "regression: RPC failure was reported as NoAccess — \
+                 fail-closed contract requires distinguishing 'not on list' \
+                 from 'could not determine'"
+            ),
+            other => panic!(
+                "expected PrivateDownloadError::Rpc, got: {other:?} \
+                 (any non-Rpc variant must be deliberate; update this \
+                 test if the contract changes)"
+            ),
+        }
+    }
+
     // ── End-to-end round trip with synthetic ciphertext ─────────────
 
     #[test]

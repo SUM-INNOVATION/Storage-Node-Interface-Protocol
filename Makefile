@@ -3,7 +3,7 @@
 # Run `make` (no args) to print this help.
 
 .DEFAULT_GOAL := help
-.PHONY: help fmt lint lint-strict test build release-check smoke
+.PHONY: help fmt lint lint-strict test build release-check smoke audit-logs
 
 help:
 	@printf "Targets:\n"
@@ -12,7 +12,8 @@ help:
 	@printf "  lint           cargo clippy --workspace --all-targets (warnings allowed)\n"
 	@printf "  lint-strict    cargo clippy --workspace --all-targets -- -D warnings\n"
 	@printf "  build          cargo build --release -p sum-node\n"
-	@printf "  release-check  fmt + lint-strict + test + build (run before tagging a release)\n"
+	@printf "  audit-logs     scripts/audit-logs.sh (privacy guardrail)\n"
+	@printf "  release-check  fmt + lint-strict + test + build + audit-logs\n"
 	@printf "  smoke RPC=URL  read-only chain smoke against RPC (e.g. RPC=http://localhost:8545)\n"
 
 fmt:
@@ -30,7 +31,10 @@ test:
 build:
 	cargo build --release -p sum-node
 
-release-check: fmt lint-strict test build
+audit-logs:
+	scripts/audit-logs.sh
+
+release-check: fmt lint-strict test build audit-logs
 	@printf "release-check: ok\n"
 
 smoke:

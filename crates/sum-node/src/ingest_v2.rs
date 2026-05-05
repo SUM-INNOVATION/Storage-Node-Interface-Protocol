@@ -4956,4 +4956,41 @@ mod tests {
         let recovered = decrypt_manifest(&k_file, &encrypted.encrypted_manifest_bytes).unwrap();
         assert_eq!(recovered, cbor_plain);
     }
+
+    /// **Privacy-audit row #12 pin.** `PrivateArtifacts._ciphertext_temp`
+    /// is a `tempfile::NamedTempFile`; dropping the artifacts (success
+    /// OR abort path) MUST remove the underlying ciphertext file from
+    /// disk. A future refactor that swaps the type for a bare
+    /// `PathBuf` (no auto-cleanup) would silently leak Private
+    /// ciphertext on every aborted ingest. This test pins the field
+    /// type's contract — drop ⇒ filesystem entry gone.
+    #[test]
+    fn private_artifacts_temp_ciphertext_is_removed_on_drop() {
+        let plaintext = b"private data that must not leak to disk after abort";
+
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("plain.bin");
+        std::fs::write(&plaintext_path, plaintext).unwrap();
+
+        let k_file: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new([0x42u8; 32]);
+        let artifacts =
+            build_private_artifacts(&plaintext_path, &k_file).expect("build_private_artifacts");
+
+        let temp_path = artifacts._ciphertext_temp.path().to_path_buf();
+        assert!(
+            temp_path.exists(),
+            "sanity: temp ciphertext file must exist while artifacts are alive: {:?}",
+            temp_path
+        );
+
+        drop(artifacts);
+
+        assert!(
+            !temp_path.exists(),
+            "regression: Private ciphertext temp file leaked after drop: {:?} \
+             — `_ciphertext_temp` must remain a tempfile::NamedTempFile so the \
+             abort path is automatically cleaned up",
+            temp_path
+        );
+    }
 }

@@ -36,6 +36,7 @@ use sum_node::acl::AclChecker;
 use sum_node::assignment_attestor::AssignmentAttestor;
 use sum_node::download::DownloadOrchestrator;
 use sum_node::download_private::run_download_private;
+use sum_node::download_route::{route_download_target, DownloadPath};
 use sum_node::inbound_v2::V2Dispatcher;
 use sum_node::market_sync::MarketSyncWorker;
 use sum_node::peer_state::{apply_peer_event, PeerMapChange};
@@ -2052,34 +2053,33 @@ async fn run_download(
         }
     }
 
-    // ── Step 2: now safe to start networking ───────────────────────
+    // ── Step 2: route based on chain V2 row (fail closed on unknown
+    //          visibility bytes; see download_route.rs). Routing
+    //          decision must depend only on the V2 chain row presence
+    //          and visibility — not on local chunk store, peer state,
+    //          or any side channel.
+    let path = route_download_target(v2_info.as_ref())?;
+
+    // ── Step 3: now safe to start networking ───────────────────────
     let net = Arc::new(SumNet::new(net_config, keypair.clone()).await?);
 
-    // V2 dispatch. We ONLY take the Private path when chain confirms
-    // this is a Private V2 row; every other outcome — Public V2,
-    // pre-V2 / V1 file, V2 RPC unsupported, transient RPC error, file
-    // not found — falls through to the existing Public download
-    // orchestrator with no behavior change. This way V1 / legacy
-    // Public downloads cannot regress when the chain side adds or
-    // removes V2 metadata for unrelated files.
-    if let Some(info) = v2_info {
-        if info.visibility.is_private() {
-            let seed = seed.expect("checked above before SumNet::new");
-            return run_download_private(
-                keypair,
-                seed,
-                rpc,
-                net,
-                info,
-                parsed_root,
-                output,
-                max_concurrent,
-                Duration::from_secs(timeout_secs),
-            )
-            .await;
-        }
-        // Public V2 row: fall through to the existing Public path.
+    if matches!(path, DownloadPath::V2Private) {
+        let info = v2_info.expect("V2Private implies Some(info)");
+        let seed = seed.expect("checked above before SumNet::new");
+        return run_download_private(
+            keypair,
+            seed,
+            rpc,
+            net,
+            info,
+            parsed_root,
+            output,
+            max_concurrent,
+            Duration::from_secs(timeout_secs),
+        )
+        .await;
     }
+    // V2Public and V1Legacy share the existing public-path orchestrator.
 
     // ── Step 3: existing Public / V1 / legacy path ────────────────
     let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
