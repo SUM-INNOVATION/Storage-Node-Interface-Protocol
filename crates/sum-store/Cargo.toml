@@ -22,10 +22,11 @@ ciborium   = { workspace = true }
 bincode    = { workspace = true }
 async-trait = { workspace = true }
 anyhow     = { workspace = true }
+# Phase 4b: ManifestIndex formats Private merkle roots as hex for the
+# `<root>.opaque` / `<root>.private_chunks` sidecar filenames and in
+# error messages on rebind attempts.
+hex        = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio    = { workspace = true }
-# W3 — hex used by `tests/assignment_v2_conformance.rs` to spell
-# Appendix C byte vectors as compact literals.
-hex      = { workspace = true }

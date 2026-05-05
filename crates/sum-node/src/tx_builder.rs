@@ -204,6 +204,84 @@ pub fn build_accept_assignment_v2_tx(
     sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
 }
 
+/// Build a hex-encoded `SignedTransaction` for `AddAccessV2`
+/// (chain plan §3.1 access-list mutation; Phase 4c).
+///
+/// The chain enforces that only the file's owner can submit access
+/// mutations. Caller is responsible for that pre-check (in
+/// `access::run_share`); this builder only signs+encodes the tx.
+///
+/// `entry.encrypted_key_bundle` carries the recipient's wrapped
+/// `K_file` (Phase 4a `wrap_for_recipient`) so the recipient can
+/// later decrypt the file's chunks. The chain stores the bundle
+/// verbatim — it never sees `K_file`.
+pub fn build_add_access_v2_tx(
+    ed25519_seed: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+    fee: u128,
+    merkle_root: [u8; 32],
+    entry: AccessEntryV2Mirror,
+) -> Result<String> {
+    let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
+        operation: StorageMetadataOperationV2Mirror::AddAccessV2 { merkle_root, entry },
+    });
+    sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
+}
+
+/// Build a hex-encoded `SignedTransaction` for `RemoveAccessV2`
+/// (chain plan §3.1; Phase 4c).
+///
+/// Removing the address takes effect at chain finalization: the
+/// chain-side ACL gate immediately denies that address on chunk and
+/// manifest pulls. The recipient still holds their old
+/// `encrypted_key_bundle` locally — Phase 4c does NOT rotate `K_file`
+/// (see the operator-message warning in `run_revoke` for forward-
+/// secrecy implications; chain-level revocation is sufficient for
+/// Phase 4c's threat model).
+pub fn build_remove_access_v2_tx(
+    ed25519_seed: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+    fee: u128,
+    merkle_root: [u8; 32],
+    address: [u8; 20],
+) -> Result<String> {
+    let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
+        operation: StorageMetadataOperationV2Mirror::RemoveAccessV2 { merkle_root, address },
+    });
+    sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
+}
+
+/// Build a hex-encoded `SignedTransaction` for `UpdateAccessV2`
+/// (chain plan §3.1; Phase 4c).
+///
+/// First-cut Phase 4c uses this only to update `expires_at` (set or
+/// clear). Callers MUST preserve the existing `encrypted_key_bundle`
+/// on the `new_entry` — passing a bundle wrapped under a different
+/// `K_file` would silently break the recipient's downloads. Future
+/// flavors (key rotation: re-wrap `K_file` for the same recipient
+/// because they registered a new X25519 key) are deferred to
+/// Phase 5+; for now the operator does revoke→share.
+pub fn build_update_access_v2_tx(
+    ed25519_seed: &[u8; 32],
+    chain_id: u64,
+    nonce: u64,
+    fee: u128,
+    merkle_root: [u8; 32],
+    address: [u8; 20],
+    new_entry: AccessEntryV2Mirror,
+) -> Result<String> {
+    let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
+        operation: StorageMetadataOperationV2Mirror::UpdateAccessV2 {
+            merkle_root,
+            address,
+            new_entry,
+        },
+    });
+    sign_and_encode(ed25519_seed, chain_id, nonce, fee, payload)
+}
+
 /// Build a hex-encoded `SignedTransaction` for `StorageMetadata::RegisterFile`.
 pub fn build_register_file_tx(
     ed25519_seed: &[u8; 32],
@@ -1179,6 +1257,283 @@ mod tests {
                 + inner_tag
                 + &"42".repeat(32);
             assert_eq!(actual, expected, "{label} wrapper bytes diverged");
+        }
+    }
+
+    // ── Phase 4c access-mutation wire fixtures ─────────────────────────
+    //
+    // Same fixed-input convention as the chain-side
+    // `crates/primitives/tests/v2_wire_fixtures.rs` block. Adds three
+    // new constants (a recipient address and an 80-byte bundle filled
+    // with 0xCC) so the AddAccess / RemoveAccess / UpdateAccess hex
+    // strings stay deterministic.
+
+    const FIXTURE_RECIPIENT_ADDR: [u8; 20] = [0x55; 20];
+    const FIXTURE_BUNDLE: [u8; 80] = [0xCC; 80];
+    const FIXTURE_EXPIRES_AT: u64 = 1000;
+
+    #[test]
+    fn fixture_add_access_v2_bytes() {
+        let entry = AccessEntryV2Mirror {
+            address: FIXTURE_RECIPIENT_ADDR,
+            encrypted_key_bundle: Some(Bundle80(FIXTURE_BUNDLE)),
+            expires_at: Some(FIXTURE_EXPIRES_AT),
+        };
+        let actual = op_hex(StorageMetadataOperationV2Mirror::AddAccessV2 {
+            merkle_root: FIXTURE_MERKLE_ROOT,
+            entry,
+        });
+        // Variant 4 (chain-confirmed; access-list ops shift up after
+        // AcceptAssignmentV2 = 3): tag = 04000000.
+        // Then merkle_root (32 × 0x42).
+        // Then AccessEntryV2 fields in declaration order:
+        //   address: [u8; 20] = 20 × 0x55
+        //   encrypted_key_bundle: Option<Bundle80>
+        //     = 0x01 (Some) + 80 × 0xCC
+        //   expires_at: Option<u64>
+        //     = 0x01 (Some) + 1000 as u64 LE = 0xE803000000000000
+        let expected = "04000000".to_string()
+            + &"42".repeat(32)
+            + &"55".repeat(20)
+            + "01"
+            + &"cc".repeat(80)
+            + "01"
+            + "e803000000000000";
+        assert_eq!(
+            actual, expected,
+            "AddAccessV2 wire bytes diverged from chain fixture"
+        );
+    }
+
+    #[test]
+    fn fixture_remove_access_v2_bytes() {
+        let actual = op_hex(StorageMetadataOperationV2Mirror::RemoveAccessV2 {
+            merkle_root: FIXTURE_MERKLE_ROOT,
+            address: FIXTURE_RECIPIENT_ADDR,
+        });
+        // Variant 5: tag = 05000000, then merkle_root, then address.
+        let expected = "05000000".to_string()
+            + &"42".repeat(32)
+            + &"55".repeat(20);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn fixture_update_access_v2_bytes() {
+        // Update with bundle preserved + new expiry. This is the
+        // "bump expiry" flavor Phase 4c supports today.
+        let new_entry = AccessEntryV2Mirror {
+            address: FIXTURE_RECIPIENT_ADDR,
+            encrypted_key_bundle: Some(Bundle80(FIXTURE_BUNDLE)),
+            expires_at: Some(FIXTURE_EXPIRES_AT),
+        };
+        let actual = op_hex(StorageMetadataOperationV2Mirror::UpdateAccessV2 {
+            merkle_root: FIXTURE_MERKLE_ROOT,
+            address: FIXTURE_RECIPIENT_ADDR,
+            new_entry,
+        });
+        // Variant 6: tag = 06000000.
+        // Then merkle_root, then address, then full new_entry.
+        let expected = "06000000".to_string()
+            + &"42".repeat(32)
+            + &"55".repeat(20)
+            // new_entry fields:
+            + &"55".repeat(20)
+            + "01"
+            + &"cc".repeat(80)
+            + "01"
+            + "e803000000000000";
+        assert_eq!(actual, expected);
+    }
+
+    /// Update with `expires_at = None` is the "clear expiry" flavor —
+    /// pin the wire bytes for that path so the chain stops gating on
+    /// the old expiry the moment finality lands.
+    #[test]
+    fn fixture_update_access_v2_clear_expires_at_bytes() {
+        let new_entry = AccessEntryV2Mirror {
+            address: FIXTURE_RECIPIENT_ADDR,
+            encrypted_key_bundle: Some(Bundle80(FIXTURE_BUNDLE)),
+            expires_at: None,
+        };
+        let actual = op_hex(StorageMetadataOperationV2Mirror::UpdateAccessV2 {
+            merkle_root: FIXTURE_MERKLE_ROOT,
+            address: FIXTURE_RECIPIENT_ADDR,
+            new_entry,
+        });
+        let expected = "06000000".to_string()
+            + &"42".repeat(32)
+            + &"55".repeat(20)
+            + &"55".repeat(20)
+            + "01"
+            + &"cc".repeat(80)
+            + "00"; // Option<u64>::None
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn fixture_tx_payload_storage_metadata_v2_add_remove_update() {
+        // Outer TxPayload variant for StorageMetadataV2 = 20 → 0x14000000.
+        // Each inner op gets its own variant tag.
+        let entry = AccessEntryV2Mirror {
+            address: FIXTURE_RECIPIENT_ADDR,
+            encrypted_key_bundle: Some(Bundle80(FIXTURE_BUNDLE)),
+            expires_at: Some(FIXTURE_EXPIRES_AT),
+        };
+        for (op, inner_tag, label) in [
+            (
+                StorageMetadataOperationV2Mirror::AddAccessV2 {
+                    merkle_root: FIXTURE_MERKLE_ROOT,
+                    entry: entry.clone(),
+                },
+                "04000000",
+                "add",
+            ),
+            (
+                StorageMetadataOperationV2Mirror::RemoveAccessV2 {
+                    merkle_root: FIXTURE_MERKLE_ROOT,
+                    address: FIXTURE_RECIPIENT_ADDR,
+                },
+                "05000000",
+                "remove",
+            ),
+            (
+                StorageMetadataOperationV2Mirror::UpdateAccessV2 {
+                    merkle_root: FIXTURE_MERKLE_ROOT,
+                    address: FIXTURE_RECIPIENT_ADDR,
+                    new_entry: entry.clone(),
+                },
+                "06000000",
+                "update",
+            ),
+        ] {
+            let payload = TxPayloadMirror::StorageMetadataV2(StorageMetadataV2TxDataMirror {
+                operation: op,
+            });
+            let actual = hex::encode(bincode1::serialize(&payload).unwrap());
+            assert!(
+                actual.starts_with(&format!("14000000{inner_tag}")),
+                "{label}: outer (20) + inner tag prefix mismatch — got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_and_verify_add_access_v2_tx_round_trips() {
+        let seed = [33u8; 32];
+        let entry = AccessEntryV2Mirror {
+            address: FIXTURE_RECIPIENT_ADDR,
+            encrypted_key_bundle: Some(Bundle80(FIXTURE_BUNDLE)),
+            expires_at: Some(FIXTURE_EXPIRES_AT),
+        };
+        let hex_str = build_add_access_v2_tx(
+            &seed,
+            1337,
+            5,
+            500_000,
+            FIXTURE_MERKLE_ROOT,
+            entry.clone(),
+        )
+        .unwrap();
+        let bytes = hex::decode(&hex_str).unwrap();
+        let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
+        match signed.inner {
+            TxInnerMirror::V2(tx) => {
+                assert_eq!(tx.nonce, 5);
+                match tx.payload {
+                    TxPayloadMirror::StorageMetadataV2(data) => match data.operation {
+                        StorageMetadataOperationV2Mirror::AddAccessV2 {
+                            merkle_root,
+                            entry: e,
+                        } => {
+                            assert_eq!(merkle_root, FIXTURE_MERKLE_ROOT);
+                            assert_eq!(e.address, entry.address);
+                            assert!(e.encrypted_key_bundle.is_some());
+                            assert_eq!(e.expires_at, entry.expires_at);
+                        }
+                        _ => panic!("wrong V2 op variant"),
+                    },
+                    _ => panic!("expected StorageMetadataV2"),
+                }
+            }
+            _ => panic!("wrong TxInner"),
+        }
+    }
+
+    #[test]
+    fn build_and_verify_remove_access_v2_tx_round_trips() {
+        let seed = [34u8; 32];
+        let hex_str = build_remove_access_v2_tx(
+            &seed,
+            1337,
+            6,
+            500_000,
+            FIXTURE_MERKLE_ROOT,
+            FIXTURE_RECIPIENT_ADDR,
+        )
+        .unwrap();
+        let bytes = hex::decode(&hex_str).unwrap();
+        let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
+        match signed.inner {
+            TxInnerMirror::V2(tx) => match tx.payload {
+                TxPayloadMirror::StorageMetadataV2(data) => match data.operation {
+                    StorageMetadataOperationV2Mirror::RemoveAccessV2 {
+                        merkle_root,
+                        address,
+                    } => {
+                        assert_eq!(merkle_root, FIXTURE_MERKLE_ROOT);
+                        assert_eq!(address, FIXTURE_RECIPIENT_ADDR);
+                    }
+                    _ => panic!("wrong V2 op variant"),
+                },
+                _ => panic!("expected StorageMetadataV2"),
+            },
+            _ => panic!("wrong TxInner"),
+        }
+    }
+
+    #[test]
+    fn build_and_verify_update_access_v2_tx_round_trips() {
+        let seed = [35u8; 32];
+        let new_entry = AccessEntryV2Mirror {
+            address: FIXTURE_RECIPIENT_ADDR,
+            encrypted_key_bundle: Some(Bundle80(FIXTURE_BUNDLE)),
+            expires_at: None, // Clear-expiry flavor.
+        };
+        let hex_str = build_update_access_v2_tx(
+            &seed,
+            1337,
+            7,
+            500_000,
+            FIXTURE_MERKLE_ROOT,
+            FIXTURE_RECIPIENT_ADDR,
+            new_entry.clone(),
+        )
+        .unwrap();
+        let bytes = hex::decode(&hex_str).unwrap();
+        let signed: SignedTransactionMirror = bincode1::deserialize(&bytes).unwrap();
+        match signed.inner {
+            TxInnerMirror::V2(tx) => match tx.payload {
+                TxPayloadMirror::StorageMetadataV2(data) => match data.operation {
+                    StorageMetadataOperationV2Mirror::UpdateAccessV2 {
+                        merkle_root,
+                        address,
+                        new_entry: ne,
+                    } => {
+                        assert_eq!(merkle_root, FIXTURE_MERKLE_ROOT);
+                        assert_eq!(address, FIXTURE_RECIPIENT_ADDR);
+                        assert_eq!(ne.address, new_entry.address);
+                        assert!(ne.encrypted_key_bundle.is_some());
+                        assert_eq!(
+                            ne.expires_at, None,
+                            "clear-expiry path must round-trip with None"
+                        );
+                    }
+                    _ => panic!("wrong V2 op variant"),
+                },
+                _ => panic!("expected StorageMetadataV2"),
+            },
+            _ => panic!("wrong TxInner"),
         }
     }
 

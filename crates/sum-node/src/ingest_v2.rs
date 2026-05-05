@@ -572,57 +572,68 @@ struct PrivateEncrypted {
     stored_size_bytes: u64,
 }
 
-/// Encrypt a file for Private ingest: chunk plaintext at
-/// `PRIVATE_PLAINTEXT_CHUNK_SIZE`, AEAD-encrypt each chunk + manifest,
-/// wrap `K_file` for the owner and each recipient, and lay the
-/// ciphertext chunks out contiguously in a tempfile so S2's mmap
-/// codepath can serve them by `(offset, size)` exactly like the Public
-/// path.
+/// Wraps-free Phase 4a/4d artifacts from running the Private
+/// encryption pipeline under a supplied `K_file`. Same shape as
+/// `PrivateEncrypted` but without `initial_access` (the chain
+/// already holds those bundles for resume; the recipient-wrap step
+/// is the ingest-only diff layered on top of this helper).
+///
+/// Field-order discipline matches `PrivateEncrypted`: `ciphertext_mmap`
+/// declared before `_ciphertext_temp` so the mmap drops first.
+pub(crate) struct PrivateArtifacts {
+    pub ciphertext_mmap: memmap2::Mmap,
+    pub _ciphertext_temp: tempfile::NamedTempFile,
+    pub manifest: DataManifest,
+    pub encrypted_manifest_bytes: Vec<u8>,
+    pub stored_size_bytes: u64,
+}
+
+/// Pure encrypt-and-manifest pipeline: takes an explicit `K_file`
+/// (caller's responsibility to source it — fresh OsRng for ingest,
+/// recovered from the owner's chain bundle for resume) and produces
+/// the on-disk ciphertext layout, the chain-bound manifest, and the
+/// AEAD-encrypted manifest blob. Does NOT generate `K_file`. Does
+/// NOT wrap for any recipients.
+///
+/// Determinism is the load-bearing property for resume: given the
+/// same `K_file` + plaintext, this function produces byte-identical
+/// ciphertext bytes (chain plan §3.1: `encrypt_chunk` derives
+/// per-chunk key + nonce via HKDF over `(K_file, chunk_index)`),
+/// byte-identical chunk hashes, byte-identical Merkle tree, and
+/// thus a byte-identical `merkle_root`. Resume relies on this to
+/// reproduce the chain-stored root from the recovered key.
 ///
 /// Empty plaintexts are rejected — the chain rule
 /// `chunk_count == ceil(stored_size / CHUNK_SIZE)` requires
-/// `chunk_count > 0`, and a zero-byte file would also produce an
-/// `initial_access` entry whose decrypter has nothing to recover.
-fn encrypt_for_private(
+/// `chunk_count > 0`.
+pub(crate) fn build_private_artifacts(
     path: &Path,
-    spec: &PrivateIngestSpec,
-) -> Result<PrivateEncrypted> {
-    use rand_core::{OsRng, RngCore};
+    k_file: &zeroize::Zeroizing<[u8; 32]>,
+) -> Result<PrivateArtifacts> {
     use std::io::Write;
-    use sum_crypto::{encrypt_chunk, encrypt_manifest, wrap_for_recipient};
+    use sum_crypto::{encrypt_chunk, encrypt_manifest};
 
     let in_file = std::fs::File::open(path)
-        .map_err(|e| anyhow::anyhow!("private ingest: open {path:?} failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("private artifacts: open {path:?} failed: {e}"))?;
     let plaintext_meta = in_file
         .metadata()
-        .map_err(|e| anyhow::anyhow!("private ingest: stat {path:?} failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("private artifacts: stat {path:?} failed: {e}"))?;
     let plaintext_len = plaintext_meta.len();
     if plaintext_len == 0 {
-        anyhow::bail!("private ingest: empty file is not supported");
+        anyhow::bail!("private artifacts: empty file is not supported");
     }
-    // Mmap is fine here: the encryption pass reads each chunk
-    // exactly once and we hold the mapping only for the duration of
-    // this function.
     let plaintext_mmap = unsafe {
         memmap2::Mmap::map(&in_file)
-            .map_err(|e| anyhow::anyhow!("private ingest: mmap {path:?} failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("private artifacts: mmap {path:?} failed: {e}"))?
     };
 
-    // Fresh K_file (locked decision #5: random via OsRng).
-    let mut k_file = [0u8; 32];
-    OsRng.fill_bytes(&mut k_file);
-
-    // Plaintext whole-file hash (recipient verifies after assembly).
     let file_hash = *blake3::hash(&plaintext_mmap).as_bytes();
-
     let chunk_count_usize = (plaintext_len as usize).div_ceil(PRIVATE_PLAINTEXT_CHUNK_SIZE);
     let chunk_count = u32::try_from(chunk_count_usize)
-        .map_err(|_| anyhow::anyhow!("private ingest: chunk_count overflows u32"))?;
+        .map_err(|_| anyhow::anyhow!("private artifacts: chunk_count overflows u32"))?;
 
-    // Stage ciphertext into a tempfile so S2 can mmap-and-read it via
-    // (offset, size) lookups — same pattern as the Public path.
     let mut ciphertext_temp = tempfile::NamedTempFile::new()
-        .map_err(|e| anyhow::anyhow!("private ingest: tempfile create failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("private artifacts: tempfile create failed: {e}"))?;
     let mut chunks = Vec::with_capacity(chunk_count as usize);
     let mut leaves = Vec::with_capacity(chunk_count as usize);
     let mut offset: u64 = 0;
@@ -634,11 +645,11 @@ fn encrypt_for_private(
             let end = std::cmp::min(start + PRIVATE_PLAINTEXT_CHUNK_SIZE, plaintext_len as usize);
             let pt = &plaintext_mmap[start..end];
             let pt_hash = *blake3::hash(pt).as_bytes();
-            let ct = encrypt_chunk(&k_file, i, pt);
+            let ct = encrypt_chunk(k_file, i, pt);
             let ct_hash = blake3::hash(&ct);
             let cid = cid_from_data(&ct);
             writer.write_all(&ct).map_err(|e| {
-                anyhow::anyhow!("private ingest: ciphertext tempfile write failed: {e}")
+                anyhow::anyhow!("private artifacts: ciphertext tempfile write failed: {e}")
             })?;
             chunks.push(ChunkDescriptor {
                 chunk_index: i,
@@ -651,16 +662,15 @@ fn encrypt_for_private(
             leaves.push(ct_hash);
             offset = offset
                 .checked_add(ct.len() as u64)
-                .ok_or_else(|| anyhow::anyhow!("private ingest: ciphertext offset overflow"))?;
+                .ok_or_else(|| anyhow::anyhow!("private artifacts: ciphertext offset overflow"))?;
             stored_total = stored_total
                 .checked_add(ct.len() as u64)
-                .ok_or_else(|| anyhow::anyhow!("private ingest: stored_total overflow"))?;
+                .ok_or_else(|| anyhow::anyhow!("private artifacts: stored_total overflow"))?;
         }
         writer.flush().map_err(|e| {
-            anyhow::anyhow!("private ingest: ciphertext tempfile flush failed: {e}")
+            anyhow::anyhow!("private artifacts: ciphertext tempfile flush failed: {e}")
         })?;
     }
-    // Drop plaintext mapping — we no longer need it.
     drop(plaintext_mmap);
 
     let tree = MerkleTree::build(&leaves);
@@ -675,11 +685,51 @@ fn encrypt_for_private(
         chunks,
     };
 
-    // CBOR-serialize the plaintext manifest, then AEAD-encrypt with K_file.
     let mut cbor = Vec::new();
     ciborium::ser::into_writer(&manifest, &mut cbor)
-        .map_err(|e| anyhow::anyhow!("private ingest: manifest CBOR encode failed: {e}"))?;
-    let encrypted_manifest_bytes = encrypt_manifest(&k_file, &cbor);
+        .map_err(|e| anyhow::anyhow!("private artifacts: manifest CBOR encode failed: {e}"))?;
+    let encrypted_manifest_bytes = encrypt_manifest(k_file, &cbor);
+
+    let ciphertext_mmap = unsafe {
+        memmap2::Mmap::map(ciphertext_temp.as_file())
+            .map_err(|e| anyhow::anyhow!("private artifacts: ciphertext mmap failed: {e}"))?
+    };
+
+    Ok(PrivateArtifacts {
+        ciphertext_mmap,
+        _ciphertext_temp: ciphertext_temp,
+        manifest,
+        encrypted_manifest_bytes,
+        stored_size_bytes: stored_total,
+    })
+}
+
+/// Encrypt a file for Private ingest. Wraps `build_private_artifacts`
+/// with the K_file generation and recipient-wrap layer that ingest
+/// (but NOT resume) needs.
+///
+/// Empty plaintexts are rejected — the chain rule
+/// `chunk_count == ceil(stored_size / CHUNK_SIZE)` requires
+/// `chunk_count > 0`, and a zero-byte file would also produce an
+/// `initial_access` entry whose decrypter has nothing to recover.
+fn encrypt_for_private(
+    path: &Path,
+    spec: &PrivateIngestSpec,
+) -> Result<PrivateEncrypted> {
+    use rand_core::{OsRng, RngCore};
+    use sum_crypto::wrap_for_recipient;
+    use zeroize::Zeroizing;
+
+    // Fresh K_file (locked decision #5: random via OsRng). Held in
+    // `Zeroizing<[u8; 32]>` so the key bytes are zeroed when this
+    // binding goes out of scope (whether via normal return, `?`, or
+    // panic). Key-lifetime hygiene only — the ciphertext written to
+    // `ciphertext_temp` below is intentionally on disk and is governed
+    // by the tempfile's own drop, not by K_file's.
+    let mut k_file: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(&mut *k_file);
+
+    let artifacts = build_private_artifacts(path, &k_file)?;
 
     // Wrap K_file for the owner first, then each recipient. Owner is
     // auto-added so "no recipients" still yields a usable file for the
@@ -708,25 +758,16 @@ fn encrypt_for_private(
         });
     }
 
-    // K_file is no longer needed in scope. Best-effort scrub: overwrite
-    // the on-stack copy. (Future hardening: a `Zeroizing<[u8; 32]>`
-    // wrapper would handle this on drop automatically.)
-    for b in k_file.iter_mut() {
-        *b = 0;
-    }
-
-    let ciphertext_mmap = unsafe {
-        memmap2::Mmap::map(ciphertext_temp.as_file())
-            .map_err(|e| anyhow::anyhow!("private ingest: ciphertext mmap failed: {e}"))?
-    };
+    // `k_file` is no longer needed; it goes out of scope at the end of
+    // this function and `Zeroizing<[u8; 32]>` wipes the bytes on drop.
 
     Ok(PrivateEncrypted {
-        manifest,
-        encrypted_manifest_bytes,
+        ciphertext_mmap: artifacts.ciphertext_mmap,
+        _ciphertext_temp: artifacts._ciphertext_temp,
+        manifest: artifacts.manifest,
+        encrypted_manifest_bytes: artifacts.encrypted_manifest_bytes,
         initial_access,
-        stored_size_bytes: stored_total,
-        _ciphertext_temp: ciphertext_temp,
-        ciphertext_mmap,
+        stored_size_bytes: artifacts.stored_size_bytes,
     })
 }
 
@@ -752,6 +793,10 @@ where
     net: Arc<N>,
     peers: Arc<P>,
     signing_key_seed: [u8; 32],
+    /// Operator's L1 address bytes. Stored alongside the base58 form
+    /// so Private resume can call `unwrap_for_self` (which takes
+    /// `[u8; 20]`) without re-decoding the base58 string.
+    my_addr: [u8; 20],
     my_addr_base58: String,
     params: IngestParams,
 }
@@ -775,6 +820,7 @@ where
             net,
             peers,
             signing_key_seed,
+            my_addr,
             my_addr_base58: sum_net::l1_address_base58(&my_addr),
             params,
         }
@@ -1609,26 +1655,16 @@ where
                 source: e,
             };
         }
-        // Re-chunk and verify the path matches the recorded root.
-        let (manifest, mmap, tree) = match self.s0_chunk(file_path).await {
-            Ok(triple) => triple,
-            Err(e) => {
-                return IngestOutcome::Failed {
-                    stage: IngestStage::Register,
-                    manifest: None,
-                    source: e,
-                };
-            }
-        };
-        if manifest.merkle_root != merkle_root {
-            return IngestOutcome::RootMismatch {
-                expected: merkle_root,
-                actual: manifest.merkle_root,
-                manifest,
-            };
-        }
 
-        // Lifecycle gate.
+        // Phase 4d: probe chain BEFORE re-deriving the manifest. The
+        // visibility byte decides whether we re-chunk plaintext
+        // (Public) or recover K_file + re-encrypt (Private). For
+        // Public files this is the same shape as before; for
+        // Private it's a new branch that uses
+        // `recover_k_file_from_seed_page` + `build_private_artifacts`.
+        // Lifecycle handling (Active/Abandoned → terminal outcomes,
+        // Pending → continue) also moves above re-chunk so we don't
+        // burn CPU on a file the chain has already finalized.
         let info = match self
             .rpc
             .storage_get_file_info_v2(&format!("0x{}", hex::encode(merkle_root)))
@@ -1638,11 +1674,141 @@ where
             Err(e) => {
                 return IngestOutcome::Failed {
                     stage: IngestStage::Register,
-                    manifest: Some(manifest),
+                    manifest: None,
                     source: e.context("resume: storage_getFileInfoV2 failed"),
                 };
             }
         };
+
+        // Phase 4d Private resume — re-derive the manifest from the
+        // file path. For Public files, `s0_chunk` re-chunks the
+        // plaintext (existing behavior). For Private files we
+        // recover `K_file` from the owner's own access bundle on
+        // chain (factored helper from Phase 4c) and re-encrypt
+        // deterministically; the resulting ciphertext + manifest
+        // must reproduce the chain's `merkle_root` byte-for-byte.
+        // Owner-only enforcement and root verification fail
+        // pre-S2/S3 with typed outcomes.
+        //
+        // The 5-tuple shape lets the rest of the resume pipeline
+        // (lifecycle gate, snapshot, coverage, S2, S3, S4, S5) treat
+        // both visibilities uniformly: `mmap` is the on-disk byte
+        // source S2 reads from (plaintext for Public, ciphertext for
+        // Private), and `encrypted_manifest_override` is `Some(_)`
+        // for Private (so S3 sends the encrypted blob) and `None`
+        // for Public (so S3 CBOR-serializes `manifest`). The held
+        // `_ciphertext_temp` keeps the Private tempfile alive for
+        // the duration of `mmap`; Drop order is Mmap → tempfile, the
+        // same field-order rule we use elsewhere.
+        let (manifest, mmap, tree, encrypted_manifest_override, _ciphertext_temp): (
+            DataManifest,
+            memmap2::Mmap,
+            MerkleTree,
+            Option<Vec<u8>>,
+            Option<tempfile::NamedTempFile>,
+        ) = if info.visibility.is_private() {
+            // Owner-only gate. Reveals less than running through
+            // K_file recovery and unwrap-failing — we know up front
+            // that a non-owner cannot have a usable bundle here.
+            if info.owner != self.my_addr_base58 {
+                return IngestOutcome::Failed {
+                    stage: IngestStage::Register,
+                    manifest: None,
+                    source: anyhow::anyhow!(
+                        "resume (Private): operator {} is not the file owner ({}); \
+                         cannot recover K_file",
+                        self.my_addr_base58,
+                        info.owner
+                    ),
+                };
+            }
+            // Recover K_file from the owner's own access entry on
+            // chain. Uses the seed-page-only variant (no pagination)
+            // — Phase 4a's "owner-first" insertion guarantees the
+            // owner is in the first page of `info.access_list` for
+            // any reasonably-sized file.
+            let k_file = match crate::access::recover_k_file_from_seed_page(
+                &self.signing_key_seed,
+                self.my_addr,
+                &self.my_addr_base58,
+                &info,
+            ) {
+                Ok(k) => k,
+                Err(e) => {
+                    return IngestOutcome::Failed {
+                        stage: IngestStage::Register,
+                        manifest: None,
+                        source: anyhow::anyhow!(
+                            "resume (Private): K_file recovery from owner bundle failed: {e}"
+                        ),
+                    };
+                }
+            };
+            // Re-encrypt under the recovered K_file. Per-chunk
+            // (key, nonce) HKDF derivation is deterministic in
+            // `(K_file, chunk_index)`, so the ciphertext bytes —
+            // and hence the merkle root — are byte-identical to the
+            // original ingest.
+            let artifacts = match build_private_artifacts(file_path, &k_file) {
+                Ok(a) => a,
+                Err(e) => {
+                    return IngestOutcome::Failed {
+                        stage: IngestStage::Register,
+                        manifest: None,
+                        source: e.context(
+                            "resume (Private): re-encryption with recovered K_file failed",
+                        ),
+                    };
+                }
+            };
+            // Verify the recovered K_file reproduces the chain
+            // root. If not, the operator handed us the wrong file
+            // OR the chain row is corrupt — either way we refuse
+            // pre-S2.
+            if artifacts.manifest.merkle_root != merkle_root {
+                return IngestOutcome::RootMismatch {
+                    expected: merkle_root,
+                    actual: artifacts.manifest.merkle_root,
+                    manifest: artifacts.manifest,
+                };
+            }
+            let leaves: Vec<blake3::Hash> = artifacts
+                .manifest
+                .chunks
+                .iter()
+                .map(|c| blake3::Hash::from(c.blake3_hash))
+                .collect();
+            let tree = MerkleTree::build(&leaves);
+            debug_assert_eq!(*tree.root().as_bytes(), artifacts.manifest.merkle_root);
+            (
+                artifacts.manifest,
+                artifacts.ciphertext_mmap,
+                tree,
+                Some(artifacts.encrypted_manifest_bytes),
+                Some(artifacts._ciphertext_temp),
+            )
+        } else {
+            // Public path — existing behavior, unchanged.
+            let (m, mm, t) = match self.s0_chunk(file_path).await {
+                Ok(triple) => triple,
+                Err(e) => {
+                    return IngestOutcome::Failed {
+                        stage: IngestStage::Register,
+                        manifest: None,
+                        source: e,
+                    };
+                }
+            };
+            if m.merkle_root != merkle_root {
+                return IngestOutcome::RootMismatch {
+                    expected: merkle_root,
+                    actual: m.merkle_root,
+                    manifest: m,
+                };
+            }
+            (m, mm, t, None, None)
+        };
+
         if info.lifecycle.is_active() {
             // No work to do. Heights from chain state (no tx hashes —
             // chain plan §4 doesn't expose them).
@@ -1811,12 +1977,21 @@ where
                 }
             };
 
-            // Re-push manifest to all distinct-assigned archives (idempotent).
-            // Phase 4a: resume() is Public-only for now. Private resume
-            // would need to recover K_file from the owner's bundle on
-            // chain (locked decision #5) and re-encrypt the manifest;
-            // that's deferred to Phase 4a-resume.
-            if let Err(e) = self.s3_push_manifest(&manifest, &distinct_assigned, None).await {
+            // Re-push manifest to all distinct-assigned archives
+            // (idempotent on receiver). For Public the override is
+            // `None` and S3 CBOR-serializes `manifest`; for Private
+            // (Phase 4d) we pass the encrypted manifest blob built
+            // by `build_private_artifacts` so the receiver stores
+            // opaque bytes (Phase 4b storage shape).
+            //
+            // We `.clone()` the override because S3 takes ownership;
+            // `encrypted_manifest_override` may need to live past
+            // this call if a future retry layer re-attempts. Cheap
+            // clone — ~KB of opaque bytes.
+            if let Err(e) = self
+                .s3_push_manifest(&manifest, &distinct_assigned, encrypted_manifest_override.clone())
+                .await
+            {
                 return IngestOutcome::PendingNeedsAction {
                     merkle_root,
                     manifest,
@@ -2379,11 +2554,34 @@ mod tests {
         my_addr: [u8; 20],
         params: IngestParams,
     ) -> IngestPipeline<MockRpc, MockNet, StaticPeers> {
+        build_pipeline_with_seed(
+            rpc,
+            net,
+            archive_to_peer,
+            my_addr,
+            [42u8; 32],
+            params,
+        )
+    }
+
+    /// Variant that lets the test override the operator's Ed25519
+    /// seed. Phase 4d Private resume tests need this so the seed
+    /// matches the X25519 public key the test wraps `K_file` against
+    /// — without it the recover path would fail on AEAD tag check
+    /// rather than on the test's intended assertion.
+    fn build_pipeline_with_seed(
+        rpc: Arc<MockRpc>,
+        net: Arc<MockNet>,
+        archive_to_peer: HashMap<[u8; 20], PeerId>,
+        my_addr: [u8; 20],
+        seed: [u8; 32],
+        params: IngestParams,
+    ) -> IngestPipeline<MockRpc, MockNet, StaticPeers> {
         IngestPipeline::new(
             rpc,
             net,
             Arc::new(StaticPeers { map: archive_to_peer }),
-            [42u8; 32],
+            seed,
             my_addr,
             params,
         )
@@ -3616,10 +3814,21 @@ mod tests {
         let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
         let actual_root = manifest_dryrun.merkle_root;
         // Operator passes a wrong explicit root.
-        let claimed_root = [0xFF; 32];
+        let claimed_root = [0xFFu8; 32];
         assert_ne!(claimed_root, actual_root);
 
+        // Phase 4d: resume now probes the chain BEFORE re-deriving
+        // the manifest, so the claimed root must exist on the mock
+        // chain (as a Public Pending file) for resume to reach the
+        // visibility branch where the actual-vs-claimed root check
+        // fires. Without this stage, the chain probe would short-
+        // circuit with `unknown root` and resume returns Failed
+        // instead of RootMismatch.
         let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(
+            &format!("0x{}", hex::encode(claimed_root)),
+            pending_file_info(&claimed_root, 1, 100),
+        );
         let net = Arc::new(MockNet::new());
 
         let pipeline = build_pipeline(
@@ -3686,6 +3895,372 @@ mod tests {
                 "lifecycle=Active + activated_at_height=None must surface as Failed; got {other:?}"
             ),
         }
+    }
+
+    // ── Phase 4d Private resume tests ───────────────────────────────
+
+    /// Helper: build a Private V2 chain row whose owner's access
+    /// entry wraps the supplied K_file under the owner's X25519
+    /// pubkey (derived from `owner_seed` via the same Phase 4a HKDF
+    /// the resume path will use to recover). The returned shape is
+    /// what `recover_k_file_from_seed_page` expects on chain.
+    fn private_pending_info_with_owner_bundle(
+        merkle_root: [u8; 32],
+        chunk_count: u32,
+        assignment_height: u64,
+        owner_addr: [u8; 20],
+        owner_seed: &[u8; 32],
+        k_file_to_wrap: &[u8; 32],
+    ) -> StorageFileInfoV2 {
+        use sum_crypto::{wrap_for_recipient, x25519_keypair_from_ed25519_seed};
+        let (_sk, owner_pk) = x25519_keypair_from_ed25519_seed(owner_seed);
+        let bundle = wrap_for_recipient(k_file_to_wrap, &owner_addr, &owner_pk)
+            .expect("wrap K_file for owner");
+        let bundle_hex = format!("0x{}", hex::encode(bundle));
+        let owner_b58 = l1_address_base58(&owner_addr);
+        StorageFileInfoV2 {
+            merkle_root: format!("0x{}", hex::encode(merkle_root)),
+            owner: owner_b58.clone(),
+            plaintext_size_bytes: 0,
+            stored_size_bytes: 0,
+            chunk_count,
+            fee_pool: 0,
+            created_at: 100,
+            activated_at_height: None,
+            abandoned_at_height: None,
+            assignment_height,
+            visibility: VisibilityV2::PRIVATE,
+            lifecycle: LifecycleV2::PENDING,
+            access_list: vec![sum_types::rpc_types::AccessEntryV2 {
+                address: owner_b58,
+                encrypted_key_bundle: Some(bundle_hex),
+                expires_at: None,
+            }],
+        }
+    }
+
+    /// Phase 4d happy path: a Private file the operator originally
+    /// ingested but failed to push completely. Resume probes chain →
+    /// recovers K_file → re-encrypts → produces a manifest whose
+    /// root matches the chain → coverage says can_activate_now
+    /// (skip S2/S3) → S5 ActivateFileV2 finalizes →
+    /// `ResumedActivated`.
+    ///
+    /// The chain stages a chunk_count derived from the same
+    /// encryption pipeline so the resume's `info.chunk_count`
+    /// matches the manifest's count (no shape mismatch).
+    #[tokio::test]
+    async fn private_resume_recovers_k_file_and_completes() {
+        // 1. Operator identity.
+        let owner_seed = [0xA1u8; 32];
+        let owner_addr = sum_net::identity::l1_address_from_keypair(
+            &sum_net::identity::keypair_from_seed(&owner_seed).unwrap(),
+        );
+
+        // 2. Plaintext file + K_file used at the original ingest.
+        let plaintext = vec![0xCDu8; 200_000];
+        let (_dir, path) = write_test_file(&plaintext);
+        let k_file_plain = [0x99u8; 32];
+        let k_file: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new(k_file_plain);
+
+        // 3. Run the same encryption pipeline that ingest used so
+        //    we know the chain's expected merkle_root.
+        let artifacts = build_private_artifacts(&path, &k_file).expect("encrypt for fixture");
+        let merkle_root = artifacts.manifest.merkle_root;
+        let chunk_count = artifacts.manifest.chunk_count;
+        drop(artifacts); // close mmap + tempfile; resume re-derives.
+
+        // 4. Stage chain row with the owner's wrapped bundle.
+        let assignment_height = 500u64;
+        let snapshot = five_archives();
+        let info = private_pending_info_with_owner_bundle(
+            merkle_root,
+            chunk_count,
+            assignment_height,
+            owner_addr,
+            &owner_seed,
+            &k_file_plain,
+        );
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(&format!("0x{}", hex::encode(merkle_root)), info);
+        rpc.add_snapshot(
+            assignment_height,
+            snapshot.iter().map(node_record).collect(),
+        );
+        // Coverage says can_activate_now → resume skips S2/S3.
+        rpc.enqueue_coverage(coverage_active(chunk_count, true));
+        // S5 ActivateFileV2 + finality.
+        rpc.set_nonce(&l1_address_base58(&owner_addr), 1);
+        rpc.enqueue_send("0xtx-activate-private-resume");
+        rpc.enqueue_status(TxStatusV2::Finalized { block_height: 200 });
+
+        let net = Arc::new(MockNet::new());
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = 5;
+        let pipeline = build_pipeline_with_seed(
+            rpc.clone(),
+            net,
+            HashMap::new(),
+            owner_addr,
+            owner_seed,
+            params,
+        );
+
+        match pipeline.resume(merkle_root, &path).await {
+            IngestOutcome::ResumedActivated {
+                merkle_root: r,
+                activate_height,
+                ..
+            } => {
+                assert_eq!(r, merkle_root);
+                assert_eq!(activate_height, 200);
+            }
+            other => panic!("expected ResumedActivated, got {other:?}"),
+        }
+    }
+
+    /// Phase 4d: operator hands resume a path whose plaintext does
+    /// NOT correspond to the chain's merkle_root (different file).
+    /// Resume recovers K_file successfully but the re-encryption
+    /// produces a different root → typed `RootMismatch`.
+    #[tokio::test]
+    async fn private_resume_root_mismatch_when_path_does_not_match_chain_root() {
+        let owner_seed = [0xA2u8; 32];
+        let owner_addr = sum_net::identity::l1_address_from_keypair(
+            &sum_net::identity::keypair_from_seed(&owner_seed).unwrap(),
+        );
+
+        // Original file used at the (hypothetical) ingest.
+        let original_plaintext = vec![0xAAu8; 200_000];
+        let (_dir_orig, original_path) = write_test_file(&original_plaintext);
+        let k_file_plain = [0xBBu8; 32];
+        let k_file = zeroize::Zeroizing::new(k_file_plain);
+        let artifacts = build_private_artifacts(&original_path, &k_file).unwrap();
+        let chain_root = artifacts.manifest.merkle_root;
+        let chunk_count = artifacts.manifest.chunk_count;
+        drop(artifacts);
+
+        // The operator runs `resume <chain_root> <wrong_file_path>`.
+        let wrong_plaintext = vec![0xCCu8; 200_000];
+        let (_dir_wrong, wrong_path) = write_test_file(&wrong_plaintext);
+
+        let snapshot = five_archives();
+        let info = private_pending_info_with_owner_bundle(
+            chain_root,
+            chunk_count,
+            500,
+            owner_addr,
+            &owner_seed,
+            &k_file_plain,
+        );
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(&format!("0x{}", hex::encode(chain_root)), info);
+        rpc.add_snapshot(500, snapshot.iter().map(node_record).collect());
+        let net = Arc::new(MockNet::new());
+
+        let pipeline = build_pipeline_with_seed(
+            rpc.clone(),
+            net,
+            HashMap::new(),
+            owner_addr,
+            owner_seed,
+            params_for_test(defaults_for_tests()),
+        );
+
+        match pipeline.resume(chain_root, &wrong_path).await {
+            IngestOutcome::RootMismatch { expected, actual, .. } => {
+                assert_eq!(expected, chain_root);
+                assert_ne!(actual, chain_root);
+            }
+            other => panic!("expected RootMismatch, got {other:?}"),
+        }
+        // No tx submitted: resume must refuse before S5.
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
+    }
+
+    /// Phase 4d: owner's chain entry exists but `encrypted_key_bundle`
+    /// is `None`. Chain rule violation; resume must refuse with a
+    /// typed Failed pre-S2.
+    #[tokio::test]
+    async fn private_resume_refuses_when_owner_bundle_missing() {
+        let owner_seed = [0xA3u8; 32];
+        let owner_addr = sum_net::identity::l1_address_from_keypair(
+            &sum_net::identity::keypair_from_seed(&owner_seed).unwrap(),
+        );
+        let plaintext = vec![0xDDu8; 100_000];
+        let (_dir, path) = write_test_file(&plaintext);
+
+        let merkle_root = [0xEEu8; 32]; // arbitrary; we won't reach root verification.
+        let owner_b58 = l1_address_base58(&owner_addr);
+        let info = StorageFileInfoV2 {
+            merkle_root: format!("0x{}", hex::encode(merkle_root)),
+            owner: owner_b58.clone(),
+            plaintext_size_bytes: 0,
+            stored_size_bytes: 0,
+            chunk_count: 1,
+            fee_pool: 0,
+            created_at: 100,
+            activated_at_height: None,
+            abandoned_at_height: None,
+            assignment_height: 500,
+            visibility: VisibilityV2::PRIVATE,
+            lifecycle: LifecycleV2::PENDING,
+            access_list: vec![sum_types::rpc_types::AccessEntryV2 {
+                address: owner_b58,
+                encrypted_key_bundle: None, // chain rule violation
+                expires_at: None,
+            }],
+        };
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(&format!("0x{}", hex::encode(merkle_root)), info);
+        let net = Arc::new(MockNet::new());
+
+        let pipeline = build_pipeline_with_seed(
+            rpc.clone(),
+            net,
+            HashMap::new(),
+            owner_addr,
+            owner_seed,
+            params_for_test(defaults_for_tests()),
+        );
+
+        match pipeline.resume(merkle_root, &path).await {
+            IngestOutcome::Failed { stage, source, .. } => {
+                assert_eq!(stage, IngestStage::Register);
+                let msg = source.to_string();
+                assert!(
+                    msg.contains("K_file recovery") || msg.contains("OwnerBundleMissing")
+                        || msg.contains("encrypted_key_bundle"),
+                    "expected K_file recovery failure surface, got: {msg}"
+                );
+            }
+            other => panic!("expected Failed (owner bundle missing), got {other:?}"),
+        }
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
+    }
+
+    /// Phase 4d: chain row's owner is a different address than the
+    /// operator running resume. Refuse pre-recovery with a typed
+    /// Failed — even if the operator's seed could decrypt some
+    /// other file's bundle, this isn't their file.
+    #[tokio::test]
+    async fn private_resume_refuses_when_operator_is_not_owner() {
+        let real_owner_seed = [0xA4u8; 32];
+        let real_owner_addr = sum_net::identity::l1_address_from_keypair(
+            &sum_net::identity::keypair_from_seed(&real_owner_seed).unwrap(),
+        );
+        let stranger_seed = [0xB4u8; 32];
+        let stranger_addr = sum_net::identity::l1_address_from_keypair(
+            &sum_net::identity::keypair_from_seed(&stranger_seed).unwrap(),
+        );
+
+        // Real file under the real owner's K_file.
+        let plaintext = vec![0xDDu8; 100_000];
+        let (_dir, path) = write_test_file(&plaintext);
+        let k_file_plain = [0xCCu8; 32];
+        let k_file = zeroize::Zeroizing::new(k_file_plain);
+        let artifacts = build_private_artifacts(&path, &k_file).unwrap();
+        let merkle_root = artifacts.manifest.merkle_root;
+        let chunk_count = artifacts.manifest.chunk_count;
+        drop(artifacts);
+
+        let info = private_pending_info_with_owner_bundle(
+            merkle_root,
+            chunk_count,
+            500,
+            real_owner_addr,
+            &real_owner_seed,
+            &k_file_plain,
+        );
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(&format!("0x{}", hex::encode(merkle_root)), info);
+        let net = Arc::new(MockNet::new());
+
+        // Pipeline is built with the STRANGER's seed/addr — they're
+        // not the owner.
+        let pipeline = build_pipeline_with_seed(
+            rpc.clone(),
+            net,
+            HashMap::new(),
+            stranger_addr,
+            stranger_seed,
+            params_for_test(defaults_for_tests()),
+        );
+
+        match pipeline.resume(merkle_root, &path).await {
+            IngestOutcome::Failed { stage, source, .. } => {
+                assert_eq!(stage, IngestStage::Register);
+                let msg = source.to_string();
+                assert!(
+                    msg.contains("not the file owner") || msg.contains("cannot recover K_file"),
+                    "expected non-owner refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected Failed (non-owner), got {other:?}"),
+        }
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
+    }
+
+    /// Phase 4d: chain row carries a Private file whose owner bundle
+    /// wraps `K_file_A`, but the chain's `merkle_root` corresponds
+    /// to a different K_file's encryption (chain corruption / a
+    /// pathologically constructed test fixture). Resume recovers
+    /// `K_file_A`, re-encrypts the plaintext under it, and the
+    /// resulting root won't match the chain's claimed root → typed
+    /// `RootMismatch`.
+    #[tokio::test]
+    async fn private_resume_recovered_key_root_mismatch_refuses() {
+        let owner_seed = [0xA5u8; 32];
+        let owner_addr = sum_net::identity::l1_address_from_keypair(
+            &sum_net::identity::keypair_from_seed(&owner_seed).unwrap(),
+        );
+        let plaintext = vec![0xEEu8; 100_000];
+        let (_dir, path) = write_test_file(&plaintext);
+
+        // The operator's actual K_file.
+        let k_file_a_plain = [0x11u8; 32];
+        let k_file_a = zeroize::Zeroizing::new(k_file_a_plain);
+        let artifacts_a = build_private_artifacts(&path, &k_file_a).unwrap();
+        let actual_root_under_a = artifacts_a.manifest.merkle_root;
+        let chunk_count = artifacts_a.manifest.chunk_count;
+        drop(artifacts_a);
+
+        // Construct a chain row claiming a DIFFERENT root (K_file_B's
+        // hypothetical root) but with the owner bundle wrapping
+        // K_file_A. Resume recovers K_file_A, re-encrypts, and the
+        // produced root is `actual_root_under_a`, not the claimed
+        // chain root.
+        let claimed_chain_root = [0xFFu8; 32];
+        assert_ne!(claimed_chain_root, actual_root_under_a);
+        let info = private_pending_info_with_owner_bundle(
+            claimed_chain_root,
+            chunk_count,
+            500,
+            owner_addr,
+            &owner_seed,
+            &k_file_a_plain,
+        );
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(&format!("0x{}", hex::encode(claimed_chain_root)), info);
+        let net = Arc::new(MockNet::new());
+
+        let pipeline = build_pipeline_with_seed(
+            rpc.clone(),
+            net,
+            HashMap::new(),
+            owner_addr,
+            owner_seed,
+            params_for_test(defaults_for_tests()),
+        );
+
+        match pipeline.resume(claimed_chain_root, &path).await {
+            IngestOutcome::RootMismatch { expected, actual, .. } => {
+                assert_eq!(expected, claimed_chain_root);
+                assert_eq!(actual, actual_root_under_a);
+            }
+            other => panic!("expected RootMismatch (recovered key reproduces wrong root), got {other:?}"),
+        }
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
     }
 
     // ── W11 abandon tests ───────────────────────────────────────────

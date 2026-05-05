@@ -35,6 +35,7 @@ use sum_types::config::{NetConfig, StoreConfig};
 use sum_node::acl::AclChecker;
 use sum_node::assignment_attestor::AssignmentAttestor;
 use sum_node::download::DownloadOrchestrator;
+use sum_node::download_private::run_download_private;
 use sum_node::inbound_v2::V2Dispatcher;
 use sum_node::market_sync::MarketSyncWorker;
 use sum_node::peer_state::{apply_peer_event, PeerMapChange};
@@ -251,6 +252,50 @@ enum Command {
     /// for finality. Re-runs are idempotent (chain overwrites the slot).
     RegisterEncryptionKey,
 
+    /// Phase 4c — share a Private V2 file with a new recipient.
+    /// Owner-only: recovers `K_file` locally from the owner's own
+    /// access bundle on chain, wraps it for the new recipient's
+    /// registered X25519 key, and submits `AddAccessV2`. The chain
+    /// never sees `K_file`.
+    Share {
+        /// Hex-encoded 32-byte merkle root of the file.
+        merkle_root: String,
+        /// Recipient: `<base58 L1 addr>` or `<addr>:<expires_at_height>`
+        /// or `<addr>:none`. The recipient's X25519 pubkey is fetched
+        /// from chain via `account_getEncryptionPublicKey`; missing
+        /// keys cause `share` to abort BEFORE submitting any tx.
+        #[arg(long)]
+        recipient: String,
+    },
+
+    /// Phase 4c — revoke a recipient's access to a Private V2 file.
+    /// Owner-only. Removes the chain-side access entry. Does NOT
+    /// rotate `K_file`: the revoked recipient still holds their old
+    /// bundle locally but chain ACL denies them on the next pull.
+    /// For forward secrecy, revoke + re-ingest under a fresh key.
+    Revoke {
+        /// Hex-encoded 32-byte merkle root of the file.
+        merkle_root: String,
+        /// Address to revoke. The expiry segment (if any) is ignored
+        /// for revoke.
+        #[arg(long)]
+        recipient: String,
+    },
+
+    /// Phase 4c — update a recipient's expiry on a Private V2 file.
+    /// Owner-only. Preserves the existing encrypted_key_bundle
+    /// byte-for-byte; only the entry's `expires_at` changes.
+    /// REQUIRES an explicit expiry directive: `<addr>:<height>` to
+    /// set, `<addr>:none` to clear. A bare `<addr>` is rejected as
+    /// no-op so the operator's intent is unambiguous.
+    UpdateAccess {
+        /// Hex-encoded 32-byte merkle root of the file.
+        merkle_root: String,
+        /// Recipient + explicit expiry directive (`:<height>` or `:none`).
+        #[arg(long)]
+        recipient: String,
+    },
+
     /// Discover a peer on the LAN, publish a test message, then exit.
     Send {
         /// UTF-8 message to broadcast on `sum/test/v1`.
@@ -427,9 +472,60 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Share { merkle_root, recipient } => {
+            let seed = seed.ok_or_else(|| {
+                anyhow::anyhow!("share requires --key-file (owner key recovers K_file locally)")
+            })?;
+            let parsed_root = parse_merkle_root_hex(&merkle_root)?;
+            let recipient_spec = sum_node::access::parse_recipient_spec(&recipient)?;
+            sum_node::access::run_share(
+                keypair,
+                seed,
+                cli.rpc_url.clone(),
+                cli.chain_id,
+                cli.attest_fee,
+                parsed_root,
+                recipient_spec,
+            )
+            .await
+        }
+        Command::Revoke { merkle_root, recipient } => {
+            let seed = seed.ok_or_else(|| {
+                anyhow::anyhow!("revoke requires --key-file (RemoveAccessV2 needs a signing key)")
+            })?;
+            let parsed_root = parse_merkle_root_hex(&merkle_root)?;
+            let target = sum_node::access::parse_recipient_spec(&recipient)?;
+            sum_node::access::run_revoke(
+                keypair,
+                seed,
+                cli.rpc_url.clone(),
+                cli.chain_id,
+                cli.attest_fee,
+                parsed_root,
+                target,
+            )
+            .await
+        }
+        Command::UpdateAccess { merkle_root, recipient } => {
+            let seed = seed.ok_or_else(|| {
+                anyhow::anyhow!("update-access requires --key-file (UpdateAccessV2 needs a signing key)")
+            })?;
+            let parsed_root = parse_merkle_root_hex(&merkle_root)?;
+            let target = sum_node::access::parse_recipient_spec(&recipient)?;
+            sum_node::access::run_update_access(
+                keypair,
+                seed,
+                cli.rpc_url.clone(),
+                cli.chain_id,
+                cli.attest_fee,
+                parsed_root,
+                target,
+            )
+            .await
+        }
         Command::Fetch { cid } => run_fetch(keypair, net_config, cid).await,
         Command::Download { merkle_root, output, max_concurrent, download_timeout_secs } => {
-            run_download(keypair, cli.rpc_url.clone(), net_config, merkle_root, output, max_concurrent, download_timeout_secs).await
+            run_download(keypair, seed, cli.rpc_url.clone(), net_config, merkle_root, output, max_concurrent, download_timeout_secs).await
         }
         Command::Send { message } => run_send(keypair, net_config, message).await,
     }
@@ -1917,8 +2013,10 @@ async fn run_fetch(keypair: Keypair, net_config: NetConfig, cid: String) -> Resu
 
 // ── Download mode ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run_download(
     keypair: Keypair,
+    seed: Option<[u8; 32]>,
     rpc_url: String,
     net_config: NetConfig,
     merkle_root: String,
@@ -1928,12 +2026,65 @@ async fn run_download(
 ) -> Result<()> {
     info!(%merkle_root, output = %output.display(), "starting download");
 
-    let net = Arc::new(SumNet::new(net_config, keypair.clone()).await?);
-    let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
+    // ── Step 1: pre-flight chain probes BEFORE any libp2p work ─────
+    //
+    // We need the V2 file row to know whether this is a Private file,
+    // and we want to fail fast on the obvious operator mistakes
+    // (missing --key-file for a Private file) without burning a UDP
+    // bind, mDNS announce, or QUIC handshake. Doing the RPC probe
+    // first costs one HTTP round-trip but lets us bail before any
+    // network state mutates.
+    let parsed_root = parse_merkle_root_hex(&merkle_root)?;
+    let root_hex = format!("0x{}", hex::encode(parsed_root));
     let rpc = Arc::new(L1RpcClient::new(rpc_url));
+    let v2_info = rpc
+        .storage_get_file_info_v2(&root_hex, None, None)
+        .await
+        .ok();
+
+    // Private + missing seed → bail before SumNet::new.
+    if let Some(info) = v2_info.as_ref() {
+        if info.visibility.is_private() && seed.is_none() {
+            anyhow::bail!(
+                "download of Private file {merkle_root} requires --key-file \
+                 (no X25519 secret to unwrap K_file)"
+            );
+        }
+    }
+
+    // ── Step 2: now safe to start networking ───────────────────────
+    let net = Arc::new(SumNet::new(net_config, keypair.clone()).await?);
+
+    // V2 dispatch. We ONLY take the Private path when chain confirms
+    // this is a Private V2 row; every other outcome — Public V2,
+    // pre-V2 / V1 file, V2 RPC unsupported, transient RPC error, file
+    // not found — falls through to the existing Public download
+    // orchestrator with no behavior change. This way V1 / legacy
+    // Public downloads cannot regress when the chain side adds or
+    // removes V2 metadata for unrelated files.
+    if let Some(info) = v2_info {
+        if info.visibility.is_private() {
+            let seed = seed.expect("checked above before SumNet::new");
+            return run_download_private(
+                keypair,
+                seed,
+                rpc,
+                net,
+                info,
+                parsed_root,
+                output,
+                max_concurrent,
+                Duration::from_secs(timeout_secs),
+            )
+            .await;
+        }
+        // Public V2 row: fall through to the existing Public path.
+    }
+
+    // ── Step 3: existing Public / V1 / legacy path ────────────────
+    let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
     let peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>> =
         Arc::new(RwLock::new(HashMap::new()));
-
     let orchestrator = DownloadOrchestrator::new(
         merkle_root,
         output.clone(),

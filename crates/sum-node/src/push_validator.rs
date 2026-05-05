@@ -130,6 +130,18 @@ pub trait V2RpcClient: Send + Sync {
 }
 
 /// Reasons a push gets rejected. Each variant maps to a distinct
+/// Successful validation outcome. Carries the chunk's BLAKE3 leaf
+/// hash (used by the dispatcher to derive the on-disk CID) and the
+/// chain-stated visibility so downstream paths don't have to re-probe
+/// the chain to know whether this is a Public or Private file —
+/// `validate_push` already had to fetch the file info to verify the
+/// Merkle proof, and that fetch is the canonical source of truth.
+#[derive(Debug, Clone, Copy)]
+pub struct ValidatedPush {
+    pub leaf_hash: [u8; 32],
+    pub visibility: sum_types::rpc_types::VisibilityV2,
+}
+
 /// receive-side response so the sender can reason about whether to
 /// retry. Phase 0b doesn't yet emit per-reason error codes on the wire
 /// (W5 will); locally we use this enum as the call-site discriminant.
@@ -246,7 +258,7 @@ impl<C: V2RpcClient> PushValidator<C> {
         chunk_index: u32,
         data: &[u8],
         merkle_path: &[[u8; 32]],
-    ) -> Result<[u8; 32], PushReject> {
+    ) -> Result<ValidatedPush, PushReject> {
         let leaf_hash: [u8; 32] = *blake3::hash(data).as_bytes();
 
         let info = self.fetch_file_info(&merkle_root).await?;
@@ -308,7 +320,14 @@ impl<C: V2RpcClient> PushValidator<C> {
             return Err(PushReject::BadProof);
         }
 
-        Ok(leaf_hash)
+        // Visibility comes from the same `info` we already validated
+        // above. Returning it here means downstream callers (the V2
+        // dispatcher) don't need a second probe to know whether to
+        // record the Phase 4b ciphertext-CID → root mapping.
+        Ok(ValidatedPush {
+            leaf_hash,
+            visibility: info.visibility,
+        })
     }
 
     /// Cache-fronted wrapper around `storage_getFileInfoV2`. On miss,
@@ -670,12 +689,15 @@ mod tests {
     async fn happy_path_pending_validates() {
         let fx = build_fixture(LifecycleV2::PENDING);
         let i = fx.good_index;
-        let leaf = fx
+        let validated = fx
             .validator
             .validate_push(fx.tree.root, i, fx.tree.data(i), &fx.tree.proof(i))
             .await
             .expect("happy path must validate");
-        assert_eq!(leaf, *blake3::hash(fx.tree.data(i)).as_bytes());
+        assert_eq!(
+            validated.leaf_hash,
+            *blake3::hash(fx.tree.data(i)).as_bytes()
+        );
     }
 
     #[tokio::test]
