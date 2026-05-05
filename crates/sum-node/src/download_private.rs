@@ -25,7 +25,7 @@
 //! `storage_getFileInfoV2` returns a Private V2 row, otherwise it falls
 //! through to the existing Public `DownloadOrchestrator` unchanged.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,6 +95,32 @@ pub enum PrivateDownloadError {
 
     #[error("encrypted manifest fetch failed: {0}")]
     ManifestFetch(#[source] anyhow::Error),
+
+    #[error(
+        "encrypted manifest fetch exhausted all V2-assigned archives: tried \
+         {tried} of {assigned_total} ({resolvable} resolvable, {unresolvable} \
+         unresolvable); last error: {last_reason}"
+    )]
+    ManifestFetchAllArchivesFailed {
+        /// Total V2-assigned archives for this file — the union of
+        /// `assigned_archives(merkle_root, snapshot, chunk_index, R)` across
+        /// every chunk index. Mirrors the upload-side `distinct_assigned`
+        /// set so the caller is asking the same archives that hold the file.
+        assigned_total: usize,
+        /// Archives we issued a `request_manifest` to before giving up.
+        /// Equal to the number of distinct archives whose PeerId we resolved
+        /// (each resolvable archive is dispatched at most once).
+        tried: usize,
+        /// Archives whose PeerId resolved at any point before failure.
+        resolvable: usize,
+        /// Archives whose PeerId never resolved before the deadline (peer
+        /// not yet identified, possibly offline).
+        unresolvable: usize,
+        /// Last per-response failure surfaced (validation rejection,
+        /// peer-side error string, or "deadline exceeded"). Diagnostic
+        /// hint only — not a structured cause.
+        last_reason: String,
+    },
 
     #[error(
         "manifest decryption failed (wrong K_file? tampered manifest?): {0}"
@@ -394,20 +420,29 @@ pub async fn run_download_private(
         .map_err(PrivateDownloadError::BundleUnwrap)?;
     let k_file: Zeroizing<[u8; 32]> = Zeroizing::new(k_file_bytes);
 
-    // ── Step 7: fetch encrypted manifest ────────────────────────────
+    // ── Step 7–11: fetch + verify manifest (V2 fan-out) ────────────
+    //
+    // Phase 4d: bounded fan-out across the V2 distinct_assigned set.
+    // Inline validation (decrypt + chain-root + Merkle) means this
+    // returns a `DataManifest` directly — Step 8–11 of the original
+    // Phase 4b plan are now folded in. Caller MUST NOT re-validate.
     let peer_addresses: Arc<RwLock<HashMap<PeerId, [u8; 20]>>> =
         Arc::new(RwLock::new(HashMap::new()));
-    let encrypted_manifest_bytes =
-        fetch_encrypted_manifest(net.as_ref(), &peer_addresses, &chain_root, timeout)
-            .await
-            .map_err(PrivateDownloadError::ManifestFetch)?;
-
-    // ── Step 8–11: decrypt manifest, verify root + Merkle ──────────
-    let manifest = decrypt_and_verify_manifest(&k_file, &encrypted_manifest_bytes, chain_root)?;
+    let manifest = fetch_manifest_v2(
+        net.as_ref(),
+        rpc.as_ref(),
+        &peer_addresses,
+        &info,
+        chain_root,
+        &k_file,
+        timeout,
+        max_concurrent,
+    )
+    .await?;
     info!(
         chunks = manifest.chunks.len(),
         plaintext_size = manifest.total_size_bytes,
-        "Private manifest decrypted and verified"
+        "Private manifest fetched and verified"
     );
 
     // ── Step 12: fetch ciphertext chunks (V2-assignment-aware) ──────
@@ -466,62 +501,348 @@ pub async fn run_download_private(
 // `DownloadOrchestrator` to share peer-discovery / manifest-fetch code
 // is more invasive than the win is worth for a single new caller.
 
-async fn fetch_encrypted_manifest(
+/// V2-assignment-aware manifest fetch with bounded fan-out and inline
+/// validation (Phase 4d).
+///
+/// Replaces the Phase 4b single-peer manifest fetch. The Phase 4b
+/// version accepted the FIRST manifest response from any connected
+/// peer (peer-discovered, not assignment-aware) and validated it
+/// AFTER returning. Two consequences:
+///
+///   * A slow / malicious peer in the assigned set could stall fetch
+///     even when other archives could serve immediately.
+///   * Wrong-root or undecryptable responses surfaced as a hard error
+///     instead of a per-peer rejection — one bad responder poisoned
+///     the whole download.
+///
+/// Phase 4d behavior:
+///
+///   1. Compute the V2 distinct_assigned set: the union of
+///      `assigned_archives(merkle_root, snapshot, chunk_index, R)` for
+///      every chunk index in `[0, info.chunk_count)`. This mirrors
+///      the upload-side push set in `s2_push_chunks` byte-for-byte —
+///      the same archives that received the manifest at upload are
+///      asked for it at download.
+///   2. Maintain a `ManifestArchiveStatus` per archive (Untried /
+///      Dispatched / Failed). Dispatch up to `fanout =
+///      compute_manifest_fanout(max_concurrent, |distinct_assigned|)`
+///      requests in flight at a time, picking sorted-by-address.
+///   3. On `ShardReceived` for the manifest CID from a peer we
+///      dispatched to: validate inline (decrypt with K_file, parse,
+///      check chain root, rebuild Merkle root). First archive whose
+///      response validates wins.
+///   4. On rejection (peer-side error string, decrypt fail, parse
+///      fail, root mismatch, Merkle mismatch): mark archive `Failed`,
+///      log a per-archive warn, dispatch a replacement so the
+///      in-flight cap stays full.
+///   5. Drop unsolicited responses (CID mismatch, sender not a peer
+///      we asked, archive already transitioned to Failed) silently —
+///      same hygiene as chunk fetch.
+///   6. On all archives `Failed` (no `Untried` and no `Dispatched`
+///      left) OR on deadline: return
+///      `PrivateDownloadError::ManifestFetchAllArchivesFailed` with
+///      structured tried / resolvable / unresolvable counts and the
+///      last rejection reason.
+///
+/// Returns the already-decrypted, root-and-Merkle-verified
+/// `DataManifest`. Caller MUST NOT re-validate.
+async fn fetch_manifest_v2(
     net: &SumNet,
+    rpc: &L1RpcClient,
     peer_addresses: &RwLock<HashMap<PeerId, [u8; 20]>>,
-    chain_root: &[u8; 32],
+    info: &StorageFileInfoV2,
+    chain_root: [u8; 32],
+    k_file: &Zeroizing<[u8; 32]>,
     timeout: Duration,
-) -> Result<Vec<u8>> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let root_hex = hex::encode(chain_root);
-    let manifest_cid = format!("{MANIFEST_REQUEST_PREFIX}{root_hex}");
-    let mut tried: HashSet<PeerId> = HashSet::new();
-    let mut discovered_peers: Vec<PeerId> = Vec::new();
+    max_concurrent: usize,
+) -> std::result::Result<DataManifest, PrivateDownloadError> {
+    // ── 1. Build V2 distinct_assigned ───────────────────────────────
+    //
+    // Mirrors `fetch_all_ciphertext_chunks_v2` Step 12a — duplicated
+    // inline rather than extracted to keep the manifest-fan-out diff
+    // local to this function (chunk fetch is intentionally untouched
+    // by this slice). A small follow-up could lift snapshot+R into a
+    // shared helper if the duplication starts hurting.
+    let snapshot_records = rpc
+        .storage_get_active_nodes_at_height(info.assignment_height)
+        .await
+        .map_err(|e| {
+            PrivateDownloadError::ManifestFetch(anyhow::anyhow!(
+                "storage_getActiveNodesAtHeight: {e}"
+            ))
+        })?;
+    let mut snapshot: Vec<[u8; 20]> = Vec::with_capacity(snapshot_records.len());
+    for n in &snapshot_records {
+        let addr = sum_net::identity::l1_address_from_base58(&n.address).map_err(|e| {
+            PrivateDownloadError::ManifestFetch(anyhow::anyhow!("snapshot l1 address parse: {e}"))
+        })?;
+        snapshot.push(addr);
+    }
+    snapshot.sort();
+    if snapshot.is_empty() {
+        return Err(PrivateDownloadError::ManifestFetch(anyhow::anyhow!(
+            "snapshot at assignment_height={} has no active archives — \
+             cannot route manifest request",
+            info.assignment_height
+        )));
+    }
+    let chain_params = rpc
+        .chain_get_chain_params()
+        .await
+        .map_err(|e| {
+            PrivateDownloadError::ManifestFetch(anyhow::anyhow!("chain_getChainParams: {e}"))
+        })?;
+    let r = chain_params.assignment_replication_factor;
 
-    loop {
-        tokio::select! {
-            event = net.next_event() => {
-                match event {
-                    Some(SumNetEvent::PeerDiscovered { peer_id, .. }) => {
-                        if !discovered_peers.contains(&peer_id) {
-                            discovered_peers.push(peer_id);
-                            try_request_manifest(net, peer_id, &root_hex, &mut tried).await;
-                        }
-                    }
-                    Some(ref e @ SumNetEvent::PeerIdentified { .. })
-                    | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {
-                        apply_peer_event(&mut *peer_addresses.write().await, e);
-                    }
-                    Some(SumNetEvent::ShardReceived { peer_id, response }) if response.cid == manifest_cid => {
-                        if let Some(err) = response.error.as_deref() {
-                            warn!(%peer_id, %err, "Private manifest fetch: peer rejected — waiting for others");
-                            continue;
-                        }
-                        return Ok(response.data);
-                    }
-                    None => anyhow::bail!("network shut down before Private manifest received"),
-                    _ => {}
+    let mut distinct_assigned: BTreeSet<[u8; 20]> = BTreeSet::new();
+    for chunk_index in 0..info.chunk_count {
+        let assigned =
+            sum_store::assignment_v2::assigned_archives(&chain_root, &snapshot, chunk_index, r);
+        for addr in assigned {
+            distinct_assigned.insert(addr);
+        }
+    }
+    if distinct_assigned.is_empty() {
+        return Err(PrivateDownloadError::ManifestFetch(anyhow::anyhow!(
+            "file has 0 V2-assigned archives (chunk_count={}); cannot fetch manifest",
+            info.chunk_count
+        )));
+    }
+    let assigned_total = distinct_assigned.len();
+    let fanout = compute_manifest_fanout(max_concurrent, assigned_total);
+
+    // ── 2. Per-archive state + bookkeeping ──────────────────────────
+    let mut archive_status: HashMap<[u8; 20], ManifestArchiveStatus> = distinct_assigned
+        .iter()
+        .map(|a| (*a, ManifestArchiveStatus::Untried))
+        .collect();
+    // Reverse map peer_id → archive_addr for the (small) set of peers
+    // we've dispatched to. Lets us reject `ShardReceived` from peers
+    // we never asked without scanning archive_status.
+    let mut dispatched_peers: HashMap<PeerId, [u8; 20]> = HashMap::new();
+    let manifest_cid = format!("{MANIFEST_REQUEST_PREFIX}{}", hex::encode(chain_root));
+    let root_hex = hex::encode(chain_root);
+    // Last per-response failure surfaced; embedded in the structured
+    // error if every archive is exhausted.
+    let mut last_reason: String = "no responses received".to_string();
+
+    // Helper: snapshot peer_addresses, run the pure selector, fire
+    // `request_manifest`, and transition archive_status. Mirrors the
+    // chunk-concurrency `try_dispatch_pending` style.
+    async fn dispatch_wave(
+        net: &SumNet,
+        peer_addresses: &RwLock<HashMap<PeerId, [u8; 20]>>,
+        archive_status: &mut HashMap<[u8; 20], ManifestArchiveStatus>,
+        dispatched_peers: &mut HashMap<PeerId, [u8; 20]>,
+        root_hex: &str,
+        fanout: usize,
+    ) {
+        let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
+            .read()
+            .await
+            .iter()
+            .map(|(p, a)| (*a, *p))
+            .collect();
+        let dispatches = select_manifest_dispatch(archive_status, &addr_to_peer, fanout);
+        for d in dispatches {
+            match net.request_manifest(d.peer_id, root_hex.to_string()).await {
+                Ok(()) => {
+                    archive_status.insert(d.archive_addr, ManifestArchiveStatus::Dispatched);
+                    dispatched_peers.insert(d.peer_id, d.archive_addr);
                 }
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                anyhow::bail!("Private manifest fetch timed out after {timeout:?}");
+                Err(e) => {
+                    // Send-side enqueue failure: mark this archive
+                    // failed (it never reached the wire). Prefer
+                    // marking-Failed over leaving Untried so we don't
+                    // try the same dispatch repeatedly on every
+                    // dispatch wave.
+                    warn!(
+                        peer = %d.peer_id,
+                        archive = %hex::encode(d.archive_addr),
+                        %e,
+                        "Private manifest fan-out: enqueue failed; marking archive failed"
+                    );
+                    archive_status.insert(d.archive_addr, ManifestArchiveStatus::Failed);
+                }
             }
         }
     }
-}
 
-async fn try_request_manifest(
-    net: &SumNet,
-    peer_id: PeerId,
-    root_hex: &str,
-    tried: &mut HashSet<PeerId>,
-) {
-    if tried.insert(peer_id) {
-        if let Err(e) = net
-            .request_manifest(peer_id, root_hex.to_string())
-            .await
-        {
-            warn!(%peer_id, %e, "Private manifest request enqueue failed");
+    // Helper: build the structured all-failed error. Used by every
+    // non-success exit path (deadline, network shutdown, archives
+    // exhausted) so the diagnostic shape is identical.
+    let build_all_failed = |archive_status: &HashMap<[u8; 20], ManifestArchiveStatus>,
+                            addr_to_peer: &HashMap<[u8; 20], PeerId>,
+                            last_reason: String|
+     -> PrivateDownloadError {
+        let resolvable = distinct_assigned
+            .iter()
+            .filter(|a| addr_to_peer.contains_key(*a))
+            .count();
+        let unresolvable = assigned_total - resolvable;
+        let tried = archive_status
+            .values()
+            .filter(|s| !matches!(s, ManifestArchiveStatus::Untried))
+            .count();
+        PrivateDownloadError::ManifestFetchAllArchivesFailed {
+            assigned_total,
+            tried,
+            resolvable,
+            unresolvable,
+            last_reason,
+        }
+    };
+
+    // ── 3. Initial dispatch ────────────────────────────────────────
+    dispatch_wave(
+        net,
+        peer_addresses,
+        &mut archive_status,
+        &mut dispatched_peers,
+        &root_hex,
+        fanout,
+    )
+    .await;
+
+    // ── 4. Event loop ──────────────────────────────────────────────
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        // Termination: every archive has been Failed (no Untried
+        // waiting on PeerIdentified, no Dispatched in-flight). We
+        // intentionally keep looping while ANY archive is Untried —
+        // it may yet become resolvable via PeerIdentified before the
+        // deadline.
+        let any_alive = archive_status
+            .values()
+            .any(|s| !matches!(s, ManifestArchiveStatus::Failed));
+        if !any_alive {
+            let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
+                .read()
+                .await
+                .iter()
+                .map(|(p, a)| (*a, *p))
+                .collect();
+            return Err(build_all_failed(&archive_status, &addr_to_peer, last_reason));
+        }
+
+        let event = tokio::select! {
+            ev = net.next_event() => ev,
+            _ = tokio::time::sleep_until(deadline) => {
+                let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
+                    .read()
+                    .await
+                    .iter()
+                    .map(|(p, a)| (*a, *p))
+                    .collect();
+                return Err(build_all_failed(
+                    &archive_status,
+                    &addr_to_peer,
+                    format!("manifest fetch deadline exceeded after {timeout:?}; previous: {last_reason}"),
+                ));
+            }
+        };
+
+        match event {
+            Some(SumNetEvent::PeerDiscovered { .. }) => {
+                // PeerDiscovered alone doesn't unlock the
+                // L1-addr→PeerId map; PeerIdentified does.
+            }
+            Some(ref e @ SumNetEvent::PeerIdentified { .. })
+            | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {
+                apply_peer_event(&mut *peer_addresses.write().await, e);
+                // A new PeerIdentified may have unlocked an Untried
+                // archive — try to fill the in-flight quota.
+                dispatch_wave(
+                    net,
+                    peer_addresses,
+                    &mut archive_status,
+                    &mut dispatched_peers,
+                    &root_hex,
+                    fanout,
+                )
+                .await;
+            }
+            Some(SumNetEvent::ShardReceived { peer_id, response }) => {
+                if response.cid != manifest_cid {
+                    // Not the manifest CID — likely a chunk response
+                    // we don't care about right now (Step 12 handles
+                    // chunks). Drop silently.
+                    continue;
+                }
+                let Some(&archive_addr) = dispatched_peers.get(&peer_id) else {
+                    // Sender wasn't on our dispatch list — could be
+                    // stale or unsolicited. Drop.
+                    continue;
+                };
+                if !matches!(
+                    archive_status.get(&archive_addr),
+                    Some(ManifestArchiveStatus::Dispatched)
+                ) {
+                    // Already transitioned (duplicate response, or a
+                    // race we don't expect). Drop.
+                    continue;
+                }
+
+                if let Some(err) = response.error.as_deref() {
+                    warn!(
+                        peer = %peer_id,
+                        archive = %hex::encode(archive_addr),
+                        %err,
+                        "Private manifest fan-out: peer-side error; trying others"
+                    );
+                    last_reason =
+                        format!("archive {} peer error: {}", hex::encode(archive_addr), err);
+                    archive_status.insert(archive_addr, ManifestArchiveStatus::Failed);
+                } else {
+                    match decrypt_and_verify_manifest(k_file, &response.data, chain_root) {
+                        Ok(manifest) => {
+                            // First valid response wins. Subsequent
+                            // ShardReceived events for the manifest CID
+                            // (from still-in-flight peers) drain into
+                            // the next caller's `next_event()` and are
+                            // dropped there as unrecognized CIDs.
+                            return Ok(manifest);
+                        }
+                        Err(e) => {
+                            warn!(
+                                peer = %peer_id,
+                                archive = %hex::encode(archive_addr),
+                                err = %e,
+                                "Private manifest fan-out: validation rejected response; trying others"
+                            );
+                            last_reason =
+                                format!("archive {} validation: {}", hex::encode(archive_addr), e);
+                            archive_status.insert(archive_addr, ManifestArchiveStatus::Failed);
+                        }
+                    }
+                }
+
+                // Replace the failed in-flight slot so the next-fastest
+                // archive isn't blocked on the slow one.
+                dispatch_wave(
+                    net,
+                    peer_addresses,
+                    &mut archive_status,
+                    &mut dispatched_peers,
+                    &root_hex,
+                    fanout,
+                )
+                .await;
+            }
+            None => {
+                let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
+                    .read()
+                    .await
+                    .iter()
+                    .map(|(p, a)| (*a, *p))
+                    .collect();
+                return Err(build_all_failed(
+                    &archive_status,
+                    &addr_to_peer,
+                    format!("network shut down mid-fetch; previous: {last_reason}"),
+                ));
+            }
+            _ => {}
         }
     }
 }
@@ -924,6 +1245,109 @@ fn select_chunks_to_dispatch(
                 in_flight += 1;
             }
         }
+    }
+    out
+}
+
+// ── Phase 4d manifest fan-out: pure helpers ──────────────────────────────────
+
+/// Per-archive manifest-fetch state, keyed by L1 address. Mirrors the
+/// per-chunk `ChunkFetchState` but flatter: a single archive is in
+/// exactly one of three states for the whole fetch (a manifest is
+/// served-or-not; there's no archive-list-walking like there is per
+/// chunk).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestArchiveStatus {
+    /// Eligible to be dispatched (PeerId may or may not yet be resolvable).
+    Untried,
+    /// `request_manifest` was issued; awaiting response or deadline.
+    Dispatched,
+    /// Response was received and rejected (validation failed, peer-side
+    /// error, or wire shape malformed). Will not be retried — the V2
+    /// assignment is deterministic, the SAME archive returning a SECOND
+    /// response would be no more trustworthy than the first.
+    Failed,
+}
+
+/// One scheduled manifest dispatch produced by `select_manifest_dispatch`.
+/// The async wrapper performs the wire send and transitions the archive
+/// from `Untried` to `Dispatched`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManifestDispatchTarget {
+    peer_id: PeerId,
+    archive_addr: [u8; 20],
+}
+
+/// Compute the manifest fan-out cap.
+///
+/// Per the operator-tunable constraint: `fanout = max_concurrent
+/// .clamp(1, 3) .min(assigned_size)`. The clamp upper bound (3) reflects
+/// that manifests are tiny and small-fan-out is enough to mask one slow
+/// peer; raising it past 3 amplifies inbound bandwidth on archives
+/// without buying meaningful resilience. The clamp lower bound (1) means
+/// a misconfigured `--max-concurrent 0` still attempts at least one
+/// archive instead of deadlocking. The `.min(assigned_size)` prevents
+/// dispatching more requests than there are candidates.
+///
+/// `assigned_size == 0` returns `0` and is the caller's signal to bail
+/// out before entering the fetch loop — we'd never make progress.
+fn compute_manifest_fanout(max_concurrent: usize, assigned_size: usize) -> usize {
+    if assigned_size == 0 {
+        return 0;
+    }
+    max_concurrent.clamp(1, 3).min(assigned_size)
+}
+
+/// **Pure** dispatch selector for the manifest fan-out loop. Returns
+/// the list of (peer, archive) pairs to dispatch right now, subject to
+/// the live in-flight cap of `fanout`.
+///
+/// Selection rules:
+///   * Iterates `Untried` archives in sorted-by-address order so
+///     selection is deterministic across runs (operators see the same
+///     archive picked first given the same inputs).
+///   * Skips archives whose PeerId is not yet in `addr_to_peer`. Unlike
+///     `select_chunks_to_dispatch`, here we DO skip-and-continue:
+///     manifest archives are unordered (any can serve), so passing
+///     over an unresolvable archive to dispatch a resolvable one
+///     doesn't violate any priority invariant.
+///   * Stops as soon as `(existing dispatched) + (selected this wave)
+///     == fanout`.
+fn select_manifest_dispatch(
+    archive_status: &HashMap<[u8; 20], ManifestArchiveStatus>,
+    addr_to_peer: &HashMap<[u8; 20], PeerId>,
+    fanout: usize,
+) -> Vec<ManifestDispatchTarget> {
+    let in_flight = archive_status
+        .values()
+        .filter(|s| matches!(s, ManifestArchiveStatus::Dispatched))
+        .count();
+    if in_flight >= fanout {
+        return Vec::new();
+    }
+    let mut remaining = fanout - in_flight;
+
+    let mut untried: Vec<[u8; 20]> = archive_status
+        .iter()
+        .filter(|(_, s)| matches!(s, ManifestArchiveStatus::Untried))
+        .map(|(a, _)| *a)
+        .collect();
+    untried.sort();
+
+    let mut out: Vec<ManifestDispatchTarget> = Vec::new();
+    for addr in untried {
+        if remaining == 0 {
+            break;
+        }
+        if let Some(&peer_id) = addr_to_peer.get(&addr) {
+            out.push(ManifestDispatchTarget {
+                peer_id,
+                archive_addr: addr,
+            });
+            remaining -= 1;
+        }
+        // Unresolvable: skip — keep status as Untried so a future
+        // PeerIdentified lets us pick it up next wave.
     }
     out
 }
@@ -1653,6 +2077,210 @@ mod tests {
         let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 8);
         let indices: Vec<u32> = dispatches.iter().map(|d| d.chunk_index).collect();
         assert_eq!(indices, vec![0, 2], "chunk 1 already done; dispatch 0 and 2");
+    }
+
+    // ── Phase 4d manifest fan-out: compute_manifest_fanout ─────────
+
+    /// `compute_manifest_fanout` enforces three invariants:
+    ///   * `max_concurrent == 0` clamps to 1 — a misconfigured CLI
+    ///     value cannot deadlock the fetch loop.
+    ///   * Upper bound is 3 — manifests are tiny and small fan-out is
+    ///     enough to mask one slow archive; raising the cap inflates
+    ///     inbound bandwidth on archives without buying resilience.
+    ///   * `min(assigned_size)` prevents dispatching more requests
+    ///     than there are candidates.
+    /// `assigned_size == 0` returns `0` (caller bails before entering
+    /// the fetch loop).
+    #[test]
+    fn compute_manifest_fanout_zero_clamps_to_one() {
+        assert_eq!(compute_manifest_fanout(0, 5), 1);
+    }
+
+    #[test]
+    fn compute_manifest_fanout_upper_bound_three() {
+        // Operator passes --max-concurrent 100; assigned set has 5
+        // archives. Fan-out is capped at 3, not raised toward
+        // assigned_size or max_concurrent.
+        assert_eq!(compute_manifest_fanout(100, 5), 3);
+        assert_eq!(compute_manifest_fanout(4, 5), 3);
+        assert_eq!(compute_manifest_fanout(3, 5), 3);
+    }
+
+    #[test]
+    fn compute_manifest_fanout_below_upper_bound_is_passthrough() {
+        // max_concurrent within [1,3] is honored exactly when the
+        // assigned set has at least that many archives.
+        assert_eq!(compute_manifest_fanout(1, 5), 1);
+        assert_eq!(compute_manifest_fanout(2, 5), 2);
+    }
+
+    #[test]
+    fn compute_manifest_fanout_clamped_to_assigned_size() {
+        // 1-archive file: even max_concurrent = 100 produces fan-out
+        // = 1 because there's only one candidate to ask.
+        assert_eq!(compute_manifest_fanout(100, 1), 1);
+        // 2-archive file with max_concurrent = 3: fan-out = 2.
+        assert_eq!(compute_manifest_fanout(3, 2), 2);
+    }
+
+    #[test]
+    fn compute_manifest_fanout_zero_assigned_returns_zero() {
+        // Empty assigned set is the caller's signal to bail. Returning
+        // 0 (rather than 1) makes the fetch loop's own termination
+        // checks short-circuit cleanly.
+        assert_eq!(compute_manifest_fanout(3, 0), 0);
+        assert_eq!(compute_manifest_fanout(0, 0), 0);
+    }
+
+    // ── Phase 4d manifest fan-out: select_manifest_dispatch ────────
+
+    /// Build a synthetic archive_status map (all `Untried`) and a
+    /// matching addr_to_peer (every archive resolvable to a fresh
+    /// fake PeerId). Mirrors the chunk-concurrency `synth_state`.
+    fn synth_manifest_fanout_state(
+        archives: &[[u8; 20]],
+    ) -> (
+        HashMap<[u8; 20], ManifestArchiveStatus>,
+        HashMap<[u8; 20], PeerId>,
+    ) {
+        let archive_status = archives
+            .iter()
+            .map(|a| (*a, ManifestArchiveStatus::Untried))
+            .collect();
+        let addr_to_peer = archives
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    sum_net::Keypair::generate_ed25519().public().to_peer_id(),
+                )
+            })
+            .collect();
+        (archive_status, addr_to_peer)
+    }
+
+    /// `fanout = 1` collapses to one in-flight at a time — sequential
+    /// fallback identical to the Phase 4b single-peer behavior.
+    #[test]
+    fn select_manifest_dispatch_fanout_one_is_sequential() {
+        let archives: Vec<[u8; 20]> = (1u8..=5).map(|b| [b; 20]).collect();
+        let (status, addr_to_peer) = synth_manifest_fanout_state(&archives);
+        let dispatches = select_manifest_dispatch(&status, &addr_to_peer, 1);
+        assert_eq!(dispatches.len(), 1);
+        // Sorted-by-address dispatch order: lowest archive first.
+        assert_eq!(dispatches[0].archive_addr, [1u8; 20]);
+    }
+
+    /// `fanout = N` produces exactly N dispatches when at least N
+    /// untried-and-resolvable archives exist.
+    #[test]
+    fn select_manifest_dispatch_caps_in_flight_at_fanout() {
+        let archives: Vec<[u8; 20]> = (1u8..=5).map(|b| [b; 20]).collect();
+        let (status, addr_to_peer) = synth_manifest_fanout_state(&archives);
+
+        for fanout in [1usize, 2, 3, 5] {
+            let dispatches = select_manifest_dispatch(&status, &addr_to_peer, fanout);
+            assert_eq!(
+                dispatches.len(),
+                fanout.min(archives.len()),
+                "fanout={fanout} produced {} dispatches",
+                dispatches.len()
+            );
+        }
+    }
+
+    /// Existing in-flight count is subtracted from the cap. If 2
+    /// archives are already Dispatched and fanout = 3, only ONE more
+    /// gets selected this wave.
+    #[test]
+    fn select_manifest_dispatch_respects_existing_in_flight() {
+        let archives: Vec<[u8; 20]> = (1u8..=5).map(|b| [b; 20]).collect();
+        let (mut status, addr_to_peer) = synth_manifest_fanout_state(&archives);
+        status.insert([1u8; 20], ManifestArchiveStatus::Dispatched);
+        status.insert([2u8; 20], ManifestArchiveStatus::Dispatched);
+
+        let dispatches = select_manifest_dispatch(&status, &addr_to_peer, 3);
+        assert_eq!(dispatches.len(), 1, "2 already dispatched, fanout 3 → 1 more");
+        // The remaining slot goes to the lowest-address Untried (3).
+        assert_eq!(dispatches[0].archive_addr, [3u8; 20]);
+    }
+
+    /// `Failed` and `Dispatched` archives are not re-dispatched.
+    /// Selector only picks `Untried` candidates.
+    #[test]
+    fn select_manifest_dispatch_skips_dispatched_and_failed() {
+        let archives: Vec<[u8; 20]> = (1u8..=4).map(|b| [b; 20]).collect();
+        let (mut status, addr_to_peer) = synth_manifest_fanout_state(&archives);
+        status.insert([1u8; 20], ManifestArchiveStatus::Failed);
+        status.insert([2u8; 20], ManifestArchiveStatus::Dispatched);
+        // 3 and 4 remain Untried.
+
+        let dispatches = select_manifest_dispatch(&status, &addr_to_peer, 3);
+        // 1 already in-flight → 2 slots remain. Both Untried picked.
+        let picked: Vec<[u8; 20]> = dispatches.iter().map(|d| d.archive_addr).collect();
+        assert_eq!(picked, vec![[3u8; 20], [4u8; 20]]);
+    }
+
+    /// Archives whose PeerId is not yet in `addr_to_peer` are
+    /// SKIPPED (not held). Manifest archives are unordered: passing
+    /// over an unresolvable archive in favor of a resolvable one
+    /// doesn't violate any priority invariant. Status stays
+    /// `Untried` so a future PeerIdentified picks it up.
+    #[test]
+    fn select_manifest_dispatch_skips_unresolvable_archives() {
+        let archives: Vec<[u8; 20]> = (1u8..=4).map(|b| [b; 20]).collect();
+        let (status, mut addr_to_peer) = synth_manifest_fanout_state(&archives);
+        // Lowest-address archive (1) is unresolvable.
+        addr_to_peer.remove(&[1u8; 20]);
+
+        let dispatches = select_manifest_dispatch(&status, &addr_to_peer, 3);
+        let picked: Vec<[u8; 20]> = dispatches.iter().map(|d| d.archive_addr).collect();
+        // Skipped 1, picked next 3 in sorted order.
+        assert_eq!(picked, vec![[2u8; 20], [3u8; 20], [4u8; 20]]);
+    }
+
+    /// All archives `Failed`: selector returns empty. The fetch loop
+    /// uses this state to detect "exhausted, return typed error".
+    #[test]
+    fn select_manifest_dispatch_empty_when_all_failed() {
+        let archives: Vec<[u8; 20]> = (1u8..=3).map(|b| [b; 20]).collect();
+        let (mut status, addr_to_peer) = synth_manifest_fanout_state(&archives);
+        for a in &archives {
+            status.insert(*a, ManifestArchiveStatus::Failed);
+        }
+        let dispatches = select_manifest_dispatch(&status, &addr_to_peer, 3);
+        assert!(dispatches.is_empty());
+    }
+
+    /// No resolvable Untried archives: selector returns empty even
+    /// though Untried entries exist. The fetch loop keeps waiting on
+    /// PeerIdentified events until the deadline.
+    #[test]
+    fn select_manifest_dispatch_empty_when_no_resolvable_untried() {
+        let archives: Vec<[u8; 20]> = (1u8..=3).map(|b| [b; 20]).collect();
+        let (status, _) = synth_manifest_fanout_state(&archives);
+        // Empty addr_to_peer = no archive resolvable.
+        let empty_addr_to_peer: HashMap<[u8; 20], PeerId> = HashMap::new();
+        let dispatches = select_manifest_dispatch(&status, &empty_addr_to_peer, 3);
+        assert!(dispatches.is_empty());
+    }
+
+    /// Sort-by-address determinism: given the same inputs, the
+    /// selector returns the same dispatch list every call. This is
+    /// the load-bearing testability property — concurrency invariants
+    /// tested here mirror production behavior 1:1.
+    #[test]
+    fn select_manifest_dispatch_is_deterministic() {
+        let archives: Vec<[u8; 20]> = vec![[0x42; 20], [0x10; 20], [0xAA; 20], [0x80; 20]];
+        let (status, addr_to_peer) = synth_manifest_fanout_state(&archives);
+        let first = select_manifest_dispatch(&status, &addr_to_peer, 3);
+        let second = select_manifest_dispatch(&status, &addr_to_peer, 3);
+        assert_eq!(first, second);
+        // First-by-address is 0x10.
+        assert_eq!(first[0].archive_addr, [0x10u8; 20]);
+        // Then 0x42, 0x80.
+        assert_eq!(first[1].archive_addr, [0x42u8; 20]);
+        assert_eq!(first[2].archive_addr, [0x80u8; 20]);
     }
 }
 
