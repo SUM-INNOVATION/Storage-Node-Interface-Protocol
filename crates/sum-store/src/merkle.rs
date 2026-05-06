@@ -25,14 +25,16 @@ impl MerkleTree {
             return Self { levels: vec![] };
         }
         if leaf_hashes.len() == 1 {
-            return Self { levels: vec![leaf_hashes.to_vec()] };
+            return Self {
+                levels: vec![leaf_hashes.to_vec()],
+            };
         }
 
         let mut levels = vec![leaf_hashes.to_vec()];
         let mut current = leaf_hashes.to_vec();
 
         while current.len() > 1 {
-            let mut next = Vec::with_capacity((current.len() + 1) / 2);
+            let mut next = Vec::with_capacity(current.len().div_ceil(2));
             for pair in current.chunks(2) {
                 let left = &pair[0];
                 let right = pair.get(1).unwrap_or(left); // duplicate last if odd
@@ -211,8 +213,7 @@ mod tests {
     fn cross_validate_all_proofs_with_l1_verifier() {
         // Test various tree sizes including odd counts
         for n in 1..=17u32 {
-            let leaves: Vec<blake3::Hash> =
-                (0..n).map(|i| make_leaf(&i.to_le_bytes())).collect();
+            let leaves: Vec<blake3::Hash> = (0..n).map(|i| make_leaf(&i.to_le_bytes())).collect();
             let tree = MerkleTree::build(&leaves);
             let root = tree.root();
 
@@ -252,8 +253,7 @@ mod tests {
     fn depth_matches_l1_formula() {
         // L1 formula: for chunk_count > 1, depth = 64 - (chunk_count - 1).leading_zeros()
         for n in 2..=64u32 {
-            let leaves: Vec<blake3::Hash> =
-                (0..n).map(|i| make_leaf(&i.to_le_bytes())).collect();
+            let leaves: Vec<blake3::Hash> = (0..n).map(|i| make_leaf(&i.to_le_bytes())).collect();
             let tree = MerkleTree::build(&leaves);
             let expected = 64 - ((n as u64) - 1).leading_zeros() as usize;
             assert_eq!(

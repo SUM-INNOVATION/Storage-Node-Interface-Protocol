@@ -22,13 +22,13 @@ use crate::codec::VersionedShardCodec;
 /// - `Dcutr(dcutr::Event)`
 #[derive(NetworkBehaviour)]
 pub struct LocalMeshBehaviour {
-    pub mdns:         mdns::tokio::Behaviour,
-    pub gossipsub:    gossipsub::Behaviour,
-    pub identify:     identify::Behaviour,
-    pub shard_xfer:   request_response::Behaviour<VersionedShardCodec>,
-    pub kademlia:     kad::Behaviour<kad::store::MemoryStore>,
-    pub autonat:      autonat::Behaviour,
-    pub relay:        relay::Behaviour,
+    pub mdns: mdns::tokio::Behaviour,
+    pub gossipsub: gossipsub::Behaviour,
+    pub identify: identify::Behaviour,
+    pub shard_xfer: request_response::Behaviour<VersionedShardCodec>,
+    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    pub autonat: autonat::Behaviour,
+    pub relay: relay::Behaviour,
     pub relay_client: relay::client::Behaviour,
-    pub dcutr:        dcutr::Behaviour,
+    pub dcutr: dcutr::Behaviour,
 }

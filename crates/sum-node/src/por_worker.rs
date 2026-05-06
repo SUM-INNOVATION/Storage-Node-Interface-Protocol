@@ -168,13 +168,18 @@ impl PorWorker {
         let manifest = store_read
             .manifest_idx
             .get_by_merkle_root(&merkle_root)
-            .ok_or_else(|| anyhow::anyhow!("no manifest for merkle root {}", challenge.merkle_root))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("no manifest for merkle root {}", challenge.merkle_root)
+            })?;
 
         let chunk_cid = store_read
             .manifest_idx
             .chunk_cid(&merkle_root, chunk_index)
             .ok_or_else(|| {
-                anyhow::anyhow!("no chunk at index {chunk_index} for root {}", challenge.merkle_root)
+                anyhow::anyhow!(
+                    "no chunk at index {chunk_index} for root {}",
+                    challenge.merkle_root
+                )
             })?
             .to_string();
 

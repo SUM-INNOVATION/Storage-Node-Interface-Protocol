@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use libp2p::{gossipsub, kad, mdns, PeerId, StreamProtocol};
+use libp2p::{PeerId, StreamProtocol, gossipsub, kad, mdns};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -53,9 +53,7 @@ pub fn handle_mdns_event(
             }
             for (peer_id, addrs) in by_peer {
                 info!(%peer_id, addr_count = addrs.len(), "mDNS discovered peer");
-                if let Err(e) =
-                    event_tx.try_send(SumNetEvent::PeerDiscovered { peer_id, addrs })
-                {
+                if let Err(e) = event_tx.try_send(SumNetEvent::PeerDiscovered { peer_id, addrs }) {
                     warn!(%e, "event channel full — dropping PeerDiscovered");
                 }
             }

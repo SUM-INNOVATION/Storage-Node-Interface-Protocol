@@ -1,0 +1,55 @@
+# CI — runs `make release-check` on every PR and on every push to main.
+#
+# This workflow IS the merge gate. The check name is exactly
+# "release-check (linux)" so the GitHub branch-protection rule in
+# Settings → Branches can require it by stable name (renaming the
+# job invalidates the rule). See docs/RELEASE-CHECKLIST.md for the
+# operator setup.
+#
+# Scope is intentionally minimal: no live-chain smoke (needs an RPC
+# URL we don't ship in CI), no release artifact upload, no coverage,
+# no macOS matrix. Add macOS once linux is stable in production.
+#
+# All third-party actions are pinned to a full commit SHA, not a
+# floating tag. The human tag pulled from the upstream repo is
+# included as a comment so the SHA is auditable without network
+# access. Bumping requires explicit edits + re-pin to the new SHA.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-progress runs on the same PR when new commits land. NEVER
+# cancel `main` runs mid-flight — those are the durable gate.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  release-check:
+    # NOTE: the branch-protection rule references this name verbatim.
+    # Do NOT rename without updating the GitHub Settings → Branches rule.
+    name: release-check (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Rust toolchain (stable, with rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: make release-check
+        run: make release-check

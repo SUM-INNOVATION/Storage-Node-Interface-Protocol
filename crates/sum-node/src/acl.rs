@@ -82,7 +82,11 @@ impl AclChecker {
         peer_addresses: Arc<RwLock<HashMap<PeerId, [u8; 20]>>>,
         profile: NodeProfile,
     ) -> Self {
-        Self { rpc, peer_addresses, profile }
+        Self {
+            rpc,
+            peer_addresses,
+            profile,
+        }
     }
 
     /// Whether this checker is running in Production mode. Useful for
@@ -156,7 +160,11 @@ impl AclChecker {
         //    a failure is a legitimate "no V2 row / V2 RPC unsupported"
         //    legacy-signal (→ fall back to V1) or an ambiguous infra
         //    failure (→ fail closed via the caller's policy).
-        match self.rpc.storage_get_file_info_v2(&root_hex, None, None).await {
+        match self
+            .rpc
+            .storage_get_file_info_v2(&root_hex, None, None)
+            .await
+        {
             Ok(info) => {
                 return self.check_access_v2(peer_id, cid, &info).await;
             }
@@ -230,11 +238,7 @@ impl AclChecker {
             return Ok(false);
         };
         let addr_base58 = identity::l1_address_base58(&addr);
-        let Some(entry) = info
-            .access_list
-            .iter()
-            .find(|e| e.address == addr_base58)
-        else {
+        let Some(entry) = info.access_list.iter().find(|e| e.address == addr_base58) else {
             tracing::info!(
                 %peer_id, %cid,
                 addr = %addr_base58,
@@ -467,10 +471,7 @@ mod tests {
     /// `(peer, l1_addr)` mappings. `profile = Production` so the
     /// "uncertain" branches deny — tests that expect deny don't have
     /// to switch profile.
-    async fn build_checker(
-        url: &str,
-        peers: Vec<(PeerId, [u8; 20])>,
-    ) -> AclChecker {
+    async fn build_checker(url: &str, peers: Vec<(PeerId, [u8; 20])>) -> AclChecker {
         let rpc = Arc::new(L1RpcClient::new(url.to_string()));
         let map = HashMap::from_iter(peers);
         let peer_addresses = Arc::new(RwLock::new(map));
@@ -483,11 +484,7 @@ mod tests {
 
     /// `StorageFileInfoV2` response body. Constructs the JSON shape
     /// the chain emits — see `crates/sum-types/src/rpc_types.rs`.
-    fn v2_info_json(
-        merkle_root_hex: &str,
-        visibility: u8,
-        access_list_json: &str,
-    ) -> String {
+    fn v2_info_json(merkle_root_hex: &str, visibility: u8, access_list_json: &str) -> String {
         format!(
             r#"{{
                 "merkle_root": "{merkle_root_hex}",
@@ -506,15 +503,8 @@ mod tests {
             }}"#
         )
     }
-    fn v1_info_json(
-        merkle_root_hex: &str,
-        access_list: &[&str],
-        fee_pool: u64,
-    ) -> String {
-        let list: Vec<String> = access_list
-            .iter()
-            .map(|a| format!(r#""{a}""#))
-            .collect();
+    fn v1_info_json(merkle_root_hex: &str, access_list: &[&str], fee_pool: u64) -> String {
+        let list: Vec<String> = access_list.iter().map(|a| format!(r#""{a}""#)).collect();
         format!(
             r#"{{
                 "merkle_root": "{merkle_root_hex}",
@@ -546,8 +536,7 @@ mod tests {
         let too_short = "manifest:abcd";
         assert!(resolve_root(too_short, &idx).is_none());
 
-        let non_hex =
-            "manifest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdez";
+        let non_hex = "manifest:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdez";
         assert!(resolve_root(non_hex, &idx).is_none());
     }
 
@@ -566,8 +555,7 @@ mod tests {
     #[test]
     fn private_chunk_cid_resolves_via_combined_index() {
         let dir = TempDir::new().expect("tempdir");
-        let mut idx =
-            ManifestIndex::load(dir.path()).expect("load empty manifest index");
+        let mut idx = ManifestIndex::load(dir.path()).expect("load empty manifest index");
         let private_root = [0xC4u8; 32];
         let private_cid = "bafk_private_resolve";
         idx.record_private_chunk_cid(private_root, private_cid)
@@ -740,7 +728,10 @@ mod tests {
             .check_access(&peer, cid, &idx)
             .await
             .expect("RPC succeeded");
-        assert!(allowed, "head == expires_at must still be allowed (strict >)");
+        assert!(
+            allowed,
+            "head == expires_at must still be allowed (strict >)"
+        );
     }
 
     /// V2 lookup fails with the canonical "method not found" error
@@ -887,20 +878,17 @@ mod tests {
     #[test]
     fn v2_error_classifier_pins_safe_set() {
         // Clean legacy signals → fallback OK.
-        let method_nf = anyhow::anyhow!(
-            r#"RPC error: {{"code":-32601,"message":"Method not found"}}"#
-        );
+        let method_nf =
+            anyhow::anyhow!(r#"RPC error: {{"code":-32601,"message":"Method not found"}}"#);
         assert!(v2_error_is_clean_legacy_signal(&method_nf));
 
-        let file_nr = anyhow::anyhow!(
-            r#"RPC error: {{"code":-32602,"message":"file not registered"}}"#
-        );
+        let file_nr =
+            anyhow::anyhow!(r#"RPC error: {{"code":-32602,"message":"file not registered"}}"#);
         assert!(v2_error_is_clean_legacy_signal(&file_nr));
 
         // Ambiguous JSON-RPC error → NO fallback.
-        let internal = anyhow::anyhow!(
-            r#"RPC error: {{"code":-32603,"message":"internal error"}}"#
-        );
+        let internal =
+            anyhow::anyhow!(r#"RPC error: {{"code":-32603,"message":"internal error"}}"#);
         assert!(!v2_error_is_clean_legacy_signal(&internal));
 
         // Transport / decode failures → NO fallback.

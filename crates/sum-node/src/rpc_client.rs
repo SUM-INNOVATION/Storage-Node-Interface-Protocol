@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::debug;
 
 use sum_types::rpc_types::{
@@ -59,7 +59,10 @@ impl L1RpcClient {
             .context("RPC HTTP request failed")?;
 
         let status = resp.status();
-        let text = resp.text().await.context("failed to read RPC response body")?;
+        let text = resp
+            .text()
+            .await
+            .context("failed to read RPC response body")?;
 
         if !status.is_success() {
             anyhow::bail!("RPC HTTP error {status}: {text}");
@@ -71,10 +74,7 @@ impl L1RpcClient {
             anyhow::bail!("RPC error: {err}");
         }
 
-        let result = json
-            .get("result")
-            .cloned()
-            .unwrap_or(Value::Null);
+        let result = json.get("result").cloned().unwrap_or(Value::Null);
 
         serde_json::from_value(result).context("failed to deserialize RPC result")
     }
@@ -85,10 +85,7 @@ impl L1RpcClient {
     ///
     /// `merkle_root_hex` must be 0x-prefixed (e.g., `"0xabcd..."`).
     /// Returns `None` if the file is not registered on the L1.
-    pub async fn get_access_list(
-        &self,
-        merkle_root_hex: &str,
-    ) -> Result<Option<StorageFileInfo>> {
+    pub async fn get_access_list(&self, merkle_root_hex: &str) -> Result<Option<StorageFileInfo>> {
         self.call("storage_getAccessList", json!([merkle_root_hex]))
             .await
     }
@@ -106,8 +103,7 @@ impl L1RpcClient {
 
     /// Get all files with a non-zero fee pool (eligible for storage rewards).
     pub async fn get_funded_files(&self) -> Result<Vec<StorageFileInfo>> {
-        self.call("storage_getFundedFiles", json!([]))
-            .await
+        self.call("storage_getFundedFiles", json!([])).await
     }
 
     /// Get all active ArchiveNodes, sorted deterministically by address bytes.
@@ -117,10 +113,7 @@ impl L1RpcClient {
     }
 
     /// Get the node registry record for an address.
-    pub async fn get_node_record(
-        &self,
-        node_addr_base58: &str,
-    ) -> Result<Option<NodeRecordInfo>> {
+    pub async fn get_node_record(&self, node_addr_base58: &str) -> Result<Option<NodeRecordInfo>> {
         self.call("storage_getNodeRecord", json!([node_addr_base58]))
             .await
     }
@@ -162,7 +155,8 @@ impl L1RpcClient {
     /// needs the latest head, add a separate method with explicit
     /// `["latest"]` rather than overloading this one.
     pub async fn chain_get_block_height(&self) -> Result<BlockHeightInfo> {
-        self.call("chain_getBlockHeight", json!(["finalized"])).await
+        self.call("chain_getBlockHeight", json!(["finalized"]))
+            .await
     }
 
     /// `chain_getChainParams` — live consensus + V2 protocol constants.
@@ -182,7 +176,8 @@ impl L1RpcClient {
     /// the `TxStatusV2` doc-comment in `sum_types::rpc_types` for
     /// per-variant semantics.
     pub async fn chain_get_transaction_status(&self, tx_hash: &str) -> Result<TxStatusV2> {
-        self.call("chain_getTransactionStatus", json!([tx_hash])).await
+        self.call("chain_getTransactionStatus", json!([tx_hash]))
+            .await
     }
 
     /// `storage_getFileInfoV2` — V2 file row + paginated access list.
@@ -222,7 +217,8 @@ impl L1RpcClient {
         &self,
         height: u64,
     ) -> Result<Vec<NodeRecordInfo>> {
-        self.call("storage_getActiveNodesAtHeight", json!([height])).await
+        self.call("storage_getActiveNodesAtHeight", json!([height]))
+            .await
     }
 
     /// `account_getEncryptionPublicKey(addr)` — fetch the X25519
@@ -439,7 +435,8 @@ mod contract_tests {
     async fn account_get_encryption_public_key_chain_canonical_shape() {
         let body = r#"{"jsonrpc":"2.0","id":1,
             "result": "0x1111111111111111111111111111111111111111111111111111111111111111"
-        }"#.to_string();
+        }"#
+        .to_string();
         let url = one_shot_responder(body).await;
         let client = L1RpcClient::new(url);
         let pk = client

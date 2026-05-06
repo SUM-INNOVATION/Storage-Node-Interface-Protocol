@@ -65,8 +65,8 @@ pub fn score(merkle_root: &[u8; 32], chunk_index: u32, archive: &[u8; 20]) -> u6
     let derived = blake3::derive_key(ASSIGNMENT_V2_CONTEXT, &input);
 
     u64::from_be_bytes([
-        derived[0], derived[1], derived[2], derived[3],
-        derived[4], derived[5], derived[6], derived[7],
+        derived[0], derived[1], derived[2], derived[3], derived[4], derived[5], derived[6],
+        derived[7],
     ])
 }
 

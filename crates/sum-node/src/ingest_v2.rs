@@ -57,16 +57,15 @@ use sum_store::merkle::MerkleTree;
 use sum_types::rpc_types::{
     AssignmentCoverageV2, BlockHeightInfo, ChainParamsInfo, StorageFileInfoV2,
 };
-use sum_types::storage::{ChunkDescriptor, DataManifest, CHUNK_SIZE};
+use sum_types::storage::{CHUNK_SIZE, ChunkDescriptor, DataManifest};
 use tracing::{debug, info, warn};
 
 use crate::assignment_attestor::AttestorRpc;
 use crate::push_validator::V2RpcClient;
 use crate::tx_builder::{
-    build_activate_file_v2_tx, build_register_file_pending_v2_tx, AccessEntryV2Mirror,
-    Bundle80,
+    AccessEntryV2Mirror, Bundle80, build_activate_file_v2_tx, build_register_file_pending_v2_tx,
 };
-use crate::tx_wait::{wait_for_finalized, TxWaitError};
+use crate::tx_wait::{TxWaitError, wait_for_finalized};
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -464,9 +463,7 @@ pub struct MapPeerResolver {
 }
 
 impl MapPeerResolver {
-    pub fn new(
-        peer_addresses: Arc<tokio::sync::RwLock<HashMap<PeerId, [u8; 20]>>>,
-    ) -> Self {
+    pub fn new(peer_addresses: Arc<tokio::sync::RwLock<HashMap<PeerId, [u8; 20]>>>) -> Self {
         Self { peer_addresses }
     }
 }
@@ -502,8 +499,7 @@ impl PeerResolver for MapPeerResolver {
 /// `CHUNK_SIZE - 16` (the AEAD tag) keeps each ciphertext chunk
 /// ≤ `CHUNK_SIZE` so the chain's `chunk_count` rule is uniform across
 /// visibilities (locked decision #1, Phase 4a).
-pub const PRIVATE_PLAINTEXT_CHUNK_SIZE: usize =
-    (CHUNK_SIZE as usize) - sum_crypto::TAG_SIZE;
+pub const PRIVATE_PLAINTEXT_CHUNK_SIZE: usize = (CHUNK_SIZE as usize) - sum_crypto::TAG_SIZE;
 
 /// One recipient of a Private file (besides the owner, who is added
 /// implicitly). The owner is **not** included here — Phase 4a always
@@ -712,10 +708,7 @@ pub(crate) fn build_private_artifacts(
 /// `chunk_count == ceil(stored_size / CHUNK_SIZE)` requires
 /// `chunk_count > 0`, and a zero-byte file would also produce an
 /// `initial_access` entry whose decrypter has nothing to recover.
-fn encrypt_for_private(
-    path: &Path,
-    spec: &PrivateIngestSpec,
-) -> Result<PrivateEncrypted> {
+fn encrypt_for_private(path: &Path, spec: &PrivateIngestSpec) -> Result<PrivateEncrypted> {
     use rand_core::{OsRng, RngCore};
     use sum_crypto::wrap_for_recipient;
     use zeroize::Zeroizing;
@@ -866,12 +859,7 @@ where
         // ── S1 ─────────────────────────────────────────────────────
         // Public path: stored == plaintext, visibility = 0, no recipients.
         let (register_tx_hash, register_height) = match self
-            .s1_register_pending(
-                &manifest,
-                manifest.total_size_bytes,
-                0,
-                vec![],
-            )
+            .s1_register_pending(&manifest, manifest.total_size_bytes, 0, vec![])
             .await
         {
             Ok(pair) => pair,
@@ -923,7 +911,10 @@ where
         };
 
         // ── S3 ─────────────────────────────────────────────────────
-        if let Err(e) = self.s3_push_manifest(&manifest, &distinct_assigned, None).await {
+        if let Err(e) = self
+            .s3_push_manifest(&manifest, &distinct_assigned, None)
+            .await
+        {
             return IngestOutcome::PendingNeedsAction {
                 merkle_root,
                 manifest,
@@ -998,11 +989,7 @@ where
     /// file are (a) wait + retry the full ingest under the SAME
     /// merkle_root (idempotent on chain), or (b) `abandon` (chain-only,
     /// recovers fee deposit).
-    pub async fn run_private(
-        &self,
-        path: &Path,
-        spec: PrivateIngestSpec,
-    ) -> IngestOutcome {
+    pub async fn run_private(&self, path: &Path, spec: PrivateIngestSpec) -> IngestOutcome {
         // ── V2-enabled gate ────────────────────────────────────────
         // Private ingest is significantly more expensive (full file
         // encryption). Gate before encryption so a chain that hasn't
@@ -1278,9 +1265,15 @@ where
         )
         .await
         .map_err(|e| match e {
-            TxWaitError::Failed { reason, .. } => anyhow::anyhow!("RegisterFilePendingV2 failed: {reason}"),
-            TxWaitError::Dropped => anyhow::anyhow!("RegisterFilePendingV2 dropped (resubmit with new nonce)"),
-            TxWaitError::Timeout { last_status } => anyhow::anyhow!("RegisterFilePendingV2 timeout, last status: {last_status:?}"),
+            TxWaitError::Failed { reason, .. } => {
+                anyhow::anyhow!("RegisterFilePendingV2 failed: {reason}")
+            }
+            TxWaitError::Dropped => {
+                anyhow::anyhow!("RegisterFilePendingV2 dropped (resubmit with new nonce)")
+            }
+            TxWaitError::Timeout { last_status } => {
+                anyhow::anyhow!("RegisterFilePendingV2 timeout, last status: {last_status:?}")
+            }
             TxWaitError::Rpc(e) => e,
         })?;
         info!(
@@ -1366,7 +1359,10 @@ where
         // abort — we record the (chunk, peer) pair as "no attempt yet" so
         // it can still be picked up by the retry loop on a later event.
         for (chunk_index, peer) in &targets {
-            match self.send_one_push(manifest, mmap, tree, *chunk_index, *peer).await {
+            match self
+                .send_one_push(manifest, mmap, tree, *chunk_index, *peer)
+                .await
+            {
                 Ok(()) => {
                     *attempts.get_mut(&(*chunk_index, *peer)).unwrap() = 1;
                 }
@@ -1402,7 +1398,12 @@ where
             match ev {
                 SumNetEvent::ShardReceivedV2 {
                     peer_id,
-                    response: ShardResponseV2::PushAck { merkle_root, chunk_index, error },
+                    response:
+                        ShardResponseV2::PushAck {
+                            merkle_root,
+                            chunk_index,
+                            error,
+                        },
                 } if merkle_root == manifest.merkle_root => {
                     let key = (chunk_index, peer_id);
                     // Reject ACKs from peers we never targeted for this
@@ -1547,7 +1548,10 @@ where
                 response: ShardResponseV2::ManifestPushAck { merkle_root, error },
             } = ev
             {
-                if merkle_root == manifest.merkle_root && error.is_none() && needed.contains(&peer_id) {
+                if merkle_root == manifest.merkle_root
+                    && error.is_none()
+                    && needed.contains(&peer_id)
+                {
                     acked.insert(peer_id);
                 }
             }
@@ -1594,7 +1598,9 @@ where
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(CoverageTimeout { last_coverage: last });
+                return Err(CoverageTimeout {
+                    last_coverage: last,
+                });
             }
             let sleep_for = std::cmp::min(self.params.poll_interval, deadline - now);
             tokio::time::sleep(sleep_for).await;
@@ -1619,7 +1625,9 @@ where
         )
         .await
         .map_err(|e| match e {
-            TxWaitError::Failed { reason, .. } => anyhow::anyhow!("ActivateFileV2 failed: {reason}"),
+            TxWaitError::Failed { reason, .. } => {
+                anyhow::anyhow!("ActivateFileV2 failed: {reason}")
+            }
             TxWaitError::Dropped => anyhow::anyhow!("ActivateFileV2 dropped"),
             TxWaitError::Timeout { last_status } => {
                 anyhow::anyhow!("ActivateFileV2 timeout, last status: {last_status:?}")
@@ -1641,11 +1649,7 @@ where
     // root is a typed error — operators usually trip this by passing
     // the wrong file for the recorded root. Never auto-recoverable.
 
-    pub async fn resume(
-        &self,
-        merkle_root: [u8; 32],
-        file_path: &Path,
-    ) -> IngestOutcome {
+    pub async fn resume(&self, merkle_root: [u8; 32], file_path: &Path) -> IngestOutcome {
         // V2-enabled gate first — resume's S5 ActivateFileV2 is a V2
         // tx and would burn fees if V2 isn't activated yet.
         if let Err(e) = self.check_v2_enabled().await {
@@ -1989,7 +1993,11 @@ where
             // this call if a future retry layer re-attempts. Cheap
             // clone — ~KB of opaque bytes.
             if let Err(e) = self
-                .s3_push_manifest(&manifest, &distinct_assigned, encrypted_manifest_override.clone())
+                .s3_push_manifest(
+                    &manifest,
+                    &distinct_assigned,
+                    encrypted_manifest_override.clone(),
+                )
                 .await
             {
                 return IngestOutcome::PendingNeedsAction {
@@ -2059,10 +2067,7 @@ where
     /// Walk paginated `missing_indices` until `missing_indices` is empty.
     /// Pagination cycles `missing_offset = last_returned_index + 1` per
     /// chain plan v3.2 §4 line 474.
-    async fn collect_missing_indices(
-        &self,
-        merkle_root: [u8; 32],
-    ) -> Result<BTreeSet<u32>> {
+    async fn collect_missing_indices(&self, merkle_root: [u8; 32]) -> Result<BTreeSet<u32>> {
         let root_hex = format!("0x{}", hex::encode(merkle_root));
         let mut missing: BTreeSet<u32> = BTreeSet::new();
         let mut offset: u32 = 0;
@@ -2245,12 +2250,12 @@ fn chunks_replicated_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tx_wait::TxStatusSource;
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
     use sum_net::l1_address_base58;
     use sum_types::rpc_types::{LifecycleV2, NodeRecordInfo, TxStatusV2, VisibilityV2};
-    use crate::tx_wait::TxStatusSource;
 
     /// In-memory RPC mock for the W10a state machine. All methods queue
     /// canned responses; tests assert on call counts and side effects.
@@ -2415,7 +2420,10 @@ mod tests {
             chunk_index: u32,
             _merkle_path: Vec<[u8; 32]>,
         ) -> Result<()> {
-            self.pushes.lock().unwrap().push((peer_id, merkle_root, chunk_index));
+            self.pushes
+                .lock()
+                .unwrap()
+                .push((peer_id, merkle_root, chunk_index));
             let next = self.push_chunk_results.lock().unwrap().pop_front();
             match next {
                 None | Some(Ok(())) => Ok(()),
@@ -2428,7 +2436,10 @@ mod tests {
             merkle_root: [u8; 32],
             _manifest_bytes: Vec<u8>,
         ) -> Result<()> {
-            self.manifest_pushes.lock().unwrap().push((peer_id, merkle_root));
+            self.manifest_pushes
+                .lock()
+                .unwrap()
+                .push((peer_id, merkle_root));
             let next = self.push_manifest_results.lock().unwrap().pop_front();
             match next {
                 None | Some(Ok(())) => Ok(()),
@@ -2554,14 +2565,7 @@ mod tests {
         my_addr: [u8; 20],
         params: IngestParams,
     ) -> IngestPipeline<MockRpc, MockNet, StaticPeers> {
-        build_pipeline_with_seed(
-            rpc,
-            net,
-            archive_to_peer,
-            my_addr,
-            [42u8; 32],
-            params,
-        )
+        build_pipeline_with_seed(rpc, net, archive_to_peer, my_addr, [42u8; 32], params)
     }
 
     /// Variant that lets the test override the operator's Ed25519
@@ -2580,7 +2584,9 @@ mod tests {
         IngestPipeline::new(
             rpc,
             net,
-            Arc::new(StaticPeers { map: archive_to_peer }),
+            Arc::new(StaticPeers {
+                map: archive_to_peer,
+            }),
             seed,
             my_addr,
             params,
@@ -2630,7 +2636,11 @@ mod tests {
         let snapshot = five_archives();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         // Make a 4-chunk file (chunk size is 1MiB; we use 4 MiB).
         let bytes = vec![0xCDu8; 4 * 1_048_576];
@@ -2715,9 +2725,16 @@ mod tests {
         );
         let outcome = pipeline.run(&path).await;
         match outcome {
-            IngestOutcome::Failed { stage, manifest, source } => {
+            IngestOutcome::Failed {
+                stage,
+                manifest,
+                source,
+            } => {
                 assert_eq!(stage, IngestStage::Register);
-                assert!(manifest.is_some(), "manifest must be preserved across S1 failure");
+                assert!(
+                    manifest.is_some(),
+                    "manifest must be preserved across S1 failure"
+                );
                 assert!(source.to_string().contains("visibility/bundle mismatch"));
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -2732,7 +2749,11 @@ mod tests {
         let snapshot = five_archives();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
         let merkle_root = manifest_dryrun.merkle_root;
@@ -2795,7 +2816,11 @@ mod tests {
         let snapshot = five_archives();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
         let merkle_root = manifest_dryrun.merkle_root;
@@ -2822,7 +2847,11 @@ mod tests {
                 response: ShardResponseV2::PushAck {
                     merkle_root,
                     chunk_index: 0,
-                    error: if i < 3 { None } else { Some("temporary".into()) },
+                    error: if i < 3 {
+                        None
+                    } else {
+                        Some("temporary".into())
+                    },
                 },
             })
             .await;
@@ -2876,7 +2905,11 @@ mod tests {
             .collect();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..3).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
         let merkle_root = manifest_dryrun.merkle_root;
@@ -2950,7 +2983,11 @@ mod tests {
         let snapshot = five_archives();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
         let merkle_root = manifest_dryrun.merkle_root;
@@ -3013,7 +3050,11 @@ mod tests {
         let snapshot = five_archives();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
         let merkle_root = manifest_dryrun.merkle_root;
@@ -3067,7 +3108,11 @@ mod tests {
         let snapshot = five_archives();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
         let merkle_root = manifest_dryrun.merkle_root;
@@ -3282,16 +3327,18 @@ mod tests {
         let snapshot = five_archives();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
         let merkle_root = manifest_dryrun.merkle_root;
 
         // Compute the actual V2 assignment for chunk 0 with R=3 — these
         // are the ONLY peers whose ACK should count.
-        let assigned = sum_store::assignment_v2::assigned_archives(
-            &merkle_root, &snapshot, 0, 3,
-        );
+        let assigned = sum_store::assignment_v2::assigned_archives(&merkle_root, &snapshot, 0, 3);
         assert_eq!(assigned.len(), 3, "R=3 against 5-archive snapshot");
         let unassigned: Vec<[u8; 20]> = snapshot
             .iter()
@@ -3356,9 +3403,7 @@ mod tests {
                     "only assigned-peer ACKs may count toward R"
                 );
             }
-            other => panic!(
-                "unassigned peer ACKs must not falsely satisfy R; got {other:?}"
-            ),
+            other => panic!("unassigned peer ACKs must not falsely satisfy R; got {other:?}"),
         }
     }
 
@@ -3377,14 +3422,16 @@ mod tests {
         let snapshot = five_archives();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
         let merkle_root = manifest_dryrun.merkle_root;
 
-        let assigned = sum_store::assignment_v2::assigned_archives(
-            &merkle_root, &snapshot, 0, 3,
-        );
+        let assigned = sum_store::assignment_v2::assigned_archives(&merkle_root, &snapshot, 0, 3);
         assert_eq!(assigned.len(), 3);
         let assigned_peers: Vec<PeerId> = assigned.iter().map(|a| arch_to_peer[a]).collect();
 
@@ -3454,9 +3501,8 @@ mod tests {
         let addr_a = [0xAA; 20];
         let addr_b = [0xBB; 20];
 
-        let map: Arc<tokio::sync::RwLock<HashMap<PeerId, [u8; 20]>>> = Arc::new(
-            tokio::sync::RwLock::new(HashMap::new()),
-        );
+        let map: Arc<tokio::sync::RwLock<HashMap<PeerId, [u8; 20]>>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         {
             let mut w = map.write().await;
             w.insert(peer_a, addr_a);
@@ -3482,7 +3528,11 @@ mod tests {
         let snapshot = five_archives();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
         let merkle_root = manifest_dryrun.merkle_root;
@@ -3556,14 +3606,7 @@ mod tests {
         let rpc = Arc::new(MockRpc::default());
         rpc.add_file(
             &format!("0x{}", hex::encode(merkle_root)),
-            file_info_with_lifecycle(
-                &merkle_root,
-                1,
-                50,
-                LifecycleV2::ACTIVE,
-                Some(150),
-                None,
-            ),
+            file_info_with_lifecycle(&merkle_root, 1, 50, LifecycleV2::ACTIVE, Some(150), None),
         );
         let net = Arc::new(MockNet::new());
 
@@ -3603,14 +3646,7 @@ mod tests {
         let rpc = Arc::new(MockRpc::default());
         rpc.add_file(
             &format!("0x{}", hex::encode(merkle_root)),
-            file_info_with_lifecycle(
-                &merkle_root,
-                1,
-                50,
-                LifecycleV2::ABANDONED,
-                None,
-                Some(175),
-            ),
+            file_info_with_lifecycle(&merkle_root, 1, 50, LifecycleV2::ABANDONED, None, Some(175)),
         );
         let net = Arc::new(MockNet::new());
 
@@ -3649,14 +3685,7 @@ mod tests {
         rpc.set_nonce(&l1_address_base58(&my_addr), 7);
         rpc.add_file(
             &format!("0x{}", hex::encode(merkle_root)),
-            file_info_with_lifecycle(
-                &merkle_root,
-                1,
-                50,
-                LifecycleV2::PENDING,
-                None,
-                None,
-            ),
+            file_info_with_lifecycle(&merkle_root, 1, 50, LifecycleV2::PENDING, None, None),
         );
         rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
         // Coverage probe says we can already activate.
@@ -3687,9 +3716,7 @@ mod tests {
                 // original register_tx_hash because chain doesn't expose it.
                 assert_eq!(register_height, 100);
             }
-            other => panic!(
-                "expected ResumedActivated (resume jumped to S5), got {other:?}"
-            ),
+            other => panic!("expected ResumedActivated (resume jumped to S5), got {other:?}"),
         }
         // No pushes, no manifest — coverage was already complete.
         assert_eq!(net.push_count(), 0);
@@ -3705,7 +3732,11 @@ mod tests {
         let snapshot = five_archives();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
         let merkle_root = manifest_dryrun.merkle_root;
@@ -3714,14 +3745,7 @@ mod tests {
         rpc.set_nonce(&l1_address_base58(&my_addr), 1);
         rpc.add_file(
             &format!("0x{}", hex::encode(merkle_root)),
-            file_info_with_lifecycle(
-                &merkle_root,
-                5,
-                50,
-                LifecycleV2::PENDING,
-                None,
-                None,
-            ),
+            file_info_with_lifecycle(&merkle_root, 5, 50, LifecycleV2::PENDING, None, None),
         );
         rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
 
@@ -3753,9 +3777,8 @@ mod tests {
         let r = 3;
         let net = Arc::new(MockNet::new());
         for chunk_idx in [1u32, 3u32] {
-            let assigned = sum_store::assignment_v2::assigned_archives(
-                &merkle_root, &snapshot, chunk_idx, r,
-            );
+            let assigned =
+                sum_store::assignment_v2::assigned_archives(&merkle_root, &snapshot, chunk_idx, r);
             for archive in &assigned {
                 net.push_event(SumNetEvent::ShardReceivedV2 {
                     peer_id: arch_to_peer[archive],
@@ -3771,9 +3794,9 @@ mod tests {
         // Manifest ACKs from every distinct-assigned archive (full file's set).
         let mut full_assigned: BTreeSet<[u8; 20]> = BTreeSet::new();
         for chunk_idx in 0..5u32 {
-            for a in sum_store::assignment_v2::assigned_archives(
-                &merkle_root, &snapshot, chunk_idx, r,
-            ) {
+            for a in
+                sum_store::assignment_v2::assigned_archives(&merkle_root, &snapshot, chunk_idx, r)
+            {
                 full_assigned.insert(a);
             }
         }
@@ -3798,7 +3821,7 @@ mod tests {
         assert_eq!(net.push_count(), 6, "S2 must push only missing chunks");
         // Manifest sent to the full distinct-assigned archive set.
         assert_eq!(
-            net.manifest_push_count() as usize,
+            net.manifest_push_count(),
             full_assigned.len(),
             "S3 must re-push manifest to all distinct assigned archives"
         );
@@ -3839,7 +3862,9 @@ mod tests {
             params_for_test(defaults_for_tests()),
         );
         match pipeline.resume(claimed_root, &path).await {
-            IngestOutcome::RootMismatch { expected, actual, .. } => {
+            IngestOutcome::RootMismatch {
+                expected, actual, ..
+            } => {
                 assert_eq!(expected, claimed_root);
                 assert_eq!(actual, actual_root);
             }
@@ -4068,7 +4093,9 @@ mod tests {
         );
 
         match pipeline.resume(chain_root, &wrong_path).await {
-            IngestOutcome::RootMismatch { expected, actual, .. } => {
+            IngestOutcome::RootMismatch {
+                expected, actual, ..
+            } => {
                 assert_eq!(expected, chain_root);
                 assert_ne!(actual, chain_root);
             }
@@ -4129,7 +4156,8 @@ mod tests {
                 assert_eq!(stage, IngestStage::Register);
                 let msg = source.to_string();
                 assert!(
-                    msg.contains("K_file recovery") || msg.contains("OwnerBundleMissing")
+                    msg.contains("K_file recovery")
+                        || msg.contains("OwnerBundleMissing")
                         || msg.contains("encrypted_key_bundle"),
                     "expected K_file recovery failure surface, got: {msg}"
                 );
@@ -4254,11 +4282,15 @@ mod tests {
         );
 
         match pipeline.resume(claimed_chain_root, &path).await {
-            IngestOutcome::RootMismatch { expected, actual, .. } => {
+            IngestOutcome::RootMismatch {
+                expected, actual, ..
+            } => {
                 assert_eq!(expected, claimed_chain_root);
                 assert_eq!(actual, actual_root_under_a);
             }
-            other => panic!("expected RootMismatch (recovered key reproduces wrong root), got {other:?}"),
+            other => {
+                panic!("expected RootMismatch (recovered key reproduces wrong root), got {other:?}")
+            }
         }
         assert!(rpc.sent_txs.lock().unwrap().is_empty());
     }
@@ -4275,14 +4307,7 @@ mod tests {
         let rpc = Arc::new(MockRpc::default());
         rpc.add_file(
             &format!("0x{}", hex::encode(merkle_root)),
-            file_info_with_lifecycle(
-                &merkle_root,
-                1,
-                50,
-                LifecycleV2::ACTIVE,
-                Some(150),
-                None,
-            ),
+            file_info_with_lifecycle(&merkle_root, 1, 50, LifecycleV2::ACTIVE, Some(150), None),
         );
 
         let net = Arc::new(MockNet::new());
@@ -4312,22 +4337,9 @@ mod tests {
         let my_addr = snapshot[0];
         let merkle_root = [0x02; 32];
 
-        // current_height = 149 (created_at=100, grace=50 → admissible at 151)
-        struct CurrentHeightRpc {
-            inner: Arc<MockRpc>,
-            current_height: u64,
-        }
-        // For these grace tests we override chain_get_block_height by
-        // constructing a custom adapter; instead, just monkey-patch the
-        // MockRpc default which returns 1000. We need height < 151, so
-        // create a custom MockRpc impl below... actually easier: set
-        // info.created_at=999_999, grace=50 → earliest=1_000_050;
-        // MockRpc::chain_get_block_height returns 1000 → 1000 < 1_000_050.
-        let _ = CurrentHeightRpc {
-            inner: Arc::new(MockRpc::default()),
-            current_height: 0,
-        };
-
+        // MockRpc::chain_get_block_height returns 1000. To exercise the
+        // pre-grace path, set created_at=999_900 + grace=50 →
+        // earliest_admissible=1_000_051, so 1000 < earliest → NotAdmissible.
         let rpc = Arc::new(MockRpc::default());
         rpc.add_file(
             &format!("0x{}", hex::encode(merkle_root)),
@@ -4471,7 +4483,10 @@ mod tests {
             params_for_test(defaults_for_tests()),
         );
         match pipeline.abandon(merkle_root).await {
-            AbandonOutcome::Abandoned { tx_hash, finalized_at_height } => {
+            AbandonOutcome::Abandoned {
+                tx_hash,
+                finalized_at_height,
+            } => {
                 assert_eq!(tx_hash, "0xtx-abandon");
                 assert_eq!(finalized_at_height, 1010);
             }
@@ -4574,8 +4589,7 @@ mod tests {
     // ── Phase 4a — Private file ingest ──────────────────────────────────
 
     use sum_crypto::{
-        decrypt_chunk, decrypt_manifest, unwrap_for_self,
-        x25519_keypair_from_ed25519_seed,
+        decrypt_chunk, decrypt_manifest, unwrap_for_self, x25519_keypair_from_ed25519_seed,
     };
 
     /// Build a deterministic spec where the owner has a real X25519
@@ -4633,12 +4647,18 @@ mod tests {
         let k_file = unwrap_for_self(&bundle, owner_sk, owner_addr).expect("owner unwrap");
 
         // Decrypt manifest blob.
-        let manifest_cbor =
-            decrypt_manifest(&k_file, &encrypted.encrypted_manifest_bytes).expect("manifest decrypt");
+        let manifest_cbor = decrypt_manifest(&k_file, &encrypted.encrypted_manifest_bytes)
+            .expect("manifest decrypt");
         let recovered_manifest: DataManifest =
             ciborium::de::from_reader(&manifest_cbor[..]).expect("manifest CBOR decode");
-        assert_eq!(recovered_manifest.merkle_root, encrypted.manifest.merkle_root);
-        assert_eq!(recovered_manifest.chunk_count, encrypted.manifest.chunk_count);
+        assert_eq!(
+            recovered_manifest.merkle_root,
+            encrypted.manifest.merkle_root
+        );
+        assert_eq!(
+            recovered_manifest.chunk_count,
+            encrypted.manifest.chunk_count
+        );
 
         // Decrypt each chunk by reading its on-disk bytes from the
         // ciphertext mmap at the descriptor's (offset, size).
@@ -4649,7 +4669,11 @@ mod tests {
             let on_disk = &encrypted.ciphertext_mmap[start..end];
             // Cross-check the on-disk hash matches the descriptor.
             let on_disk_hash = blake3::hash(on_disk);
-            assert_eq!(*on_disk_hash.as_bytes(), cd.blake3_hash, "ciphertext hash drift");
+            assert_eq!(
+                *on_disk_hash.as_bytes(),
+                cd.blake3_hash,
+                "ciphertext hash drift"
+            );
             let pt = decrypt_chunk(&k_file, cd.chunk_index, on_disk).expect("chunk decrypt");
             // Plaintext hash matches what the manifest claims.
             let pt_hash = blake3::hash(&pt);
@@ -4660,7 +4684,11 @@ mod tests {
             );
             reassembled.extend_from_slice(&pt);
         }
-        assert_eq!(reassembled.as_slice(), expected_plaintext, "reassembled plaintext");
+        assert_eq!(
+            reassembled.as_slice(),
+            expected_plaintext,
+            "reassembled plaintext"
+        );
     }
 
     /// Round-trip: owner encrypts a small file via the Phase 4a helper,
@@ -4694,10 +4722,7 @@ mod tests {
     #[test]
     fn private_encrypt_each_recipient_can_unwrap() {
         let owner_l1 = [0xAA; 20];
-        let recipients_in = [
-            (5u8, [0xBB; 20], None),
-            (6u8, [0xCC; 20], Some(2_000_000)),
-        ];
+        let recipients_in = [(5u8, [0xBB; 20], None), (6u8, [0xCC; 20], Some(2_000_000))];
         let (owner_keys, recipients, spec) =
             private_spec_with_recipients(7, owner_l1, &recipients_in);
 
@@ -4729,7 +4754,11 @@ mod tests {
         // A non-recipient can NOT unwrap the owner's bundle.
         let stranger_seed = [99u8; 32];
         let (stranger_sk, _) = x25519_keypair_from_ed25519_seed(&stranger_seed);
-        let owner_bundle = encrypted.initial_access[0].encrypted_key_bundle.as_ref().unwrap().0;
+        let owner_bundle = encrypted.initial_access[0]
+            .encrypted_key_bundle
+            .as_ref()
+            .unwrap()
+            .0;
         assert!(
             unwrap_for_self(&owner_bundle, &stranger_sk, &owner_l1).is_err(),
             "stranger must not be able to unwrap the owner's bundle"
@@ -4747,12 +4776,12 @@ mod tests {
 
         let pt_chunk = PRIVATE_PLAINTEXT_CHUNK_SIZE;
         let cases: &[(usize, u32)] = &[
-            (1, 1),                  // 1 byte → 1 chunk
-            (pt_chunk - 1, 1),       // just under one plaintext chunk
-            (pt_chunk, 1),           // exactly one plaintext chunk
-            (pt_chunk + 1, 2),       // just over → 2 chunks
-            (pt_chunk * 3, 3),       // exactly 3 plaintext chunks
-            (pt_chunk * 3 + 7, 4),   // 3 full + 1 small
+            (1, 1),                // 1 byte → 1 chunk
+            (pt_chunk - 1, 1),     // just under one plaintext chunk
+            (pt_chunk, 1),         // exactly one plaintext chunk
+            (pt_chunk + 1, 2),     // just over → 2 chunks
+            (pt_chunk * 3, 3),     // exactly 3 plaintext chunks
+            (pt_chunk * 3 + 7, 4), // 3 full + 1 small
         ];
         for (n, expected_count) in cases {
             let plaintext = vec![0xA5u8; *n];
@@ -4771,7 +4800,8 @@ mod tests {
                 .stored_size_bytes
                 .div_ceil(sum_types::storage::CHUNK_SIZE) as u32;
             assert_eq!(
-                derived, *expected_count,
+                derived,
+                *expected_count,
                 "chain rule violation for n={n}: stored={} CHUNK_SIZE={} ceil={derived}, declared={}",
                 encrypted.stored_size_bytes,
                 sum_types::storage::CHUNK_SIZE,
@@ -4819,8 +4849,11 @@ mod tests {
         let snapshot = five_archives();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> =
-            snapshot.iter().zip(peers.iter()).map(|(a, p)| (*a, *p)).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
 
         // Use the same seed the pipeline signs with so the derived
         // owner X25519 pubkey is consistent with the seed Bundle80
@@ -4906,7 +4939,11 @@ mod tests {
         // unknown root}. The important check: we got past S1 (chain
         // saw a register tx) — i.e. NOT IngestOutcome::Failed.
         match outcome {
-            IngestOutcome::Activated { register_tx_hash, activate_tx_hash, .. } => {
+            IngestOutcome::Activated {
+                register_tx_hash,
+                activate_tx_hash,
+                ..
+            } => {
                 assert_eq!(register_tx_hash, "0xtx-register-priv");
                 assert_eq!(activate_tx_hash, "0xtx-activate-priv");
             }
@@ -4915,7 +4952,10 @@ mod tests {
                 // the test rpc doesn't know about, so S2's
                 // `fetch_assignment_inputs` failed.
                 assert!(
-                    matches!(failed_stage, IngestStage::Push | IngestStage::ManifestPush | IngestStage::Coverage),
+                    matches!(
+                        failed_stage,
+                        IngestStage::Push | IngestStage::ManifestPush | IngestStage::Coverage
+                    ),
                     "expected post-S1 stage, got {failed_stage:?}",
                 );
             }
@@ -4968,5 +5008,42 @@ mod tests {
         // And it actually decrypts to the same CBOR.
         let recovered = decrypt_manifest(&k_file, &encrypted.encrypted_manifest_bytes).unwrap();
         assert_eq!(recovered, cbor_plain);
+    }
+
+    /// **Privacy-audit row #12 pin.** `PrivateArtifacts._ciphertext_temp`
+    /// is a `tempfile::NamedTempFile`; dropping the artifacts (success
+    /// OR abort path) MUST remove the underlying ciphertext file from
+    /// disk. A future refactor that swaps the type for a bare
+    /// `PathBuf` (no auto-cleanup) would silently leak Private
+    /// ciphertext on every aborted ingest. This test pins the field
+    /// type's contract — drop ⇒ filesystem entry gone.
+    #[test]
+    fn private_artifacts_temp_ciphertext_is_removed_on_drop() {
+        let plaintext = b"private data that must not leak to disk after abort";
+
+        let dir = tempfile::tempdir().unwrap();
+        let plaintext_path = dir.path().join("plain.bin");
+        std::fs::write(&plaintext_path, plaintext).unwrap();
+
+        let k_file: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new([0x42u8; 32]);
+        let artifacts =
+            build_private_artifacts(&plaintext_path, &k_file).expect("build_private_artifacts");
+
+        let temp_path = artifacts._ciphertext_temp.path().to_path_buf();
+        assert!(
+            temp_path.exists(),
+            "sanity: temp ciphertext file must exist while artifacts are alive: {:?}",
+            temp_path
+        );
+
+        drop(artifacts);
+
+        assert!(
+            !temp_path.exists(),
+            "regression: Private ciphertext temp file leaked after drop: {:?} \
+             — `_ciphertext_temp` must remain a tempfile::NamedTempFile so the \
+             abort path is automatically cleaned up",
+            temp_path
+        );
     }
 }

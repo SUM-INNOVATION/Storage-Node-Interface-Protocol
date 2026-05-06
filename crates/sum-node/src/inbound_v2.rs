@@ -81,9 +81,9 @@ impl<T: RespondNet + ?Sized> RespondNet for Arc<T> {
         (**self).respond_shard_v2(channel_id, response).await
     }
 }
+use sum_store::SumStore;
 use sum_store::content_id::cid_from_blake3_hash;
 use sum_store::serve::validate_manifest_push;
-use sum_store::SumStore;
 use sum_types::storage::DataManifest;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -112,10 +112,7 @@ pub const DEFAULT_ATTEST_BATCH_TIMEOUT: Duration = Duration::from_secs(120);
 #[async_trait::async_trait]
 pub trait AttestTriggerRpc: Send + Sync {
     /// Get `(chunk_count, assignment_height)` for the file at `merkle_root`.
-    async fn fetch_file_shape(
-        &self,
-        merkle_root: &[u8; 32],
-    ) -> Result<FileShape>;
+    async fn fetch_file_shape(&self, merkle_root: &[u8; 32]) -> Result<FileShape>;
 
     /// Get the canonical (decoded, sorted, deduped) active-node
     /// snapshot at `height`.
@@ -297,11 +294,7 @@ where
     }
 
     /// For tests that need to stop the attestation polling sooner.
-    pub fn with_attest_timing(
-        mut self,
-        poll_interval: Duration,
-        batch_timeout: Duration,
-    ) -> Self {
+    pub fn with_attest_timing(mut self, poll_interval: Duration, batch_timeout: Duration) -> Self {
         self.attest_poll_interval = poll_interval;
         self.attest_batch_timeout = batch_timeout;
         self
@@ -328,8 +321,13 @@ where
         channel_id: u64,
     ) {
         match request {
-            ShardRequestV2::Pull { cid, offset, max_bytes } => {
-                self.handle_pull(net, peer_id, channel_id, cid, offset, max_bytes).await;
+            ShardRequestV2::Pull {
+                cid,
+                offset,
+                max_bytes,
+            } => {
+                self.handle_pull(net, peer_id, channel_id, cid, offset, max_bytes)
+                    .await;
             }
             ShardRequestV2::Push {
                 data,
@@ -337,15 +335,27 @@ where
                 chunk_index,
                 merkle_path,
             } => {
-                self.handle_push(net, peer_id, channel_id, data, merkle_root, chunk_index, merkle_path)
-                    .await;
+                self.handle_push(
+                    net,
+                    peer_id,
+                    channel_id,
+                    data,
+                    merkle_root,
+                    chunk_index,
+                    merkle_path,
+                )
+                .await;
             }
-            ShardRequestV2::ManifestPush { merkle_root, manifest_bytes } => {
+            ShardRequestV2::ManifestPush {
+                merkle_root,
+                manifest_bytes,
+            } => {
                 self.handle_manifest_push(net, channel_id, merkle_root, manifest_bytes)
                     .await;
             }
             ShardRequestV2::ManifestPull { merkle_root } => {
-                self.handle_manifest_pull(net, peer_id, channel_id, merkle_root).await;
+                self.handle_manifest_pull(net, peer_id, channel_id, merkle_root)
+                    .await;
             }
         }
     }
@@ -359,7 +369,9 @@ where
         offset: u64,
         max_bytes: u64,
     ) {
-        let resp = self.build_pull_response(peer_id, cid, offset, max_bytes).await;
+        let resp = self
+            .build_pull_response(peer_id, cid, offset, max_bytes)
+            .await;
         if let Err(e) = net.respond_shard_v2(channel_id, resp).await {
             warn!(channel_id, %e, "V2 Pull: failed to send response");
         }
@@ -408,9 +420,7 @@ where
                         offset,
                         total_bytes: total,
                         data: Vec::new(),
-                        error: Some(format!(
-                            "offset {offset} > total_bytes {total}"
-                        )),
+                        error: Some(format!("offset {offset} > total_bytes {total}")),
                     }
                 } else {
                     let end = (start + max_bytes as usize).min(full.len());
@@ -495,9 +505,7 @@ where
                         ShardResponseV2::PushAck {
                             merkle_root,
                             chunk_index,
-                            error: Some(format!(
-                                "private chunk mapping persistence failed: {e}"
-                            )),
+                            error: Some(format!("private chunk mapping persistence failed: {e}")),
                         }
                     } else {
                         self.held
@@ -604,10 +612,15 @@ where
             let len = manifest_bytes.len();
             {
                 let mut stores = self.store.write().await;
-                if stores.manifest_idx.get_private_bytes(&merkle_root).is_some() {
+                if stores
+                    .manifest_idx
+                    .get_private_bytes(&merkle_root)
+                    .is_some()
+                {
                     info!(root = %root_hex, "V2 ManifestPush (Private): already stored (idempotent)");
-                } else if let Err(e) =
-                    stores.manifest_idx.insert_private(merkle_root, manifest_bytes)
+                } else if let Err(e) = stores
+                    .manifest_idx
+                    .insert_private(merkle_root, manifest_bytes)
                 {
                     warn!(root = %root_hex, %e, "V2 ManifestPush (Private): insert_private failed");
                     let resp = ShardResponseV2::ManifestPushAck {
@@ -664,7 +677,11 @@ where
         // manifest persistence succeeds." Attestation is async-AFTER ack.
         {
             let mut stores = self.store.write().await;
-            if stores.manifest_idx.get_by_merkle_root(&merkle_root).is_some() {
+            if stores
+                .manifest_idx
+                .get_by_merkle_root(&merkle_root)
+                .is_some()
+            {
                 info!(root = %root_hex, "V2 ManifestPush: already indexed (idempotent)");
             } else if let Err(e) = stores.manifest_idx.insert(&manifest) {
                 warn!(root = %root_hex, %e, "V2 ManifestPush: manifest_idx.insert failed");
@@ -708,7 +725,9 @@ where
         channel_id: u64,
         merkle_root: [u8; 32],
     ) {
-        let resp = self.build_manifest_pull_response(peer_id, merkle_root).await;
+        let resp = self
+            .build_manifest_pull_response(peer_id, merkle_root)
+            .await;
         if let Err(e) = net.respond_shard_v2(channel_id, resp).await {
             warn!(channel_id, %e, "V2 ManifestPull: failed to send response");
         }
@@ -919,14 +938,23 @@ mod tests {
             Self::default()
         }
         fn add_file(&self, root_hex: &str, info: StorageFileInfoV2) {
-            self.files.lock().unwrap().insert(root_hex.to_string(), info);
+            self.files
+                .lock()
+                .unwrap()
+                .insert(root_hex.to_string(), info);
         }
         fn add_snapshot(&self, height: u64, nodes: Vec<NodeRecordInfo>, decoded: Vec<[u8; 20]>) {
             self.snapshots.lock().unwrap().insert(height, nodes);
-            self.decoded_snapshots.lock().unwrap().insert(height, decoded);
+            self.decoded_snapshots
+                .lock()
+                .unwrap()
+                .insert(height, decoded);
         }
         fn enqueue_send(&self, hash: &str) {
-            self.send_responses.lock().unwrap().push_back(Ok(hash.into()));
+            self.send_responses
+                .lock()
+                .unwrap()
+                .push_back(Ok(hash.into()));
         }
         fn enqueue_status(&self, st: TxStatusV2) {
             self.status_responses.lock().unwrap().push_back(Ok(st));
@@ -1050,7 +1078,11 @@ mod tests {
         }
     }
 
-    fn file_info_active(root: &[u8; 32], chunk_count: u32, assignment_height: u64) -> StorageFileInfoV2 {
+    fn file_info_active(
+        root: &[u8; 32],
+        chunk_count: u32,
+        assignment_height: u64,
+    ) -> StorageFileInfoV2 {
         StorageFileInfoV2 {
             merkle_root: format!("0x{}", hex::encode(root)),
             owner: l1_address_base58(&[0x01; 20]),
@@ -1194,7 +1226,9 @@ mod tests {
             },
         ));
         let trigger_rpc = ArcRpcTrigger(rpc_arc);
-        let acl: Arc<dyn AccessChecker> = Arc::new(ToggleAcl { allow_default: acl_allows });
+        let acl: Arc<dyn AccessChecker> = Arc::new(ToggleAcl {
+            allow_default: acl_allows,
+        });
         V2Dispatcher::new(
             validator,
             attestor,
@@ -1372,9 +1406,7 @@ mod tests {
         let mut good = None;
         let r = crate::push_validator::V2Params::DEFAULTS.assignment_replication_factor;
         for i in 0..manifest.chunk_count {
-            let assigned = sum_store::assignment_v2::assigned_archives(
-                &root, &snapshot, i, r,
-            );
+            let assigned = sum_store::assignment_v2::assigned_archives(&root, &snapshot, i, r);
             if assigned.contains(&my_addr) {
                 good = Some(i);
                 break;
@@ -1447,9 +1479,7 @@ mod tests {
         let mut good = None;
         let r = crate::push_validator::V2Params::DEFAULTS.assignment_replication_factor;
         for i in 0..manifest.chunk_count {
-            let assigned = sum_store::assignment_v2::assigned_archives(
-                &root, &snapshot, i, r,
-            );
+            let assigned = sum_store::assignment_v2::assigned_archives(&root, &snapshot, i, r);
             if assigned.contains(&my_addr) {
                 good = Some(i);
                 break;
@@ -1543,7 +1573,9 @@ mod tests {
             .build_pull_response(fake_peer(), target_cid.clone(), 0, chunks[0].len() as u64)
             .await;
         match resp {
-            ShardResponseV2::Data { cid, data, error, .. } => {
+            ShardResponseV2::Data {
+                cid, data, error, ..
+            } => {
                 assert_eq!(cid, target_cid);
                 assert!(data.is_empty(), "denied pull must not carry chunk bytes");
                 let err = error.expect("denied pull must set error");
@@ -1571,9 +1603,18 @@ mod tests {
             .build_pull_response(fake_peer(), target_cid.clone(), 0, chunks[0].len() as u64)
             .await;
         match resp {
-            ShardResponseV2::Data { cid, data, error, total_bytes, offset } => {
+            ShardResponseV2::Data {
+                cid,
+                data,
+                error,
+                total_bytes,
+                offset,
+            } => {
                 assert_eq!(cid, target_cid);
-                assert!(error.is_none(), "allowed pull must not set error: {error:?}");
+                assert!(
+                    error.is_none(),
+                    "allowed pull must not set error: {error:?}"
+                );
                 assert_eq!(offset, 0);
                 assert_eq!(data, chunks[0]);
                 assert_eq!(total_bytes, chunks[0].len() as u64);
@@ -1597,16 +1638,29 @@ mod tests {
             /* acl_allows = */ false,
         );
         // Sanity: manifest IS indexed, so empty bytes below = ACL gate.
-        assert!(stores.read().await.manifest_idx
-            .get_by_merkle_root(&manifest.merkle_root).is_some());
+        assert!(
+            stores
+                .read()
+                .await
+                .manifest_idx
+                .get_by_merkle_root(&manifest.merkle_root)
+                .is_some()
+        );
 
         let resp = dispatcher
             .build_manifest_pull_response(fake_peer(), manifest.merkle_root)
             .await;
         match resp {
-            ShardResponseV2::ManifestData { merkle_root, manifest_bytes, error } => {
+            ShardResponseV2::ManifestData {
+                merkle_root,
+                manifest_bytes,
+                error,
+            } => {
                 assert_eq!(merkle_root, manifest.merkle_root);
-                assert!(manifest_bytes.is_empty(), "denied pull must not carry manifest bytes");
+                assert!(
+                    manifest_bytes.is_empty(),
+                    "denied pull must not carry manifest bytes"
+                );
                 let err = error.expect("denied pull must set error");
                 assert!(err.contains("ACCESS_DENIED"), "got: {err}");
             }
@@ -1702,8 +1756,7 @@ mod tests {
 
         let rpc = AllMockRpc::new();
         register_private_file(&rpc, root);
-        let dispatcher =
-            build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
+        let dispatcher = build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
 
         let net = RecorderNet::new();
         dispatcher
@@ -1747,8 +1800,7 @@ mod tests {
 
         let rpc = AllMockRpc::new();
         register_private_file(&rpc, root);
-        let dispatcher =
-            build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
+        let dispatcher = build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
 
         // Push.
         let net = RecorderNet::new();
@@ -1794,8 +1846,7 @@ mod tests {
 
         let rpc = AllMockRpc::new();
         register_public_file(&rpc, root);
-        let dispatcher =
-            build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
+        let dispatcher = build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
 
         let net = RecorderNet::new();
         dispatcher
@@ -1831,8 +1882,7 @@ mod tests {
         // RPC has NO file registered for this root → fetch_file_shape
         // returns Err → handler must refuse.
         let rpc = AllMockRpc::new();
-        let dispatcher =
-            build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
+        let dispatcher = build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
 
         let net = RecorderNet::new();
         dispatcher
@@ -1890,8 +1940,7 @@ mod tests {
 
         let rpc = AllMockRpc::new();
         register_private_file(&rpc, plaintext_manifest.merkle_root);
-        let dispatcher =
-            build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
+        let dispatcher = build_dispatcher_with_acl(rpc, five_archives()[0], stores.clone(), true);
 
         // Push encrypted bytes.
         let net = RecorderNet::new();
@@ -1908,7 +1957,11 @@ mod tests {
             .build_manifest_pull_response(fake_peer(), plaintext_manifest.merkle_root)
             .await;
         let pulled_bytes = match resp {
-            ShardResponseV2::ManifestData { manifest_bytes, error: None, .. } => manifest_bytes,
+            ShardResponseV2::ManifestData {
+                manifest_bytes,
+                error: None,
+                ..
+            } => manifest_bytes,
             other => panic!("expected ManifestData, got {other:?}"),
         };
         assert_eq!(
@@ -1918,16 +1971,13 @@ mod tests {
 
         // Decrypt + parse — proves the integration covers a real
         // Phase 4b download flow end-to-end.
-        let decrypted_cbor = decrypt_manifest(&k_file, &pulled_bytes)
-            .expect("decrypt under same K_file");
+        let decrypted_cbor =
+            decrypt_manifest(&k_file, &pulled_bytes).expect("decrypt under same K_file");
         let recovered: DataManifest =
             ciborium::de::from_reader(&decrypted_cbor[..]).expect("CBOR parse");
         assert_eq!(recovered.merkle_root, plaintext_manifest.merkle_root);
         assert_eq!(recovered.chunk_count, 1);
-        assert_eq!(
-            recovered.chunks[0].plaintext_blake3_hash,
-            Some([0xCC; 32])
-        );
+        assert_eq!(recovered.chunks[0].plaintext_blake3_hash, Some([0xCC; 32]));
     }
 
     /// Phase 4b chain-of-failure fix: an accepted V2 Push for a
@@ -2082,9 +2132,8 @@ mod tests {
 
         match net.last().unwrap().1 {
             ShardResponseV2::PushAck { error, .. } => {
-                let err = error.expect(
-                    "Private push MUST return ACK error when cid->root mapping fails",
-                );
+                let err =
+                    error.expect("Private push MUST return ACK error when cid->root mapping fails");
                 assert!(
                     err.contains("private chunk mapping persistence failed"),
                     "expected mapping-failure error, got: {err}"
@@ -2185,12 +2234,18 @@ mod tests {
             .build_manifest_pull_response(fake_peer(), manifest.merkle_root)
             .await;
         match resp {
-            ShardResponseV2::ManifestData { merkle_root, manifest_bytes, error } => {
+            ShardResponseV2::ManifestData {
+                merkle_root,
+                manifest_bytes,
+                error,
+            } => {
                 assert_eq!(merkle_root, manifest.merkle_root);
-                assert!(error.is_none(), "allowed pull must not set error: {error:?}");
+                assert!(
+                    error.is_none(),
+                    "allowed pull must not set error: {error:?}"
+                );
                 // CBOR round-trips back to the original manifest.
-                let decoded: DataManifest =
-                    ciborium::de::from_reader(&manifest_bytes[..]).unwrap();
+                let decoded: DataManifest = ciborium::de::from_reader(&manifest_bytes[..]).unwrap();
                 assert_eq!(decoded.merkle_root, manifest.merkle_root);
                 assert_eq!(decoded.chunk_count, manifest.chunk_count);
             }

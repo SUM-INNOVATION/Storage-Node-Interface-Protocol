@@ -10,17 +10,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use sum_net::{SumNet, SumNetEvent, PeerId};
+use sum_net::{PeerId, SumNet, SumNetEvent};
+use sum_store::manifest::deserialize_manifest_cbor;
 use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_store::{
-    compute_chunk_assignment, nodes_for_chunk,
-    FetchManager, FetchOutcome, MerkleTree,
+    FetchManager, FetchOutcome, MerkleTree, compute_chunk_assignment, nodes_for_chunk,
 };
-use sum_store::manifest::deserialize_manifest_cbor;
 use sum_types::storage::{DataManifest, REPLICATION_FACTOR};
 
 use crate::peer_state::apply_peer_event;
@@ -119,11 +118,11 @@ impl DownloadOrchestrator {
             tokio::select! {
                 event = net.next_event() => {
                     match event {
-                        Some(SumNetEvent::PeerDiscovered { peer_id, .. }) => {
-                            if !discovered_peers.contains(&peer_id) {
-                                discovered_peers.push(peer_id);
-                                break;
-                            }
+                        Some(SumNetEvent::PeerDiscovered { peer_id, .. })
+                            if !discovered_peers.contains(&peer_id) =>
+                        {
+                            discovered_peers.push(peer_id);
+                            break;
                         }
                         Some(ref e @ SumNetEvent::PeerIdentified { .. })
                         | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {
@@ -187,46 +186,46 @@ impl DownloadOrchestrator {
             tokio::select! {
                 event = net.next_event() => {
                     match event {
-                        Some(SumNetEvent::ShardReceived { peer_id, response }) => {
-                            if response.cid == manifest_cid {
-                                if let Some(ref err) = response.error {
-                                    // The peer we asked answered "not found".
-                                    // Don't bail — keep waiting for another
-                                    // peer's response. New peers discovered
-                                    // below will get their own request.
-                                    warn!(%peer_id, %err, "manifest request rejected by a peer — waiting for others");
-                                    continue;
-                                }
-                                let m = deserialize_manifest_cbor(&response.data)
-                                    .map_err(|e| anyhow::anyhow!("failed to deserialize manifest: {e}"))?;
-                                info!(
-                                    %peer_id,
-                                    file_name = %m.file_name,
-                                    chunk_count = m.chunk_count,
-                                    total_bytes = m.total_size_bytes,
-                                    "manifest received"
-                                );
-                                // Promote the manifest provider to the FRONT
-                                // of `discovered_peers` so Phase 3's chunk
-                                // fetcher prefers them. They demonstrably
-                                // hold content for this root; we already
-                                // have a connection to them. Without this
-                                // step, `fill_fetches` falls back to
-                                // `discovered_peers.first()` — which is
-                                // typically the bootstrap peer (the relay),
-                                // who has no chunks and answers "not found"
-                                // in a loop.
-                                if let Some(pos) = discovered_peers.iter().position(|p| *p == peer_id) {
-                                    if pos != 0 {
-                                        discovered_peers.swap(0, pos);
-                                    }
-                                } else {
-                                    discovered_peers.insert(0, peer_id);
-                                }
-                                break m;
+                        Some(SumNetEvent::ShardReceived { peer_id, response })
+                            if response.cid == manifest_cid =>
+                        {
+                            if let Some(ref err) = response.error {
+                                // The peer we asked answered "not found".
+                                // Don't bail — keep waiting for another
+                                // peer's response. New peers discovered
+                                // below will get their own request.
+                                warn!(%peer_id, %err, "manifest request rejected by a peer — waiting for others");
+                                continue;
                             }
+                            let m = deserialize_manifest_cbor(&response.data)
+                                .map_err(|e| anyhow::anyhow!("failed to deserialize manifest: {e}"))?;
+                            info!(
+                                %peer_id,
+                                file_name = %m.file_name,
+                                chunk_count = m.chunk_count,
+                                total_bytes = m.total_size_bytes,
+                                "manifest received"
+                            );
+                            // Promote the manifest provider to the FRONT
+                            // of `discovered_peers` so Phase 3's chunk
+                            // fetcher prefers them. They demonstrably
+                            // hold content for this root; we already
+                            // have a connection to them. Without this
+                            // step, `fill_fetches` falls back to
+                            // `discovered_peers.first()` — which is
+                            // typically the bootstrap peer (the relay),
+                            // who has no chunks and answers "not found"
+                            // in a loop.
+                            if let Some(pos) = discovered_peers.iter().position(|p| *p == peer_id) {
+                                if pos != 0 {
+                                    discovered_peers.swap(0, pos);
+                                }
+                            } else {
+                                discovered_peers.insert(0, peer_id);
+                            }
+                            break m;
                         }
-                        Some(SumNetEvent::ShardRequestFailed { peer_id, error }) => {
+                        Some(SumNetEvent::ShardRequestFailed { peer_id, error })
                             // An outbound request to `peer_id` failed before
                             // it could be sent (no connection, peer down,
                             // protocol mismatch). During Phase 2 the only
@@ -234,9 +233,9 @@ impl DownloadOrchestrator {
                             // treat this as a manifest failure for that
                             // peer. We don't retry against the same peer —
                             // we wait for another peer to be discovered.
-                            if tried_for_manifest.contains(&peer_id) {
-                                warn!(%peer_id, %error, "manifest request to peer dropped — will rely on other peers");
-                            }
+                            if tried_for_manifest.contains(&peer_id) =>
+                        {
+                            warn!(%peer_id, %error, "manifest request to peer dropped — will rely on other peers");
                         }
                         Some(SumNetEvent::PeerDiscovered { peer_id, .. }) => {
                             // Newly-discovered peer. If we haven't already
@@ -292,7 +291,11 @@ impl DownloadOrchestrator {
         // Store the manifest so we can read chunks back for assembly
         {
             let mut store_write = store.write().await;
-            if store_write.manifest_idx.get_by_merkle_root(&manifest.merkle_root).is_none() {
+            if store_write
+                .manifest_idx
+                .get_by_merkle_root(&manifest.merkle_root)
+                .is_none()
+            {
                 store_write.manifest_idx.insert(&manifest)?;
             }
         }
@@ -321,8 +324,10 @@ impl DownloadOrchestrator {
         if total_to_fetch == 0 {
             // All chunks already on disk — skip to assembly. No network
             // fetches happened, so peer attribution is empty.
-            return self.assemble(&store, &manifest).await.map(|total_bytes| {
-                DownloadResult {
+            return self
+                .assemble(&store, &manifest)
+                .await
+                .map(|total_bytes| DownloadResult {
                     chunks_fetched: 0,
                     chunks_skipped,
                     total_bytes,
@@ -331,8 +336,7 @@ impl DownloadOrchestrator {
                     peers_contacted: HashSet::new(),
                     started_at,
                     completed_at: SystemTime::now(),
-                }
-            });
+                });
         }
 
         // Build a peer map for chunk routing: try to use assignment
@@ -360,9 +364,15 @@ impl DownloadOrchestrator {
 
         // Fill initial batch
         self.fill_fetches(
-            &net, &mut fetcher, &mut remaining, &mut in_flight,
-            &manifest, &holder_map, &discovered_peers,
-        ).await;
+            &net,
+            &mut fetcher,
+            &mut remaining,
+            &mut in_flight,
+            &manifest,
+            &holder_map,
+            &discovered_peers,
+        )
+        .await;
 
         // Event loop: process responses, refill, until done
         loop {
@@ -450,10 +460,10 @@ impl DownloadOrchestrator {
                                 ).await;
                             }
                         }
-                        Some(SumNetEvent::PeerDiscovered { peer_id, .. }) => {
-                            if !discovered_peers.contains(&peer_id) {
-                                discovered_peers.push(peer_id);
-                            }
+                        Some(SumNetEvent::PeerDiscovered { peer_id, .. })
+                            if !discovered_peers.contains(&peer_id) =>
+                        {
+                            discovered_peers.push(peer_id);
                         }
                         Some(ref e @ SumNetEvent::PeerIdentified { .. })
                         | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {
@@ -501,7 +511,9 @@ impl DownloadOrchestrator {
         fallback_peers: &[PeerId],
     ) {
         while in_flight.len() < self.max_concurrent {
-            let Some(chunk_index) = remaining.pop_front() else { break };
+            let Some(chunk_index) = remaining.pop_front() else {
+                break;
+            };
             let chunk = &manifest.chunks[chunk_index as usize];
 
             if fetcher.is_active(&chunk.cid) {
@@ -511,7 +523,12 @@ impl DownloadOrchestrator {
             // Find a peer to fetch from: prefer assignment-based holders
             let peer = holder_map
                 .get(&chunk_index)
-                .and_then(|peers| peers.iter().find(|_p| !in_flight.contains_key(&chunk.cid)).copied())
+                .and_then(|peers| {
+                    peers
+                        .iter()
+                        .find(|_p| !in_flight.contains_key(&chunk.cid))
+                        .copied()
+                })
                 .or_else(|| fallback_peers.first().copied());
 
             let Some(peer_id) = peer else {
@@ -612,12 +629,14 @@ impl DownloadOrchestrator {
         );
 
         let store_read = store.read().await;
-        let mut file = std::fs::File::create(&self.output_path)
-            .context("failed to create output file")?;
+        let mut file =
+            std::fs::File::create(&self.output_path).context("failed to create output file")?;
 
         let mut total_bytes: u64 = 0;
         for chunk in &manifest.chunks {
-            let data = store_read.local.get(&chunk.cid)
+            let data = store_read
+                .local
+                .get(&chunk.cid)
                 .map_err(|e| anyhow::anyhow!("missing chunk {}: {e}", chunk.cid))?;
             file.write_all(&data)?;
             total_bytes += data.len() as u64;
@@ -627,7 +646,8 @@ impl DownloadOrchestrator {
         drop(store_read);
 
         // Verify merkle root
-        let leaf_hashes: Vec<blake3::Hash> = manifest.chunks
+        let leaf_hashes: Vec<blake3::Hash> = manifest
+            .chunks
             .iter()
             .map(|c| {
                 let mut h = [0u8; 32];
@@ -650,7 +670,7 @@ impl DownloadOrchestrator {
             warn!(
                 "merkle root mismatch! computed={} expected={}",
                 hex::encode(computed_root.as_bytes()),
-                hex::encode(&manifest.merkle_root),
+                hex::encode(manifest.merkle_root),
             );
         }
 

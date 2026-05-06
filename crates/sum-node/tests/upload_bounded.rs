@@ -36,8 +36,11 @@ use sum_types::storage::{ChunkDescriptor, DataManifest, REPLICATION_FACTOR};
 
 // ── MockUploadNet ────────────────────────────────────────────────────────────
 
-/// One observed push call.
+/// One observed push call. `peer_id` is captured for diagnostic purposes
+/// during recording but no assertion currently reads it; keep the field
+/// so the recorder can route by peer in future tests without redesign.
 #[derive(Clone)]
+#[allow(dead_code)]
 struct PushRecord {
     cid: String,
     peer_id: PeerId,
@@ -77,7 +80,10 @@ impl MockUploadNet {
         let mut current_peak = self.peak_in_flight.load(Ordering::SeqCst);
         while now > current_peak {
             match self.peak_in_flight.compare_exchange(
-                current_peak, now, Ordering::SeqCst, Ordering::SeqCst,
+                current_peak,
+                now,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             ) {
                 Ok(_) => break,
                 Err(actual) => current_peak = actual,
@@ -92,12 +98,7 @@ impl MockUploadNet {
 
 #[async_trait]
 impl UploadNet for MockUploadNet {
-    async fn push_chunk_shared(
-        &self,
-        peer_id: PeerId,
-        cid: String,
-        data: Arc<[u8]>,
-    ) -> Result<()> {
+    async fn push_chunk_shared(&self, peer_id: PeerId, cid: String, data: Arc<[u8]>) -> Result<()> {
         // Record the push (and the Arc pointer for sharing assertions).
         let data_ptr = data.as_ptr() as usize;
         self.record_in_flight();
@@ -242,7 +243,10 @@ async fn upload_peak_in_flight_is_bounded_by_max_in_flight_times_replication() {
         "peak in-flight {peak} exceeds bound {bound} (max_in_flight={max_in_flight}, R={REPLICATION_FACTOR})"
     );
     // Sanity: with multiple chunks, peak should be > 0.
-    assert!(peak > 0, "peak in-flight should be > 0 for a non-empty upload");
+    assert!(
+        peak > 0,
+        "peak in-flight should be > 0 for a non-empty upload"
+    );
 
     // ── Assertion 3: shared Arc identity per chunk.
     //
@@ -259,7 +263,11 @@ async fn upload_peak_in_flight_is_bounded_by_max_in_flight_times_replication() {
     for p in &pushes {
         by_cid.entry(p.cid.clone()).or_default().push(p.data_ptr);
     }
-    assert_eq!(by_cid.len(), n_chunks, "should have entries for every chunk");
+    assert_eq!(
+        by_cid.len(),
+        n_chunks,
+        "should have entries for every chunk"
+    );
     for (cid, ptrs) in &by_cid {
         assert_eq!(
             ptrs.len(),
@@ -290,15 +298,18 @@ async fn upload_with_max_in_flight_one_still_completes() {
 
     let mock = MockUploadNet::new();
     let rpc = Arc::new(L1RpcClient::new("http://invalid".into()));
-    let orchestrator = UploadOrchestrator::new(rpc, Duration::from_secs(30))
-        .with_max_in_flight_chunks(1);
+    let orchestrator =
+        UploadOrchestrator::new(rpc, Duration::from_secs(30)).with_max_in_flight_chunks(1);
 
     let result = orchestrator
         .run_with_nodes(&mock, &store, &manifest, &peer_addresses, &node_addrs)
         .await
         .expect("upload should succeed");
 
-    assert_eq!(result.confirmed as usize, n_chunks * REPLICATION_FACTOR as usize);
+    assert_eq!(
+        result.confirmed as usize,
+        n_chunks * REPLICATION_FACTOR as usize
+    );
     let peak = mock.peak_in_flight.load(Ordering::SeqCst);
     assert!(peak <= REPLICATION_FACTOR as usize, "peak {peak} > R");
 }

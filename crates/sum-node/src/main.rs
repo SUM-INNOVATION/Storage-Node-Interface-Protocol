@@ -25,22 +25,23 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use sum_net::{SumNet, SumNetEvent, Keypair, ShardResponse, TOPIC_STORAGE, TOPIC_TEST};
 use sum_net::identity;
-use sum_store::{SumStore, FetchOutcome, decode_announcement};
+use sum_net::{Keypair, ShardResponse, SumNet, SumNetEvent, TOPIC_STORAGE, TOPIC_TEST};
 use sum_store::manifest::deserialize_manifest_cbor;
 use sum_store::serve::MANIFEST_REQUEST_PREFIX;
+use sum_store::{FetchOutcome, SumStore, decode_announcement};
 use sum_types::config::{NetConfig, StoreConfig};
 
 use sum_node::acl::AclChecker;
 use sum_node::assignment_attestor::AssignmentAttestor;
 use sum_node::download::DownloadOrchestrator;
 use sum_node::download_private::run_download_private;
+use sum_node::download_route::{DownloadPath, route_download_target};
 use sum_node::inbound_v2::V2Dispatcher;
 use sum_node::market_sync::MarketSyncWorker;
-use sum_node::peer_state::{apply_peer_event, PeerMapChange};
+use sum_node::peer_state::{PeerMapChange, apply_peer_event};
 use sum_node::por_worker::PorWorker;
-use sum_node::profile::{log_profile_banner, NodeProfile};
+use sum_node::profile::{NodeProfile, log_profile_banner};
 use sum_node::push_validator::{PushValidator, V2Params};
 use sum_node::rpc_client::L1RpcClient;
 use sum_node::upload::UploadOrchestrator;
@@ -100,7 +101,11 @@ struct Cli {
 
     /// Bootstrap peer multiaddrs for Kademlia DHT (repeatable or comma-separated).
     /// Example: /ip4/1.2.3.4/tcp/4001/p2p/12D3KooW...
-    #[arg(long = "bootstrap-peer", env = "SUM_BOOTSTRAP_PEERS", value_delimiter = ',')]
+    #[arg(
+        long = "bootstrap-peer",
+        env = "SUM_BOOTSTRAP_PEERS",
+        value_delimiter = ','
+    )]
     bootstrap_peers: Vec<String>,
 
     /// TCP listen port for WAN connections (0 = OS-assigned).
@@ -309,8 +314,7 @@ enum Command {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -320,9 +324,7 @@ async fn main() -> Result<()> {
 
     // Load or generate keypair + extract seed.
     let (keypair, seed) = if let Some(ref key_path) = cli.key_file {
-        let hex_str = std::fs::read_to_string(key_path)?
-            .trim()
-            .to_string();
+        let hex_str = std::fs::read_to_string(key_path)?.trim().to_string();
         let seed_bytes = hex_to_bytes_32(&hex_str)?;
         let kp = identity::keypair_from_seed(&seed_bytes)?;
         let peer_id = identity::peer_id_from_keypair(&kp);
@@ -340,7 +342,9 @@ async fn main() -> Result<()> {
     };
 
     if cli.relay_server && !cli.enable_wan {
-        warn!("--relay-server has no effect without --enable-wan; the relay will not be reachable over the DHT");
+        warn!(
+            "--relay-server has no effect without --enable-wan; the relay will not be reachable over the DHT"
+        );
     }
 
     // Build network config from CLI args.
@@ -423,7 +427,9 @@ async fn main() -> Result<()> {
             activation_wait_secs,
         } => {
             let seed = seed.ok_or_else(|| {
-                anyhow::anyhow!("resume requires --key-file (V2 ActivateFileV2 needs a signing key)")
+                anyhow::anyhow!(
+                    "resume requires --key-file (V2 ActivateFileV2 needs a signing key)"
+                )
             })?;
             run_resume_v2(
                 keypair,
@@ -472,7 +478,10 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Share { merkle_root, recipient } => {
+        Command::Share {
+            merkle_root,
+            recipient,
+        } => {
             let seed = seed.ok_or_else(|| {
                 anyhow::anyhow!("share requires --key-file (owner key recovers K_file locally)")
             })?;
@@ -489,7 +498,10 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Revoke { merkle_root, recipient } => {
+        Command::Revoke {
+            merkle_root,
+            recipient,
+        } => {
             let seed = seed.ok_or_else(|| {
                 anyhow::anyhow!("revoke requires --key-file (RemoveAccessV2 needs a signing key)")
             })?;
@@ -506,9 +518,14 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::UpdateAccess { merkle_root, recipient } => {
+        Command::UpdateAccess {
+            merkle_root,
+            recipient,
+        } => {
             let seed = seed.ok_or_else(|| {
-                anyhow::anyhow!("update-access requires --key-file (UpdateAccessV2 needs a signing key)")
+                anyhow::anyhow!(
+                    "update-access requires --key-file (UpdateAccessV2 needs a signing key)"
+                )
             })?;
             let parsed_root = parse_merkle_root_hex(&merkle_root)?;
             let target = sum_node::access::parse_recipient_spec(&recipient)?;
@@ -524,8 +541,23 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Fetch { cid } => run_fetch(keypair, net_config, cid).await,
-        Command::Download { merkle_root, output, max_concurrent, download_timeout_secs } => {
-            run_download(keypair, seed, cli.rpc_url.clone(), net_config, merkle_root, output, max_concurrent, download_timeout_secs).await
+        Command::Download {
+            merkle_root,
+            output,
+            max_concurrent,
+            download_timeout_secs,
+        } => {
+            run_download(
+                keypair,
+                seed,
+                cli.rpc_url.clone(),
+                net_config,
+                merkle_root,
+                output,
+                max_concurrent,
+                download_timeout_secs,
+            )
+            .await
         }
         Command::Send { message } => run_send(keypair, net_config, message).await,
     }
@@ -549,7 +581,12 @@ fn hex_to_bytes_32(hex: &str) -> Result<[u8; 32]> {
 
 // ── Listen mode ───────────────────────────────────────────────────────────────
 
-async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli, net_config: NetConfig) -> Result<()> {
+async fn run_listen(
+    keypair: Keypair,
+    seed: Option<[u8; 32]>,
+    cli: &Cli,
+    net_config: NetConfig,
+) -> Result<()> {
     let net = Arc::new(SumNet::new(net_config, keypair.clone()).await?);
     let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
 
@@ -605,7 +642,9 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli, net_con
         let peer_addrs_clone = peer_addresses.clone();
         let market_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            market_sync.run(store_clone2, net_clone, peer_addrs_clone, market_shutdown).await;
+            market_sync
+                .run(store_clone2, net_clone, peer_addrs_clone, market_shutdown)
+                .await;
         });
 
         // V2 dispatcher (chain plan v3.2 §3.6 receive-side). The
@@ -822,7 +861,7 @@ async fn run_listen(keypair: Keypair, seed: Option<[u8; 32]>, cli: &Cli, net_con
                             let mut store_guard = store.write().await;
                             let store_mut: &mut SumStore = &mut store_guard;
                             let outcome = store_mut.fetcher
-                                .on_chunk_received(net.as_ref(), &store_mut.local, &response)
+                                .on_chunk_received(net.as_ref(), &store_mut.local, response)
                                 .await;
                             drop(store_guard);
                             match outcome {
@@ -922,10 +961,8 @@ async fn run_ingest(
     // Push to R=3 assigned nodes via UploadOrchestrator. The same RPC
     // client is reused below by the post-ingest serve loop's ACL checker.
     let rpc = Arc::new(L1RpcClient::new(rpc_url));
-    let orchestrator = UploadOrchestrator::new(
-        rpc.clone(),
-        Duration::from_secs(upload_timeout_secs),
-    );
+    let orchestrator =
+        UploadOrchestrator::new(rpc.clone(), Duration::from_secs(upload_timeout_secs));
 
     info!(
         peers = peer_addresses.len(),
@@ -948,8 +985,7 @@ async fn run_ingest(
     );
 
     // Strict success criterion: every chunk must reach R replicas.
-    if let Err(failure) = upload_result.check_success(sum_types::storage::REPLICATION_FACTOR as u32)
-    {
+    if let Err(failure) = upload_result.check_success(sum_types::storage::REPLICATION_FACTOR) {
         // Surface every failed push for operator triage.
         for f in &upload_result.failed {
             warn!(chunk_index = f.chunk_index, cid = %f.cid, error = %f.error, "push failed");
@@ -1133,7 +1169,10 @@ async fn push_manifest_to_recipients(
         );
     }
 
-    info!(recipients = recipients.len(), "manifest replicated to all chunk recipients");
+    info!(
+        recipients = recipients.len(),
+        "manifest replicated to all chunk recipients"
+    );
     Ok(())
 }
 
@@ -1416,7 +1455,12 @@ async fn run_ingest_v2(
         }
         // Resume-only outcomes: cannot actually be produced by `run`,
         // but the match must be exhaustive over the unified enum.
-        sum_node::ingest_v2::IngestOutcome::ActivatedOnChain { merkle_root, register_height, activate_height, .. } => {
+        sum_node::ingest_v2::IngestOutcome::ActivatedOnChain {
+            merkle_root,
+            register_height,
+            activate_height,
+            ..
+        } => {
             info!(
                 root = %hex::encode(merkle_root),
                 register_height,
@@ -1425,7 +1469,11 @@ async fn run_ingest_v2(
             );
         }
         sum_node::ingest_v2::IngestOutcome::ResumedActivated {
-            merkle_root, register_height, activate_tx_hash, activate_height, ..
+            merkle_root,
+            register_height,
+            activate_tx_hash,
+            activate_height,
+            ..
         } => {
             info!(
                 root = %hex::encode(merkle_root),
@@ -1435,14 +1483,20 @@ async fn run_ingest_v2(
                 "V2 resume ACTIVATED (no original register_tx_hash on chain)"
             );
         }
-        sum_node::ingest_v2::IngestOutcome::AbandonedOnChain { merkle_root, abandoned_at_height, .. } => {
+        sum_node::ingest_v2::IngestOutcome::AbandonedOnChain {
+            merkle_root,
+            abandoned_at_height,
+            ..
+        } => {
             warn!(
                 root = %hex::encode(merkle_root),
                 ?abandoned_at_height,
                 "V2 ingest: file is ABANDONED on chain (terminal)"
             );
         }
-        sum_node::ingest_v2::IngestOutcome::RootMismatch { expected, actual, .. } => {
+        sum_node::ingest_v2::IngestOutcome::RootMismatch {
+            expected, actual, ..
+        } => {
             warn!(
                 expected = %hex::encode(expected),
                 actual = %hex::encode(actual),
@@ -1458,13 +1512,10 @@ async fn run_ingest_v2(
 
 fn parse_merkle_root_hex(s: &str) -> Result<[u8; 32]> {
     let stripped = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(stripped)
-        .map_err(|e| anyhow::anyhow!("invalid merkle_root hex: {e}"))?;
+    let bytes =
+        hex::decode(stripped).map_err(|e| anyhow::anyhow!("invalid merkle_root hex: {e}"))?;
     if bytes.len() != 32 {
-        anyhow::bail!(
-            "merkle_root must be 32 bytes (got {} bytes)",
-            bytes.len()
-        );
+        anyhow::bail!("merkle_root must be 32 bytes (got {} bytes)", bytes.len());
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
@@ -1488,7 +1539,9 @@ async fn build_v2_ingest_params(
                 grace = cp.activation_grace_blocks,
                 "chain_getChainParams: live values populated into IngestParams"
             );
-            Ok(sum_node::ingest_v2::IngestParams::from_chain_params(&cp, defaults))
+            Ok(sum_node::ingest_v2::IngestParams::from_chain_params(
+                &cp, defaults,
+            ))
         }
         Err(e) => match profile {
             NodeProfile::Production => {
@@ -1586,20 +1639,26 @@ async fn run_resume_v2(
     };
     let params = build_v2_ingest_params(&rpc, profile, chain_id_arg, fee_per_tx, defaults).await?;
     let resolver = Arc::new(sum_node::ingest_v2::MapPeerResolver::new(peer_addresses));
-    let pipeline = sum_node::ingest_v2::IngestPipeline::new(
-        rpc, net.clone(), resolver, seed, l1_addr, params,
-    );
+    let pipeline =
+        sum_node::ingest_v2::IngestPipeline::new(rpc, net.clone(), resolver, seed, l1_addr, params);
 
     let outcome = pipeline.resume(merkle_root, &path).await;
     match &outcome {
-        sum_node::ingest_v2::IngestOutcome::Activated { activate_tx_hash, activate_height, .. } => {
+        sum_node::ingest_v2::IngestOutcome::Activated {
+            activate_tx_hash,
+            activate_height,
+            ..
+        } => {
             // resume never produces this variant (it'd require submitting
             // RegisterFilePendingV2 ourselves, which resume doesn't do)
             // but the match must be exhaustive.
             info!(%activate_tx_hash, activate_height, "RESUME activated file");
         }
         sum_node::ingest_v2::IngestOutcome::ResumedActivated {
-            register_height, activate_tx_hash, activate_height, ..
+            register_height,
+            activate_tx_hash,
+            activate_height,
+            ..
         } => {
             info!(
                 register_height,
@@ -1608,20 +1667,39 @@ async fn run_resume_v2(
                 "RESUME activated PENDING file"
             );
         }
-        sum_node::ingest_v2::IngestOutcome::ActivatedOnChain { register_height, activate_height, .. } => {
-            info!(register_height, activate_height, "RESUME: file already ACTIVE on chain");
+        sum_node::ingest_v2::IngestOutcome::ActivatedOnChain {
+            register_height,
+            activate_height,
+            ..
+        } => {
+            info!(
+                register_height,
+                activate_height, "RESUME: file already ACTIVE on chain"
+            );
         }
-        sum_node::ingest_v2::IngestOutcome::AbandonedOnChain { abandoned_at_height, .. } => {
-            warn!(?abandoned_at_height, "RESUME: file already ABANDONED on chain (terminal)");
+        sum_node::ingest_v2::IngestOutcome::AbandonedOnChain {
+            abandoned_at_height,
+            ..
+        } => {
+            warn!(
+                ?abandoned_at_height,
+                "RESUME: file already ABANDONED on chain (terminal)"
+            );
         }
-        sum_node::ingest_v2::IngestOutcome::RootMismatch { expected, actual, .. } => {
+        sum_node::ingest_v2::IngestOutcome::RootMismatch {
+            expected, actual, ..
+        } => {
             warn!(
                 expected = %hex::encode(expected),
                 actual = %hex::encode(actual),
                 "RESUME: root mismatch — wrong file for the recorded merkle_root"
             );
         }
-        sum_node::ingest_v2::IngestOutcome::PendingNeedsAction { failed_stage, source, .. } => {
+        sum_node::ingest_v2::IngestOutcome::PendingNeedsAction {
+            failed_stage,
+            source,
+            ..
+        } => {
             warn!(?failed_stage, source = ?source.as_ref().map(|e| e.to_string()), "RESUME: still PENDING — re-run resume or abandon");
         }
         sum_node::ingest_v2::IngestOutcome::Failed { stage, source, .. } => {
@@ -1663,12 +1741,14 @@ async fn run_abandon_v2(
     // keypair would have been used to build a SumNet; threaded into
     // `_keypair` so we don't drop it unused.
     let _ = keypair;
-    let pipeline = sum_node::ingest_v2::IngestPipeline::new(
-        rpc, net, resolver, seed, l1_addr, params,
-    );
+    let pipeline =
+        sum_node::ingest_v2::IngestPipeline::new(rpc, net, resolver, seed, l1_addr, params);
 
     match pipeline.abandon(merkle_root).await {
-        sum_node::ingest_v2::AbandonOutcome::Abandoned { tx_hash, finalized_at_height } => {
+        sum_node::ingest_v2::AbandonOutcome::Abandoned {
+            tx_hash,
+            finalized_at_height,
+        } => {
             info!(%tx_hash, finalized_at_height, "ABANDON finalized");
         }
         sum_node::ingest_v2::AbandonOutcome::NotAdmissible {
@@ -1700,9 +1780,9 @@ async fn run_abandon_v2(
 fn parse_recipient_spec(s: &str) -> Result<([u8; 20], Option<u64>)> {
     let (addr_str, expires) = match s.split_once(':') {
         Some((a, e)) => {
-            let h: u64 = e
-                .parse()
-                .map_err(|_| anyhow::anyhow!("recipient {s:?}: expires_at must be a u64 block height"))?;
+            let h: u64 = e.parse().map_err(|_| {
+                anyhow::anyhow!("recipient {s:?}: expires_at must be a u64 block height")
+            })?;
             (a, Some(h))
         }
         None => (s, None),
@@ -1729,8 +1809,7 @@ async fn build_private_ingest_spec(
 ) -> Result<sum_node::ingest_v2::PrivateIngestSpec> {
     use sum_node::ingest_v2::{PrivateIngestSpec, PrivateRecipient};
 
-    let (_x25519_secret, owner_x25519_pubkey) =
-        sum_crypto::x25519_keypair_from_ed25519_seed(seed);
+    let (_x25519_secret, owner_x25519_pubkey) = sum_crypto::x25519_keypair_from_ed25519_seed(seed);
 
     // Defense in depth: warn (but don't abort) if the owner's derived
     // pubkey is not registered on chain. A Private file with an
@@ -1804,7 +1883,7 @@ async fn run_register_encryption_key(
     fee: u128,
 ) -> Result<()> {
     use sum_node::tx_builder::build_register_encryption_key_tx;
-    use sum_node::tx_wait::{wait_for_finalized, TxWaitError};
+    use sum_node::tx_wait::{TxWaitError, wait_for_finalized};
 
     let l1_addr = identity::l1_address_from_keypair(&keypair);
     let l1_b58 = identity::l1_address_base58(&l1_addr);
@@ -1834,8 +1913,7 @@ async fn run_register_encryption_key(
     }
 
     // Derive the X25519 pubkey deterministically from the Ed25519 seed.
-    let (_x25519_secret, x25519_pubkey) =
-        sum_crypto::x25519_keypair_from_ed25519_seed(&seed);
+    let (_x25519_secret, x25519_pubkey) = sum_crypto::x25519_keypair_from_ed25519_seed(&seed);
 
     // Read-before-write: log whether we're registering fresh or
     // overwriting. Don't fail on a mismatched-pubkey overwrite — the
@@ -1858,7 +1936,9 @@ async fn run_register_encryption_key(
                 "encryption key on chain differs from the derived key — overwriting (key rotation)"
             );
         }
-        Err(e) => warn!(addr = %l1_b58, err = %e, "could not pre-check encryption key on chain — proceeding anyway"),
+        Err(e) => {
+            warn!(addr = %l1_b58, err = %e, "could not pre-check encryption key on chain — proceeding anyway")
+        }
     }
 
     let nonce = rpc.get_nonce(&l1_b58).await?;
@@ -1866,7 +1946,9 @@ async fn run_register_encryption_key(
     let tx_hash_value = rpc.send_raw_transaction(&tx_hex).await?;
     let tx_hash = tx_hash_value
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("send_raw_transaction returned non-string tx hash: {tx_hash_value}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("send_raw_transaction returned non-string tx hash: {tx_hash_value}")
+        })?
         .to_string();
 
     info!(
@@ -1884,10 +1966,15 @@ async fn run_register_encryption_key(
     )
     .await
     .map_err(|e| match e {
-        TxWaitError::Failed { reason, block_height } => {
+        TxWaitError::Failed {
+            reason,
+            block_height,
+        } => {
             anyhow::anyhow!("RegisterEncryptionKey failed at height {block_height:?}: {reason}")
         }
-        TxWaitError::Dropped => anyhow::anyhow!("RegisterEncryptionKey dropped from mempool — re-run with a fresh nonce"),
+        TxWaitError::Dropped => anyhow::anyhow!(
+            "RegisterEncryptionKey dropped from mempool — re-run with a fresh nonce"
+        ),
         TxWaitError::Timeout { last_status } => {
             anyhow::anyhow!("RegisterEncryptionKey timed out (last status: {last_status:?})")
         }
@@ -1955,7 +2042,9 @@ async fn run_fetch(keypair: Keypair, net_config: NetConfig, cid: String) -> Resu
 
     let peer = target_peer.unwrap();
     info!(%peer, "sending chunk request");
-    store.fetcher.start_fetch(&net, peer, cid.clone())
+    store
+        .fetcher
+        .start_fetch(&net, peer, cid.clone())
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -2052,34 +2141,33 @@ async fn run_download(
         }
     }
 
-    // ── Step 2: now safe to start networking ───────────────────────
+    // ── Step 2: route based on chain V2 row (fail closed on unknown
+    //          visibility bytes; see download_route.rs). Routing
+    //          decision must depend only on the V2 chain row presence
+    //          and visibility — not on local chunk store, peer state,
+    //          or any side channel.
+    let path = route_download_target(v2_info.as_ref())?;
+
+    // ── Step 3: now safe to start networking ───────────────────────
     let net = Arc::new(SumNet::new(net_config, keypair.clone()).await?);
 
-    // V2 dispatch. We ONLY take the Private path when chain confirms
-    // this is a Private V2 row; every other outcome — Public V2,
-    // pre-V2 / V1 file, V2 RPC unsupported, transient RPC error, file
-    // not found — falls through to the existing Public download
-    // orchestrator with no behavior change. This way V1 / legacy
-    // Public downloads cannot regress when the chain side adds or
-    // removes V2 metadata for unrelated files.
-    if let Some(info) = v2_info {
-        if info.visibility.is_private() {
-            let seed = seed.expect("checked above before SumNet::new");
-            return run_download_private(
-                keypair,
-                seed,
-                rpc,
-                net,
-                info,
-                parsed_root,
-                output,
-                max_concurrent,
-                Duration::from_secs(timeout_secs),
-            )
-            .await;
-        }
-        // Public V2 row: fall through to the existing Public path.
+    if matches!(path, DownloadPath::V2Private) {
+        let info = v2_info.expect("V2Private implies Some(info)");
+        let seed = seed.expect("checked above before SumNet::new");
+        return run_download_private(
+            keypair,
+            seed,
+            rpc,
+            net,
+            info,
+            parsed_root,
+            output,
+            max_concurrent,
+            Duration::from_secs(timeout_secs),
+        )
+        .await;
     }
+    // V2Public and V1Legacy share the existing public-path orchestrator.
 
     // ── Step 3: existing Public / V1 / legacy path ────────────────
     let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
@@ -2118,11 +2206,10 @@ async fn run_send(keypair: Keypair, net_config: NetConfig, message: String) -> R
     const TIMEOUT: Duration = Duration::from_secs(30);
     info!("waiting for a peer on the LAN (timeout: {TIMEOUT:?})");
 
-    let result =
-        tokio::time::timeout(TIMEOUT, discover_and_send(&node, &message)).await;
+    let result = tokio::time::timeout(TIMEOUT, discover_and_send(&node, &message)).await;
 
     match result {
-        Ok(inner)     => inner,
+        Ok(inner) => inner,
         Err(_elapsed) => {
             warn!("timed out — are both nodes on the same LAN?");
             Err(anyhow::anyhow!("no peer discovered within timeout"))
@@ -2137,39 +2224,56 @@ async fn discover_and_send(node: &SumNet, message: &str) -> Result<()> {
         if let SumNetEvent::PeerDiscovered { peer_id, .. } = &event {
             info!(%peer_id, "peer found — publishing");
             tokio::time::sleep(Duration::from_millis(500)).await;
-            node.publish(TOPIC_TEST, message.as_bytes().to_vec()).await?;
+            node.publish(TOPIC_TEST, message.as_bytes().to_vec())
+                .await?;
             info!("sent on '{TOPIC_TEST}' — exiting");
             tokio::time::sleep(Duration::from_millis(300)).await;
             node.shutdown().await?;
             return Ok(());
         }
     }
-    Err(anyhow::anyhow!("event stream closed before a peer was discovered"))
+    Err(anyhow::anyhow!(
+        "event stream closed before a peer was discovered"
+    ))
 }
 
 // ── Event printer ─────────────────────────────────────────────────────────────
 
 fn print_event(event: &SumNetEvent) {
     match event {
-        SumNetEvent::Listening { addr } =>
-            info!("LISTENING    {addr}"),
-        SumNetEvent::PeerDiscovered { peer_id, addrs } =>
-            info!("DISCOVERED   {peer_id}  addrs={addrs:?}"),
-        SumNetEvent::PeerExpired { peer_id } =>
-            info!("EXPIRED      {peer_id}"),
-        SumNetEvent::PeerConnected { peer_id } =>
-            info!("CONNECTED    {peer_id}"),
-        SumNetEvent::PeerDisconnected { peer_id } =>
-            info!("DISCONNECTED {peer_id}"),
+        SumNetEvent::Listening { addr } => info!("LISTENING    {addr}"),
+        SumNetEvent::PeerDiscovered { peer_id, addrs } => {
+            info!("DISCOVERED   {peer_id}  addrs={addrs:?}")
+        }
+        SumNetEvent::PeerExpired { peer_id } => info!("EXPIRED      {peer_id}"),
+        SumNetEvent::PeerConnected { peer_id } => info!("CONNECTED    {peer_id}"),
+        SumNetEvent::PeerDisconnected { peer_id } => info!("DISCONNECTED {peer_id}"),
         SumNetEvent::MessageReceived { from, topic, data } => {
             let _text = String::from_utf8_lossy(data);
-            info!("MESSAGE      topic={topic}  from={from}  len={}", data.len());
+            info!(
+                "MESSAGE      topic={topic}  from={from}  len={}",
+                data.len()
+            );
         }
-        SumNetEvent::ShardRequested { peer_id, request, channel_id } =>
-            info!("CHUNK_REQ    peer={peer_id}  cid={}  ch={channel_id}", request.cid),
-        SumNetEvent::ShardReceived { peer_id, response } =>
-            info!("CHUNK_RECV   peer={peer_id}  cid={}  offset={}  bytes={}", response.cid, response.offset, response.data.len()),
-        SumNetEvent::ShardRequestedV2 { peer_id, request, channel_id } => {
+        SumNetEvent::ShardRequested {
+            peer_id,
+            request,
+            channel_id,
+        } => info!(
+            "CHUNK_REQ    peer={peer_id}  cid={}  ch={channel_id}",
+            request.cid
+        ),
+        SumNetEvent::ShardReceived { peer_id, response } => info!(
+            "CHUNK_RECV   peer={peer_id}  cid={}  offset={}  bytes={}",
+            response.cid,
+            response.offset,
+            response.data.len()
+        ),
+        SumNetEvent::ShardRequestedV2 {
+            peer_id,
+            request,
+            channel_id,
+        } => {
             let kind = match request {
                 sum_net::ShardRequestV2::Pull { .. } => "Pull",
                 sum_net::ShardRequestV2::Push { .. } => "Push",
@@ -2187,22 +2291,33 @@ fn print_event(event: &SumNetEvent) {
             };
             info!("V2_RECV      peer={peer_id}  kind={kind}");
         }
-        SumNetEvent::ShardRequestFailed { peer_id, error } =>
-            info!("CHUNK_FAIL   peer={peer_id}  error={error}"),
-        SumNetEvent::PeerIdentified { peer_id, l1_address } =>
-            info!("IDENTIFIED   peer={peer_id}  l1={}", identity::l1_address_base58(l1_address)),
-        SumNetEvent::NatStatusChanged { is_public, public_addr } => {
+        SumNetEvent::ShardRequestFailed { peer_id, error } => {
+            info!("CHUNK_FAIL   peer={peer_id}  error={error}")
+        }
+        SumNetEvent::PeerIdentified {
+            peer_id,
+            l1_address,
+        } => info!(
+            "IDENTIFIED   peer={peer_id}  l1={}",
+            identity::l1_address_base58(l1_address)
+        ),
+        SumNetEvent::NatStatusChanged {
+            is_public,
+            public_addr,
+        } => {
             let kind = if *is_public { "PUBLIC" } else { "PRIVATE" };
             match public_addr {
                 Some(addr) => info!("NAT_STATUS   {kind}  addr={addr}"),
-                None       => info!("NAT_STATUS   {kind}"),
+                None => info!("NAT_STATUS   {kind}"),
             }
         }
-        SumNetEvent::RelayReservation { relay_peer_id, relay_addr } =>
-            info!("RELAY_RSV    relay={relay_peer_id}  addr={relay_addr}"),
-        SumNetEvent::HolePunchSucceeded { peer_id } =>
-            info!("HOLEPUNCH_OK peer={peer_id}"),
-        SumNetEvent::HolePunchFailed { peer_id, error } =>
-            info!("HOLEPUNCH_NG peer={peer_id}  error={error}"),
+        SumNetEvent::RelayReservation {
+            relay_peer_id,
+            relay_addr,
+        } => info!("RELAY_RSV    relay={relay_peer_id}  addr={relay_addr}"),
+        SumNetEvent::HolePunchSucceeded { peer_id } => info!("HOLEPUNCH_OK peer={peer_id}"),
+        SumNetEvent::HolePunchFailed { peer_id, error } => {
+            info!("HOLEPUNCH_NG peer={peer_id}  error={error}")
+        }
     }
 }

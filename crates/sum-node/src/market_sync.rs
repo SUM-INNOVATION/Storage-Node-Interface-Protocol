@@ -11,10 +11,10 @@ use anyhow::Result;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use sum_net::{SumNet, PeerId};
 use sum_net::identity;
-use sum_store::{SumStore, compute_chunk_assignment, chunks_for_node, nodes_for_chunk};
+use sum_net::{PeerId, SumNet};
 use sum_store::gc::GarbageCollector;
+use sum_store::{SumStore, chunks_for_node, compute_chunk_assignment, nodes_for_chunk};
 use sum_types::rpc_types::StorageFileInfo;
 use sum_types::storage::{CHUNK_SIZE, REPLICATION_FACTOR};
 
@@ -144,9 +144,10 @@ impl MarketSyncWorker {
 
         // 3. For each funded file, compute assignment and fetch missing chunks
         for file in &files {
-            if let Err(e) = self.sync_file(
-                file, &node_addrs, &addr_to_peer, store, net,
-            ).await {
+            if let Err(e) = self
+                .sync_file(file, &node_addrs, &addr_to_peer, store, net)
+                .await
+            {
                 warn!(merkle_root = %file.merkle_root, %e, "failed to sync file");
             }
         }
@@ -156,7 +157,10 @@ impl MarketSyncWorker {
         let assigned_cids = self.compute_assigned_cids(&files, &node_addrs, store).await;
         {
             let store_read = store.read().await;
-            match self.gc.mark_and_sweep(&store_read.local, &assigned_cids, self.last_l1_poll) {
+            match self
+                .gc
+                .mark_and_sweep(&store_read.local, &assigned_cids, self.last_l1_poll)
+            {
                 Ok(result) if result.chunks_deleted > 0 => {
                     info!(
                         deleted = result.chunks_deleted,
@@ -181,20 +185,22 @@ impl MarketSyncWorker {
         net: &Arc<SumNet>,
     ) -> Result<()> {
         // Parse merkle_root
-        let root_hex = file.merkle_root.strip_prefix("0x").unwrap_or(&file.merkle_root);
-        let root_bytes = hex_to_32(root_hex)
-            .ok_or_else(|| anyhow::anyhow!("invalid merkle_root hex"))?;
+        let root_hex = file
+            .merkle_root
+            .strip_prefix("0x")
+            .unwrap_or(&file.merkle_root);
+        let root_bytes =
+            hex_to_32(root_hex).ok_or_else(|| anyhow::anyhow!("invalid merkle_root hex"))?;
 
         // Compute chunk count
-        let chunk_count = (file.total_size_bytes + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let chunk_count = file.total_size_bytes.div_ceil(CHUNK_SIZE);
         if chunk_count == 0 {
             return Ok(());
         }
 
         // Compute assignment
-        let assignment = compute_chunk_assignment(
-            &root_bytes, chunk_count, node_addrs, REPLICATION_FACTOR,
-        );
+        let assignment =
+            compute_chunk_assignment(&root_bytes, chunk_count, node_addrs, REPLICATION_FACTOR);
 
         // Which chunks is THIS node assigned?
         let my_chunks = chunks_for_node(&assignment, &self.l1_address);
@@ -204,7 +210,10 @@ impl MarketSyncWorker {
 
         // Check if we have the manifest for this file
         let store_read = store.read().await;
-        let has_manifest = store_read.manifest_idx.get_by_merkle_root(&root_bytes).is_some();
+        let has_manifest = store_read
+            .manifest_idx
+            .get_by_merkle_root(&root_bytes)
+            .is_some();
 
         if !has_manifest {
             drop(store_read); // Release lock before network call
@@ -242,7 +251,9 @@ impl MarketSyncWorker {
         let mut targets: Vec<FetchTarget> = Vec::new();
         if let Some(manifest) = store_read.manifest_idx.get_by_merkle_root(&root_bytes) {
             for chunk_index in &my_chunks {
-                let Some(chunk) = manifest.chunks.get(*chunk_index as usize) else { continue };
+                let Some(chunk) = manifest.chunks.get(*chunk_index as usize) else {
+                    continue;
+                };
                 let cid = &chunk.cid;
 
                 if store_read.local.has(cid) {
@@ -253,8 +264,11 @@ impl MarketSyncWorker {
                 }
 
                 // Pick the first peer that holds this chunk and isn't us.
-                let Some(holders) = nodes_for_chunk(&assignment, *chunk_index) else { continue };
-                let chosen_peer = holders.iter()
+                let Some(holders) = nodes_for_chunk(&assignment, *chunk_index) else {
+                    continue;
+                };
+                let chosen_peer = holders
+                    .iter()
                     .filter(|h| **h != self.l1_address)
                     .find_map(|h| addr_to_peer.get(h).copied());
                 let Some(peer_id) = chosen_peer else { continue };
@@ -282,7 +296,8 @@ impl MarketSyncWorker {
                 "fetching assigned chunk via FetchManager"
             );
             let mut store_w = store.write().await;
-            if let Err(e) = store_w.fetcher
+            if let Err(e) = store_w
+                .fetcher
                 .start_fetch_with_expected_size(
                     net.as_ref(),
                     target.peer_id,
@@ -309,15 +324,21 @@ impl MarketSyncWorker {
         let store_read = store.read().await;
 
         for file in files {
-            let root_hex = file.merkle_root.strip_prefix("0x").unwrap_or(&file.merkle_root);
-            let Some(root_bytes) = hex_to_32(root_hex) else { continue };
+            let root_hex = file
+                .merkle_root
+                .strip_prefix("0x")
+                .unwrap_or(&file.merkle_root);
+            let Some(root_bytes) = hex_to_32(root_hex) else {
+                continue;
+            };
 
-            let chunk_count = (file.total_size_bytes + CHUNK_SIZE - 1) / CHUNK_SIZE;
-            if chunk_count == 0 { continue; }
+            let chunk_count = file.total_size_bytes.div_ceil(CHUNK_SIZE);
+            if chunk_count == 0 {
+                continue;
+            }
 
-            let assignment = compute_chunk_assignment(
-                &root_bytes, chunk_count, node_addrs, REPLICATION_FACTOR,
-            );
+            let assignment =
+                compute_chunk_assignment(&root_bytes, chunk_count, node_addrs, REPLICATION_FACTOR);
 
             let my_chunks = chunks_for_node(&assignment, &self.l1_address);
 
@@ -333,7 +354,6 @@ impl MarketSyncWorker {
 
         assigned_cids
     }
-
 }
 
 /// Parse a hex string into [u8; 32]. Returns None if invalid.

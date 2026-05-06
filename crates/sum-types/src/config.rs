@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 // ── Networking ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NetConfig {
     /// UDP port for the QUIC listener. `0` = OS-assigned (ephemeral).
     ///
@@ -29,18 +29,6 @@ pub struct NetConfig {
     /// Only enable on publicly-reachable hosts (VPS, port-forwarded home
     /// server). Does nothing unless `enable_wan` is also true.
     pub relay_server: bool,
-}
-
-impl Default for NetConfig {
-    fn default() -> Self {
-        Self {
-            udp_listen_port: 0,
-            tcp_listen_port: 0,
-            enable_wan: false,
-            bootstrap_peers: Vec::new(),
-            relay_server: false,
-        }
-    }
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────

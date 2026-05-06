@@ -27,14 +27,17 @@ impl BinaryChunker {
         let file_len = mapped.len() as u64;
 
         if file_len == 0 {
-            return Ok((mapped, DataManifest {
-                file_name: file_name_from_path(path),
-                file_hash: [0u8; 32],
-                total_size_bytes: 0,
-                chunk_count: 0,
-                merkle_root: [0u8; 32],
-                chunks: vec![],
-            }));
+            return Ok((
+                mapped,
+                DataManifest {
+                    file_name: file_name_from_path(path),
+                    file_hash: [0u8; 32],
+                    total_size_bytes: 0,
+                    chunk_count: 0,
+                    merkle_root: [0u8; 32],
+                    chunks: vec![],
+                },
+            ));
         }
 
         let file_hash = *blake3::hash(&mapped).as_bytes();

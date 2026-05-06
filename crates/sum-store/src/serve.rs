@@ -8,7 +8,7 @@
 //! `"manifest:"`, the remainder is a hex-encoded merkle root. The response
 //! contains the CBOR-serialized `DataManifest`.
 
-use sum_net::{SumNet, ShardRequest, ShardResponse};
+use sum_net::{ShardRequest, ShardResponse, SumNet};
 use tracing::{info, warn};
 
 use crate::manifest_index::ManifestIndex;
@@ -419,8 +419,8 @@ pub fn validate_manifest_push(
     root_hex: &str,
     data: &[u8],
 ) -> Result<sum_types::storage::DataManifest, String> {
-    let expected_root = hex_to_32(root_hex)
-        .ok_or_else(|| format!("invalid manifest root hex: {root_hex}"))?;
+    let expected_root =
+        hex_to_32(root_hex).ok_or_else(|| format!("invalid manifest root hex: {root_hex}"))?;
 
     let manifest: sum_types::storage::DataManifest = ciborium::de::from_reader(data)
         .map_err(|e| format!("manifest deserialization failed: {e}"))?;
@@ -473,12 +473,11 @@ pub fn validate_manifest_push(
     // This is the structural binding: with 5 + 6 holding, the leaf
     // hashes are exactly what the manifest claims, so the root we
     // recompute is the only root those leaves can produce.
-    let recomputed_root = *crate::merkle::MerkleTree::build(&leaf_hashes).root().as_bytes();
+    let recomputed_root = *crate::merkle::MerkleTree::build(&leaf_hashes)
+        .root()
+        .as_bytes();
     if recomputed_root != manifest.merkle_root {
-        let computed_hex: String = recomputed_root
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let computed_hex: String = recomputed_root.iter().map(|b| format!("{b:02x}")).collect();
         return Err(format!(
             "manifest merkle root recomputation failed: chunks compute to {computed_hex}, \
              manifest claims {root_hex}"
@@ -537,7 +536,9 @@ mod tests {
             });
             leaf_hashes.push(hash);
         }
-        let root = *crate::merkle::MerkleTree::build(&leaf_hashes).root().as_bytes();
+        let root = *crate::merkle::MerkleTree::build(&leaf_hashes)
+            .root()
+            .as_bytes();
         DataManifest {
             merkle_root: root,
             file_name: "test.bin".to_string(),
@@ -651,15 +652,18 @@ mod tests {
         // checks 5 and 6 pass; only the recomputed-root check (7)
         // catches it.
         let other = well_formed_manifest(3, 0x55);
-        assert_ne!(other.merkle_root, real_root, "fixture sanity: other != real");
+        assert_ne!(
+            other.merkle_root, real_root,
+            "fixture sanity: other != real"
+        );
 
         let forged = DataManifest {
-            merkle_root: real_root,                 // claim to be `real`'s root
+            merkle_root: real_root, // claim to be `real`'s root
             file_name: real.file_name.clone(),
             file_hash: real.file_hash,
             total_size_bytes: other.total_size_bytes,
             chunk_count: other.chunk_count,
-            chunks: other.chunks,                   // ← chunks from a DIFFERENT file
+            chunks: other.chunks, // ← chunks from a DIFFERENT file
         };
 
         let bytes = cbor(&forged);

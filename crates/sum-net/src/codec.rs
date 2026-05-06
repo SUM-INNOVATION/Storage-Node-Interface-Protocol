@@ -117,9 +117,8 @@ impl libp2p::request_response::Codec for ShardCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_length_prefixed(io, self.max_msg_bytes).await?;
-        let (req, _) =
-            bincode::serde::decode_from_slice(&buf, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let (req, _) = bincode::serde::decode_from_slice(&buf, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(req)
     }
 
@@ -132,9 +131,8 @@ impl libp2p::request_response::Codec for ShardCodec {
         T: AsyncRead + Unpin + Send,
     {
         let buf = read_length_prefixed(io, self.max_msg_bytes).await?;
-        let (resp, _) =
-            bincode::serde::decode_from_slice(&buf, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let (resp, _) = bincode::serde::decode_from_slice(&buf, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(resp)
     }
 
@@ -776,7 +774,10 @@ mod tests {
             .await;
         assert!(result.is_err(), "expected error for V2-on-V1");
         assert!(
-            result.unwrap_err().to_string().contains("V2 request written to non-V2"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("V2 request written to non-V2"),
             "wrong error message"
         );
 
@@ -796,7 +797,10 @@ mod tests {
             .await;
         assert!(result.is_err(), "expected error for V1-on-V2");
         assert!(
-            result.unwrap_err().to_string().contains("V1 request written to non-V1"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("V1 request written to non-V1"),
             "wrong error message"
         );
     }

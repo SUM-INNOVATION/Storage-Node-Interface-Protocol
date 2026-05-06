@@ -133,10 +133,7 @@ impl ManifestIndex {
 
         // Migrate legacy manifest.cbor if the index is empty.
         let legacy_path = store_dir.join("manifest.cbor");
-        if index.by_root.is_empty()
-            && index.private_bytes.is_empty()
-            && legacy_path.exists()
-        {
+        if index.by_root.is_empty() && index.private_bytes.is_empty() && legacy_path.exists() {
             if let Ok(m) = manifest::read_manifest(&legacy_path) {
                 tracing::info!("migrating legacy manifest.cbor into manifests/");
                 // Write to new location (ignore write errors on migration).
@@ -204,11 +201,7 @@ impl ManifestIndex {
     /// an error (defensive: no legitimate flow ever does this, and a
     /// silent rebind would let a malicious peer force an existing
     /// chunk into a different file's namespace).
-    pub fn record_private_chunk_cid(
-        &mut self,
-        merkle_root: [u8; 32],
-        cid: &str,
-    ) -> Result<()> {
+    pub fn record_private_chunk_cid(&mut self, merkle_root: [u8; 32], cid: &str) -> Result<()> {
         if let Some(existing) = self.private_cid_to_root.get(cid) {
             if existing == &merkle_root {
                 return Ok(()); // idempotent
@@ -220,7 +213,8 @@ impl ManifestIndex {
             )));
         }
         self.append_private_chunk_cid_to_disk(&merkle_root, cid)?;
-        self.private_cid_to_root.insert(cid.to_string(), merkle_root);
+        self.private_cid_to_root
+            .insert(cid.to_string(), merkle_root);
         Ok(())
     }
 
@@ -299,14 +293,12 @@ impl ManifestIndex {
     /// Append one CID line to `<hex_root>.private_chunks`. Each line
     /// is independently complete (`<cid>\n`), so a crash mid-write
     /// loses at most the in-flight line — the rest reloads cleanly.
-    fn append_private_chunk_cid_to_disk(
-        &self,
-        root: &[u8; 32],
-        cid: &str,
-    ) -> Result<()> {
+    fn append_private_chunk_cid_to_disk(&self, root: &[u8; 32], cid: &str) -> Result<()> {
         use std::io::Write;
         let hex_root: String = root.iter().map(|b| format!("{b:02x}")).collect();
-        let path = self.manifests_dir.join(format!("{hex_root}.private_chunks"));
+        let path = self
+            .manifests_dir
+            .join(format!("{hex_root}.private_chunks"));
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -504,7 +496,8 @@ mod tests {
         // Private: distinct root.
         let private_root = [0xBBu8; 32];
         let private_bytes = b"opaque encrypted manifest blob".to_vec();
-        idx.insert_private(private_root, private_bytes.clone()).unwrap();
+        idx.insert_private(private_root, private_bytes.clone())
+            .unwrap();
 
         // Public-side lookups only see Public.
         assert!(idx.get_by_merkle_root(&[0xAA; 32]).is_some());
@@ -553,7 +546,8 @@ mod tests {
         // Private file with one chunk.
         let private_root = [0xBBu8; 32];
         let private_cid = "bafk_private_only";
-        idx.record_private_chunk_cid(private_root, private_cid).unwrap();
+        idx.record_private_chunk_cid(private_root, private_cid)
+            .unwrap();
 
         // Each CID resolves to its own root, neither leaks into the other.
         assert_eq!(idx.merkle_root_for_cid(&public_cid_0), Some(&[0xAA; 32]));

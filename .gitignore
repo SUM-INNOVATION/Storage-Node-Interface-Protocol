@@ -8,7 +8,6 @@ target/
 # Editor / IDE
 .vscode/
 .idea/
-.claude/
 *.swp
 *.swo
 *~
@@ -22,11 +21,9 @@ target/
 # OS
 Thumbs.db
 
-# Local test / debug artifacts (ad-hoc logs, never committed)
-SNIP_*.txt
+# Ad-hoc logs
 *.log
-SNIP-V2-CHAIN-PLAN.md
-SNIP-V2-TESTNET-DEPLOYMENT-PREP.md
-SNIP-V2-RPC-CHEATSHEET.md
+SNIP_*.txt
 
+# Internal Reference
 .claude/
