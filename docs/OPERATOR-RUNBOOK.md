@@ -180,6 +180,11 @@ git checkout 5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0  # current SNIP pin
 docker-compose -f deploy/snip-local-mirror.yaml up -d --build
 ```
 
+The first `up --build` takes about **10 minutes** for the cargo
+release stage of the validator image. Subsequent builds reuse the
+docker layer cache (rust:1.85-slim base) and complete in seconds
+to a few minutes — this is normal, not hung.
+
 ### Health check (read-only)
 
 ```bash
@@ -197,39 +202,161 @@ Expected:
 
 ### Stop / wipe
 
+`stop` / `start` is the **iteration default** — pause and resume the
+same chain, same validator key, same chain DB. The chain mirror's
+entrypoint enforces this: an existing chain DB always resumes;
+genesis is never silently regenerated. Use `down -v` only when you
+genuinely want a clean slate (fresh genesis, fresh validator key).
+
 | Command | Effect |
 |---|---|
-| `docker-compose -f deploy/snip-local-mirror.yaml down`     | Preserves validator key + chain DB volume. Restart resumes the same chain. |
-| `docker-compose -f deploy/snip-local-mirror.yaml down -v`  | Wipes chain state. Next `up` regenerates a fresh validator key and runs genesis. |
+| `docker-compose -f deploy/snip-local-mirror.yaml stop`     | Pause. Chain DB + validator key untouched. **Default for iteration.** |
+| `docker-compose -f deploy/snip-local-mirror.yaml start`    | Resume the paused chain. Same height, same key, same state. |
+| `docker-compose -f deploy/snip-local-mirror.yaml down`     | Stop and remove the container; preserves named volumes. Equivalent to `stop` + container cleanup. |
+| `docker-compose -f deploy/snip-local-mirror.yaml down -v`  | Wipe everything. Next `up` runs genesis + regenerates the validator key. **Only when intended.** |
 
 ### Funded test accounts (optional, fresh-genesis only)
 
-The chain repo ships a sample funding overlay at
-`deploy/snip-mirror-extra-alloc.example.json`. To seed funded
-test accounts at genesis:
+The funding overlay is **optional** and **fresh-genesis-only** —
+the mirror reads it once at genesis. If the chain DB already
+exists (from a prior `up`), the overlay is ignored. To activate
+an overlay against a running mirror, you MUST `down -v` first
+to wipe the chain DB.
 
-1. Copy the example to a new file (don't edit the example
-   in place — keeps the repo's example clean):
+#### File format
+
+The mounted overlay is a **pure JSON object** with **numeric**
+balances (NOT strings). This is the chain mirror's load-bearing
+schema:
+
+```json
+{
+  "<base58-address>": <balance-in-base-units>,
+  "<base58-address>": <balance-in-base-units>
+}
+```
+
+A string-encoded balance (`"1000000000000"` instead of
+`1000000000000`) fails to parse and the mirror starts without
+the overlay applied — silently, from your perspective, until
+you check balances and find them all zero.
+
+#### Generating addresses
+
+The SNIP repo ships an `e2e-helper generate-e2e-keys` command
+that produces fresh seeds for the WS2b harness's roles
+(`owner`, `recipient`, `third_party`, `archive_1`, `archive_2`)
+and emits a snippet matching the schema above:
+
+```bash
+cd <snip-repo>
+cargo run --release -p sum-node --bin e2e-helper -- \
+    generate-e2e-keys --out e2e_keys > /tmp/snip-alloc-snippet.json
+cat /tmp/snip-alloc-snippet.json
+# {
+#   "<base58_owner>": 1000000000000,
+#   "<base58_recipient>": 1000000000000,
+#   ...
+# }
+```
+
+The seed files in `e2e_keys/` are 0o600 and covered by
+`.gitignore`. **Never commit them.** Once a generated seed is
+funded by the overlay it is operational signing material.
+
+#### Activating the overlay (fresh genesis)
+
+Compose volume mounts MUST be declared in YAML — `docker-compose`
+does not accept a `-v` flag for runtime volumes. Use a separate
+compose override file:
+
+1. Stop and wipe the running mirror (if it has booted before):
    ```bash
-   cp deploy/snip-mirror-extra-alloc.example.json deploy/extra-alloc.json
+   cd <chain-repo>
+   docker-compose -f deploy/snip-local-mirror.yaml down -v
    ```
-2. Edit `deploy/extra-alloc.json` to insert your own dev base58
-   addresses and balances. **DO NOT insert private keys** — only
-   public addresses and balance values. Private keys belong in
-   your local environment, your wallet, or a password manager,
-   never in any file the repo tracks.
-3. Mount the file into the mirror container as
-   `/config/extra-alloc.json:ro` (uncomment the relevant volume
-   line in the compose file, or pass `-v` at startup).
-4. `up -d --build`. The overlay is read at genesis; if the chain
-   DB already exists, it is ignored.
+2. Place the overlay file where the override mount expects it:
+   ```bash
+   cp /tmp/snip-alloc-snippet.json deploy/extra-alloc.json
+   ```
+   (Verify the JSON has numeric balances, not strings.)
+3. Bring up with the override file. The override should mount
+   `deploy/extra-alloc.json` into the mirror container at
+   `/config/extra-alloc.json:ro`. Example
+   `deploy/snip-local-mirror.override.yaml`:
+   ```yaml
+   services:
+     mirror:
+       volumes:
+         - ./extra-alloc.json:/config/extra-alloc.json:ro
+   ```
+   Then:
+   ```bash
+   docker-compose \
+       -f deploy/snip-local-mirror.yaml \
+       -f deploy/snip-local-mirror.override.yaml \
+       up -d --build
+   ```
 
-If the chain DB already exists and you need a freshly funded
-account, choose:
+#### Verifying the overlay landed
 
-- **Transfer.** Submit a transfer tx from an already-funded
-  account to the new address.
-- **Reset.** `down -v` to wipe, place the overlay, `up -d --build`.
+After bringing the mirror up with the overlay, verify three
+properties before running any test:
+
+1. **`chain_id` returns `31337`** — confirms the mirror booted
+   and the RPC endpoint matches the documented value.
+2. **Block height advances** — confirms the validator is
+   producing blocks (not stuck mid-genesis).
+3. **Each WS2b role address has a non-zero balance** — confirms
+   the overlay parsed and applied.
+
+The first two are covered by `make smoke RPC=http://localhost:8545
+SMOKE_ARGS=--require-v2`. For the per-address balance check:
+
+```bash
+cd <snip-repo>
+for role in owner recipient third_party archive_1 archive_2; do
+    seed=$(cat e2e_keys/$role.seed.hex)
+    addr=$(cargo run --quiet -p sum-node --bin e2e-helper -- \
+        l1-address --seed-hex "$seed")
+    bal=$(cargo run --quiet -p sum-node --bin e2e-helper -- \
+        balance --rpc-url http://localhost:8545 --address "$addr")
+    echo "$role  $addr  balance=$bal"
+done
+```
+
+Every line must show a non-zero balance. If any role shows
+`balance="0"`, the overlay didn't activate (most common cause:
+the chain DB wasn't wiped before re-up, OR the JSON used string
+balances instead of numbers).
+
+#### Intentional hard-fails (read these before debugging)
+
+The chain mirror's startup script applies two hard-fails that
+catch the most common operator mistakes. Both print clear
+`[snip-mirror] ERROR: …` messages explaining the right next
+action — do NOT treat them as bugs:
+
+- **Template-placeholder rejection.** The example overlay file
+  ships with placeholder addresses. If your `extra-alloc.json`
+  still contains any of them (almost always a copy-paste
+  mistake where the operator forgot to swap in their own
+  generated addresses), the validator refuses to boot. Replace
+  every placeholder with a real base58 address from your
+  `e2e_keys/` snippet and retry.
+- **Existing-DB rejection.** If a chain DB volume already
+  exists and an overlay is mounted, the validator refuses to
+  boot. Genesis allocations cannot fund accounts retroactively.
+  Either submit a transfer tx from an already-funded account,
+  or `down -v` to wipe and re-bring-up with the overlay (see
+  next subsection).
+
+#### Re-funding without re-genesis
+
+If the chain DB already exists and you only need ONE more funded
+account (not a full re-genesis), submit a transfer transaction
+from an existing funded account. The overlay route requires
+`down -v`, which destroys all chain state.
 
 The mirror is the source of truth for hermetic E2E validation;
 live chain RPC is for read-only smoke only (see

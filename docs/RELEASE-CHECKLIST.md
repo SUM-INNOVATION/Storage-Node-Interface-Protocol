@@ -146,13 +146,26 @@ git checkout 5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0
 docker-compose -f deploy/snip-local-mirror.yaml up -d --build
 ```
 
-Health check (read-only, no tx):
+Health check (read-only, no tx). After bringing the mirror up,
+verify all three:
 
-```bash
-make smoke RPC=http://localhost:8545
-# Expect: V2 state ENABLED_FROM_GENESIS, finalized height advancing
-# (~2s block cadence). chain_id = 31337.
-```
+1. **chain_id returns `31337`** and finality is `"finalized"`:
+   ```bash
+   make smoke RPC=http://localhost:8545 SMOKE_ARGS=--require-v2
+   # Expect: chain_id=31337, V2 state ENABLED_FROM_GENESIS.
+   ```
+2. **Block height advances** (~2s block cadence). The smoke
+   line `chain_getBlockHeight ........... OK (finalized
+   height=N, finality=finalized)` confirms; re-running smoke a
+   few seconds later must show a higher N.
+3. **Each WS2b role address has a non-zero balance** (only
+   applies if you brought the mirror up with the funded-test-
+   accounts overlay; see
+   [`OPERATOR-RUNBOOK.md`](../docs/OPERATOR-RUNBOOK.md)
+   "Funded test accounts" for the per-role balance check
+   loop).
+
+A failure in any of the three is a hard release blocker.
 
 Stop / wipe (from the chain checkout):
 
@@ -163,8 +176,15 @@ docker-compose -f deploy/snip-local-mirror.yaml down -v    # wipe + regen keys
 
 Optional fresh-genesis funded accounts: see
 [`OPERATOR-RUNBOOK.md`](../docs/OPERATOR-RUNBOOK.md)
-"Funded test accounts (optional, fresh-genesis only)". DO NOT
-commit private keys for the funded addresses.
+"Funded test accounts (optional, fresh-genesis only)". The
+overlay file MUST use numeric balances (`{ "<base58>": <int>,
+... }`), not string-encoded balances. Compose volume mounts MUST
+be declared in YAML — `docker-compose` does not accept a `-v`
+flag for runtime volumes; use a separate override file. If the
+mirror has already been started, run
+`docker-compose -f deploy/snip-local-mirror.yaml down -v`
+before starting with the overlay (the overlay is fresh-genesis
+gated). DO NOT commit private keys for the funded addresses.
 
 When WS2 ships:
 
