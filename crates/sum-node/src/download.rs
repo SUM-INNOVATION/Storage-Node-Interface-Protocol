@@ -118,11 +118,11 @@ impl DownloadOrchestrator {
             tokio::select! {
                 event = net.next_event() => {
                     match event {
-                        Some(SumNetEvent::PeerDiscovered { peer_id, .. }) => {
-                            if !discovered_peers.contains(&peer_id) {
-                                discovered_peers.push(peer_id);
-                                break;
-                            }
+                        Some(SumNetEvent::PeerDiscovered { peer_id, .. })
+                            if !discovered_peers.contains(&peer_id) =>
+                        {
+                            discovered_peers.push(peer_id);
+                            break;
                         }
                         Some(ref e @ SumNetEvent::PeerIdentified { .. })
                         | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {
@@ -186,46 +186,46 @@ impl DownloadOrchestrator {
             tokio::select! {
                 event = net.next_event() => {
                     match event {
-                        Some(SumNetEvent::ShardReceived { peer_id, response }) => {
-                            if response.cid == manifest_cid {
-                                if let Some(ref err) = response.error {
-                                    // The peer we asked answered "not found".
-                                    // Don't bail — keep waiting for another
-                                    // peer's response. New peers discovered
-                                    // below will get their own request.
-                                    warn!(%peer_id, %err, "manifest request rejected by a peer — waiting for others");
-                                    continue;
-                                }
-                                let m = deserialize_manifest_cbor(&response.data)
-                                    .map_err(|e| anyhow::anyhow!("failed to deserialize manifest: {e}"))?;
-                                info!(
-                                    %peer_id,
-                                    file_name = %m.file_name,
-                                    chunk_count = m.chunk_count,
-                                    total_bytes = m.total_size_bytes,
-                                    "manifest received"
-                                );
-                                // Promote the manifest provider to the FRONT
-                                // of `discovered_peers` so Phase 3's chunk
-                                // fetcher prefers them. They demonstrably
-                                // hold content for this root; we already
-                                // have a connection to them. Without this
-                                // step, `fill_fetches` falls back to
-                                // `discovered_peers.first()` — which is
-                                // typically the bootstrap peer (the relay),
-                                // who has no chunks and answers "not found"
-                                // in a loop.
-                                if let Some(pos) = discovered_peers.iter().position(|p| *p == peer_id) {
-                                    if pos != 0 {
-                                        discovered_peers.swap(0, pos);
-                                    }
-                                } else {
-                                    discovered_peers.insert(0, peer_id);
-                                }
-                                break m;
+                        Some(SumNetEvent::ShardReceived { peer_id, response })
+                            if response.cid == manifest_cid =>
+                        {
+                            if let Some(ref err) = response.error {
+                                // The peer we asked answered "not found".
+                                // Don't bail — keep waiting for another
+                                // peer's response. New peers discovered
+                                // below will get their own request.
+                                warn!(%peer_id, %err, "manifest request rejected by a peer — waiting for others");
+                                continue;
                             }
+                            let m = deserialize_manifest_cbor(&response.data)
+                                .map_err(|e| anyhow::anyhow!("failed to deserialize manifest: {e}"))?;
+                            info!(
+                                %peer_id,
+                                file_name = %m.file_name,
+                                chunk_count = m.chunk_count,
+                                total_bytes = m.total_size_bytes,
+                                "manifest received"
+                            );
+                            // Promote the manifest provider to the FRONT
+                            // of `discovered_peers` so Phase 3's chunk
+                            // fetcher prefers them. They demonstrably
+                            // hold content for this root; we already
+                            // have a connection to them. Without this
+                            // step, `fill_fetches` falls back to
+                            // `discovered_peers.first()` — which is
+                            // typically the bootstrap peer (the relay),
+                            // who has no chunks and answers "not found"
+                            // in a loop.
+                            if let Some(pos) = discovered_peers.iter().position(|p| *p == peer_id) {
+                                if pos != 0 {
+                                    discovered_peers.swap(0, pos);
+                                }
+                            } else {
+                                discovered_peers.insert(0, peer_id);
+                            }
+                            break m;
                         }
-                        Some(SumNetEvent::ShardRequestFailed { peer_id, error }) => {
+                        Some(SumNetEvent::ShardRequestFailed { peer_id, error })
                             // An outbound request to `peer_id` failed before
                             // it could be sent (no connection, peer down,
                             // protocol mismatch). During Phase 2 the only
@@ -233,9 +233,9 @@ impl DownloadOrchestrator {
                             // treat this as a manifest failure for that
                             // peer. We don't retry against the same peer —
                             // we wait for another peer to be discovered.
-                            if tried_for_manifest.contains(&peer_id) {
-                                warn!(%peer_id, %error, "manifest request to peer dropped — will rely on other peers");
-                            }
+                            if tried_for_manifest.contains(&peer_id) =>
+                        {
+                            warn!(%peer_id, %error, "manifest request to peer dropped — will rely on other peers");
                         }
                         Some(SumNetEvent::PeerDiscovered { peer_id, .. }) => {
                             // Newly-discovered peer. If we haven't already
@@ -460,10 +460,10 @@ impl DownloadOrchestrator {
                                 ).await;
                             }
                         }
-                        Some(SumNetEvent::PeerDiscovered { peer_id, .. }) => {
-                            if !discovered_peers.contains(&peer_id) {
-                                discovered_peers.push(peer_id);
-                            }
+                        Some(SumNetEvent::PeerDiscovered { peer_id, .. })
+                            if !discovered_peers.contains(&peer_id) =>
+                        {
+                            discovered_peers.push(peer_id);
                         }
                         Some(ref e @ SumNetEvent::PeerIdentified { .. })
                         | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {

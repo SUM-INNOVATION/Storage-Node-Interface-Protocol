@@ -332,9 +332,8 @@ impl<R: AttestorRpc> AssignmentAttestor<R> {
         // we reach `chunks(cap)`.
 
         let mut batches: Vec<BatchOutcome> = Vec::new();
-        let mut nonce = req.starting_nonce;
 
-        for chunk_batch in attest_set.chunks(cap) {
+        for (nonce, chunk_batch) in (req.starting_nonce..).zip(attest_set.chunks(cap)) {
             let chunk_indices: Vec<u32> = chunk_batch.to_vec();
 
             // Building the tx is infallible given a 32-byte seed; the
@@ -410,7 +409,6 @@ impl<R: AttestorRpc> AssignmentAttestor<R> {
                 tx_hash,
                 finalized_at_height: height,
             });
-            nonce += 1;
         }
 
         info!(
