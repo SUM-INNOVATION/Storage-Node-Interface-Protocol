@@ -13,10 +13,13 @@ target/
 *~
 .DS_Store
 
-# Environment / secrets
+# Environment / secrets — never commit signing material in any form.
 .env
 *.pem
 *.key
+*.seed
+*.seed.hex
+keys/
 
 # OS
 Thumbs.db

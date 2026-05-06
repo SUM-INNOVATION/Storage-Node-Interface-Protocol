@@ -158,11 +158,84 @@ re-ingestion is required.
 
 ## Local mirror
 
-Local-mirror setup is provided by chain ops out-of-band. Use the
-artifact / runbook supplied for the target internal chain release.
-The mirror is the source of truth for hermetic E2E validation; live
-chain RPC is for read-only smoke only (see
-[`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md) §4).
+The local mirror is a **disposable single-validator devnet** for
+V2 client integration testing. It is NOT production, NOT a public
+testnet, and NOT representative of liveness or security
+characteristics. Use it only to validate that SNIP talks to the
+chain wire shape correctly at the pinned commit
+([`CHAIN-COMPAT.md`](CHAIN-COMPAT.md)).
+
+Validator keys are generated on first boot into a Docker named
+volume. No validator signing material, faucet privates, or test
+seeds are committed to the chain repo, and SNIP must never
+consume an artifact that ships keys. The same rule applies
+prospectively to every future re-pin.
+
+### Bring up
+
+```bash
+git clone <chain repo> sum-chain
+cd sum-chain
+git checkout 5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0  # current SNIP pin
+docker-compose -f deploy/snip-local-mirror.yaml up -d --build
+```
+
+### Health check (read-only)
+
+```bash
+make smoke RPC=http://localhost:8545
+```
+
+Expected:
+
+- `chain_getChainParams` returns `chain_id = 31337` and
+  `v2_enabled_from_height = 0` → SNIP reports
+  `V2 state: ENABLED_FROM_GENESIS`.
+- `chain_getBlockHeight(["finalized"])` returns
+  `finality = "finalized"` and a non-zero, advancing height.
+  Blocks advance approximately every 2 seconds.
+
+### Stop / wipe
+
+| Command | Effect |
+|---|---|
+| `docker-compose -f deploy/snip-local-mirror.yaml down`     | Preserves validator key + chain DB volume. Restart resumes the same chain. |
+| `docker-compose -f deploy/snip-local-mirror.yaml down -v`  | Wipes chain state. Next `up` regenerates a fresh validator key and runs genesis. |
+
+### Funded test accounts (optional, fresh-genesis only)
+
+The chain repo ships a sample funding overlay at
+`deploy/snip-mirror-extra-alloc.example.json`. To seed funded
+test accounts at genesis:
+
+1. Copy the example to a new file (don't edit the example
+   in place — keeps the repo's example clean):
+   ```bash
+   cp deploy/snip-mirror-extra-alloc.example.json deploy/extra-alloc.json
+   ```
+2. Edit `deploy/extra-alloc.json` to insert your own dev base58
+   addresses and balances. **DO NOT insert private keys** — only
+   public addresses and balance values. Private keys belong in
+   your local environment, your wallet, or a password manager,
+   never in any file the repo tracks.
+3. Mount the file into the mirror container as
+   `/config/extra-alloc.json:ro` (uncomment the relevant volume
+   line in the compose file, or pass `-v` at startup).
+4. `up -d --build`. The overlay is read at genesis; if the chain
+   DB already exists, it is ignored.
+
+If the chain DB already exists and you need a freshly funded
+account, choose:
+
+- **Transfer.** Submit a transfer tx from an already-funded
+  account to the new address.
+- **Reset.** `down -v` to wipe, place the overlay, `up -d --build`.
+
+The mirror is the source of truth for hermetic E2E validation;
+live chain RPC is for read-only smoke only (see
+[`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md) §4 and §5). The
+SNIP-side WS2 E2E suite that drives this mirror end-to-end is
+the next workstream.
 
 ## Monitoring
 

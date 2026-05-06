@@ -72,17 +72,24 @@ exemption in the commit message and in [`Cargo.toml`](../Cargo.toml)
 ## 3. Chain compatibility
 
 - [ ] [`CHAIN-COMPAT.md`](CHAIN-COMPAT.md) "Pinned chain version"
-      table reflects the internal release tag this release targets.
-      The exact private chain commit is verified out-of-band by chain
-      ops, NOT inlined here.
-- [ ] The fixture tests pass without modification:
+      row holds an actual SHA. The SHA MUST be from a chain
+      history that contains no committed signing material; if
+      chain ops rewrote history to scrub secrets, confirm the
+      rewrite landed before pinning.
+- [ ] The fixture tests pass without modification on the pinned
+      SHA's regenerated mirror types:
       ```bash
       cargo test -p sum-node tx_builder rpc_client
       cargo test -p sum-types
       ```
       Any diff in fixture bytes is a wire-format change and MUST be
-      a separate commit referencing the new chain release tag
-      (chain-team coordination required).
+      a separate commit referencing the new chain SHA (chain-team
+      coordination required).
+- [ ] Chain team has reported a green run of their own V2 wire-
+      fixture suite on the pinned SHA (e.g.
+      `cargo test -p sumchain-primitives --test v2_wire_fixtures`).
+      Both sides green means the V2 wire shape is confirmed-stable
+      on this commit.
 - [ ] V2-gate semantics tests still pass (regression guard for
       `Some(0)` ≠ `None`):
       ```bash
@@ -122,16 +129,67 @@ Asserts read-only:
 
 ## 5. Local-mirror full E2E
 
-> Local-mirror setup is provided by chain ops out-of-band. Use the
-> artifact / runbook supplied for the target internal chain release.
-> Until then, the mock-driven integration suite (`cargo test
-> --workspace`) covers the SNIP-side logic.
+> **Mirror is runnable at the pinned chain SHA.** The
+> chain-side compose preset at
+> `deploy/snip-local-mirror.yaml` brings up a self-
+> bootstrapping single-validator devnet (validator key
+> generated into a Docker named volume on first boot; no
+> signing material in the repo). The SNIP-side **WS2 E2E
+> suite** that drives this mirror end-to-end through the full
+> Phase 4 lifecycle is the next workstream — until it lands,
+> the mirror is verified via `make smoke` only.
 
-When available:
+Bring up (from the chain checkout):
 
 ```bash
-# Bring up the chain-ops-supplied local mirror; exact command depends
-# on the supplied artifact (e.g. `docker-compose up`, a binary, etc).
+git checkout 5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0
+docker-compose -f deploy/snip-local-mirror.yaml up -d --build
+```
+
+Health check (read-only, no tx):
+
+```bash
+make smoke RPC=http://localhost:8545
+# Expect: V2 state ENABLED_FROM_GENESIS, finalized height advancing
+# (~2s block cadence). chain_id = 31337.
+```
+
+Stop / wipe (from the chain checkout):
+
+```bash
+docker-compose -f deploy/snip-local-mirror.yaml down       # preserve volume
+docker-compose -f deploy/snip-local-mirror.yaml down -v    # wipe + regen keys
+```
+
+Optional fresh-genesis funded accounts: see
+[`OPERATOR-RUNBOOK.md`](../docs/OPERATOR-RUNBOOK.md)
+"Funded test accounts (optional, fresh-genesis only)". DO NOT
+commit private keys for the funded addresses.
+
+When WS2 ships:
+
+```bash
+cargo test --test e2e_lifecycle -- --include-ignored
+```
+
+Asserts: Public ingest/download, Private owner-only, Private
+shared, share/revoke/update-access with finality boundary,
+archive restart recovery, V1 legacy compatibility.
+>
+> Until then, releases gate on:
+>
+>   * `make release-check` (the linux CI gate, § 0).
+>   * In-tree bincode v1 fixture tests (§ 3) — exhaustive for the
+>     V2 wire surface SNIP submits / decodes.
+>   * Live-chain read-only smoke (§ 4) — sanity-checks the target
+>     RPC's V2 state without sending any tx.
+
+When unblocked:
+
+```bash
+# Bring up the chain-ops-supplied local mirror per their updated
+# instructions (exact command depends on the artifact they ship —
+# could be `docker-compose up`, a binary, etc).
 cargo test --test e2e_lifecycle -- --include-ignored
 # Tear down per the supplied runbook.
 ```

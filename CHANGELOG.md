@@ -74,10 +74,14 @@ in [`docs/CHAIN-COMPAT.md`](docs/CHAIN-COMPAT.md).
   cached ciphertext + bundle can still decrypt past content.
   Operators wanting forward secrecy must revoke + re-ingest under
   a fresh `K_file`.
-- **Local-mirror E2E gating.** The mock-driven workspace test suite
-  covers SNIP-side correctness today. The local-mirror E2E suite
-  (the release gate for chain-side wire compatibility) lands once
-  the chain ops local-mirror artifact is supplied.
+- **Local-mirror E2E suite.** Chain ops shipped a runnable
+  self-bootstrapping mirror at the pinned commit; operators can
+  bring it up via the compose preset documented in
+  [`docs/OPERATOR-RUNBOOK.md`](docs/OPERATOR-RUNBOOK.md). The
+  SNIP-side WS2 suite that drives the mirror end-to-end through
+  the full Phase 4 lifecycle is the next workstream. In the
+  meantime, the in-tree fixture + contract tests + `make smoke`
+  against the running mirror are the operator gate.
 - **CI.** `.github/workflows/ci.yml` ships in WS8 of the
   production-readiness workstream; until then, `make release-check`
   is the single-command equivalent operators run locally.
