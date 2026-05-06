@@ -232,10 +232,18 @@ mod tests {
         let report = store.health_check();
         assert_eq!(report.chunk_count, 0);
         assert_eq!(report.manifest_count, 0);
-        // disk_usage may include subdirectory entries (manifests/), so just check it's small
+        // disk_usage_bytes sums `metadata().len()` of every direct child
+        // of the store root, including subdirectories. Subdirectory
+        // sizes are filesystem-dependent — APFS/HFS+ may report ~0 for
+        // an empty dir, while ext4/xfs allocate a full block (typically
+        // 4096 bytes) per dir. With a few subdirs (`manifests/`, etc.)
+        // this can reach tens of KB on Linux for a *truly* empty store.
+        // The load-bearing assertion is "no chunks, no manifests, dir
+        // writable"; the byte threshold just guards against runaway
+        // (e.g. accidentally writing GBs of state on `new()`).
         assert!(
-            report.disk_usage_bytes < 1024,
-            "expected minimal disk usage, got {}",
+            report.disk_usage_bytes < 64 * 1024,
+            "expected minimal disk usage (< 64 KiB), got {}",
             report.disk_usage_bytes
         );
         assert!(report.store_dir_writable);
