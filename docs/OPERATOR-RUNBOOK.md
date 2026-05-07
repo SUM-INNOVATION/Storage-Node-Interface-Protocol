@@ -245,8 +245,11 @@ you check balances and find them all zero.
 
 The SNIP repo ships an `e2e-helper generate-e2e-keys` command
 that produces fresh seeds for the WS2b harness's roles
-(`owner`, `recipient`, `third_party`, `archive_1`, `archive_2`)
-and emits a snippet matching the schema above:
+(`owner`, `recipient`, `third_party`, `archive_1`, `archive_2`,
+`archive_3`) and emits a snippet matching the schema above. The
+chain plan fixes `assignment_replication_factor = 3`, so the
+harness needs **three** archive identities — registering /
+listening only one or two leaves ingest unable to satisfy quorum:
 
 ```bash
 cd <snip-repo>
@@ -315,7 +318,7 @@ SMOKE_ARGS=--require-v2`. For the per-address balance check:
 
 ```bash
 cd <snip-repo>
-for role in owner recipient third_party archive_1 archive_2; do
+for role in owner recipient third_party archive_1 archive_2 archive_3; do
     seed=$(cat e2e_keys/$role.seed.hex)
     addr=$(cargo run --quiet -p sum-node --bin e2e-helper -- \
         l1-address --seed-hex "$seed")

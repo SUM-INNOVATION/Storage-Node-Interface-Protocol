@@ -160,7 +160,10 @@ enum Command {
     /// `.gitignore` entry covering the output dir.
     ///
     /// Default roles: `owner`, `recipient`, `third_party`,
-    /// `archive_1`, `archive_2`. The harness in WS2b Commit 2
+    /// `archive_1`, `archive_2`, `archive_3`. The chain plan
+    /// fixes `assignment_replication_factor = 3`, so the
+    /// WS2b harness needs three archive identities to satisfy
+    /// quorum during ingest scenarios. The harness in WS2b Commit 2
     /// references these names.
     GenerateE2eKeys {
         /// Output directory for the generated seed files.
@@ -760,12 +763,18 @@ fn parse_seed(hex: &str) -> Result<[u8; 32]> {
 
 /// Roles the WS2b harness expects. Stable order so a hand-edited
 /// overlay stays diff-friendly across regenerations.
+///
+/// The three `archive_*` roles cover the chain plan's
+/// `assignment_replication_factor = 3`: WS2b ingest scenarios spawn
+/// all three as concurrent listeners so chain-side quorum is
+/// satisfied without lowering R or special-casing chain params.
 const E2E_ROLES: &[&str] = &[
     "owner",
     "recipient",
     "third_party",
     "archive_1",
     "archive_2",
+    "archive_3",
 ];
 
 /// Generate fresh Ed25519 seeds, write them to `<out>/<role>.seed.hex`
@@ -1266,11 +1275,13 @@ mod tests {
 
     // ── generate_e2e_keys ──────────────────────────────────────────
 
-    /// Happy path: empty dir, 5 seed files written, JSON snippet
-    /// has 5 entries with valid base58 addresses + the supplied
-    /// balance.
+    /// Happy path: empty dir, one seed file per role written, JSON
+    /// snippet has the same number of entries with valid base58
+    /// addresses + the supplied balance. The role count tracks
+    /// `E2E_ROLES.len()` rather than a magic number so adding /
+    /// removing a role doesn't silently desync this test.
     #[test]
-    fn generate_e2e_keys_writes_five_seed_files_and_returns_alloc_snippet() {
+    fn generate_e2e_keys_writes_seed_files_and_returns_alloc_snippet() {
         let dir = tempfile::tempdir().unwrap();
         let snippet = generate_e2e_keys(dir.path(), 12345).expect("generate");
 
@@ -1316,7 +1327,11 @@ mod tests {
         // mirror genesis.
         let parsed: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(&snippet).expect("JSON snippet must parse");
-        assert_eq!(parsed.len(), 5, "5 alloc entries");
+        assert_eq!(
+            parsed.len(),
+            E2E_ROLES.len(),
+            "alloc entries must match E2E_ROLES count"
+        );
         for (addr, bal) in &parsed {
             assert!(!addr.is_empty(), "address must be non-empty");
             assert!(
