@@ -728,18 +728,10 @@ where
     let tx_hex = build_tx(nonce)
         .context("tx build failed")
         .map_err(AccessOpError::TxSubmit)?;
-    let tx_hash_value = rpc
+    let tx_hash = rpc
         .send_raw_transaction(&tx_hex)
         .await
         .map_err(AccessOpError::TxSubmit)?;
-    let tx_hash = tx_hash_value
-        .as_str()
-        .ok_or_else(|| {
-            AccessOpError::TxSubmit(anyhow::anyhow!(
-                "send_raw_transaction returned non-string tx hash: {tx_hash_value}"
-            ))
-        })?
-        .to_string();
 
     info!(label, %tx_hash, "submitted, waiting for finality");
     let height = wait_for_finalized(rpc, &tx_hash, DEFAULT_POLL_INTERVAL, FINALITY_TIMEOUT)

@@ -1943,13 +1943,7 @@ async fn run_register_encryption_key(
 
     let nonce = rpc.get_nonce(&l1_b58).await?;
     let tx_hex = build_register_encryption_key_tx(&seed, chain_id, nonce, fee, x25519_pubkey)?;
-    let tx_hash_value = rpc.send_raw_transaction(&tx_hex).await?;
-    let tx_hash = tx_hash_value
-        .as_str()
-        .ok_or_else(|| {
-            anyhow::anyhow!("send_raw_transaction returned non-string tx hash: {tx_hash_value}")
-        })?
-        .to_string();
+    let tx_hash = rpc.send_raw_transaction(&tx_hex).await?;
 
     info!(
         %tx_hash,

@@ -83,19 +83,11 @@ pub trait AttestorRpc: TxStatusSource {
 #[async_trait]
 impl AttestorRpc for L1RpcClient {
     async fn send_raw_transaction(&self, signed_tx_hex: &str) -> Result<String> {
-        // The chain's `send_raw_transaction` returns a JSON string carrying
-        // the tx hash. Anything else is a chain bug — callers downstream
-        // (`wait_for_finalized`) need a hash, so reject other shapes here
-        // rather than papering over with a debug-printed Value.
-        //
-        // UFCS to disambiguate from this very trait method.
-        let raw = L1RpcClient::send_raw_transaction(self, signed_tx_hex).await?;
-        match raw {
-            serde_json::Value::String(s) => Ok(s),
-            other => Err(anyhow::anyhow!(
-                "send_raw_transaction returned non-string result: {other:?}"
-            )),
-        }
+        // L1RpcClient::send_raw_transaction now returns the tx hash
+        // directly, tolerating both bare-string and `{"tx_hash":"..."}`
+        // chain wire shapes. UFCS to disambiguate from this trait
+        // method.
+        L1RpcClient::send_raw_transaction(self, signed_tx_hex).await
     }
 }
 
