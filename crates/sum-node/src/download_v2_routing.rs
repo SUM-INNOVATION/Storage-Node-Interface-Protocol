@@ -159,9 +159,7 @@ pub async fn build_v2_assignment_view(
 pub enum ManifestDecodeError {
     #[error("manifest CBOR deserialize failed: {0}")]
     Cbor(String),
-    #[error(
-        "manifest merkle_root mismatch: peer returned {got} but caller expected {want}"
-    )]
+    #[error("manifest merkle_root mismatch: peer returned {got} but caller expected {want}")]
     RootMismatch { got: String, want: String },
 }
 

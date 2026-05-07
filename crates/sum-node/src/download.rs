@@ -658,14 +658,9 @@ impl DownloadOrchestrator {
             .with_context(|| format!("info.merkle_root invalid: {}", info.merkle_root))?;
 
         // ── Phase 1: V2 assignment view ─────────────────────────────
-        let view = build_v2_assignment_view(
-            &self.rpc,
-            &info,
-            chain_root,
-            0..info.chunk_count,
-        )
-        .await
-        .map_err(|e: V2AssignmentError| anyhow::anyhow!(e))?;
+        let view = build_v2_assignment_view(&self.rpc, &info, chain_root, 0..info.chunk_count)
+            .await
+            .map_err(|e: V2AssignmentError| anyhow::anyhow!(e))?;
 
         info!(
             merkle_root = %self.merkle_root_hex,
@@ -883,7 +878,10 @@ async fn fetch_v2_public_manifest(
             .collect();
         // Greedy: walk archives in deterministic order, dispatch up to
         // `fanout - in_flight` to Untried + resolvable archives.
-        let in_flight = status.values().filter(|s| **s == Status::Dispatched).count();
+        let in_flight = status
+            .values()
+            .filter(|s| **s == Status::Dispatched)
+            .count();
         let mut remaining = fanout.saturating_sub(in_flight);
         if remaining == 0 {
             return;
@@ -1077,7 +1075,8 @@ async fn fetch_v2_public_manifest(
                             %error,
                             "V2Public manifest fan-out: outbound failure; marking failed"
                         );
-                        last_reason = format!("archive {} outbound failure: {error}", hex::encode(archive));
+                        last_reason =
+                            format!("archive {} outbound failure: {error}", hex::encode(archive));
                         status.insert(archive, Status::Failed);
                         dispatch_wave(
                             net,
@@ -1226,13 +1225,12 @@ async fn fetch_v2_public_chunks(
             };
             // V2 single-shot pull. `max_bytes = cd.size` lets the
             // archive return the full chunk in one Data response.
-            if let Err(e) = net
-                .pull_chunk_v2(peer_id, cd.cid.clone(), 0, cd.size)
-                .await
-            {
+            if let Err(e) = net.pull_chunk_v2(peer_id, cd.cid.clone(), 0, cd.size).await {
                 bail!("pull_chunk_v2 (chunk {}): {e}", cd.chunk_index);
             }
-            let s_mut = state.get_mut(&cd.chunk_index).expect("idx came from manifest");
+            let s_mut = state
+                .get_mut(&cd.chunk_index)
+                .expect("idx came from manifest");
             s_mut.in_flight_to = Some((peer_id, target_addr));
             s_mut.next_attempt_idx += 1;
             in_flight += 1;
@@ -1336,10 +1334,7 @@ async fn fetch_v2_public_chunks(
                             .put(&cd.cid, &data)
                             .map_err(|e| anyhow::anyhow!("store.put({}): {e}", cd.cid))?;
                         drop(store_read);
-                        state
-                            .get_mut(&idx)
-                            .expect("idx came from manifest")
-                            .done = true;
+                        state.get_mut(&idx).expect("idx came from manifest").done = true;
                         chunks_fetched += 1;
                         *chunk_peer_attribution.entry(peer_id).or_insert(0) += 1;
                         peers_contacted.insert(peer_id);
@@ -1362,9 +1357,8 @@ async fn fetch_v2_public_chunks(
                 // this peer. Same semantics as the V1 orchestrator's
                 // wedging guard — without this, a transport reset
                 // permanently parks the chunk.
-                let wedged_idx: Option<u32> = state
-                    .iter()
-                    .find_map(|(idx, s)| match s.in_flight_to {
+                let wedged_idx: Option<u32> =
+                    state.iter().find_map(|(idx, s)| match s.in_flight_to {
                         Some((p, _)) if p == peer_id => Some(*idx),
                         _ => None,
                     });

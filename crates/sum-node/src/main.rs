@@ -504,14 +504,7 @@ async fn main() -> Result<()> {
                     "register-node requires --key-file (NodeRegistry needs a signing key)"
                 )
             })?;
-            run_register_node(
-                keypair,
-                seed,
-                cli.rpc_url.clone(),
-                cli.attest_fee,
-                stake,
-            )
-            .await
+            run_register_node(keypair, seed, cli.rpc_url.clone(), cli.attest_fee, stake).await
         }
         Command::Share {
             merkle_root,

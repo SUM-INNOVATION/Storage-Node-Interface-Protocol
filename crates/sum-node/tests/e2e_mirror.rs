@@ -300,9 +300,7 @@ const ARCHIVE_ROLES: [&str; 3] = ["archive_1", "archive_2", "archive_3"];
 ///
 /// Returns RAII guards + the tempdirs so callers can keep the
 /// archives alive for the duration of the test (drop = teardown).
-async fn spawn_archive_fleet(
-    rpc: &L1RpcClient,
-) -> (Vec<ChildGuard>, Vec<tempfile::TempDir>) {
+async fn spawn_archive_fleet(rpc: &L1RpcClient) -> (Vec<ChildGuard>, Vec<tempfile::TempDir>) {
     for role in ARCHIVE_ROLES {
         funded_or_skip(rpc, role).await;
         ensure_archive_registered(rpc, role).await;
@@ -641,7 +639,10 @@ async fn private_shared_recipient_ingest_then_recipient_download() {
     ensure_encryption_key_registered(&rpc, "recipient").await;
     let (_archives, _archive_dirs) = spawn_archive_fleet(&rpc).await;
 
-    let plaintext = unique_plaintext("private_shared_recipient_ingest_then_recipient_download", 1024);
+    let plaintext = unique_plaintext(
+        "private_shared_recipient_ingest_then_recipient_download",
+        1024,
+    );
     let (_pt_dir, pt_path) = write_test_plaintext(&plaintext);
     let recipient_addr = role_address("recipient");
     let merkle_root = spawn_ingest_and_extract_root(
@@ -903,7 +904,10 @@ async fn update_access_extend_expiry_admits_past_original_cutoff() {
     let recipient_addr = role_address("recipient");
     let recipient_with_expiry = format!("{recipient_addr}:{original_expires}");
 
-    let plaintext = unique_plaintext("update_access_extend_expiry_admits_past_original_cutoff", 1024);
+    let plaintext = unique_plaintext(
+        "update_access_extend_expiry_admits_past_original_cutoff",
+        1024,
+    );
     let (_pt_dir, pt_path) = write_test_plaintext(&plaintext);
     let merkle_root = spawn_ingest_and_extract_root(
         &role_seed_path("owner"),
