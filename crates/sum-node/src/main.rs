@@ -2161,9 +2161,9 @@ async fn run_download(
         )
         .await;
     }
-    // V2Public and V1Legacy share the existing public-path orchestrator.
-
-    // ── Step 3: existing Public / V1 / legacy path ────────────────
+    // V2 rows must use the V2 request protocol. With V2 advertised first,
+    // sending V1 payloads on a V2 stream fails at the codec layer. V1 is
+    // retained only for legacy rows with no storage_getFileInfoV2 result.
     let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
     let peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -2175,7 +2175,16 @@ async fn run_download(
         Duration::from_secs(timeout_secs),
     );
 
-    let result = orchestrator.run(net.clone(), store, peer_addresses).await?;
+    let result = match path {
+        DownloadPath::V2Public => {
+            let info = v2_info.expect("V2Public implies Some(info)");
+            orchestrator
+                .run_v2_public(net.clone(), store, peer_addresses, info)
+                .await?
+        }
+        DownloadPath::V1Legacy => orchestrator.run(net.clone(), store, peer_addresses).await?,
+        DownloadPath::V2Private => unreachable!("V2Private handled above"),
+    };
 
     info!(
         chunks_fetched = result.chunks_fetched,

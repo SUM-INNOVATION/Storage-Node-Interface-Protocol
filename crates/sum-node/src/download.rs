@@ -14,14 +14,19 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use sum_net::{PeerId, SumNet, SumNetEvent};
+use sum_net::{PeerId, ShardResponseV2, SumNet, SumNetEvent};
 use sum_store::manifest::deserialize_manifest_cbor;
 use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_store::{
     FetchManager, FetchOutcome, MerkleTree, compute_chunk_assignment, nodes_for_chunk,
 };
+use sum_types::rpc_types::StorageFileInfoV2;
 use sum_types::storage::{DataManifest, REPLICATION_FACTOR};
 
+use crate::download_v2_routing::{
+    ManifestDecodeError, V2AssignmentError, V2AssignmentView, build_v2_assignment_view,
+    decode_v2_manifest_bytes,
+};
 use crate::peer_state::apply_peer_event;
 use crate::rpc_client::L1RpcClient;
 
@@ -615,6 +620,135 @@ impl DownloadOrchestrator {
         holder_map
     }
 
+    /// V2 Public download — uses `pull_manifest_v2` / `pull_chunk_v2`
+    /// over `/sum/storage/v2`, routed by chain-deterministic V2
+    /// assignment.
+    ///
+    /// Same four phases as `run`:
+    ///   1. Build the V2 assignment view from `info.assignment_height`.
+    ///   2. Fan out `pull_manifest_v2` across distinct V2-assigned
+    ///      archives; the first one to return a CBOR-decodable
+    ///      manifest with the matching `merkle_root` wins.
+    ///   3. For each chunk, single-shot `pull_chunk_v2` against an
+    ///      assigned archive; on failure / wrong bytes, fall back to
+    ///      the next assigned archive in V2-deterministic order. No
+    ///      "any connected peer" fallback — for V2 rows, chain
+    ///      assignment is the truth.
+    ///   4. Assemble + merkle-verify (unchanged from V1).
+    ///
+    /// V1 helpers / `FetchManager` are NOT used here. Public V2
+    /// rows must travel `/sum/storage/v2` end-to-end; calling
+    /// `request_manifest` / `request_shard_chunk` (V1) on a peer
+    /// that prefers V2 results in the codec rejecting the V1
+    /// payload on the negotiated V2 stream.
+    pub async fn run_v2_public(
+        self,
+        net: Arc<SumNet>,
+        store: Arc<RwLock<sum_store::SumStore>>,
+        peer_addresses: Arc<RwLock<HashMap<PeerId, [u8; 20]>>>,
+        info: StorageFileInfoV2,
+    ) -> Result<DownloadResult> {
+        let started_at = SystemTime::now();
+        let deadline = tokio::time::Instant::now() + self.timeout;
+
+        // Parse the chain-side merkle root once. `info.merkle_root` is
+        // a 0x-prefixed 64-hex string; we need the 32-byte form for
+        // the V2 helpers.
+        let chain_root = parse_root_hex_32(&info.merkle_root)
+            .with_context(|| format!("info.merkle_root invalid: {}", info.merkle_root))?;
+
+        // ── Phase 1: V2 assignment view ─────────────────────────────
+        let view = build_v2_assignment_view(
+            &self.rpc,
+            &info,
+            chain_root,
+            0..info.chunk_count,
+        )
+        .await
+        .map_err(|e: V2AssignmentError| anyhow::anyhow!(e))?;
+
+        info!(
+            merkle_root = %self.merkle_root_hex,
+            distinct_archives = view.distinct_assigned.len(),
+            r = view.r,
+            "V2Public: assignment view built"
+        );
+
+        // ── Phase 2: V2 manifest fetch ──────────────────────────────
+        let manifest = fetch_v2_public_manifest(
+            net.as_ref(),
+            &peer_addresses,
+            &view,
+            chain_root,
+            self.max_concurrent,
+            deadline,
+        )
+        .await?;
+
+        info!(
+            file_name = %manifest.file_name,
+            chunk_count = manifest.chunk_count,
+            total_bytes = manifest.total_size_bytes,
+            "V2Public: manifest received"
+        );
+
+        // Empty file shortcut — same contract as V1's `run`.
+        if manifest.chunk_count == 0 {
+            std::fs::File::create(&self.output_path)?;
+            info!(output = %self.output_path.display(), "wrote empty file");
+            return Ok(DownloadResult {
+                chunks_fetched: 0,
+                chunks_skipped: 0,
+                total_bytes: 0,
+                merkle_verified: true,
+                chunk_peer_attribution: HashMap::new(),
+                peers_contacted: HashSet::new(),
+                started_at,
+                completed_at: SystemTime::now(),
+            });
+        }
+
+        // Persist the manifest in the local store so `assemble` can
+        // read chunks back via `manifest_idx` lookups (matches V1's
+        // contract).
+        {
+            let mut store_write = store.write().await;
+            if store_write
+                .manifest_idx
+                .get_by_merkle_root(&manifest.merkle_root)
+                .is_none()
+            {
+                store_write.manifest_idx.insert(&manifest)?;
+            }
+        }
+
+        // ── Phase 3: V2 chunk fetch ─────────────────────────────────
+        let fetch_outcome = fetch_v2_public_chunks(
+            net.as_ref(),
+            &store,
+            &peer_addresses,
+            &view,
+            &manifest,
+            self.max_concurrent,
+            deadline,
+        )
+        .await?;
+
+        // ── Phase 4: assemble + verify ──────────────────────────────
+        let total_bytes = self.assemble(&store, &manifest).await?;
+
+        Ok(DownloadResult {
+            chunks_fetched: fetch_outcome.chunks_fetched,
+            chunks_skipped: fetch_outcome.chunks_skipped,
+            total_bytes,
+            merkle_verified: true,
+            chunk_peer_attribution: fetch_outcome.chunk_peer_attribution,
+            peers_contacted: fetch_outcome.peers_contacted,
+            started_at,
+            completed_at: SystemTime::now(),
+        })
+    }
+
     /// Read all chunks in order, concatenate, write to output file.
     /// Verifies merkle root after assembly.
     async fn assemble(
@@ -676,4 +810,593 @@ impl DownloadOrchestrator {
 
         Ok(total_bytes)
     }
+}
+
+// ── V2 Public helpers ────────────────────────────────────────────────────────
+
+/// Parse `0x`-prefixed 64-hex (or bare 64-hex) into a 32-byte root.
+/// Pure helper; no I/O. Mirrors `crate::main::parse_merkle_root_hex`
+/// but is kept module-private to avoid forcing a `pub` re-export
+/// just so the orchestrator can call it.
+fn parse_root_hex_32(s: &str) -> Result<[u8; 32]> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(stripped).map_err(|e| anyhow::anyhow!("invalid hex: {e}"))?;
+    if bytes.len() != 32 {
+        bail!("root must be 32 bytes (got {} bytes)", bytes.len());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Fan-out `pull_manifest_v2` across `view.distinct_assigned` until
+/// one peer returns a CBOR-decodable manifest whose embedded
+/// `merkle_root` equals `chain_root`.
+///
+/// The V2 path doesn't fall back to "any connected peer" — for V2
+/// rows the chain's assignment is the truth, and an unresolvable
+/// assigned archive is an actionable diagnostic, not a routing
+/// retry signal.
+async fn fetch_v2_public_manifest(
+    net: &SumNet,
+    peer_addresses: &RwLock<HashMap<PeerId, [u8; 20]>>,
+    view: &V2AssignmentView,
+    chain_root: [u8; 32],
+    max_concurrent: usize,
+    deadline: tokio::time::Instant,
+) -> Result<DataManifest> {
+    use std::collections::BTreeSet;
+
+    // Per-archive state: Untried / Dispatched / Failed. Same shape
+    // as the Private path's `ManifestArchiveStatus`, kept inline so
+    // the Public path doesn't take a dependency on `download_private`'s
+    // private types.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Status {
+        Untried,
+        Dispatched,
+        Failed,
+    }
+    let mut status: HashMap<[u8; 20], Status> = view
+        .distinct_assigned
+        .iter()
+        .map(|a| (*a, Status::Untried))
+        .collect();
+    let mut dispatched_peers: HashMap<PeerId, [u8; 20]> = HashMap::new();
+    let assigned_total = view.distinct_assigned.len();
+    let fanout = max_concurrent.max(1).min(assigned_total);
+    let mut last_reason: String = "no responses received".to_string();
+
+    async fn dispatch_wave(
+        net: &SumNet,
+        peer_addresses: &RwLock<HashMap<PeerId, [u8; 20]>>,
+        status: &mut HashMap<[u8; 20], Status>,
+        dispatched_peers: &mut HashMap<PeerId, [u8; 20]>,
+        chain_root: [u8; 32],
+        fanout: usize,
+    ) {
+        let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
+            .read()
+            .await
+            .iter()
+            .map(|(p, a)| (*a, *p))
+            .collect();
+        // Greedy: walk archives in deterministic order, dispatch up to
+        // `fanout - in_flight` to Untried + resolvable archives.
+        let in_flight = status.values().filter(|s| **s == Status::Dispatched).count();
+        let mut remaining = fanout.saturating_sub(in_flight);
+        if remaining == 0 {
+            return;
+        }
+        // Iterate in BTreeSet order (sorted address) so the dispatch
+        // sequence is deterministic and operator-debuggable.
+        let archives: Vec<[u8; 20]> = status
+            .iter()
+            .filter(|(_, s)| **s == Status::Untried)
+            .map(|(a, _)| *a)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for archive in archives {
+            if remaining == 0 {
+                break;
+            }
+            let Some(&peer_id) = addr_to_peer.get(&archive) else {
+                continue;
+            };
+            match net.pull_manifest_v2(peer_id, chain_root).await {
+                Ok(()) => {
+                    status.insert(archive, Status::Dispatched);
+                    dispatched_peers.insert(peer_id, archive);
+                    remaining -= 1;
+                }
+                Err(e) => {
+                    warn!(
+                        %peer_id,
+                        archive = %hex::encode(archive),
+                        %e,
+                        "V2Public manifest fan-out: enqueue failed; marking archive failed"
+                    );
+                    status.insert(archive, Status::Failed);
+                }
+            }
+        }
+    }
+
+    let build_all_failed_err = |status: &HashMap<[u8; 20], Status>,
+                                addr_to_peer: &HashMap<[u8; 20], PeerId>,
+                                last_reason: &str|
+     -> anyhow::Error {
+        let resolvable = view
+            .distinct_assigned
+            .iter()
+            .filter(|a| addr_to_peer.contains_key(*a))
+            .count();
+        let unresolvable = assigned_total - resolvable;
+        let tried = status
+            .values()
+            .filter(|s| !matches!(s, Status::Untried))
+            .count();
+        anyhow::anyhow!(
+            "V2Public manifest fetch exhausted all V2-assigned archives: \
+             tried {tried} of {assigned_total} ({resolvable} resolvable, \
+             {unresolvable} unresolvable); last error: {last_reason}"
+        )
+    };
+
+    dispatch_wave(
+        net,
+        peer_addresses,
+        &mut status,
+        &mut dispatched_peers,
+        chain_root,
+        fanout,
+    )
+    .await;
+
+    loop {
+        let any_alive = status.values().any(|s| !matches!(s, Status::Failed));
+        if !any_alive {
+            let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
+                .read()
+                .await
+                .iter()
+                .map(|(p, a)| (*a, *p))
+                .collect();
+            return Err(build_all_failed_err(&status, &addr_to_peer, &last_reason));
+        }
+
+        let event = tokio::select! {
+            ev = net.next_event() => ev,
+            _ = tokio::time::sleep_until(deadline) => {
+                let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
+                    .read()
+                    .await
+                    .iter()
+                    .map(|(p, a)| (*a, *p))
+                    .collect();
+                return Err(build_all_failed_err(
+                    &status,
+                    &addr_to_peer,
+                    &format!("manifest fetch deadline exceeded; previous: {last_reason}"),
+                ));
+            }
+        };
+
+        match event {
+            Some(SumNetEvent::PeerDiscovered { .. }) => {
+                // PeerDiscovered alone doesn't unlock the L1-addr →
+                // PeerId map; PeerIdentified does.
+            }
+            Some(ref e @ SumNetEvent::PeerIdentified { .. })
+            | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {
+                apply_peer_event(&mut *peer_addresses.write().await, e);
+                dispatch_wave(
+                    net,
+                    peer_addresses,
+                    &mut status,
+                    &mut dispatched_peers,
+                    chain_root,
+                    fanout,
+                )
+                .await;
+            }
+            Some(SumNetEvent::ShardReceivedV2 {
+                peer_id,
+                response:
+                    ShardResponseV2::ManifestData {
+                        merkle_root,
+                        manifest_bytes,
+                        error,
+                    },
+            }) => {
+                if merkle_root != chain_root {
+                    continue;
+                }
+                let Some(&archive) = dispatched_peers.get(&peer_id) else {
+                    continue;
+                };
+                if status.get(&archive) != Some(&Status::Dispatched) {
+                    continue;
+                }
+                if let Some(err) = error.as_deref() {
+                    warn!(
+                        %peer_id,
+                        archive = %hex::encode(archive),
+                        %err,
+                        "V2Public manifest fan-out: peer-side error; trying others"
+                    );
+                    last_reason = format!("archive {} peer error: {err}", hex::encode(archive));
+                    status.insert(archive, Status::Failed);
+                } else {
+                    match decode_v2_manifest_bytes(&manifest_bytes, chain_root) {
+                        Ok(m) => return Ok(m),
+                        Err(ManifestDecodeError::RootMismatch { got, want }) => {
+                            warn!(
+                                %peer_id,
+                                archive = %hex::encode(archive),
+                                %got,
+                                %want,
+                                "V2Public manifest fan-out: root mismatch; trying others"
+                            );
+                            last_reason = format!(
+                                "archive {} root mismatch (got {got})",
+                                hex::encode(archive)
+                            );
+                            status.insert(archive, Status::Failed);
+                        }
+                        Err(ManifestDecodeError::Cbor(e)) => {
+                            warn!(
+                                %peer_id,
+                                archive = %hex::encode(archive),
+                                err = %e,
+                                "V2Public manifest fan-out: CBOR decode failed; trying others"
+                            );
+                            last_reason =
+                                format!("archive {} CBOR decode: {e}", hex::encode(archive));
+                            status.insert(archive, Status::Failed);
+                        }
+                    }
+                }
+                dispatch_wave(
+                    net,
+                    peer_addresses,
+                    &mut status,
+                    &mut dispatched_peers,
+                    chain_root,
+                    fanout,
+                )
+                .await;
+            }
+            Some(SumNetEvent::ShardRequestFailed { peer_id, error }) => {
+                if let Some(&archive) = dispatched_peers.get(&peer_id) {
+                    if status.get(&archive) == Some(&Status::Dispatched) {
+                        warn!(
+                            %peer_id,
+                            archive = %hex::encode(archive),
+                            %error,
+                            "V2Public manifest fan-out: outbound failure; marking failed"
+                        );
+                        last_reason = format!("archive {} outbound failure: {error}", hex::encode(archive));
+                        status.insert(archive, Status::Failed);
+                        dispatch_wave(
+                            net,
+                            peer_addresses,
+                            &mut status,
+                            &mut dispatched_peers,
+                            chain_root,
+                            fanout,
+                        )
+                        .await;
+                    }
+                }
+            }
+            None => {
+                let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
+                    .read()
+                    .await
+                    .iter()
+                    .map(|(p, a)| (*a, *p))
+                    .collect();
+                return Err(build_all_failed_err(
+                    &status,
+                    &addr_to_peer,
+                    &format!("network shut down mid-fetch; previous: {last_reason}"),
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Aggregate counters returned by `fetch_v2_public_chunks`.
+struct V2PublicFetchOutcome {
+    chunks_fetched: u32,
+    chunks_skipped: u32,
+    chunk_peer_attribution: HashMap<PeerId, u32>,
+    peers_contacted: HashSet<PeerId>,
+}
+
+/// V2 per-chunk fetch with V2-assignment routing.
+///
+/// For each chunk pending fetch, walks the chunk's V2-assigned
+/// archive list (in chain-deterministic order) and dispatches a
+/// single-shot `pull_chunk_v2(cid, 0, chunk.size)`. The peer's
+/// `ShardResponseV2::Data` must satisfy `offset == 0`,
+/// `total_bytes == chunk.size`, and `data.len() == chunk.size`;
+/// any windowed/partial response is treated as a peer failure
+/// (single-shot is the only supported mode for now).
+///
+/// On peer error or wrong bytes, advances to the next assigned
+/// archive. If every assigned archive fails for some chunk, the
+/// fetch fails — no "any connected peer" fallback.
+async fn fetch_v2_public_chunks(
+    net: &SumNet,
+    store: &Arc<RwLock<sum_store::SumStore>>,
+    peer_addresses: &RwLock<HashMap<PeerId, [u8; 20]>>,
+    view: &V2AssignmentView,
+    manifest: &DataManifest,
+    max_concurrent: usize,
+    deadline: tokio::time::Instant,
+) -> Result<V2PublicFetchOutcome> {
+    // Per-chunk state. `assigned` is the V2-deterministic order;
+    // `next_attempt_idx` walks it on each failure; `in_flight_to`
+    // pins the (peer_id, archive) we're awaiting; `received` is set
+    // when the chunk is persisted to local disk.
+    struct ChunkState {
+        assigned: Vec<[u8; 20]>,
+        next_attempt_idx: usize,
+        in_flight_to: Option<(PeerId, [u8; 20])>,
+        done: bool,
+    }
+
+    // Skip-on-disk: if a chunk is already in the local store (from a
+    // prior partial run), don't refetch. Initial `done` reflects this.
+    let mut state: HashMap<u32, ChunkState> = HashMap::with_capacity(manifest.chunks.len());
+    let mut chunks_skipped: u32 = 0;
+    {
+        let store_read = store.read().await;
+        for cd in &manifest.chunks {
+            let assigned = view
+                .per_chunk_assigned
+                .get(&cd.chunk_index)
+                .cloned()
+                .unwrap_or_default();
+            let already_have = store_read.local.has(&cd.cid);
+            if already_have {
+                chunks_skipped += 1;
+            }
+            state.insert(
+                cd.chunk_index,
+                ChunkState {
+                    assigned,
+                    next_attempt_idx: 0,
+                    in_flight_to: None,
+                    done: already_have,
+                },
+            );
+        }
+    }
+
+    let cid_to_idx: HashMap<String, u32> = manifest
+        .chunks
+        .iter()
+        .map(|c| (c.cid.clone(), c.chunk_index))
+        .collect();
+
+    let mut chunks_fetched: u32 = 0;
+    let mut chunk_peer_attribution: HashMap<PeerId, u32> = HashMap::new();
+    let mut peers_contacted: HashSet<PeerId> = HashSet::new();
+
+    async fn try_dispatch(
+        net: &SumNet,
+        peer_addresses: &RwLock<HashMap<PeerId, [u8; 20]>>,
+        manifest: &DataManifest,
+        state: &mut HashMap<u32, ChunkState>,
+        max_concurrent: usize,
+    ) -> Result<()> {
+        let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
+            .read()
+            .await
+            .iter()
+            .map(|(p, a)| (*a, *p))
+            .collect();
+        let cap = max_concurrent.max(1);
+        let mut in_flight = state.values().filter(|s| s.in_flight_to.is_some()).count();
+        for cd in &manifest.chunks {
+            if in_flight >= cap {
+                break;
+            }
+            let Some(s) = state.get(&cd.chunk_index) else {
+                continue;
+            };
+            if s.done || s.in_flight_to.is_some() {
+                continue;
+            }
+            let probe_idx = s.next_attempt_idx;
+            if probe_idx >= s.assigned.len() {
+                // No more assigned archives to try for this chunk —
+                // surfaced by the caller's "all failed" path.
+                continue;
+            }
+            let target_addr = s.assigned[probe_idx];
+            let Some(&peer_id) = addr_to_peer.get(&target_addr) else {
+                // Not yet resolvable; wait for PeerIdentified.
+                continue;
+            };
+            // V2 single-shot pull. `max_bytes = cd.size` lets the
+            // archive return the full chunk in one Data response.
+            if let Err(e) = net
+                .pull_chunk_v2(peer_id, cd.cid.clone(), 0, cd.size)
+                .await
+            {
+                bail!("pull_chunk_v2 (chunk {}): {e}", cd.chunk_index);
+            }
+            let s_mut = state.get_mut(&cd.chunk_index).expect("idx came from manifest");
+            s_mut.in_flight_to = Some((peer_id, target_addr));
+            s_mut.next_attempt_idx += 1;
+            in_flight += 1;
+        }
+        Ok(())
+    }
+
+    try_dispatch(net, peer_addresses, manifest, &mut state, max_concurrent).await?;
+
+    while state.values().any(|s| !s.done) {
+        let event = tokio::select! {
+            ev = net.next_event() => ev,
+            _ = tokio::time::sleep_until(deadline) => {
+                let next_missing = manifest
+                    .chunks
+                    .iter()
+                    .map(|c| c.chunk_index)
+                    .find(|i| state.get(i).is_some_and(|s| !s.done))
+                    .unwrap_or(0);
+                bail!(
+                    "V2Public chunk fetch timed out; chunk {next_missing} still pending"
+                );
+            }
+        };
+        match event {
+            Some(SumNetEvent::PeerDiscovered { .. }) => {}
+            Some(ref e @ SumNetEvent::PeerIdentified { .. })
+            | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {
+                apply_peer_event(&mut *peer_addresses.write().await, e);
+                try_dispatch(net, peer_addresses, manifest, &mut state, max_concurrent).await?;
+            }
+            Some(SumNetEvent::ShardReceivedV2 {
+                peer_id,
+                response:
+                    ShardResponseV2::Data {
+                        cid,
+                        offset,
+                        total_bytes,
+                        data,
+                        error,
+                    },
+            }) => {
+                let Some(&idx) = cid_to_idx.get(&cid) else {
+                    continue;
+                };
+                let s = state.get_mut(&idx).expect("idx came from manifest");
+                if s.done {
+                    continue;
+                }
+                let Some((expected_peer, attempted_addr)) = s.in_flight_to else {
+                    continue;
+                };
+                if peer_id != expected_peer {
+                    continue;
+                }
+                s.in_flight_to = None;
+                let cd = manifest
+                    .chunks
+                    .iter()
+                    .find(|c| c.chunk_index == idx)
+                    .expect("idx came from manifest");
+
+                let mut chunk_succeeded = false;
+                if let Some(err) = error.as_deref() {
+                    warn!(
+                        chunk_index = idx,
+                        %peer_id,
+                        archive = %hex::encode(attempted_addr),
+                        %err,
+                        "V2Public chunk fetch: peer error, trying next assigned archive"
+                    );
+                } else if offset != 0 || total_bytes != cd.size || data.len() as u64 != cd.size {
+                    warn!(
+                        chunk_index = idx,
+                        %peer_id,
+                        archive = %hex::encode(attempted_addr),
+                        offset,
+                        total_bytes,
+                        got_len = data.len(),
+                        expected_size = cd.size,
+                        "V2Public chunk fetch: partial V2 pull unsupported — \
+                         expected single-shot {expected} bytes, trying next assigned archive",
+                        expected = cd.size,
+                    );
+                } else {
+                    let actual_hash = *blake3::hash(&data).as_bytes();
+                    if actual_hash != cd.blake3_hash {
+                        warn!(
+                            chunk_index = idx,
+                            %peer_id,
+                            archive = %hex::encode(attempted_addr),
+                            got = %hex::encode(actual_hash),
+                            expected = %hex::encode(cd.blake3_hash),
+                            "V2Public chunk fetch: peer served wrong bytes, trying next assigned archive"
+                        );
+                    } else {
+                        // Persist + mark done.
+                        let store_read = store.read().await;
+                        store_read
+                            .local
+                            .put(&cd.cid, &data)
+                            .map_err(|e| anyhow::anyhow!("store.put({}): {e}", cd.cid))?;
+                        drop(store_read);
+                        state
+                            .get_mut(&idx)
+                            .expect("idx came from manifest")
+                            .done = true;
+                        chunks_fetched += 1;
+                        *chunk_peer_attribution.entry(peer_id).or_insert(0) += 1;
+                        peers_contacted.insert(peer_id);
+                        chunk_succeeded = true;
+                    }
+                }
+                if !chunk_succeeded {
+                    let s = state.get_mut(&idx).expect("idx came from manifest");
+                    if s.next_attempt_idx >= s.assigned.len() {
+                        bail!(
+                            "V2Public chunk fetch: chunk {idx} exhausted all {} V2-assigned archives",
+                            s.assigned.len()
+                        );
+                    }
+                }
+                try_dispatch(net, peer_addresses, manifest, &mut state, max_concurrent).await?;
+            }
+            Some(SumNetEvent::ShardRequestFailed { peer_id, error }) => {
+                // Re-queue the chunk whose dispatch was attributed to
+                // this peer. Same semantics as the V1 orchestrator's
+                // wedging guard — without this, a transport reset
+                // permanently parks the chunk.
+                let wedged_idx: Option<u32> = state
+                    .iter()
+                    .find_map(|(idx, s)| match s.in_flight_to {
+                        Some((p, _)) if p == peer_id => Some(*idx),
+                        _ => None,
+                    });
+                if let Some(idx) = wedged_idx {
+                    let s = state.get_mut(&idx).expect("idx from state");
+                    let attempted = s.in_flight_to.map(|(_, a)| a).unwrap_or_default();
+                    s.in_flight_to = None;
+                    warn!(
+                        chunk_index = idx,
+                        %peer_id,
+                        archive = %hex::encode(attempted),
+                        %error,
+                        "V2Public chunk fetch: outbound failure, trying next assigned archive"
+                    );
+                    if s.next_attempt_idx >= s.assigned.len() {
+                        bail!(
+                            "V2Public chunk fetch: chunk {idx} exhausted all {} V2-assigned archives",
+                            s.assigned.len()
+                        );
+                    }
+                    try_dispatch(net, peer_addresses, manifest, &mut state, max_concurrent).await?;
+                }
+            }
+            None => bail!("V2Public chunk fetch: network shut down mid-fetch"),
+            _ => {}
+        }
+    }
+
+    Ok(V2PublicFetchOutcome {
+        chunks_fetched,
+        chunks_skipped,
+        chunk_peer_attribution,
+        peers_contacted,
+    })
 }
