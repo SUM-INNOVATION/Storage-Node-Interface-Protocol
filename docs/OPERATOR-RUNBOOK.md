@@ -158,11 +158,214 @@ re-ingestion is required.
 
 ## Local mirror
 
-Local-mirror setup is provided by chain ops out-of-band. Use the
-artifact / runbook supplied for the target internal chain release.
-The mirror is the source of truth for hermetic E2E validation; live
-chain RPC is for read-only smoke only (see
-[`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md) §4).
+The local mirror is a **disposable single-validator devnet** for
+V2 client integration testing. It is NOT production, NOT a public
+testnet, and NOT representative of liveness or security
+characteristics. Use it only to validate that SNIP talks to the
+chain wire shape correctly at the pinned commit
+([`CHAIN-COMPAT.md`](CHAIN-COMPAT.md)).
+
+Validator keys are generated on first boot into a Docker named
+volume. No validator signing material, faucet privates, or test
+seeds are committed to the chain repo, and SNIP must never
+consume an artifact that ships keys. The same rule applies
+prospectively to every future re-pin.
+
+### Bring up
+
+```bash
+git clone <chain repo> sum-chain
+cd sum-chain
+git checkout 5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0  # current SNIP pin
+docker-compose -f deploy/snip-local-mirror.yaml up -d --build
+```
+
+The first `up --build` takes about **10 minutes** for the cargo
+release stage of the validator image. Subsequent builds reuse the
+docker layer cache (rust:1.85-slim base) and complete in seconds
+to a few minutes — this is normal, not hung.
+
+### Health check (read-only)
+
+```bash
+make smoke RPC=http://localhost:8545
+```
+
+Expected:
+
+- `chain_getChainParams` returns `chain_id = 31337` and
+  `v2_enabled_from_height = 0` → SNIP reports
+  `V2 state: ENABLED_FROM_GENESIS`.
+- `chain_getBlockHeight(["finalized"])` returns
+  `finality = "finalized"` and a non-zero, advancing height.
+  Blocks advance approximately every 2 seconds.
+
+### Stop / wipe
+
+`stop` / `start` is the **iteration default** — pause and resume the
+same chain, same validator key, same chain DB. The chain mirror's
+entrypoint enforces this: an existing chain DB always resumes;
+genesis is never silently regenerated. Use `down -v` only when you
+genuinely want a clean slate (fresh genesis, fresh validator key).
+
+| Command | Effect |
+|---|---|
+| `docker-compose -f deploy/snip-local-mirror.yaml stop`     | Pause. Chain DB + validator key untouched. **Default for iteration.** |
+| `docker-compose -f deploy/snip-local-mirror.yaml start`    | Resume the paused chain. Same height, same key, same state. |
+| `docker-compose -f deploy/snip-local-mirror.yaml down`     | Stop and remove the container; preserves named volumes. Equivalent to `stop` + container cleanup. |
+| `docker-compose -f deploy/snip-local-mirror.yaml down -v`  | Wipe everything. Next `up` runs genesis + regenerates the validator key. **Only when intended.** |
+
+### Funded test accounts (optional, fresh-genesis only)
+
+The funding overlay is **optional** and **fresh-genesis-only** —
+the mirror reads it once at genesis. If the chain DB already
+exists (from a prior `up`), the overlay is ignored. To activate
+an overlay against a running mirror, you MUST `down -v` first
+to wipe the chain DB.
+
+#### File format
+
+The mounted overlay is a **pure JSON object** with **numeric**
+balances (NOT strings). This is the chain mirror's load-bearing
+schema:
+
+```json
+{
+  "<base58-address>": <balance-in-base-units>,
+  "<base58-address>": <balance-in-base-units>
+}
+```
+
+A string-encoded balance (`"1000000000000"` instead of
+`1000000000000`) fails to parse and the mirror starts without
+the overlay applied — silently, from your perspective, until
+you check balances and find them all zero.
+
+#### Generating addresses
+
+The SNIP repo ships an `e2e-helper generate-e2e-keys` command
+that produces fresh seeds for the WS2b harness's roles
+(`owner`, `recipient`, `third_party`, `archive_1`, `archive_2`,
+`archive_3`) and emits a snippet matching the schema above. The
+chain plan fixes `assignment_replication_factor = 3`, so the
+harness needs **three** archive identities — registering /
+listening only one or two leaves ingest unable to satisfy quorum:
+
+```bash
+cd <snip-repo>
+cargo run --release -p sum-node --bin e2e-helper -- \
+    generate-e2e-keys --out e2e_keys > /tmp/snip-alloc-snippet.json
+cat /tmp/snip-alloc-snippet.json
+# {
+#   "<base58_owner>": 1000000000000,
+#   "<base58_recipient>": 1000000000000,
+#   ...
+# }
+```
+
+The seed files in `e2e_keys/` are 0o600 and covered by
+`.gitignore`. **Never commit them.** Once a generated seed is
+funded by the overlay it is operational signing material.
+
+#### Activating the overlay (fresh genesis)
+
+Compose volume mounts MUST be declared in YAML — `docker-compose`
+does not accept a `-v` flag for runtime volumes. Use a separate
+compose override file:
+
+1. Stop and wipe the running mirror (if it has booted before):
+   ```bash
+   cd <chain-repo>
+   docker-compose -f deploy/snip-local-mirror.yaml down -v
+   ```
+2. Place the overlay file where the override mount expects it:
+   ```bash
+   cp /tmp/snip-alloc-snippet.json deploy/extra-alloc.json
+   ```
+   (Verify the JSON has numeric balances, not strings.)
+3. Bring up with the override file. The override should mount
+   `deploy/extra-alloc.json` into the mirror container at
+   `/config/extra-alloc.json:ro`. Example
+   `deploy/snip-local-mirror.override.yaml`:
+   ```yaml
+   services:
+     mirror:
+       volumes:
+         - ./extra-alloc.json:/config/extra-alloc.json:ro
+   ```
+   Then:
+   ```bash
+   docker-compose \
+       -f deploy/snip-local-mirror.yaml \
+       -f deploy/snip-local-mirror.override.yaml \
+       up -d --build
+   ```
+
+#### Verifying the overlay landed
+
+After bringing the mirror up with the overlay, verify three
+properties before running any test:
+
+1. **`chain_id` returns `31337`** — confirms the mirror booted
+   and the RPC endpoint matches the documented value.
+2. **Block height advances** — confirms the validator is
+   producing blocks (not stuck mid-genesis).
+3. **Each WS2b role address has a non-zero balance** — confirms
+   the overlay parsed and applied.
+
+The first two are covered by `make smoke RPC=http://localhost:8545
+SMOKE_ARGS=--require-v2`. For the per-address balance check:
+
+```bash
+cd <snip-repo>
+for role in owner recipient third_party archive_1 archive_2 archive_3; do
+    seed=$(cat e2e_keys/$role.seed.hex)
+    addr=$(cargo run --quiet -p sum-node --bin e2e-helper -- \
+        l1-address --seed-hex "$seed")
+    bal=$(cargo run --quiet -p sum-node --bin e2e-helper -- \
+        balance --rpc-url http://localhost:8545 --address "$addr")
+    echo "$role  $addr  balance=$bal"
+done
+```
+
+Every line must show a non-zero balance. If any role shows
+`balance="0"`, the overlay didn't activate (most common cause:
+the chain DB wasn't wiped before re-up, OR the JSON used string
+balances instead of numbers).
+
+#### Intentional hard-fails (read these before debugging)
+
+The chain mirror's startup script applies two hard-fails that
+catch the most common operator mistakes. Both print clear
+`[snip-mirror] ERROR: …` messages explaining the right next
+action — do NOT treat them as bugs:
+
+- **Template-placeholder rejection.** The example overlay file
+  ships with placeholder addresses. If your `extra-alloc.json`
+  still contains any of them (almost always a copy-paste
+  mistake where the operator forgot to swap in their own
+  generated addresses), the validator refuses to boot. Replace
+  every placeholder with a real base58 address from your
+  `e2e_keys/` snippet and retry.
+- **Existing-DB rejection.** If a chain DB volume already
+  exists and an overlay is mounted, the validator refuses to
+  boot. Genesis allocations cannot fund accounts retroactively.
+  Either submit a transfer tx from an already-funded account,
+  or `down -v` to wipe and re-bring-up with the overlay (see
+  next subsection).
+
+#### Re-funding without re-genesis
+
+If the chain DB already exists and you only need ONE more funded
+account (not a full re-genesis), submit a transfer transaction
+from an existing funded account. The overlay route requires
+`down -v`, which destroys all chain state.
+
+The mirror is the source of truth for hermetic E2E validation;
+live chain RPC is for read-only smoke only (see
+[`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md) §4 and §5). The
+SNIP-side WS2 E2E suite that drives this mirror end-to-end is
+the next workstream.
 
 ## Monitoring
 

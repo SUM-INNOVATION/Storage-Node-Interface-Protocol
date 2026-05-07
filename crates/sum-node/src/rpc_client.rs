@@ -122,9 +122,21 @@ impl L1RpcClient {
 
     /// Submit a hex-encoded signed transaction to the L1 mempool.
     ///
-    /// Returns the transaction hash on success.
-    pub async fn send_raw_transaction(&self, hex: &str) -> Result<Value> {
-        self.call("send_raw_transaction", json!([hex])).await
+    /// Returns the transaction hash on success. Tolerates two
+    /// chain wire shapes:
+    ///
+    ///   1. Bare hex string: `"0xabc..."`
+    ///   2. Wrapped object:  `{"tx_hash": "0xabc..."}`
+    ///
+    /// Both are observed in different chain-mirror builds; SNIP
+    /// extracts the hex hash from either form. Anything else (a
+    /// non-string non-object, an object missing `tx_hash`, an
+    /// object with a non-string `tx_hash`) surfaces as a typed
+    /// error so callers can't accidentally pass a JSON blob into
+    /// `chain_getTransactionStatus`.
+    pub async fn send_raw_transaction(&self, hex: &str) -> Result<String> {
+        let raw: Value = self.call("send_raw_transaction", json!([hex])).await?;
+        extract_tx_hash(&raw)
     }
 
     /// Get the current nonce for an account.
@@ -281,6 +293,33 @@ impl L1RpcClient {
     pub fn rpc_url(&self) -> &str {
         &self.rpc_url
     }
+}
+
+/// Extract the transaction hash from `send_raw_transaction`'s
+/// response. The chain has shipped two wire shapes across builds:
+///
+///   * Bare hex string — `"0xabc..."`
+///   * Wrapped object — `{"tx_hash": "0xabc..."}`
+///
+/// Both decode here; anything else (non-string non-object, object
+/// missing `tx_hash`, object with non-string `tx_hash`) surfaces as
+/// a typed error. Pulled out as a free function so the contract
+/// tests can pin both shapes without spinning up an HTTP server
+/// per case.
+fn extract_tx_hash(raw: &Value) -> Result<String> {
+    if let Some(s) = raw.as_str() {
+        return Ok(s.to_string());
+    }
+    if let Some(obj) = raw.as_object() {
+        if let Some(field) = obj.get("tx_hash") {
+            if let Some(s) = field.as_str() {
+                return Ok(s.to_string());
+            }
+            anyhow::bail!("send_raw_transaction returned object with non-string tx_hash: {raw}");
+        }
+        anyhow::bail!("send_raw_transaction returned object without tx_hash field: {raw}");
+    }
+    anyhow::bail!("send_raw_transaction returned non-string non-object value: {raw}")
 }
 
 // ── Contract tests ───────────────────────────────────────────────────────────
@@ -514,6 +553,79 @@ mod contract_tests {
             assert!(
                 res.is_err(),
                 "malformed payload must NOT silently decode as None; got {res:?}"
+            );
+        }
+    }
+
+    // ── send_raw_transaction wire-shape tests ────────────────────────
+
+    /// Bare hex string — the canonical V2 chain shape.
+    #[test]
+    fn extract_tx_hash_accepts_bare_string() {
+        let v = serde_json::json!("0xabcdef0123");
+        assert_eq!(extract_tx_hash(&v).unwrap(), "0xabcdef0123");
+    }
+
+    /// Wrapped object — what a current chain mirror build emits.
+    /// SNIP MUST tolerate this shape so the tx-hash isn't passed
+    /// downstream as a JSON blob.
+    #[test]
+    fn extract_tx_hash_accepts_wrapped_object() {
+        let v = serde_json::json!({"tx_hash": "0xdeadbeef"});
+        assert_eq!(extract_tx_hash(&v).unwrap(), "0xdeadbeef");
+    }
+
+    /// Object with extra fields alongside `tx_hash` is still
+    /// extracted — extra metadata (e.g., a future `block_hint`)
+    /// shouldn't break us as long as `tx_hash` is present.
+    #[test]
+    fn extract_tx_hash_accepts_object_with_extra_fields() {
+        let v = serde_json::json!({
+            "tx_hash": "0xfoobar",
+            "ack_height": 1234,
+            "future_field": "ignored",
+        });
+        assert_eq!(extract_tx_hash(&v).unwrap(), "0xfoobar");
+    }
+
+    /// Object missing `tx_hash` field is a typed error — never
+    /// silently passes a JSON blob into downstream code.
+    #[test]
+    fn extract_tx_hash_rejects_object_without_tx_hash_field() {
+        let v = serde_json::json!({"hash": "0xabc"});
+        let err = extract_tx_hash(&v).expect_err("missing tx_hash must error");
+        assert!(
+            err.to_string().contains("without tx_hash field"),
+            "error must explain why: {err}"
+        );
+    }
+
+    /// Object with a non-string `tx_hash` (e.g., chain bug emits
+    /// number) is a typed error.
+    #[test]
+    fn extract_tx_hash_rejects_object_with_non_string_tx_hash() {
+        let v = serde_json::json!({"tx_hash": 12345});
+        let err = extract_tx_hash(&v).expect_err("non-string tx_hash must error");
+        assert!(
+            err.to_string().contains("non-string tx_hash"),
+            "error must explain why: {err}"
+        );
+    }
+
+    /// Non-string non-object response (number, bool, null, array)
+    /// is a typed error.
+    #[test]
+    fn extract_tx_hash_rejects_other_shapes() {
+        for bogus in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!(["0xabc"]),
+        ] {
+            let err = extract_tx_hash(&bogus).expect_err("must error on {bogus}");
+            assert!(
+                err.to_string().contains("non-string non-object"),
+                "error for {bogus} should mention shape: {err}"
             );
         }
     }

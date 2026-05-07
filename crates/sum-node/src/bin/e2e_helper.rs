@@ -148,6 +148,39 @@ enum Command {
         #[arg(long)]
         require_v2: bool,
     },
+
+    /// Generate fresh Ed25519 seeds for the WS2b local-mirror E2E
+    /// suite and print an `extra-alloc` JSON snippet the operator
+    /// pastes into the chain mirror's funding overlay.
+    ///
+    /// Seeds are written to `<out>/<role>.seed.hex` (one file per
+    /// role). The output directory MUST be empty or non-existent —
+    /// the command refuses to overwrite existing seeds. Files are
+    /// `0o600`. Generated seeds are local-only; pair with a
+    /// `.gitignore` entry covering the output dir.
+    ///
+    /// Default roles: `owner`, `recipient`, `third_party`,
+    /// `archive_1`, `archive_2`, `archive_3`. The chain plan
+    /// fixes `assignment_replication_factor = 3`, so the
+    /// WS2b harness needs three archive identities to satisfy
+    /// quorum during ingest scenarios. The harness in WS2b Commit 2
+    /// references these names.
+    GenerateE2eKeys {
+        /// Output directory for the generated seed files.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Default balance (in chain base units) to suggest for each
+        /// generated address in the printed extra-alloc snippet.
+        /// Operators edit before pasting if a different value is
+        /// needed; this is a hint, not a chain-side authority.
+        ///
+        /// Parsed as `u128` and emitted as a JSON **number** (not a
+        /// string) — the chain mirror's `extra-alloc.json` schema
+        /// requires `{ "<base58>": <integer>, ... }` with numeric
+        /// balances.
+        #[arg(long, default_value = "1000000000000")]
+        balance: u128,
+    },
 }
 
 #[tokio::main]
@@ -306,6 +339,15 @@ async fn run(cli: Cli) -> Result<i32> {
                 print!("{}", format_smoke_human(&report));
             }
             return Ok(if report.ok { 0 } else { 1 });
+        }
+
+        Command::GenerateE2eKeys { out, balance } => {
+            // Writes one seed file per WS2b role and prints a JSON
+            // snippet of public addresses + balances for the
+            // operator's `extra-alloc.json` overlay. Refuses to
+            // overwrite existing keys.
+            let snippet = generate_e2e_keys(&out, balance)?;
+            println!("{snippet}");
         }
     }
     Ok(0)
@@ -715,6 +757,103 @@ fn parse_seed(hex: &str) -> Result<[u8; 32]> {
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&bytes);
     Ok(seed)
+}
+
+// ── generate-e2e-keys ────────────────────────────────────────────────────────
+
+/// Roles the WS2b harness expects. Stable order so a hand-edited
+/// overlay stays diff-friendly across regenerations.
+///
+/// The three `archive_*` roles cover the chain plan's
+/// `assignment_replication_factor = 3`: WS2b ingest scenarios spawn
+/// all three as concurrent listeners so chain-side quorum is
+/// satisfied without lowering R or special-casing chain params.
+const E2E_ROLES: &[&str] = &[
+    "owner",
+    "recipient",
+    "third_party",
+    "archive_1",
+    "archive_2",
+    "archive_3",
+];
+
+/// Generate fresh Ed25519 seeds, write them to `<out>/<role>.seed.hex`
+/// (mode `0o600`), and return a JSON snippet mapping base58
+/// addresses to balances. Refuses to overwrite a non-empty `<out>`.
+///
+/// The snippet matches the chain mirror's `extra-alloc.json` schema
+/// exactly — a pure JSON object with **numeric** balances:
+///
+/// ```json
+/// { "<base58-address>": <balance-in-base-units>, ... }
+/// ```
+///
+/// The mirror reads this file at first boot only (fresh-genesis
+/// gating). See `docs/OPERATOR-RUNBOOK.md` for the override-file
+/// + `down -v` workflow that activates the overlay.
+fn generate_e2e_keys(out: &std::path::Path, balance: u128) -> Result<String> {
+    use rand_core::{OsRng, RngCore};
+
+    // Refuse to overwrite. `<out>` must not exist OR be empty.
+    if out.exists() {
+        let mut entries = std::fs::read_dir(out)?;
+        if entries.next().is_some() {
+            anyhow::bail!(
+                "refusing to write into a non-empty directory: {}\n\
+                 (existing seed files would be overwritten — pick a fresh path,\n\
+                 or wipe the dir manually if you intend to regenerate)",
+                out.display()
+            );
+        }
+    } else {
+        std::fs::create_dir_all(out)?;
+    }
+
+    // Sanity: the dir must be ignored by git so generated seeds
+    // don't leak. We don't enforce here — but the operator runbook
+    // documents the .gitignore expectation.
+
+    let mut addresses: Vec<String> = Vec::new();
+    for role in E2E_ROLES {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let kp = identity::keypair_from_seed(&seed)?;
+        let addr = identity::l1_address_from_keypair(&kp);
+        let addr_b58 = identity::l1_address_base58(&addr);
+
+        // Hex-encode and write with 0o600 on unix; on non-unix
+        // hosts the file is writable but the SNIP project is
+        // Linux-only in production so this is acceptable.
+        let path = out.join(format!("{role}.seed.hex"));
+        let hex_seed = hex::encode(seed);
+        std::fs::write(&path, format!("{hex_seed}\n"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms)?;
+        }
+        // Hex bytes drop out of scope here (Rust string `Drop`
+        // releases without zeroing — fine for ephemeral test seeds
+        // that the file already persists, but production code paths
+        // should still go through `Zeroizing`).
+        let _ = hex_seed;
+
+        addresses.push(addr_b58);
+    }
+
+    // Render JSON snippet with stable role order. Balances are
+    // emitted as JSON **numbers** (no quotes) per the chain
+    // mirror's overlay schema. Public addresses only — never the
+    // seed.
+    let mut snippet = String::from("{\n");
+    for (i, addr) in addresses.iter().enumerate() {
+        let comma = if i + 1 == addresses.len() { "" } else { "," };
+        snippet.push_str(&format!("  \"{addr}\": {balance}{comma}\n"));
+    }
+    snippet.push('}');
+    Ok(snippet)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1132,5 +1271,135 @@ mod tests {
             .find(|c| c.name == "chain_getChainParams")
             .expect("chain_getChainParams should appear in checks");
         assert_eq!(chain_params_check.status, "fail");
+    }
+
+    // ── generate_e2e_keys ──────────────────────────────────────────
+
+    /// Happy path: empty dir, one seed file per role written, JSON
+    /// snippet has the same number of entries with valid base58
+    /// addresses + the supplied balance. The role count tracks
+    /// `E2E_ROLES.len()` rather than a magic number so adding /
+    /// removing a role doesn't silently desync this test.
+    #[test]
+    fn generate_e2e_keys_writes_seed_files_and_returns_alloc_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        let snippet = generate_e2e_keys(dir.path(), 12345).expect("generate");
+
+        // 5 .seed.hex files written.
+        for role in E2E_ROLES {
+            let path = dir.path().join(format!("{role}.seed.hex"));
+            assert!(path.exists(), "{role}.seed.hex must be written");
+            let content = std::fs::read_to_string(&path).unwrap();
+            // 64 hex chars + trailing newline.
+            assert_eq!(
+                content.trim_end().len(),
+                64,
+                "{role}.seed.hex must contain a 64-char hex seed"
+            );
+            assert!(
+                content.trim_end().chars().all(|c| c.is_ascii_hexdigit()),
+                "{role}.seed.hex must be hex-only"
+            );
+            // 0o600 on unix.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert_eq!(
+                    mode & 0o777,
+                    0o600,
+                    "{role}.seed.hex must be 0o600, got {:o}",
+                    mode & 0o777
+                );
+            }
+        }
+
+        // JSON snippet parses; has 5 entries; every value is a
+        // JSON **number** (NOT a string) matching the requested
+        // balance; every key is non-empty (a proxy for "valid
+        // base58 address" — actual address parsing is
+        // `sum_net::identity::l1_address_from_base58`'s job).
+        //
+        // The JSON-number invariant is load-bearing: the chain
+        // mirror's overlay schema is `{ "<base58>": <integer> }`
+        // with numeric balances, NOT string-encoded ones. A
+        // string-encoded value would fail to parse the overlay at
+        // mirror genesis.
+        let parsed: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&snippet).expect("JSON snippet must parse");
+        assert_eq!(
+            parsed.len(),
+            E2E_ROLES.len(),
+            "alloc entries must match E2E_ROLES count"
+        );
+        for (addr, bal) in &parsed {
+            assert!(!addr.is_empty(), "address must be non-empty");
+            assert!(
+                bal.is_number(),
+                "balance MUST be a JSON number per chain overlay schema, got {bal:?}"
+            );
+            assert_eq!(
+                bal.as_u64(),
+                Some(12345),
+                "balance must equal the supplied hint as an integer"
+            );
+        }
+    }
+
+    /// **Refuse-to-overwrite invariant.** Generating into a
+    /// non-empty dir would silently overwrite existing seed files
+    /// and rotate funded test addresses — same risk class as
+    /// committing keys. The command refuses; operator must wipe
+    /// the dir manually if regeneration is intended.
+    #[test]
+    fn generate_e2e_keys_refuses_non_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // Drop a sentinel file in the dir.
+        std::fs::write(dir.path().join("some-existing-seed.hex"), b"DEADBEEF").unwrap();
+
+        let result = generate_e2e_keys(dir.path(), 1);
+        let err = result.expect_err("non-empty dir must be refused");
+        assert!(
+            err.to_string().contains("non-empty directory"),
+            "error must explain why: got {err}"
+        );
+
+        // Sentinel file is untouched.
+        let content = std::fs::read_to_string(dir.path().join("some-existing-seed.hex")).unwrap();
+        assert_eq!(content, "DEADBEEF");
+    }
+
+    /// Empty dir is accepted. Non-existent dir is also accepted
+    /// (we create it). Distinguishing "dir doesn't exist" from
+    /// "dir exists and is empty" would force a strange UX with no
+    /// real value.
+    #[test]
+    fn generate_e2e_keys_creates_dir_if_missing() {
+        let parent = tempfile::tempdir().unwrap();
+        let nested = parent.path().join("does/not/exist/yet");
+        assert!(!nested.exists());
+        let snippet = generate_e2e_keys(&nested, 1).expect("create + generate");
+        assert!(nested.exists());
+        assert!(snippet.starts_with('{') && snippet.ends_with('}'));
+    }
+
+    /// Each invocation generates fresh seeds — no determinism, no
+    /// reuse. Pinning this catches a regression where the OsRng
+    /// path got accidentally swapped for a fixed seed (e.g., during
+    /// debugging).
+    #[test]
+    fn generate_e2e_keys_produces_distinct_seeds_across_runs() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let snippet1 = generate_e2e_keys(dir1.path(), 1).unwrap();
+        let snippet2 = generate_e2e_keys(dir2.path(), 1).unwrap();
+        assert_ne!(
+            snippet1, snippet2,
+            "two invocations must produce different addresses (OsRng-backed)"
+        );
+        // Cross-check at the seed-file level too.
+        let seed1 = std::fs::read_to_string(dir1.path().join("owner.seed.hex")).unwrap();
+        let seed2 = std::fs::read_to_string(dir2.path().join("owner.seed.hex")).unwrap();
+        assert_ne!(seed1, seed2, "seeds must differ across runs");
     }
 }

@@ -15,17 +15,56 @@ operator-facing source of truth for how SNIP and chain stay aligned.
 
 ## Pinned chain version
 
-| Field                      | Value                                          |
-|----------------------------|------------------------------------------------|
-| Chain repository           | `<internal-chain-repo>`                        |
-| Chain release tag          | `<internal-chain-release-tag>`                 |
-| Exact chain commit         | provided out-of-band by chain ops              |
-| Local-mirror chain id      | `31337`                                        |
-| Local-mirror `v2_enabled_from_height` | emits `0` (V2 enabled from genesis) |
-| Live-chain `v2_enabled_from_height`   | published with the live release tag |
-| Last verified              | `<release-date>`                               |
+| Field                                 | Value                                                |
+|---------------------------------------|------------------------------------------------------|
+| Chain commit (internal private chain) | `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0`           |
+| Local-mirror RPC                      | `http://localhost:8545`                              |
+| Local-mirror `chain_id`               | `31337` (verify at runtime via `chain_getChainParams`) |
+| Local-mirror `v2_enabled_from_height` | emits `0` (V2 enabled from genesis)                  |
+| Local-mirror block cadence            | ~2 seconds                                           |
+| Live-chain `v2_enabled_from_height`   | published with the live release tag                  |
+
+The chain commit recorded here is an internal private-chain
+reference. The chain repository, branch, and release tooling are
+not public; this SHA is the load-bearing identifier operators and
+reviewers use to say "SNIP is built against THIS chain state."
+
+Chain team confirmed the V2 wire-format fixture suite passes
+against this commit:
+
+```
+cargo test -p sumchain-primitives --test v2_wire_fixtures
+# 18 passed / 0 failed
+```
+
+The 18-fixture surface mirrors the `tx_builder::tests::fixture_*`
+and `rpc_client::contract_tests::*` constants pinned in this repo
+(see "Transaction payload fixtures" and "RPC contract tests"
+below). Wire-shape divergence between the two surfaces is what
+this pin is meant to detect; both sides green means the V2 wire
+shape is confirmed-stable on this chain commit.
+
+Bumping requires a chain-team-coordinated re-pin (see "Re-pinning"
+below). The "no signing material in any committed artifact" rule
+applies to every future re-pin: the SHA must be from a chain
+history that contains no validator keys, dev seeds, faucet
+privates, or any other signing material.
 
 Re-pinning procedure is in [`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md).
+
+> **Local mirror is runnable at this pin.** The compose preset
+> at `deploy/snip-local-mirror.yaml` in the chain repo, checked
+> out at the pinned SHA, brings up a single-validator devnet
+> with V2 enabled from genesis. Validator key is generated at
+> first boot into a Docker named volume — no signing material is
+> committed. The SNIP-side WS2 suite that drives this mirror
+> end-to-end is the next workstream; until it lands, operators
+> can still smoke-check the running mirror via
+> `make smoke RPC=http://localhost:8545`. See
+> [`OPERATOR-RUNBOOK.md`](OPERATOR-RUNBOOK.md) for bring-up /
+> stop / wipe commands and
+> [`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md) § 5 for the
+> release-flow integration.
 
 ## V2 enablement gate (load-bearing)
 
@@ -138,21 +177,50 @@ enabled from genesis." Tests SHOULD assert that SNIP deserializes
 this as `Some(0)` and admits — not as `None` and not as a bare `u64`
 that silently defaults.
 
-Local-mirror setup is provided by chain ops out-of-band. Use the
-artifact / runbook supplied for the target internal chain release.
+The mirror's documented `chain_id` is `31337`, recorded in the
+"Pinned chain version" table above. Operators SHOULD still call
+`chain_getChainParams` against the running mirror at the start of
+any tx-signing test and abort if the returned id doesn't match —
+catches the case where a future mirror release silently bumps the
+id (e.g., dev → stage), which would otherwise let SNIP sign with
+a stale chain id.
 
-## Re-pinning when chain releases a new tag
+**Self-bootstrapping is a hard requirement.** The mirror at this
+pin generates validator keys at runtime into a Docker named
+volume; the keys are never committed to the chain repo, and SNIP
+must never consume an artifact that ships keys. The same rule
+applies prospectively to every future re-pin.
 
-1. Pull the new chain release tag (out-of-band — chain ops manages
-   the private chain repo).
+The canonical truth for "SNIP-side correctness against the chain
+wire shape" remains the in-tree fixture + contract test surface
+listed above; the local-mirror E2E suite (WS2) is the operator
+gate that confirms SNIP and the chain agree end-to-end at this
+pin. The in-tree tests are stable, exhaustive for V2 operations,
+and run on every PR via the linux CI gate; the WS2 mirror suite
+is run before each release.
+
+## Re-pinning when chain delivers a new tip SHA
+
+1. Chain ops delivers a new internal tip SHA out-of-band. The SHA
+   MUST be from a history that contains no committed signing
+   material; if chain rewrote history to scrub leaked secrets,
+   confirm the rewrite landed before pinning.
 2. Regenerate the bincode-v1 fixtures against the new chain types
    (chain-team responsibility — they own the type definitions
-   SNIP mirrors).
+   SNIP mirrors). Chain team should report the result of their
+   own V2 wire-fixture suite (e.g.
+   `cargo test -p sumchain-primitives --test v2_wire_fixtures`)
+   on the new SHA before SNIP pins.
 3. Run `cargo test -p sum-node tx_builder rpc_client` and
    `cargo test -p sum-types`. Any diff in fixture bytes or
    deserialization tests is an intentional wire-format change and
-   MUST land in a separate commit referencing the new chain tag.
-4. Update the "Pinned chain version" table at the top of this doc
-   with the new release tag and verification date.
-5. Run `make release-check` end-to-end against the local mirror.
+   MUST land in a separate commit referencing the new chain SHA.
+4. Update the "Pinned chain version" row at the top of this doc
+   with the actual SHA. Do NOT pin against any history that
+   retains committed signing material; do NOT echo a superseded
+   SHA in commit messages or doc bodies — SNIP's public history
+   should not retain a pointer to compromised or scrubbed state.
+5. Run `make release-check` (linux CI gate). When local-mirror
+   E2E is unblocked, run that suite against the new chain commit
+   too; until then, fixture + contract tests are the gate.
 6. Update [`CHANGELOG.md`](../CHANGELOG.md).

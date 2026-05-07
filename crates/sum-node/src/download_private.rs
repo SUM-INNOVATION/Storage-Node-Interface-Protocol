@@ -40,10 +40,9 @@ use sum_crypto::{
     RECIPIENT_BUNDLE_SIZE, decrypt_chunk, decrypt_manifest, unwrap_for_self,
     x25519_keypair_from_ed25519_seed,
 };
-use sum_net::{Keypair, PeerId, SumNet, SumNetEvent};
+use sum_net::{Keypair, PeerId, ShardResponseV2, SumNet, SumNetEvent};
 use sum_store::manifest::deserialize_manifest_cbor;
 use sum_store::merkle::MerkleTree;
-use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_types::rpc_types::{AccessEntryV2, StorageFileInfoV2};
 use sum_types::storage::{ChunkDescriptor, DataManifest};
 
@@ -615,24 +614,30 @@ async fn fetch_manifest_v2(
         .map(|a| (*a, ManifestArchiveStatus::Untried))
         .collect();
     // Reverse map peer_id → archive_addr for the (small) set of peers
-    // we've dispatched to. Lets us reject `ShardReceived` from peers
-    // we never asked without scanning archive_status.
+    // we've dispatched to. Lets us reject `ShardReceivedV2` events
+    // from peers we never asked without scanning archive_status.
     let mut dispatched_peers: HashMap<PeerId, [u8; 20]> = HashMap::new();
-    let manifest_cid = format!("{MANIFEST_REQUEST_PREFIX}{}", hex::encode(chain_root));
-    let root_hex = hex::encode(chain_root);
     // Last per-response failure surfaced; embedded in the structured
     // error if every archive is exhausted.
     let mut last_reason: String = "no responses received".to_string();
 
     // Helper: snapshot peer_addresses, run the pure selector, fire
-    // `request_manifest`, and transition archive_status. Mirrors the
+    // `pull_manifest_v2`, and transition archive_status. Mirrors the
     // chunk-concurrency `try_dispatch_pending` style.
+    //
+    // V2 dispatch: `pull_manifest_v2` issues a `ShardRequestV2::ManifestPull`
+    // on the `/sum/storage/v2` protocol. The chain plan v3.2 §3.6 V2
+    // dispatcher serves these via `handle_manifest_pull` →
+    // `ShardResponseV2::ManifestData { merkle_root, manifest_bytes, error }`.
+    // Calling V1 `request_manifest` here would race with libp2p's
+    // V2-first protocol negotiation and the codec would refuse to
+    // write a V1 payload onto the negotiated V2 stream.
     async fn dispatch_wave(
         net: &SumNet,
         peer_addresses: &RwLock<HashMap<PeerId, [u8; 20]>>,
         archive_status: &mut HashMap<[u8; 20], ManifestArchiveStatus>,
         dispatched_peers: &mut HashMap<PeerId, [u8; 20]>,
-        root_hex: &str,
+        chain_root: [u8; 32],
         fanout: usize,
     ) {
         let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
@@ -643,7 +648,7 @@ async fn fetch_manifest_v2(
             .collect();
         let dispatches = select_manifest_dispatch(archive_status, &addr_to_peer, fanout);
         for d in dispatches {
-            match net.request_manifest(d.peer_id, root_hex.to_string()).await {
+            match net.pull_manifest_v2(d.peer_id, chain_root).await {
                 Ok(()) => {
                     archive_status.insert(d.archive_addr, ManifestArchiveStatus::Dispatched);
                     dispatched_peers.insert(d.peer_id, d.archive_addr);
@@ -697,7 +702,7 @@ async fn fetch_manifest_v2(
         peer_addresses,
         &mut archive_status,
         &mut dispatched_peers,
-        &root_hex,
+        chain_root,
         fanout,
     )
     .await;
@@ -759,16 +764,27 @@ async fn fetch_manifest_v2(
                     peer_addresses,
                     &mut archive_status,
                     &mut dispatched_peers,
-                    &root_hex,
+                    chain_root,
                     fanout,
                 )
                 .await;
             }
-            Some(SumNetEvent::ShardReceived { peer_id, response }) => {
-                if response.cid != manifest_cid {
-                    // Not the manifest CID — likely a chunk response
-                    // we don't care about right now (Step 12 handles
-                    // chunks). Drop silently.
+            Some(SumNetEvent::ShardReceivedV2 {
+                peer_id,
+                response:
+                    ShardResponseV2::ManifestData {
+                        merkle_root,
+                        manifest_bytes,
+                        error,
+                    },
+            }) => {
+                if merkle_root != chain_root {
+                    // Response for a different file — ignore. The
+                    // codec writes the chain-side `merkle_root` we
+                    // asked for back to us; mismatch usually means a
+                    // stray response landed in our event stream from
+                    // a concurrent fetch, so drop without burning an
+                    // archive attempt.
                     continue;
                 }
                 let Some(&archive_addr) = dispatched_peers.get(&peer_id) else {
@@ -785,7 +801,7 @@ async fn fetch_manifest_v2(
                     continue;
                 }
 
-                if let Some(err) = response.error.as_deref() {
+                if let Some(err) = error.as_deref() {
                     warn!(
                         peer = %peer_id,
                         archive = %hex::encode(archive_addr),
@@ -796,13 +812,13 @@ async fn fetch_manifest_v2(
                         format!("archive {} peer error: {}", hex::encode(archive_addr), err);
                     archive_status.insert(archive_addr, ManifestArchiveStatus::Failed);
                 } else {
-                    match decrypt_and_verify_manifest(k_file, &response.data, chain_root) {
+                    match decrypt_and_verify_manifest(k_file, &manifest_bytes, chain_root) {
                         Ok(manifest) => {
                             // First valid response wins. Subsequent
-                            // ShardReceived events for the manifest CID
-                            // (from still-in-flight peers) drain into
-                            // the next caller's `next_event()` and are
-                            // dropped there as unrecognized CIDs.
+                            // ManifestData events from still-in-flight
+                            // peers drain into the next caller's
+                            // `next_event()` and are dropped there as
+                            // unrecognized roots.
                             return Ok(manifest);
                         }
                         Err(e) => {
@@ -826,7 +842,7 @@ async fn fetch_manifest_v2(
                     peer_addresses,
                     &mut archive_status,
                     &mut dispatched_peers,
-                    &root_hex,
+                    chain_root,
                     fanout,
                 )
                 .await;
@@ -980,24 +996,33 @@ async fn fetch_all_ciphertext_chunks_v2(
             select_chunks_to_dispatch(state, &manifest.chunks, &addr_to_peer, max_concurrent);
 
         for d in dispatches {
-            // Find the chunk's CID — we already validated `idx` came
-            // from the manifest in `select_chunks_to_dispatch`.
-            let cid = manifest
+            // Find the chunk descriptor — we already validated `idx`
+            // came from the manifest in `select_chunks_to_dispatch`.
+            // We need both `cid` (request key) and `size` (V2 Pull
+            // requires explicit `max_bytes` for windowed reads;
+            // single-shot reads pass `max_bytes = chunk.size`).
+            let cd = manifest
                 .chunks
                 .iter()
                 .find(|c| c.chunk_index == d.chunk_index)
-                .expect("idx came from manifest")
-                .cid
-                .clone();
-            if let Err(e) = net.request_shard_chunk(d.peer_id, cid, None, None).await {
+                .expect("idx came from manifest");
+            let cid = cd.cid.clone();
+            // V2 single-shot Pull. The chain plan v3.2 §3.6 V2 path
+            // serves these via `handle_pull` →
+            // `ShardResponseV2::Data { cid, offset, total_bytes, data, error }`.
+            // `pull_chunk_v2` lands on `/sum/storage/v2`; calling V1
+            // `request_shard_chunk` would race libp2p's V2-first
+            // negotiation and the codec would refuse to write a V1
+            // payload onto a V2 stream.
+            if let Err(e) = net.pull_chunk_v2(d.peer_id, cid, 0, cd.size).await {
                 // Send-side failure: surface the error. State is
                 // unchanged (we haven't marked in_flight_to yet), so
                 // a future dispatch attempt can retry the same
                 // (chunk, archive) pair without burning the archive.
-                return Err((d.chunk_index, anyhow::anyhow!("request_shard_chunk: {e}")));
+                return Err((d.chunk_index, anyhow::anyhow!("pull_chunk_v2: {e}")));
             }
             // Mark in-flight ONLY after the wire send succeeded so a
-            // failed `request_shard_chunk` doesn't burn an archive
+            // failed `pull_chunk_v2` doesn't burn an archive
             // attempt. Burning the archive would force the chunk to
             // skip a perfectly-good peer just because the local send
             // queue was momentarily full.
@@ -1058,8 +1083,18 @@ async fn fetch_all_ciphertext_chunks_v2(
                 try_dispatch_pending(net, peer_addresses, manifest, &mut state, max_concurrent)
                     .await?;
             }
-            Some(SumNetEvent::ShardReceived { peer_id, response }) => {
-                let Some(&idx) = cid_to_idx.get(&response.cid) else {
+            Some(SumNetEvent::ShardReceivedV2 {
+                peer_id,
+                response:
+                    ShardResponseV2::Data {
+                        cid,
+                        offset,
+                        total_bytes,
+                        data,
+                        error,
+                    },
+            }) => {
+                let Some(&idx) = cid_to_idx.get(&cid) else {
                     // Not a chunk we're waiting on (or already fulfilled).
                     continue;
                 };
@@ -1077,7 +1112,7 @@ async fn fetch_all_ciphertext_chunks_v2(
                     continue;
                 }
                 s.in_flight_to = None;
-                if let Some(err) = response.error.as_deref() {
+                if let Some(err) = error.as_deref() {
                     warn!(
                         chunk_index = idx,
                         peer = %peer_id,
@@ -1087,27 +1122,50 @@ async fn fetch_all_ciphertext_chunks_v2(
                     );
                     // Fall through to dispatch (advances next_attempt_idx, picks next archive).
                 } else {
-                    // Defensive ciphertext-hash check (chain commits to
-                    // these bytes via the merkle root).
                     let cd = manifest
                         .chunks
                         .iter()
                         .find(|c| c.chunk_index == idx)
                         .expect("idx came from manifest");
-                    let actual_hash = *blake3::hash(&response.data).as_bytes();
-                    if actual_hash != cd.blake3_hash {
+                    // V2 Pull is currently issued single-shot
+                    // (`offset=0, max_bytes=cd.size`). A windowed
+                    // response would mean the peer truncated; a
+                    // future patch can add an accumulator, but for
+                    // now reject the partial rather than silently
+                    // assemble incomplete ciphertext.
+                    if offset != 0 || total_bytes != cd.size || data.len() as u64 != cd.size {
                         warn!(
                             chunk_index = idx,
                             peer = %peer_id,
                             archive = %hex::encode(attempted_addr),
-                            got = %hex::encode(actual_hash),
-                            expected = %hex::encode(cd.blake3_hash),
-                            "Private chunk fetch: peer served wrong bytes, trying next assigned archive"
+                            offset,
+                            total_bytes,
+                            got_len = data.len(),
+                            expected_size = cd.size,
+                            "Private chunk fetch: partial V2 pull unsupported — \
+                             expected single-shot {expected} bytes, got partial; \
+                             trying next assigned archive",
+                            expected = cd.size,
                         );
-                        // Fall through to dispatch.
+                        // Fall through to dispatch (treat as archive failure).
                     } else {
-                        s.received = Some(response.data);
-                        continue;
+                        // Defensive ciphertext-hash check (chain commits to
+                        // these bytes via the merkle root).
+                        let actual_hash = *blake3::hash(&data).as_bytes();
+                        if actual_hash != cd.blake3_hash {
+                            warn!(
+                                chunk_index = idx,
+                                peer = %peer_id,
+                                archive = %hex::encode(attempted_addr),
+                                got = %hex::encode(actual_hash),
+                                expected = %hex::encode(cd.blake3_hash),
+                                "Private chunk fetch: peer served wrong bytes, trying next assigned archive"
+                            );
+                            // Fall through to dispatch.
+                        } else {
+                            s.received = Some(data);
+                            continue;
+                        }
                     }
                 }
                 // Failure path: re-dispatch this chunk to its next assigned archive.

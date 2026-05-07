@@ -13,10 +13,19 @@ target/
 *~
 .DS_Store
 
-# Environment / secrets
+# Environment / secrets — never commit signing material in any form.
 .env
 *.pem
 *.key
+*.seed
+*.seed.hex
+keys/
+# Generated WS2b test seeds (e2e-helper generate-e2e-keys output dirs).
+# These dirs hold OsRng-generated seeds that get funded on the local
+# mirror; treat as signing material and keep out of git.
+e2e_keys/
+extra-alloc.json
+extra-alloc.local.json
 
 # OS
 Thumbs.db

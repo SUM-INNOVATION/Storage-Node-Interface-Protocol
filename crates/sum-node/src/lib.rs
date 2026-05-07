@@ -6,6 +6,7 @@ pub mod assignment_attestor;
 pub mod download;
 pub mod download_private;
 pub mod download_route;
+pub mod download_v2_routing;
 pub mod inbound_v2;
 pub mod ingest_v2;
 pub mod market_sync;
