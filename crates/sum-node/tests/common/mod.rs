@@ -288,10 +288,257 @@ impl AccessListSource for StaticAccessRpc {
     }
 }
 
+// ── WS2b helpers (real local-mirror harness) ────────────────────────────────
+//
+// Helpers below are used by `tests/e2e_mirror.rs` (all `#[ignore]`'d).
+// They assume:
+//   * The chain mirror is already running at `http://localhost:8545`.
+//   * `e2e_keys/` exists at the SNIP repo root (operator ran
+//     `e2e-helper generate-e2e-keys --out e2e_keys` and brought up
+//     the mirror with the corresponding `extra-alloc.json` overlay).
+//
+// Tests fail-fast with actionable messages if either assumption is
+// violated — so an operator running `make e2e-mirror` against an
+// un-funded mirror sees exactly what to fix, not a confusing
+// libp2p / RPC error chain.
+
+use std::path::Path as StdPath;
+
+use sum_node::rpc_client::L1RpcClient;
+use sum_types::rpc_types::TxStatusV2;
+
+/// Default chain mirror RPC URL. Overrideable per-test via the
+/// `SNIP_E2E_RPC_URL` env var.
+pub const E2E_RPC_URL_DEFAULT: &str = "http://localhost:8545";
+
+/// Wall-clock budget for a single tx to finalize. The mirror's
+/// declared block cadence is ~2s; finality_depth=3 → expect ~6s in
+/// the steady-state. Budget 16s to absorb CI runner jitter / cold
+/// boot. WS2b is the wall-clock layer; if chain ever ships a
+/// `dev_finalizeNow` RPC, swap this helper's body — the test
+/// contract stays identical.
+pub const E2E_FINALITY_BUDGET_SECS: u64 = 16;
+
+/// Resolve the RPC URL the harness should target.
+pub fn e2e_rpc_url() -> String {
+    std::env::var("SNIP_E2E_RPC_URL").unwrap_or_else(|_| E2E_RPC_URL_DEFAULT.to_string())
+}
+
+/// Path to the operator-supplied `e2e_keys/` directory at the SNIP
+/// repo root. Override per-test via `SNIP_E2E_KEYS_DIR`.
+pub fn e2e_keys_dir() -> std::path::PathBuf {
+    std::env::var("SNIP_E2E_KEYS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            // CARGO_MANIFEST_DIR is the path of the crate being
+            // tested (= crates/sum-node). The keys dir lives at
+            // the SNIP repo root, two levels up.
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("e2e_keys")
+        })
+}
+
+/// Read a role's seed file produced by `e2e-helper generate-e2e-keys`
+/// and decode the hex into 32 bytes.
+pub fn read_e2e_seed(role: &str) -> [u8; 32] {
+    let path = e2e_keys_dir().join(format!("{role}.seed.hex"));
+    let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "e2e: missing seed file at {}: {e}\n\
+             Generate with: cargo run -p sum-node --bin e2e-helper -- \\\n\
+             \tgenerate-e2e-keys --out e2e_keys\n\
+             Then bring up the mirror with the overlay (see\n\
+             docs/OPERATOR-RUNBOOK.md `Funded test accounts`).",
+            path.display()
+        )
+    });
+    let trimmed = content.trim();
+    let bytes = hex::decode(trimmed)
+        .unwrap_or_else(|e| panic!("e2e: seed file {} not valid hex: {e}", path.display()));
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    seed
+}
+
+/// Derive the L1 base58 address for a role's seed.
+pub fn role_address(role: &str) -> String {
+    let seed = read_e2e_seed(role);
+    let kp = sum_net::identity::keypair_from_seed(&seed)
+        .unwrap_or_else(|e| panic!("e2e: keypair_from_seed failed for role {role}: {e}"));
+    let addr = sum_net::identity::l1_address_from_keypair(&kp);
+    sum_net::identity::l1_address_base58(&addr)
+}
+
+/// Verify the mirror is reachable + V2 enabled + finality is
+/// advancing. Panics with an actionable message if any check fails.
+/// Each WS2b scenario should call this as its first action.
+pub async fn mirror_running_or_skip(rpc: &L1RpcClient) {
+    let params = rpc.chain_get_chain_params().await.unwrap_or_else(|e| {
+        panic!(
+            "e2e: chain_getChainParams failed against {}: {e}\n\
+             Is the local mirror up? Try: make smoke RPC=<url>",
+            e2e_rpc_url()
+        )
+    });
+    assert_eq!(
+        params.chain_id, 31337,
+        "e2e: mirror reports chain_id={}, expected 31337 (per docs/CHAIN-COMPAT.md)",
+        params.chain_id
+    );
+    let v2 = params.v2_enabled_from_height;
+    assert!(
+        matches!(v2, Some(0)),
+        "e2e: mirror reports v2_enabled_from_height={v2:?}, expected Some(0). \
+         Mirror genesis didn't enable V2 — chain-compat issue."
+    );
+
+    let head = rpc
+        .chain_get_block_height()
+        .await
+        .unwrap_or_else(|e| panic!("e2e: chain_getBlockHeight failed: {e}"));
+    assert_eq!(
+        head.finality, "finalized",
+        "e2e: mirror returned finality={}, expected \"finalized\"",
+        head.finality
+    );
+    // height==0 is allowed (fresh-genesis mirror at first poll); the
+    // tx-finality scenarios will time out their finality budgets if
+    // the chain isn't actually advancing.
+}
+
+/// Assert the role's address has a non-zero balance on the mirror.
+/// If zero, panic with the exact bring-up command operators need.
+pub async fn funded_or_skip(rpc: &L1RpcClient, role: &str) {
+    let addr = role_address(role);
+    let bal_str = rpc
+        .call_public::<serde_json::Value>("get_balance", serde_json::json!([&addr]))
+        .await
+        .unwrap_or_else(|e| panic!("e2e: get_balance({addr}) failed: {e}"))
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let bal: u128 = bal_str.parse().unwrap_or(0);
+    assert!(
+        bal > 0,
+        "e2e: role={role} address={addr} has balance=0.\n\
+         The mirror was not brought up with this overlay, OR the chain DB\n\
+         existed when the overlay was mounted (overlay is fresh-genesis only).\n\
+         To fix:\n\
+           cd <chain-repo>\n\
+           docker-compose -f deploy/snip-local-mirror.yaml down -v\n\
+           # ensure deploy/extra-alloc.json contains your e2e_keys addresses\n\
+           docker-compose \\\n\
+               -f deploy/snip-local-mirror.yaml \\\n\
+               -f deploy/snip-local-mirror.override.yaml \\\n\
+               up -d --build\n\
+         See docs/OPERATOR-RUNBOOK.md \"Funded test accounts\" for the full flow."
+    );
+}
+
+/// Poll `chain_getTransactionStatus` until the tx is `Finalized`,
+/// or fail with a budget-exceeded error after
+/// `E2E_FINALITY_BUDGET_SECS`. Real wall-clock — WS2b's manual
+/// gate is the only place sleeps are acceptable in this repo.
+pub async fn await_tx_finality(rpc: &L1RpcClient, tx_hash: &str) -> u64 {
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(E2E_FINALITY_BUDGET_SECS);
+    let mut last_status = "unknown".to_string();
+    while tokio::time::Instant::now() < deadline {
+        match rpc.chain_get_transaction_status(tx_hash).await {
+            Ok(TxStatusV2::Finalized { block_height }) => return block_height,
+            Ok(TxStatusV2::Failed {
+                block_height,
+                reason,
+            }) => panic!("e2e: tx {tx_hash} failed at {block_height:?}: {reason}"),
+            Ok(TxStatusV2::Dropped) => panic!("e2e: tx {tx_hash} dropped from mempool"),
+            Ok(other) => {
+                last_status = format!("{other:?}");
+            }
+            Err(e) => {
+                last_status = format!("Err({e})");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    panic!(
+        "e2e: tx {tx_hash} did not finalize within {}s budget (last status: {last_status})",
+        E2E_FINALITY_BUDGET_SECS
+    );
+}
+
+/// Spawn `sum-node` (or `e2e-helper`) as a subprocess, capturing
+/// output. Path comes from cargo's `CARGO_BIN_EXE_<name>` env var,
+/// guaranteeing the test runs against the same build artifact
+/// `cargo test` produced. Returns `Output` so the caller can assert
+/// on `status` + parse `stdout` / `stderr`.
+///
+/// Each spawn carries a clean env to insulate from operator shell
+/// state — only `RUST_LOG` and the explicitly-supplied env vars
+/// pass through.
+pub fn spawn_bin(
+    bin_name: &str,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    let bin_path = match bin_name {
+        "sum-node" => env!("CARGO_BIN_EXE_sum-node"),
+        "e2e-helper" => env!("CARGO_BIN_EXE_e2e-helper"),
+        other => panic!("e2e: spawn_bin unknown binary {other}"),
+    };
+    let mut cmd = std::process::Command::new(bin_path);
+    cmd.env_clear();
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        cmd.env("RUST_LOG", rust_log);
+    }
+    // `PATH` minimally needed so subprocess can locate dynamic
+    // loader / libc / etc on the host.
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.args(args);
+    cmd.output()
+        .unwrap_or_else(|e| panic!("e2e: spawn_bin({bin_name}) failed: {e}"))
+}
+
+/// Convenience: write a hex seed to a tempfile and return its path.
+/// Used by tests that need to pass `--key-file <path>` to a
+/// subprocess. The tempfile drops at end-of-scope, removing the
+/// seed from disk.
+pub fn write_seed_tempfile(seed: &[u8; 32]) -> tempfile::NamedTempFile {
+    let mut f = tempfile::NamedTempFile::new().expect("e2e: tempfile");
+    use std::io::Write;
+    writeln!(f.as_file_mut(), "{}", hex::encode(seed)).expect("e2e: write seed");
+    f
+}
+
+/// Path to the seed file for `role` inside `e2e_keys/` (read-only).
+/// Returned as a `PathBuf` for convenience; tests pass it directly
+/// as `--key-file`.
+pub fn role_seed_path(role: &str) -> std::path::PathBuf {
+    e2e_keys_dir().join(format!("{role}.seed.hex"))
+}
+
+/// Cargo workspace root path (parent of `crates/`). Tests use this
+/// when they need to invoke `sum-node` from a known CWD.
+pub fn workspace_root() -> std::path::PathBuf {
+    StdPath::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("e2e: workspace root canonicalize")
+}
+
 // ── Sanity self-tests ───────────────────────────────────────────────────────
 //
 // The helper module itself doesn't run as a test crate; these guard
-// the helper invariants the lifecycle tests rely on.
+// the helper invariants the lifecycle tests rely on. Per clippy
+// `items_after_test_module`, this block stays at the bottom of the
+// file.
 
 #[cfg(test)]
 mod helpers_self_test {

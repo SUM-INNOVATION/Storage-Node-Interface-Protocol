@@ -48,10 +48,8 @@ smoke:
 	cargo run -p sum-node --bin e2e-helper -- smoke --rpc-url "$(RPC)" $(SMOKE_ARGS)
 
 e2e-mirror:
-	@if ! cargo test -p sum-node --test e2e_mirror --no-run 2>/dev/null; then \
-		printf "e2e-mirror: tests/e2e_mirror.rs is not present yet (lands in WS2b commit 2).\n" >&2; \
-		printf "            Once it lands, this target runs the manual local-mirror E2E suite\n" >&2; \
-		printf "            against an already-running chain mirror at http://localhost:8545.\n" >&2; \
-		exit 2; \
-	fi
+	@printf "e2e-mirror: running local-mirror E2E suite (assumes mirror at http://localhost:8545,\n" >&2
+	@printf "            funded via extra-alloc overlay matching e2e_keys/ at the SNIP repo root).\n" >&2
+	@printf "            Each ignored test fails fast with actionable guidance if a precondition\n" >&2
+	@printf "            isn't met. NOT part of release-check or PR CI.\n\n" >&2
 	cargo test -p sum-node --test e2e_mirror -- --ignored --test-threads=1
