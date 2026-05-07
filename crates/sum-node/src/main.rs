@@ -257,6 +257,26 @@ enum Command {
     /// for finality. Re-runs are idempotent (chain overwrites the slot).
     RegisterEncryptionKey,
 
+    /// Register this account as an `ArchiveNode` with the on-chain
+    /// `NodeRegistry` (V1 op). Operator-facing entry point used by
+    /// WS2b: the dev `e2e-helper register-node` skips finality and
+    /// is RPC-only, whereas this command runs the full
+    /// production-shape submit-and-wait flow.
+    ///
+    /// Reads `chain_id` live from RPC (`chain_id`) so the operator
+    /// cannot mis-flag the tx against a different network and burn a
+    /// fee. Submits `NodeRegistry::Register(ArchiveNode { stake })`,
+    /// then waits for `Finalized` and prints both the tx hash and
+    /// the block height it landed in.
+    RegisterNode {
+        /// Stake (in chain native units) committed alongside
+        /// registration. Default matches the WS2b runbook fixture
+        /// (`1_000_000_000`); override only if your chain genesis
+        /// pins a different minimum.
+        #[arg(long, default_value = "1000000000")]
+        stake: u64,
+    },
+
     /// Phase 4c — share a Private V2 file with a new recipient.
     /// Owner-only: recovers `K_file` locally from the owner's own
     /// access bundle on chain, wraps it for the new recipient's
@@ -475,6 +495,21 @@ async fn main() -> Result<()> {
                 cli.rpc_url.clone(),
                 cli.chain_id,
                 cli.attest_fee,
+            )
+            .await
+        }
+        Command::RegisterNode { stake } => {
+            let seed = seed.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "register-node requires --key-file (NodeRegistry needs a signing key)"
+                )
+            })?;
+            run_register_node(
+                keypair,
+                seed,
+                cli.rpc_url.clone(),
+                cli.attest_fee,
+                stake,
             )
             .await
         }
@@ -1432,6 +1467,8 @@ async fn run_ingest_v2(
                 activate_height,
                 "V2 ingest ACTIVATED"
             );
+            println!("merkle_root: 0x{}", hex::encode(merkle_root));
+            println!("lifecycle: Active");
         }
         sum_node::ingest_v2::IngestOutcome::Failed { stage, source, .. } => {
             warn!(?stage, %source, "V2 ingest FAILED before chain registration");
@@ -1452,6 +1489,13 @@ async fn run_ingest_v2(
                 source = ?source.as_ref().map(|e| e.to_string()),
                 "V2 ingest PENDING — file is registered on chain; run `resume` or `abandon`"
             );
+            // The file IS registered on chain — operators (and the
+            // WS2b harness) need the merkle root to drive the
+            // `resume` / `abandon` follow-up. Emit it on stdout
+            // unconditionally; the warn! above is for humans, this
+            // is the machine-parseable contract.
+            println!("merkle_root: 0x{}", hex::encode(merkle_root));
+            println!("lifecycle: Pending");
         }
         // Resume-only outcomes: cannot actually be produced by `run`,
         // but the match must be exhaustive over the unified enum.
@@ -1467,6 +1511,8 @@ async fn run_ingest_v2(
                 activate_height,
                 "V2 ingest: file already ACTIVE on chain (no-op)"
             );
+            println!("merkle_root: 0x{}", hex::encode(merkle_root));
+            println!("lifecycle: Active");
         }
         sum_node::ingest_v2::IngestOutcome::ResumedActivated {
             merkle_root,
@@ -1482,6 +1528,8 @@ async fn run_ingest_v2(
                 activate_height,
                 "V2 resume ACTIVATED (no original register_tx_hash on chain)"
             );
+            println!("merkle_root: 0x{}", hex::encode(merkle_root));
+            println!("lifecycle: Active");
         }
         sum_node::ingest_v2::IngestOutcome::AbandonedOnChain {
             merkle_root,
@@ -1493,6 +1541,8 @@ async fn run_ingest_v2(
                 ?abandoned_at_height,
                 "V2 ingest: file is ABANDONED on chain (terminal)"
             );
+            println!("merkle_root: 0x{}", hex::encode(merkle_root));
+            println!("lifecycle: Abandoned");
         }
         sum_node::ingest_v2::IngestOutcome::RootMismatch {
             expected, actual, ..
@@ -1653,6 +1703,8 @@ async fn run_resume_v2(
             // RegisterFilePendingV2 ourselves, which resume doesn't do)
             // but the match must be exhaustive.
             info!(%activate_tx_hash, activate_height, "RESUME activated file");
+            println!("merkle_root: 0x{}", hex::encode(merkle_root));
+            println!("lifecycle: Active");
         }
         sum_node::ingest_v2::IngestOutcome::ResumedActivated {
             register_height,
@@ -1666,6 +1718,8 @@ async fn run_resume_v2(
                 activate_height,
                 "RESUME activated PENDING file"
             );
+            println!("merkle_root: 0x{}", hex::encode(merkle_root));
+            println!("lifecycle: Active");
         }
         sum_node::ingest_v2::IngestOutcome::ActivatedOnChain {
             register_height,
@@ -1676,6 +1730,8 @@ async fn run_resume_v2(
                 register_height,
                 activate_height, "RESUME: file already ACTIVE on chain"
             );
+            println!("merkle_root: 0x{}", hex::encode(merkle_root));
+            println!("lifecycle: Active");
         }
         sum_node::ingest_v2::IngestOutcome::AbandonedOnChain {
             abandoned_at_height,
@@ -1685,6 +1741,8 @@ async fn run_resume_v2(
                 ?abandoned_at_height,
                 "RESUME: file already ABANDONED on chain (terminal)"
             );
+            println!("merkle_root: 0x{}", hex::encode(merkle_root));
+            println!("lifecycle: Abandoned");
         }
         sum_node::ingest_v2::IngestOutcome::RootMismatch {
             expected, actual, ..
@@ -1701,6 +1759,8 @@ async fn run_resume_v2(
             ..
         } => {
             warn!(?failed_stage, source = ?source.as_ref().map(|e| e.to_string()), "RESUME: still PENDING — re-run resume or abandon");
+            println!("merkle_root: 0x{}", hex::encode(merkle_root));
+            println!("lifecycle: Pending");
         }
         sum_node::ingest_v2::IngestOutcome::Failed { stage, source, .. } => {
             warn!(?stage, %source, "RESUME: failed");
@@ -1982,6 +2042,80 @@ async fn run_register_encryption_key(
         pubkey = %hex::encode(x25519_pubkey),
         "RegisterEncryptionKey finalized — this account can now receive private files"
     );
+    Ok(())
+}
+
+// ── Register-node (NodeRegistry V1) ──────────────────────────────────────────
+
+/// Submit `NodeRegistry::Register(ArchiveNode)` for this account, then
+/// wait for finality. Production-shape counterpart to
+/// `e2e-helper register-node` (which is RPC-fire-and-forget).
+///
+/// `chain_id` comes from the live RPC (`chain_id`) — operators using
+/// this command should not have to keep `--chain-id` in sync with the
+/// network they're aimed at. The CLI's top-level `--chain-id` flag is
+/// for V2 paths that already had it threaded; we ignore it here so a
+/// stale flag value cannot cause a silently-rejected registration.
+async fn run_register_node(
+    keypair: Keypair,
+    seed: [u8; 32],
+    rpc_url: String,
+    fee: u128,
+    stake: u64,
+) -> Result<()> {
+    use sum_node::tx_builder::build_register_archive_node_tx;
+    use sum_node::tx_wait::{TxWaitError, wait_for_finalized};
+
+    let l1_addr = identity::l1_address_from_keypair(&keypair);
+    let l1_b58 = identity::l1_address_base58(&l1_addr);
+    let rpc = L1RpcClient::new(rpc_url);
+
+    let chain_id = rpc.get_chain_id().await?;
+    let nonce = rpc.get_nonce(&l1_b58).await?;
+    let tx_hex = build_register_archive_node_tx(&seed, chain_id, nonce, fee, stake)?;
+    let tx_hash = rpc.send_raw_transaction(&tx_hex).await?;
+
+    info!(
+        %tx_hash,
+        addr = %l1_b58,
+        chain_id,
+        stake,
+        "RegisterNode submitted, waiting for finality"
+    );
+
+    let height = wait_for_finalized(
+        &rpc,
+        &tx_hash,
+        sum_node::tx_wait::DEFAULT_POLL_INTERVAL,
+        Duration::from_secs(120),
+    )
+    .await
+    .map_err(|e| match e {
+        TxWaitError::Failed {
+            reason,
+            block_height,
+        } => anyhow::anyhow!("RegisterNode failed at height {block_height:?}: {reason}"),
+        TxWaitError::Dropped => {
+            anyhow::anyhow!("RegisterNode dropped from mempool — re-run with a fresh nonce")
+        }
+        TxWaitError::Timeout { last_status } => {
+            anyhow::anyhow!("RegisterNode timed out (last status: {last_status:?})")
+        }
+        TxWaitError::Rpc(e) => e,
+    })?;
+
+    info!(
+        %tx_hash,
+        height,
+        addr = %l1_b58,
+        "RegisterNode finalized"
+    );
+    // Stable stdout contract for WS2b scenario 2 + operator scripts:
+    // first the tx hash, then the finalized height. Each on its own
+    // line, `key: value` so consumers can grep without positional
+    // assumptions.
+    println!("tx_hash: {tx_hash}");
+    println!("finalized_height: {height}");
     Ok(())
 }
 
