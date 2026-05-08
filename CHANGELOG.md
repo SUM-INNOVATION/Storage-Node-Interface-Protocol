@@ -7,6 +7,44 @@ in [`docs/CHAIN-COMPAT.md`](docs/CHAIN-COMPAT.md).
 
 ## [Unreleased]
 
+## [0.4.0-rc3] - 2026-05-08
+
+Operator-safety follow-up to `v0.4.0-rc2`. Adds a single
+`e2e-helper` subcommand that lets bring-up scripts gate the first
+mainnet ingest on the chain plan's `assignment_replication_factor = 3`
+quorum. No production `sum-node` logic is touched.
+
+### Added (e2e-helper)
+- **`e2e-helper active-nodes-at-height`.** Read-only chain
+  snapshot: resolves the finalized head (or an explicit u64),
+  calls `storage_getActiveNodesAtHeight`, and prints the role ×
+  status breakdown. Optional `--require-archives N` converts the
+  helper into a script-friendly pre-flight gate — exit `2` if
+  the ArchiveNode/Active count is below `N`, exit `0` if met or
+  no requirement, exit `1` on RPC/wire failure. JSON output via
+  `--json`.
+
+### Changed (docs)
+- `docs/OPERATOR-RUNBOOK.md` "Mainnet bring-up" hard pre-flight
+  replaces the inline `curl + jq` snippet with the new helper.
+- `docs/RELEASE-CHECKLIST.md` § 7 "Pre-final-release gates" likewise
+  uses the helper for the `≥ 3 archives` check.
+
+### Verification
+- 7 new unit tests in `e2e_helper.rs` pin the role × status tally,
+  the exit-code decision (no requirement, threshold met exactly,
+  below threshold), and the human-output formatting (key:value
+  shape + empty-snapshot hint).
+- `make release-check` clean.
+- Live smoke against the local mirror exercises both branches
+  (`exit 0` without threshold, `exit 2` when threshold unmet).
+
+### Constraints honored
+- Production `sum-node` logic untouched. WS2 tests untouched.
+- No new mainnet writes; helper is read-only.
+- `v0.4.0-rc1` and `v0.4.0-rc2` tags unchanged. `v0.4.0-rc3` is a
+  separate annotated tag at the new main tip.
+
 ## [0.4.0-rc2] - 2026-05-07
 
 Docs-only release candidate. No code changes; same binary as

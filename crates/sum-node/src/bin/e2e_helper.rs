@@ -18,6 +18,7 @@
 //! or `::1`. This protects live chains without breaking
 //! local-mirror automation.
 
+use std::collections::BTreeMap;
 use std::process;
 
 use anyhow::Result;
@@ -147,6 +148,36 @@ enum Command {
         /// states intent explicitly.
         #[arg(long)]
         require_v2: bool,
+    },
+
+    /// Read-only chain snapshot of active node records at a given
+    /// height. Operator pre-flight gate before first ingest, scriptable
+    /// via `--require-archives N` (exit 2 when below threshold).
+    ///
+    /// Counts ArchiveNode/Active rows from
+    /// `storage_getActiveNodesAtHeight`. Other roles + statuses are
+    /// reported in the breakdown but don't gate the exit code.
+    /// Mirrors the chain plan's `assignment_replication_factor = 3`
+    /// pre-flight: ingest cannot satisfy quorum below R distinct
+    /// archive identities.
+    ActiveNodesAtHeight {
+        #[arg(long)]
+        rpc_url: String,
+        /// `finalized` (default) or an explicit u64. `finalized` calls
+        /// `chain_getBlockHeight(["finalized"])` first, then queries
+        /// the active-nodes snapshot at that height.
+        #[arg(long, default_value = "finalized")]
+        height: String,
+        /// If set, require at least N ArchiveNode/Active rows; exit 2
+        /// if the count is below the threshold. No env equivalent —
+        /// flag-only on purpose so each invocation states intent
+        /// explicitly (matches the `--require-v2` precedent on
+        /// `smoke`).
+        #[arg(long)]
+        require_archives: Option<usize>,
+        /// Emit a single JSON object instead of human-readable lines.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Generate fresh Ed25519 seeds for the WS2b local-mirror E2E
@@ -339,6 +370,22 @@ async fn run(cli: Cli) -> Result<i32> {
                 print!("{}", format_smoke_human(&report));
             }
             return Ok(if report.ok { 0 } else { 1 });
+        }
+
+        Command::ActiveNodesAtHeight {
+            rpc_url,
+            height,
+            require_archives,
+            json,
+        } => {
+            let rpc = L1RpcClient::new(rpc_url.clone());
+            let report = build_active_nodes_report(&rpc, &height).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_active_nodes_human(&report));
+            }
+            return Ok(active_nodes_exit_code(&report, require_archives));
         }
 
         Command::GenerateE2eKeys { out, balance } => {
@@ -747,6 +794,113 @@ fn format_smoke_human(report: &SmokeReport) -> String {
     let _ = writeln!(out);
     let _ = writeln!(out, "smoke: {}", if report.ok { "ok" } else { "FAILED" });
     out
+}
+
+// ── Active-nodes preflight ───────────────────────────────────────────────────
+
+/// Snapshot returned by `ActiveNodesAtHeight`. Captures both the
+/// height we resolved against (so a future `finalized` query is
+/// reproducible) and the role/status breakdown the operator wants
+/// to gate on.
+#[derive(Debug, Serialize)]
+struct ActiveNodesReport {
+    /// Effective height the snapshot was taken at. When the caller
+    /// passes `--height finalized`, this is the value `chain_getBlockHeight`
+    /// returned at probe time; with an explicit u64, it's the input.
+    height: u64,
+    /// Number of `ArchiveNode` rows with `status == "Active"`. This
+    /// is what `--require-archives` gates on.
+    active_archives: usize,
+    /// Full role × status breakdown so operators can spot stuck
+    /// `Pending`/`Slashed` rows that don't satisfy quorum.
+    by_role_status: BTreeMap<String, BTreeMap<String, usize>>,
+}
+
+/// Resolve `--height` (either `finalized` or an explicit u64), call
+/// `storage_getActiveNodesAtHeight`, and tally the breakdown.
+async fn build_active_nodes_report(
+    rpc: &L1RpcClient,
+    height_arg: &str,
+) -> Result<ActiveNodesReport> {
+    let effective_height = if height_arg.eq_ignore_ascii_case("finalized") {
+        rpc.chain_get_block_height()
+            .await
+            .map_err(|e| anyhow::anyhow!("chain_getBlockHeight: {e}"))?
+            .height
+    } else {
+        height_arg
+            .parse::<u64>()
+            .map_err(|e| anyhow::anyhow!("--height must be `finalized` or a u64: {e}"))?
+    };
+
+    let nodes = rpc
+        .storage_get_active_nodes_at_height(effective_height)
+        .await
+        .map_err(|e| anyhow::anyhow!("storage_getActiveNodesAtHeight({effective_height}): {e}"))?;
+
+    let by_role_status = tally_active_nodes(&nodes);
+    let active_archives = by_role_status
+        .get("ArchiveNode")
+        .and_then(|inner| inner.get("Active"))
+        .copied()
+        .unwrap_or(0);
+
+    Ok(ActiveNodesReport {
+        height: effective_height,
+        active_archives,
+        by_role_status,
+    })
+}
+
+/// Pure tally — pulled out of `build_active_nodes_report` so unit
+/// tests can pin the role × status arithmetic without spinning up
+/// a real RPC.
+fn tally_active_nodes(
+    nodes: &[sum_types::rpc_types::NodeRecordInfo],
+) -> BTreeMap<String, BTreeMap<String, usize>> {
+    let mut out: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    for n in nodes {
+        *out.entry(n.role.clone())
+            .or_default()
+            .entry(n.status.clone())
+            .or_insert(0) += 1;
+    }
+    out
+}
+
+/// Render the report as plain operator-readable lines. Mirrors the
+/// `smoke`-style key:value layout so operators eyeballing CI logs
+/// see consistent shape across both subcommands.
+fn format_active_nodes_human(report: &ActiveNodesReport) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "height: {}", report.height);
+    let _ = writeln!(out, "active_archives: {}", report.active_archives);
+    if report.by_role_status.is_empty() {
+        let _ = writeln!(
+            out,
+            "(snapshot is empty — chain reports no nodes at this height)"
+        );
+    } else {
+        for (role, statuses) in &report.by_role_status {
+            for (status, count) in statuses {
+                let _ = writeln!(out, "{role}/{status}: {count}");
+            }
+        }
+    }
+    out
+}
+
+/// Decide the exit code: `0` when no requirement set or threshold
+/// met; `2` when `--require-archives N` is set and the ArchiveNode/
+/// Active count is below `N`. RPC/wire failures are bubbled up to
+/// the `run` layer's `1` exit via the `?` chain — this function is
+/// only invoked when the report is in hand.
+fn active_nodes_exit_code(report: &ActiveNodesReport, require_archives: Option<usize>) -> i32 {
+    match require_archives {
+        Some(threshold) if report.active_archives < threshold => 2,
+        _ => 0,
+    }
 }
 
 fn parse_seed(hex: &str) -> Result<[u8; 32]> {
@@ -1401,5 +1555,130 @@ mod tests {
         let seed1 = std::fs::read_to_string(dir1.path().join("owner.seed.hex")).unwrap();
         let seed2 = std::fs::read_to_string(dir2.path().join("owner.seed.hex")).unwrap();
         assert_ne!(seed1, seed2, "seeds must differ across runs");
+    }
+
+    // ── active_nodes preflight ────────────────────────────────────
+
+    use sum_types::rpc_types::NodeRecordInfo;
+
+    fn n(role: &str, status: &str) -> NodeRecordInfo {
+        NodeRecordInfo {
+            address: format!("{role}_{status}"),
+            role: role.into(),
+            staked_balance: 1,
+            status: status.into(),
+            registered_at: 1,
+        }
+    }
+
+    /// `tally_active_nodes` is the pure boundary the helper relies
+    /// on for the role × status breakdown. Empty input → empty map
+    /// (NOT a row of zeros — distinguishes "no nodes" from "no
+    /// archives but other roles present").
+    #[test]
+    fn tally_active_nodes_empty_input_is_empty_map() {
+        let tally = tally_active_nodes(&[]);
+        assert!(tally.is_empty());
+    }
+
+    /// Mixed role/status inventory tallies correctly. Pinning this
+    /// catches a regression where the keys got swapped (status
+    /// outside / role inside) — the report shape is operator-
+    /// facing and changing it would break runbook scripts.
+    #[test]
+    fn tally_active_nodes_counts_by_role_then_status() {
+        let nodes = vec![
+            n("ArchiveNode", "Active"),
+            n("ArchiveNode", "Active"),
+            n("ArchiveNode", "Active"),
+            n("ArchiveNode", "Pending"),
+            n("Validator", "Active"),
+            n("Validator", "Slashed"),
+        ];
+        let tally = tally_active_nodes(&nodes);
+        assert_eq!(tally["ArchiveNode"]["Active"], 3);
+        assert_eq!(tally["ArchiveNode"]["Pending"], 1);
+        assert_eq!(tally["Validator"]["Active"], 1);
+        assert_eq!(tally["Validator"]["Slashed"], 1);
+    }
+
+    /// Exit code 0 when no requirement set, regardless of count.
+    /// Operators reading a snapshot without gating want the report,
+    /// not a failure exit.
+    #[test]
+    fn active_nodes_exit_code_no_requirement_is_zero_even_when_empty() {
+        let report = ActiveNodesReport {
+            height: 0,
+            active_archives: 0,
+            by_role_status: BTreeMap::new(),
+        };
+        assert_eq!(active_nodes_exit_code(&report, None), 0);
+    }
+
+    /// Exit code 0 when requirement met exactly — `>= N` is the
+    /// gate, not `> N`. Mainnet bootstraps with exactly 3 archives
+    /// in the common case; off-by-one here would block the first
+    /// ingest the operator scripted for.
+    #[test]
+    fn active_nodes_exit_code_meets_threshold_exactly() {
+        let report = ActiveNodesReport {
+            height: 100,
+            active_archives: 3,
+            by_role_status: BTreeMap::new(),
+        };
+        assert_eq!(active_nodes_exit_code(&report, Some(3)), 0);
+    }
+
+    /// Exit code 2 when requirement set and count below threshold.
+    /// `2` is the documented "operator pre-flight unmet" exit
+    /// (matches the convention used elsewhere in this binary for
+    /// operator-misuse / pre-flight failures).
+    #[test]
+    fn active_nodes_exit_code_below_threshold_returns_two() {
+        let report = ActiveNodesReport {
+            height: 100,
+            active_archives: 2,
+            by_role_status: BTreeMap::new(),
+        };
+        assert_eq!(active_nodes_exit_code(&report, Some(3)), 2);
+    }
+
+    /// Human-format renders `key: value` lines mirroring the smoke
+    /// subcommand's shape. Pinning this catches accidental
+    /// formatting drift that would break operators' grep-based
+    /// scripts.
+    #[test]
+    fn format_active_nodes_human_renders_key_value_lines() {
+        let mut by = BTreeMap::new();
+        let mut archive = BTreeMap::new();
+        archive.insert("Active".to_string(), 3usize);
+        by.insert("ArchiveNode".to_string(), archive);
+        let report = ActiveNodesReport {
+            height: 5_200_042,
+            active_archives: 3,
+            by_role_status: by,
+        };
+        let out = format_active_nodes_human(&report);
+        assert!(out.contains("height: 5200042"), "got: {out}");
+        assert!(out.contains("active_archives: 3"), "got: {out}");
+        assert!(out.contains("ArchiveNode/Active: 3"), "got: {out}");
+    }
+
+    /// Empty snapshot renders the explicit "snapshot is empty"
+    /// hint so a brand-new mainnet operator (zero archive nodes
+    /// registered) doesn't see a silent blank line and assume the
+    /// helper hung.
+    #[test]
+    fn format_active_nodes_human_explains_empty_snapshot() {
+        let report = ActiveNodesReport {
+            height: 0,
+            active_archives: 0,
+            by_role_status: BTreeMap::new(),
+        };
+        let out = format_active_nodes_human(&report);
+        assert!(
+            out.contains("snapshot is empty"),
+            "empty-snapshot hint must appear; got: {out}"
+        );
     }
 }
