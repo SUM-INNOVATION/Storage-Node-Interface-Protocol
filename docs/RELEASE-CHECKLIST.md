@@ -267,14 +267,17 @@ mainnet.
       the chain pin, re-run all gates.
 
 - [ ] **At least 3 archive nodes registered + listening on mainnet.**
-      Confirm at the current finalized head:
+      Confirm via the `e2e-helper active-nodes-at-height` gate
+      (reads finalized head + the active-nodes snapshot in one
+      step; exit 2 when below threshold):
 
       ```bash
-      curl -s -X POST https://rpc.sumchain.io \
-          -H "Content-Type: application/json" \
-          -d '{"jsonrpc":"2.0","id":1,"method":"storage_getActiveNodesAtHeight","params":[<finalized_height>]}' \
-          | jq '[.result[] | select(.role=="ArchiveNode" and .status=="Active")] | length'
-      # must return ≥ 3
+      cargo run --release -p sum-node --bin e2e-helper -- \
+          active-nodes-at-height \
+          --rpc-url https://rpc.sumchain.io \
+          --height finalized \
+          --require-archives 3
+      # exit 0 ⇒ pre-flight cleared
       ```
 
       The chain plan's `assignment_replication_factor = 3` makes

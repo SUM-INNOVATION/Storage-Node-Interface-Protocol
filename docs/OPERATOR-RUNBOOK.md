@@ -265,21 +265,32 @@ stuck in `Pending` because S2 cannot satisfy R=3.
 Mainnet currently has **zero** registered archive nodes. Before
 attempting the first mainnet ingest:
 
-1. Confirm at chain head that ≥ 3 ArchiveNode/Active rows exist:
+1. Confirm at chain head that ≥ 3 ArchiveNode/Active rows exist.
+   Use the `e2e-helper active-nodes-at-height` pre-flight gate; it
+   reads `chain_getBlockHeight(["finalized"])` + `storage_getActiveNodesAtHeight`,
+   prints the role × status breakdown, and exits `2` when the
+   archive count is below the threshold (script-friendly):
 
    ```bash
-   curl -s -X POST https://rpc.sumchain.io \
-       -H "Content-Type: application/json" \
-       -d '{"jsonrpc":"2.0","id":1,"method":"chain_getBlockHeight","params":["finalized"]}' \
-       | jq -r '.result.height'
-   # → <H>
-
-   curl -s -X POST https://rpc.sumchain.io \
-       -H "Content-Type: application/json" \
-       -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"storage_getActiveNodesAtHeight\",\"params\":[<H>]}" \
-       | jq '[.result[] | select(.role=="ArchiveNode" and .status=="Active")] | length'
-   # → must be ≥ 3 before first ingest
+   cargo run --release -p sum-node --bin e2e-helper -- \
+       active-nodes-at-height \
+       --rpc-url https://rpc.sumchain.io \
+       --height finalized \
+       --require-archives 3
    ```
+
+   Sample human output when quorum is satisfied:
+
+   ```text
+   height: <H>
+   active_archives: 3
+   ArchiveNode/Active: 3
+   ```
+
+   Exit codes: `0` if the requirement is met (or no `--require-archives`
+   set); `2` if below threshold; `1` on any RPC / wire failure.
+   Drop the helper into a bring-up script as the gate before
+   running `ingest-v2` against mainnet.
 
 2. Pick one of two operational shapes for the bootstrap:
 
