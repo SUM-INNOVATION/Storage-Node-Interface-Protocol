@@ -228,7 +228,73 @@ recovery, V1 legacy compatibility.
       pinning test reference; new threats added since last release
       have new rows.
 
-## 7. Tag and ship
+## 7. Pre-final-release gates (release-candidate → final)
+
+A release-candidate (`vX.Y.Z-rcN`) is **not** final production until
+every gate below clears against that tag's commit. These gates exist
+to catch hidden local-environment assumptions and chain-state
+prerequisites that only surface on a fresh machine or against live
+mainnet.
+
+- [ ] **Fresh-machine local-mirror E2E.** A different operator on a
+      different machine clones the repo at the rc tag, generates
+      keys via `e2e-helper generate-e2e-keys`, brings up the chain
+      mirror per [`OPERATOR-RUNBOOK.md`](OPERATOR-RUNBOOK.md), and
+      runs the full WS2b suite:
+
+      ```bash
+      cargo test -p sum-node --test e2e_mirror -- \
+          --ignored --test-threads=1 --nocapture
+      # target: 11 passed; 0 failed
+      ```
+
+      The fresh-machine reproduction catches path / dependency /
+      mirror-bring-up assumptions baked into the original developer's
+      environment. A green run on the original machine is necessary
+      but not sufficient.
+
+- [ ] **Mainnet read-only smoke.** Against the live mainnet RPC at
+      the chain commit listed in [`CHAIN-COMPAT.md`](CHAIN-COMPAT.md)
+      "Mainnet pin / deployed chain":
+
+      ```bash
+      make smoke RPC=https://rpc.sumchain.io SMOKE_ARGS=--require-v2
+      ```
+
+      Confirms `chain_id`, V2 enablement state, and finality
+      cadence match the values in CHAIN-COMPAT. A drift here means
+      the chain advanced past what the rc was built against — bump
+      the chain pin, re-run all gates.
+
+- [ ] **At least 3 archive nodes registered + listening on mainnet.**
+      Confirm at the current finalized head:
+
+      ```bash
+      curl -s -X POST https://rpc.sumchain.io \
+          -H "Content-Type: application/json" \
+          -d '{"jsonrpc":"2.0","id":1,"method":"storage_getActiveNodesAtHeight","params":[<finalized_height>]}' \
+          | jq '[.result[] | select(.role=="ArchiveNode" and .status=="Active")] | length'
+      # must return ≥ 3
+      ```
+
+      The chain plan's `assignment_replication_factor = 3` makes
+      this a hard pre-flight: no V2 ingest can activate without
+      three resolvable archive peers. Below 3, ingest registers on
+      chain but stalls in `Pending` indefinitely.
+
+- [ ] **First mainnet Public V2 ingest + download round-trip.** Use
+      a throwaway file (operator personal data, NOT customer data)
+      and verify the round-trip succeeds through the full
+      `RegisterFilePendingV2` → push chunks → push manifest →
+      `ActivateFileV2` → download → byte-identical reassembly path.
+      This is the canonical "first real bytes" milestone; it is
+      out-of-band today (no automated mainnet test). Record the
+      tx hash and the merkle root in the release notes.
+
+Only after **all four** gates clear does an `rcN` advance to a
+final `vX.Y.Z` tag.
+
+## 8. Tag and ship
 
 - [ ] Bump version in [`Cargo.toml`](../Cargo.toml)
       `[workspace.package].version`.
@@ -241,7 +307,7 @@ recovery, V1 legacy compatibility.
 - [ ] `git tag -a vX.Y.Z -m "vX.Y.Z"`.
 - [ ] `git push && git push --tags`.
 
-## 8. Post-release
+## 9. Post-release
 
 - [ ] Watch the first-deploy logs for any new warning/error patterns.
 - [ ] Verify operator runbook still describes the shipped binary

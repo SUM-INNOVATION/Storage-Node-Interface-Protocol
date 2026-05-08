@@ -52,6 +52,118 @@ privates, or any other signing material.
 
 Re-pinning procedure is in [`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md).
 
+## Mainnet pin / deployed chain
+
+Confirmed-public facts about the deployed mainnet at the pinned
+chain commit. These values are wire-protocol observable and safe
+to publish; chain-team-private fields (validator hostnames, RPC
+admin endpoints, validator binary SHA) deliberately do not appear
+in this table.
+
+| Field                                  | Value                                                       |
+|----------------------------------------|-------------------------------------------------------------|
+| `chain_id`                             | `1`                                                         |
+| Public RPC                             | `https://rpc.sumchain.io`                                   |
+| Chain commit                           | `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0`                  |
+| Genesis SHA-256                        | `040b1fd32bfab5008c8c6c048e853fa6717db82b5a3af56cab494f88fc1ec431` |
+| `v2_enabled_from_height`               | `5200000`                                                   |
+| `finality_depth`                       | `6` blocks                                                  |
+| `block_time_ms`                        | `3000` (≈ 3 s)                                              |
+| V2 live since                          | finalized height ≥ `5200000`                                |
+
+The chain commit is authoritative. Release builds are not byte-
+reproducible across hosts (toolchain version, build flags, system
+libraries vary), so the validator binary SHA is intentionally
+NOT listed here as a reproducibility requirement — operators
+should treat the chain commit as the canonical reference and
+trust the chain team's release tooling for binary distribution.
+
+Genesis SHA-256 is the SHA-256 of the canonical genesis JSON file
+the chain ships at the pinned commit. Operators bringing up a
+node SHOULD verify their local genesis matches this hash before
+syncing — a mismatched genesis means a different chain.
+
+### Transaction payloads SNIP submits to mainnet
+
+Both payload kinds below are pinned by the bincode-v1 fixtures
+listed under "Transaction payload fixtures" further down. The
+TxPayload tag indices are stable on this chain commit; a diff is
+a hard chain-compat break.
+
+**Archive-node registration** (V1 path, used today):
+
+```text
+TxPayload::NodeRegistry(NodeRegistryOperation::Register {
+    role: ArchiveNode,
+    stake,
+})
+TxPayload tag: 17
+```
+
+Archive registration deliberately stays on V1 `NodeRegistry`.
+`NodeRegistryV2` exists at TxPayload tag `19` but is currently
+scoped to encryption-key registration only — there is no V2
+archive-registration op today. If the chain ever adds one, SNIP
+will pin a new fixture and update this section in the same
+release.
+
+**Encryption key registration** (V2 path):
+
+```text
+TxPayload::NodeRegistryV2(NodeRegistryOperationV2::RegisterEncryptionKey {
+    encryption_pubkey,
+})
+TxPayload tag: 19
+```
+
+Required for any address that wants to receive Private V2 file
+shares. The X25519 pubkey is HKDF-derived from the operator's
+Ed25519 seed (domain `snip-x25519-encryption-key-v1`); the seed
+itself never reaches the chain.
+
+### RPC methods SNIP intentionally uses
+
+These are the JSON-RPC methods SNIP calls against any compatible
+chain (mainnet, local-mirror, or future replica). Aliases that
+exist on the chain but SNIP does NOT use are listed below for
+clarity — operators reading chain logs may see other methods
+flowing, but SNIP itself stays on this set.
+
+| Method                              | Used for                                                       |
+|-------------------------------------|----------------------------------------------------------------|
+| `send_raw_transaction`              | submit signed bincode-v1 tx (returns tx hash)                  |
+| `chain_getTransactionStatus`        | poll for `Finalized` / `Failed` / `Dropped` after submission   |
+| `storage_getFileInfoV2`             | resolve V2 chain row (visibility, lifecycle, access list)      |
+| `storage_getActiveNodesAtHeight`    | snapshot of `ArchiveNode/Active` rows at a chain height        |
+| `chain_getChainParams`              | read `chain_id`, `assignment_replication_factor`, etc.         |
+| `account_getEncryptionPublicKey`    | resolve a recipient's registered X25519 pubkey                 |
+| `chain_getBlockHeight`              | read finalized head for V2 enablement gate + finality budgets  |
+| `get_balance`, `get_nonce`          | preflight + tx assembly                                        |
+
+The mainnet chain also exposes alias methods (`sum_sendRawTransaction`
+and per-tx receipt aliases). **SNIP does not use them.** Staying on
+the canonical `send_raw_transaction` + `chain_getTransactionStatus`
+pair keeps the wire surface SNIP depends on small and review-able;
+an alias divergence on the chain side is then a no-op for SNIP.
+
+### Mainnet vs local-mirror
+
+The local-mirror chain (compose preset at the pinned commit) is a
+single-validator devnet, NOT mainnet. Operator-visible differences:
+
+| Field                          | Mainnet                  | Local mirror             |
+|--------------------------------|--------------------------|--------------------------|
+| `chain_id`                     | `1`                      | `31337`                  |
+| `v2_enabled_from_height`       | `5200000`                | `0` (V2 from genesis)    |
+| Block cadence                  | ~3 s                     | ~2 s                     |
+| Pre-funded test addresses      | none                     | yes (overlay-funded)     |
+
+Operators MUST verify `chain_id` at runtime via
+`chain_getChainParams` (or `make smoke`) before any tx submission.
+Signing the wrong `chain_id` means the chain rejects the tx and
+the fee is burned. The fastest way to catch a mis-configured RPC
+URL is to gate on the smoke check before any first write.
+
 > **Local mirror is runnable at this pin.** The compose preset
 > at `deploy/snip-local-mirror.yaml` in the chain repo, checked
 > out at the pinned SHA, brings up a single-validator devnet

@@ -128,6 +128,181 @@ cargo run --release -p sum-node -- \
     revoke <merkle-root-hex> --recipient <recipient-l1-address>
 ```
 
+## Mainnet bring-up
+
+Sequence for bringing a brand-new archive operator onto live
+mainnet. Read [`CHAIN-COMPAT.md`](CHAIN-COMPAT.md) "Mainnet pin /
+deployed chain" first — the values quoted below are operator-
+visible facts confirmed at the pinned chain commit.
+
+### 0. Mainnet vs local mirror
+
+Confirm at runtime, never assume.
+
+| Field                      | Mainnet                   | Local mirror              |
+|----------------------------|---------------------------|---------------------------|
+| `chain_id`                 | `1`                       | `31337`                   |
+| RPC                        | `https://rpc.sumchain.io` | `http://localhost:8545`   |
+| `v2_enabled_from_height`   | `5200000`                 | `0` (V2 from genesis)     |
+
+Signing against the wrong `chain_id` means the chain rejects the
+tx and the fee is burned. Always gate on `make smoke` before any
+write — the smoke check fails loudly if `chain_id` ≠ what the
+SNIP build expects.
+
+### 1. Read-only smoke
+
+No write, no fee, no risk. Confirms RPC reachability,
+`chain_id`, V2 enablement state, and finality cadence.
+
+```bash
+make smoke RPC=https://rpc.sumchain.io SMOKE_ARGS=--require-v2
+```
+
+Expected output (truncated):
+
+```text
+chain_id=1, R=3, v2_enabled_from_height=Some(5200000)
+finalized height=<N>, finality=finalized
+V2 state: ENABLED_FROM_FINALIZED_HEIGHT (active since 5200000)
+smoke: ok
+```
+
+If the smoke check fails, do NOT proceed to any write step.
+
+### 2. Balance check (canary, costs nothing)
+
+Before submitting any tx, confirm the operator's funded address
+actually carries balance. A zero balance means the funding flow
+hasn't completed; submitting a tx would fail at the chain side
+with `InsufficientBalance`.
+
+```bash
+cargo run -p sum-node --bin e2e-helper -- balance \
+    --rpc-url https://rpc.sumchain.io \
+    --address <operator_l1_address>
+```
+
+A non-zero, integer balance string is the success condition.
+
+### 3. Smallest write canary — register encryption key
+
+`register-encryption-key` is the lowest-blast-radius mainnet
+write: one tx, no stake, idempotent on chain (re-running with the
+same seed is a fee-burning no-op). It validates the operator's
+end-to-end signing + finality flow before any stake is committed.
+
+```bash
+sum-node \
+    --key-file /secure/path/archive.seed.hex \
+    --rpc-url https://rpc.sumchain.io \
+    register-encryption-key
+```
+
+Stable stdout contract on success:
+
+```text
+tx_hash: 0x<hex>
+finalized_height: <N>
+```
+
+If this command surfaces `Failed`, `Dropped`, or a timeout,
+investigate before any larger write — the same failure mode will
+hit `register-node` for non-recoverable reasons (wrong chain_id,
+insufficient balance, RPC drift).
+
+### 4. Archive registration
+
+Once the encryption-key write has finalized cleanly:
+
+```bash
+sum-node \
+    --key-file /secure/path/archive.seed.hex \
+    --rpc-url https://rpc.sumchain.io \
+    register-node --stake 1000000000
+```
+
+`--stake` is the chain-side stake commitment. The default
+matches the local-mirror fixture; mainnet operators should set
+this per the chain team's published minimum (out-of-band).
+
+### 5. Verify node record on chain
+
+```bash
+cargo run -p sum-node --bin e2e-helper -- node-record \
+    --rpc-url https://rpc.sumchain.io \
+    --address <archive_l1_address>
+```
+
+The response should show
+`{ role: "ArchiveNode", status: "Active", staked_balance: <N>, ... }`.
+A `null` response means the registration didn't finalize on this
+chain — re-check finality status before assuming the archive is
+operational.
+
+### 6. Start serving
+
+```bash
+sum-node \
+    --key-file /secure/path/archive.seed.hex \
+    --rpc-url https://rpc.sumchain.io \
+    --profile production \
+    listen
+```
+
+`--profile production` fails closed on every uncertain ACL path;
+never use `--profile dev` against mainnet.
+
+### Hard pre-flight before first ingest: ≥ 3 archives
+
+The chain plan fixes `assignment_replication_factor = 3`. **Every
+ingest's S2 push wave needs three distinct archive identities,
+all currently registered AND listening, before V2 ingest can
+activate.** A single archive registration is not enough; the
+chain will accept `RegisterFilePendingV2` but the file will get
+stuck in `Pending` because S2 cannot satisfy R=3.
+
+Mainnet currently has **zero** registered archive nodes. Before
+attempting the first mainnet ingest:
+
+1. Confirm at chain head that ≥ 3 ArchiveNode/Active rows exist:
+
+   ```bash
+   curl -s -X POST https://rpc.sumchain.io \
+       -H "Content-Type: application/json" \
+       -d '{"jsonrpc":"2.0","id":1,"method":"chain_getBlockHeight","params":["finalized"]}' \
+       | jq -r '.result.height'
+   # → <H>
+
+   curl -s -X POST https://rpc.sumchain.io \
+       -H "Content-Type: application/json" \
+       -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"storage_getActiveNodesAtHeight\",\"params\":[<H>]}" \
+       | jq '[.result[] | select(.role=="ArchiveNode" and .status=="Active")] | length'
+   # → must be ≥ 3 before first ingest
+   ```
+
+2. Pick one of two operational shapes for the bootstrap:
+
+   **Option A — coordinated ramp.** Three independent operators
+   on three hosts each register and start `listen` within a
+   tight window. Each MUST use a distinct seed (= distinct L1
+   address), distinct store root, distinct ports. No shared
+   key material across hosts.
+
+   **Option B — single-org bootstrap.** One operator runs three
+   archive identities on three hosts. Same constraints (distinct
+   seeds, store roots, ports). Trust is concentrated until
+   external operators onboard.
+
+   Either shape is acceptable for unblocking the first mainnet
+   ingest. Coordinated ramp is preferred for diversity; single-
+   org bootstrap is faster to prove the path.
+
+3. Do NOT run the first mainnet ingest until step 1 returns
+   `≥ 3`. Until then, ingest will register on chain but never
+   finalize as `Active`, and the deposit sits in `Pending`
+   until grace-blocks pass and the file is abandoned.
+
 ## Resume / abandon
 
 V2 ingest is multi-step: `RegisterFilePendingV2` → push chunks →
