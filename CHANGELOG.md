@@ -7,6 +7,59 @@ in [`docs/CHAIN-COMPAT.md`](docs/CHAIN-COMPAT.md).
 
 ## [Unreleased]
 
+## [0.4.0-rc2] - 2026-05-07
+
+Docs-only release candidate. No code changes; same binary as
+`v0.4.0-rc1`. Promotes the operator-facing docs to mainnet-ready
+state by recording the chain team's confirmed-public mainnet pin
+and the bring-up flow that goes with it.
+
+### Added (docs)
+- **`docs/CHAIN-COMPAT.md` "Mainnet pin / deployed chain"
+  section.** Records the publicly observable mainnet facts at the
+  pinned chain commit — `chain_id = 1`, public RPC, genesis SHA-256,
+  `v2_enabled_from_height = 5200000`, `finality_depth = 6`,
+  `block_time_ms = 3000`. Documents the canonical TxPayload shapes
+  SNIP submits (V1 archive registration at tag 17, V2 encryption-key
+  registration at tag 19) and the JSON-RPC method set SNIP
+  intentionally uses, with explicit notes that aliases like
+  `sum_sendRawTransaction` are NOT used by SNIP. New
+  "Mainnet vs local-mirror" comparison table catches mis-configured
+  RPC URLs.
+- **`docs/OPERATOR-RUNBOOK.md` "Mainnet bring-up" section.**
+  Step-by-step flow: read-only smoke → balance check → smallest
+  write canary (`register-encryption-key`) → archive registration
+  (`register-node`) → verify node record → start `listen` with
+  `--profile production`. Includes a hard pre-flight that bars the
+  first ingest until `storage_getActiveNodesAtHeight` shows ≥ 3
+  active archives — single-archive registration is structurally
+  insufficient under chain plan `R = 3`. Operational shape options
+  documented: coordinated ramp (3 independent operators) or
+  single-org bootstrap (3 identities on 3 hosts).
+- **`docs/RELEASE-CHECKLIST.md` "Pre-final-release gates" section
+  (new § 7).** Codifies the four gates an `rcN` must clear before
+  promoting to a final `vX.Y.Z` tag: fresh-machine local-mirror
+  E2E reproduction, mainnet read-only smoke, ≥ 3 mainnet archive
+  nodes registered + listening, and a first Public V2 ingest +
+  download round-trip against mainnet using a throwaway file.
+
+### Constraints honored
+- Validator binary SHA is intentionally NOT documented as a
+  reproducibility requirement — release builds are not
+  byte-reproducible across hosts (toolchain, build flags, system
+  libraries vary). The chain commit is the canonical reference.
+- Validator hostnames, RPC admin endpoints, and any other chain-
+  team-private facts are excluded. Only operator-visible mainnet
+  facts the chain team has confirmed for public docs are recorded.
+- No code changes. Same binary surface as `v0.4.0-rc1`. The
+  release-candidate jump from rc1 to rc2 reflects docs-readiness,
+  not a behavioral change.
+
+### Verification
+- `make release-check` clean (fmt + lint + tests + release build).
+- `v0.4.0-rc1` tag is unchanged; this release-candidate is a
+  separate annotated tag at the new main tip.
+
 ## [0.4.0-rc1] - 2026-05-07
 
 Release candidate; not final production. Operators on a fresh
