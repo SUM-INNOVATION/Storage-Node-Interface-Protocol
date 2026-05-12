@@ -159,12 +159,14 @@ No write, no fee, no risk. Confirms RPC reachability,
 make smoke RPC=https://rpc.sumchain.io SMOKE_ARGS=--require-v2
 ```
 
-Expected output (truncated):
+Expected output (eyeball — exact text matters):
 
 ```text
-chain_id=1, R=3, v2_enabled_from_height=Some(5200000)
-finalized height=<N>, finality=finalized
-V2 state: ENABLED_FROM_FINALIZED_HEIGHT (active since 5200000)
+smoke target: https://rpc.sumchain.io
+[1/2] chain_getChainParams ........... OK (chain_id=1, R=3, v2_enabled_from_height=Some(5200000))
+[2/2] chain_getBlockHeight ........... OK (finalized height=<N>, finality=finalized)
+V2 state: ENABLED_FROM_HEIGHT (v2_enabled_from_height=Some(5200000) → enabled at height 5200000)
+
 smoke: ok
 ```
 
@@ -313,6 +315,11 @@ attempting the first mainnet ingest:
    `≥ 3`. Until then, ingest will register on chain but never
    finalize as `Active`, and the deposit sits in `Pending`
    until grace-blocks pass and the file is abandoned.
+
+[`MAINNET-BRINGUP.md`](MAINNET-BRINGUP.md) is the standalone field
+guide for full mainnet archive bring-up, three-archive
+coordination, first throwaway round-trip, and mainnet-specific
+failure triage.
 
 ## Resume / abandon
 

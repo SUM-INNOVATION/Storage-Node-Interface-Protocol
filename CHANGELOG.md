@@ -7,6 +7,74 @@ in [`docs/CHAIN-COMPAT.md`](docs/CHAIN-COMPAT.md).
 
 ## [Unreleased]
 
+## [0.4.0-rc4] - 2026-05-12
+
+Docs-only release candidate. Same binary surface as `v0.4.0-rc1` /
+`rc2` / `rc3`. Lands the mainnet bring-up field guide previously
+tracked in GitHub issue #20, fixes one stale string in the operator
+runbook, corrects the README's client-vs-archive workflow language,
+and records the first verified mainnet Public V2 round-trip
+artifacts.
+
+### Added (docs)
+- `docs/MAINNET-BRINGUP.md`. Standalone field guide for mainnet
+  archive bring-up. Covers host prerequisites (including the
+  recommended separate owner/client identity), install at the
+  current release-candidate tag, read-only smoke + balance +
+  active-archive preflight, per-archive registration, the
+  three-archive bootstrap gate, the canonical throwaway Public V2
+  round-trip (success + below-quorum Pending paths), Private file
+  readiness, operational notes, the four-gate promotion criteria
+  from `RELEASE-CHECKLIST.md` § 7, and mainnet-specific failure
+  triage.
+
+### Changed (docs)
+- `docs/OPERATOR-RUNBOOK.md` § Mainnet bring-up step 3.1 smoke
+  sample updated to match the actual `format_smoke_human` output
+  (`ENABLED_FROM_HEIGHT`, two-line `[1/2]` + `[2/2]` check format).
+  Adds a pointer to `MAINNET-BRINGUP.md` at the end of the section.
+- `docs/RELEASE-CHECKLIST.md` § 7 adds a pointer to
+  `MAINNET-BRINGUP.md` for step-by-step gate-satisfaction
+  instructions.
+- `README.md` CLI Reference workflow language corrected to clearly
+  distinguish two SNIP operator roles: client (file user, pays
+  fees, no stake, no `listen`) and archive operator (registers,
+  stakes, runs `listen`). Client examples updated to use V2
+  (`ingest-v2 --visibility public`) since V2 is the chain-canonical
+  path on mainnet. Archive-operator examples now show
+  `register-encryption-key` + `register-node --stake 1000000000`
+  before `listen --profile production`. Cross-links to
+  `docs/MAINNET-BRINGUP.md` and `docs/CHAIN-COMPAT.md` added.
+
+### Verified (informational; no code changes)
+First mainnet Public V2 round-trip executed against `v0.4.0-rc3`
+with a three-archive fleet:
+
+- merkle_root: `0x617538f7ecd0d36f65e82802227d4fb4081af7ec5ed5d8ea2fb8d9ae07f53ba0`
+- RegisterFilePendingV2 tx: `0x8ba095ac329170ad610ad714f29566cfb446bc4f369dbb2695ca731057138117` (height 5,647,745)
+- ActivateFileV2 tx: `0x6d2cabd10cfef15cdfbaf23983d37ffa2411432dfbb48c835c802d805e88538f` (height 5,647,755)
+- file size / SHA-256: 4,096 B / `036536268a41f495e13ca8d6f52b9f3c9118280848339f2b6eee266cd67ee812`
+- archive fleet (L1 base58): `EbhtpDt6DUgviJfPcQvQoiett8GtS5s71`, `79oSi1TAfTjv76pPQhhgEpgqJFiBDKcdZ`, `8c7viqt3gKjwgEw9BbNVmoJDxcqSvjToe`
+- owner (L1 base58): `2udfFGPbxMnfEJ8sdrK9uvnJ1zmPbwL69`
+- outcome: `lifecycle: Active` on single-pass ingest; recovered file
+  byte-identical to source.
+
+All four `RELEASE-CHECKLIST.md` § 7 pre-final-release gates green
+against the rc3 binary: fresh-machine local-mirror E2E (11/11),
+mainnet read-only smoke, ≥ 3 archives registered + listening,
+single-pass byte-identical Public V2 round-trip.
+
+### Constraints honored
+- No code changes; no tests changed.
+- `v0.4.0-rc1`, `rc2`, `rc3` tags unchanged. `v0.4.0-rc4` is a
+  separate annotated tag at the new main tip.
+- No private keys, validator hostnames, or chain-team-private
+  facts. No validator binary SHA reproducibility claim — chain
+  commit remains the canonical reference.
+- Stable stdout claim for ingest/resume limited to `merkle_root:`
+  and `lifecycle:` lines; tx hashes documented as best-effort log
+  output, not as pinned stdout.
+
 ## [0.4.0-rc3] - 2026-05-08
 
 Operator-safety follow-up to `v0.4.0-rc2`. Adds a single

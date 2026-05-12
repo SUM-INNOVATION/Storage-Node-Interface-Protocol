@@ -580,21 +580,51 @@ V2 is the chain-canonical path going forward. V1 stays operational for legacy tr
 
 ## CLI Reference
 
+SNIP has two operator roles, exercised through the same `sum-node`
+binary with different flags:
+
+1. **Client / user (Alice, Bob).** Stores and retrieves files by
+   paying storage and transaction fees. Does **not** register as an
+   archive node, does **not** stake, does **not** run `listen`.
+   Cannot earn rewards; cannot be slashed.
+2. **Archive / operator (N1–N10).** Registers as `ArchiveNode` on
+   chain, stakes `1_000_000_000` base units (1 Koppa), runs
+   `listen`, stores chunks on behalf of clients, can earn rewards,
+   can be slashed for protocol violations.
+
+Mainnet operation requires at least `R = 3` archive operators
+online (chain plan `assignment_replication_factor`). Clients can
+store files once that bootstrap quorum exists.
+
 **For external users (Alice/Bob) — client mode:**
 
 | Command | What it does |
 |---------|-------------|
-| `sum-node --client ingest <path>` | Upload a file: chunk locally, push to R=3 assigned nodes, wait for confirmations, clean up local chunks, exit |
-| `sum-node download <merkle_root> --output <path>` | Download a complete file by merkle root: manifest fetch, parallel chunk download, CID verification, merkle root verification, file reassembly, exit |
+| `sum-node --client --key-file <seed> --rpc-url <url> ingest-v2 <path> --visibility public` | V2 upload: chunk locally, push to R=3 V2-assigned archives, finalize on chain, clean up local chunks, exit |
+| `sum-node --client --key-file <seed> --rpc-url <url> download <merkle_root> --output <path>` | Download a complete file by merkle root: manifest fetch, parallel chunk download, CID verification, merkle root verification, file reassembly, exit |
+
+V2 (`ingest-v2`) is the chain-canonical path on mainnet and is what
+clients should use for new files. V1 `--client ingest` is retained
+for legacy traffic only.
 
 **For storage node operators — node mode:**
 
+One-time on-chain setup, then long-running `listen`:
+
 | Command | What it does |
 |---------|-------------|
-| `sum-node listen` | Run as a storage node: serve chunks, enforce ACLs, respond to PoR challenges, run MarketSync + GC, dispatch V2 inbound when a signing key is present |
-| `sum-node ingest <path>` | V1 upload: chunk, push to R=3 assigned nodes, stay running to serve chunks |
+| `sum-node --key-file <seed> --rpc-url <url> register-encryption-key` | One-time registration of the archive's X25519 encryption pubkey on chain (required to receive Private V2 file shares; safe to skip for Public-only operators, but recommended). One tx, no stake. |
+| `sum-node --key-file <seed> --rpc-url <url> register-node --stake 1000000000` | One-time on-chain registration as `ArchiveNode` with the 1-Koppa stake commitment. Waits for finality. |
+| `sum-node --key-file <seed> --rpc-url <url> --profile production listen` | Run as an archive node: serve chunks, enforce ACLs, respond to PoR challenges, run MarketSync + GC, dispatch V2 inbound when a signing key is present |
+| `sum-node ingest <path>` | V1 upload (legacy): chunk, push to R=3 assigned nodes, stay running to serve chunks |
 | `sum-node fetch <cid>` | Download a single chunk by CID from a LAN peer |
 | `sum-node send <message>` | Broadcast a test gossipsub message |
+
+For the full mainnet bring-up sequence — host prerequisites, fleet
+coordination, first throwaway round-trip, failure triage — see
+[`docs/MAINNET-BRINGUP.md`](docs/MAINNET-BRINGUP.md). For
+chain-version compatibility and wire-format facts (including the
+mainnet pin) see [`docs/CHAIN-COMPAT.md`](docs/CHAIN-COMPAT.md).
 
 **For V2 lifecycle operations (chain plan v3.2 — Phase 0b):**
 
