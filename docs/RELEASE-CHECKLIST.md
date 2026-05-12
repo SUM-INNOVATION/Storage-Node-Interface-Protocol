@@ -236,6 +236,11 @@ to catch hidden local-environment assumptions and chain-state
 prerequisites that only surface on a fresh machine or against live
 mainnet.
 
+Step-by-step operator instructions for satisfying gates 2–4 against
+live mainnet are in [`MAINNET-BRINGUP.md`](MAINNET-BRINGUP.md). This
+section defines *what* must be true to promote; that guide describes
+*how* to make it true.
+
 - [ ] **Fresh-machine local-mirror E2E.** A different operator on a
       different machine clones the repo at the rc tag, generates
       keys via `e2e-helper generate-e2e-keys`, brings up the chain
