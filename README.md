@@ -4,6 +4,28 @@ A native decentralized storage protocol for the SUM Chain blockchain. The L1 act
 
 ---
 
+## Platform support
+
+Client mode (file user) and archive mode (long-running operator)
+have different platform stories:
+
+| Environment | Client | Archive |
+|---|---|---|
+| Linux | ✅ Supported | ✅ Supported |
+| macOS (Apple Silicon) | ✅ Supported | ⚠️ Experimental |
+| Windows (via WSL2) | ⚠️ With caveats | ❌ Not supported |
+| ChromeOS (via Crostini) | ⚠️ With caveats | ❌ Not supported |
+
+Archive operation is Linux-first; macOS may join after one
+operator's long-run validation completes. Windows and ChromeOS
+users run SNIP as clients through their Linux-compatible
+environments (WSL2 / Crostini). For the full matrix, rationale,
+per-environment setup recipes, promotion criteria, and items
+not planned for `v0.4.x`, see
+[`docs/PLATFORM-SUPPORT.md`](docs/PLATFORM-SUPPORT.md).
+
+---
+
 ## The Complete SUM Chain Decentralized Storage Process
 
 ### The Actors

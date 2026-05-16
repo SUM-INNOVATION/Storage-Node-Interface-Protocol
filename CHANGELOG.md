@@ -7,6 +7,25 @@ in [`docs/CHAIN-COMPAT.md`](docs/CHAIN-COMPAT.md).
 
 ## [Unreleased]
 
+### Added (docs)
+- `docs/PLATFORM-SUPPORT.md`. Initial cross-platform support
+  matrix establishing the `v0.4.x` contract: client mode runs on
+  any Linux-compatible environment (Linux native, macOS native,
+  Windows via WSL2, ChromeOS via Crostini); archive mode is
+  Linux-first with macOS as experimental pending operator
+  long-run validation; Windows and ChromeOS archive modes are
+  not supported. Records per-environment setup recipes (WSL2
+  install + Crostini quickstart), promotion criteria for
+  Experimental → Supported, items not planned for `v0.4.x`
+  (native Windows tooling, launchd templates, packaging, code
+  signing), and permanent non-goals (ChromeOS native, iOS /
+  Android client).
+
+### Changed (docs)
+- `README.md` adds a compact platform support matrix near the
+  top with a pointer to `docs/PLATFORM-SUPPORT.md` for the full
+  rationale.
+
 ## [0.4.0-rc4] - 2026-05-12
 
 Docs-only release candidate. Same binary surface as `v0.4.0-rc1` /
