@@ -26,6 +26,37 @@ not planned for `v0.4.x`, see
 
 ---
 
+## Install
+
+Prebuilt binaries are published for **Linux x86_64**. Every other
+supported platform builds from source — see
+[`docs/INSTALL.md`](docs/INSTALL.md) and
+[`docs/PLATFORM-SUPPORT.md`](docs/PLATFORM-SUPPORT.md) for
+per-environment recipes.
+
+The recommended first install is the **manual-verify path**
+(download → check SHA256 → extract → move binaries). See
+[`docs/INSTALL.md`](docs/INSTALL.md) for the step-by-step
+commands.
+
+A curl-pipe convenience script is also published with each
+release. It requires you to pin a version explicitly — there is
+no `--latest`:
+
+```bash
+# Replace v0.4.0 with the release you want to install.
+curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/v0.4.0/install.sh \
+    | sh -s -- --version v0.4.0
+```
+
+The script installs `sum-node` and `e2e-helper` into
+`$HOME/.local/bin` by default. It refuses to run on anything
+other than Linux x86_64 and does not invoke `sudo` itself. To
+install system-wide, run the curl-pipe under your own `sudo` and
+pass `--prefix /usr/local`.
+
+---
+
 ## The Complete SUM Chain Decentralized Storage Process
 
 ### The Actors

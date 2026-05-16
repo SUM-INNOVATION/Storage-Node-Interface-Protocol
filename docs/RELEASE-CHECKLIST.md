@@ -315,6 +315,59 @@ final `vX.Y.Z` tag.
 - [ ] `git tag -a vX.Y.Z -m "vX.Y.Z"`.
 - [ ] `git push && git push --tags`.
 
+### 8a. Verify the prebuilt-binary draft release
+
+Pushing the tag triggers
+[`.github/workflows/release.yml`](../.github/workflows/release.yml),
+which builds the Linux x86_64 release binaries, packages them as
+`snip-vX.Y.Z-linux-x86_64.tar.gz`, computes `SHA256SUMS`, and
+uploads those plus `scripts/install.sh` to a **draft** GitHub
+Release. The workflow never auto-publishes. A human must:
+
+- [ ] Wait for the `release` workflow on the tag to finish green.
+- [ ] Open the draft release in the GitHub UI and confirm the
+      asset list contains exactly three files:
+      `snip-vX.Y.Z-linux-x86_64.tar.gz`, `SHA256SUMS`,
+      `install.sh`.
+- [ ] On a clean Linux x86_64 host (or an Ubuntu 22.04 VM /
+      container), exercise the **manual-verify path** end-to-end
+      against the draft assets:
+
+      ```bash
+      # Authenticated download from the draft release.
+      # Draft assets are NOT reachable via the unauthenticated
+      # releases URL; use `gh release download` from a logged-in
+      # gh CLI for the preflight.
+      gh release download vX.Y.Z \
+          --repo SUM-INNOVATION/Storage-Node-Interface-Protocol \
+          --pattern 'snip-*-linux-x86_64.tar.gz' \
+          --pattern 'SHA256SUMS'
+
+      sha256sum --check --ignore-missing SHA256SUMS
+      tar xzf snip-vX.Y.Z-linux-x86_64.tar.gz
+      ./snip-vX.Y.Z-linux-x86_64/bin/sum-node --version
+      ```
+
+      Confirms tarball integrity, layout, and that the binary
+      runs on a clean host. After publishing the release, the
+      curl-pipe install line from the README/INSTALL becomes
+      reachable; that is the next gate.
+- [ ] Replace the auto-generated draft body with the matching
+      `CHANGELOG.md` section + the install command.
+- [ ] Manually publish the draft. For rc tags, keep the
+      "pre-release" flag checked.
+- [ ] After publishing, re-run the documented curl-pipe install
+      line on a clean host as a final smoke:
+
+      ```bash
+      curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/vX.Y.Z/install.sh \
+          | sh -s -- --version vX.Y.Z
+      sum-node --version
+      ```
+
+      This is the line copy-pasted into the README; if it does
+      not work after publish, no user can install vX.Y.Z.
+
 ## 9. Post-release
 
 - [ ] Watch the first-deploy logs for any new warning/error patterns.

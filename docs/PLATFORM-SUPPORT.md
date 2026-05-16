@@ -62,6 +62,13 @@ are WSL2 and Crostini respectively.
 Validated on mainnet (`v0.4.0-rc3` bring-up: three archive nodes
 on Hetzner CX21 VPSs, first Public V2 round-trip byte-identical).
 
+**Linux x86_64 has a prebuilt tarball.** This is the only cell
+in the matrix with prebuilts in the `v0.4.x` line. See
+[`INSTALL.md`](INSTALL.md) for both the manual-verify path
+(download, check SHA256, extract, move binaries) and the
+curl-pipe convenience script. The build-from-source path below
+remains supported and is the contract on every other cell.
+
 ```bash
 # Build essentials.
 sudo apt update
@@ -77,10 +84,12 @@ git checkout v0.4.0-rc4            # or <latest-release-candidate-tag>
 make release-check
 ```
 
-aarch64 is the same toolchain. Promotion of archive mode on
+aarch64 is the same toolchain but has **no prebuilt tarball** in
+`v0.4.x` — build from source. Promotion of archive mode on
 aarch64 from "with caveats" to "supported" requires one operator
 to run a long-lived archive against mainnet for the documented
-validation window.
+validation window. A prebuilt aarch64 tarball is a candidate for
+`v0.4.1+` once that validation lands.
 
 For the full mainnet archive bring-up flow see
 [`MAINNET-BRINGUP.md`](MAINNET-BRINGUP.md).
@@ -240,10 +249,18 @@ These items are deliberately deferred. Re-evaluate at the
   ChromeOS-side change in policy.
 - **macOS launchd plist templates.** Will land alongside the
   macOS archive promotion when its validation window closes.
-- **Pre-built binary distribution, code signing, notarization.**
-  Build-from-source is the contract for `v0.4.x`. Packaging
-  (Homebrew, winget, scoop, deb/rpm, signed installers) is a
-  v0.5.x+ workstream.
+- **Code signing, notarization, signed checksums.** `v0.4.x`
+  ships a Linux x86_64 tarball and a SHA256SUMS file but does
+  NOT sign binaries, notarize for macOS Gatekeeper, sign
+  `SHA256SUMS` with PGP, or publish Sigstore attestations.
+  Operators with threat models that require any of these should
+  build from source at the matching tag. The full signing
+  workstream is deferred to `v0.5.x`.
+- **Prebuilt distribution beyond Linux x86_64.** `v0.4.x` ships
+  a Linux x86_64 tarball only. Linux aarch64 and macOS arm64
+  prebuilts are candidates for `v0.4.1+` once their per-cell
+  promotion criteria clear. Homebrew, winget, scoop, deb/rpm
+  packaging is a `v0.5.x+` workstream.
 - **`cargo xtask release-check` cross-platform dev-loop wrapper.**
   `make release-check` via Git Bash / WSL2 / Crostini is enough.
 

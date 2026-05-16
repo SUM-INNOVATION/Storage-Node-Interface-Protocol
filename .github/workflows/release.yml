@@ -1,0 +1,136 @@
+# Release workflow — triggered on version tags (v*). Builds release
+# binaries from the tag checkout, packages them as a Linux x86_64
+# tarball, computes SHA256SUMS, and uploads the artifacts together
+# with `scripts/install.sh` to a DRAFT GitHub Release.
+#
+# The release is never auto-published. A human verifies the assets
+# and runs the documented install command before clicking publish.
+# Both rc and final tags create a draft (rc tags additionally carry
+# the GitHub "pre-release" flag once published).
+#
+# Scope: Linux x86_64 only for v0.4.x. macOS / aarch64 are deferred
+# to v0.4.1+. Build-from-source remains the contract for every other
+# platform cell — see docs/PLATFORM-SUPPORT.md.
+#
+# All third-party actions are pinned to a full commit SHA, not a
+# floating tag. The human tag is included as a comment so the SHA
+# is auditable without network access. Bumping requires explicit
+# edits + re-pin to the new SHA.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # required to create / upload to the draft release
+
+jobs:
+  linux-x86_64:
+    name: package linux-x86_64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (tag)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Validate tag format
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*) ;;
+            *)
+              echo "error: tag '$TAG' does not match vX.Y.Z or vX.Y.Z-rcN" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: make release-check
+        run: make release-check
+
+      - name: Build workspace (release)
+        run: cargo build --workspace --release --locked
+
+      - name: Stage tarball and checksums
+        id: stage
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          PLATFORM="linux-x86_64"
+          ROOT="snip-${TAG}-${PLATFORM}"
+
+          mkdir -p "dist/${ROOT}/bin"
+          cp target/release/sum-node    "dist/${ROOT}/bin/sum-node"
+          cp target/release/e2e-helper  "dist/${ROOT}/bin/e2e-helper"
+          cp README.md                  "dist/${ROOT}/README.md"
+          cp CHANGELOG.md               "dist/${ROOT}/CHANGELOG.md"
+          cp LICENSE-MIT                "dist/${ROOT}/LICENSE-MIT"
+          cp LICENSE-APACHE             "dist/${ROOT}/LICENSE-APACHE"
+
+          # Belt + suspenders against tag/tarball drift if this
+          # workflow is ever edited. The interpolation above already
+          # pins this, but assert anyway.
+          test "${ROOT}" = "snip-${TAG}-${PLATFORM}" || {
+              echo "error: staged dir '${ROOT}' disagrees with tag '${TAG}'" >&2
+              exit 1
+          }
+
+          ( cd dist && tar czf "${ROOT}.tar.gz" "${ROOT}" )
+          ( cd dist && sha256sum "${ROOT}.tar.gz" > SHA256SUMS )
+
+          echo "tag=${TAG}"                   >> "$GITHUB_OUTPUT"
+          echo "tarball=dist/${ROOT}.tar.gz"  >> "$GITHUB_OUTPUT"
+          echo "checksums=dist/SHA256SUMS"    >> "$GITHUB_OUTPUT"
+
+      - name: Show staged assets
+        run: |
+          ls -la dist/
+          cat dist/SHA256SUMS
+
+      - name: Create draft release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          TAG="${{ steps.stage.outputs.tag }}"
+
+          case "$TAG" in
+            *-rc*) PRERELEASE_FLAG="--prerelease" ;;
+            *)     PRERELEASE_FLAG="" ;;
+          esac
+
+          # The release is always created as a draft. A human must
+          # verify assets + install line before publishing in the
+          # GitHub UI. NEVER add `--latest` here; we do not promise
+          # an implicit-latest contract for v0.4.x.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists — re-uploading assets (clobber)"
+            gh release upload "$TAG" \
+                "${{ steps.stage.outputs.tarball }}" \
+                "${{ steps.stage.outputs.checksums }}" \
+                scripts/install.sh \
+                --clobber
+          else
+            gh release create "$TAG" \
+                --draft $PRERELEASE_FLAG \
+                --title "$TAG" \
+                --notes "Draft release. Replace this body with the matching CHANGELOG.md section before publishing." \
+                "${{ steps.stage.outputs.tarball }}" \
+                "${{ steps.stage.outputs.checksums }}" \
+                scripts/install.sh
+          fi

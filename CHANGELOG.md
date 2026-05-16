@@ -7,7 +7,40 @@ in [`docs/CHAIN-COMPAT.md`](docs/CHAIN-COMPAT.md).
 
 ## [Unreleased]
 
+### Added
+- Prebuilt Linux x86_64 binary tarball published as a GitHub
+  Release asset. Tarball layout:
+  `snip-vX.Y.Z-linux-x86_64/{bin/{sum-node,e2e-helper},README.md,CHANGELOG.md,LICENSE-MIT,LICENSE-APACHE}`.
+  Sibling `SHA256SUMS` asset published alongside. Linux x86_64
+  is the only platform with prebuilts in `v0.4.x`; every other
+  cell builds from source per `docs/PLATFORM-SUPPORT.md`.
+- `.github/workflows/release.yml`. Tag-triggered (`v*`) workflow
+  that builds release binaries from the tag checkout, validates
+  the tag format (`vX.Y.Z` or `vX.Y.Z-rcN`), runs
+  `make release-check`, packages the tarball, computes
+  `SHA256SUMS`, and uploads tarball + checksums +
+  `scripts/install.sh` to a **draft** GitHub Release. The
+  workflow never auto-publishes. rc tags additionally carry the
+  GitHub `--prerelease` flag.
+- `scripts/install.sh`. Idempotent installer that pins the
+  release version (no implicit "latest"), refuses to run on
+  anything other than Linux x86_64, downloads tarball +
+  checksums into `mktemp -d`, verifies the SHA256, and installs
+  `sum-node` + `e2e-helper` into `$HOME/.local/bin` by default
+  (or `$PREFIX/bin` if `--prefix` is supplied). The installer
+  does NOT invoke `sudo`; system installs run the curl-pipe
+  under user-supplied sudo. Released as a versioned release
+  asset alongside the tarball.
+
 ### Added (docs)
+- `docs/INSTALL.md`. Documents both the manual-verify install
+  path (download → check SHA256 → extract → move binaries) and
+  the curl-pipe convenience script. Manual-verify is documented
+  first; curl-pipe references the release-asset URL (never
+  `main`). Includes the build-from-source fallback for cells
+  without a prebuilt and the v0.4.x security-model notes (no
+  code signing, no notarization, no signed checksums — these
+  are deferred packaging items).
 - `docs/PLATFORM-SUPPORT.md`. Initial cross-platform support
   matrix establishing the `v0.4.x` contract: client mode runs on
   any Linux-compatible environment (Linux native, macOS native,
@@ -17,14 +50,29 @@ in [`docs/CHAIN-COMPAT.md`](docs/CHAIN-COMPAT.md).
   not supported. Records per-environment setup recipes (WSL2
   install + Crostini quickstart), promotion criteria for
   Experimental → Supported, items not planned for `v0.4.x`
-  (native Windows tooling, launchd templates, packaging, code
-  signing), and permanent non-goals (ChromeOS native, iOS /
-  Android client).
+  (native Windows tooling, launchd templates, signed packaging),
+  and permanent non-goals (ChromeOS native, iOS / Android
+  client).
 
 ### Changed (docs)
 - `README.md` adds a compact platform support matrix near the
   top with a pointer to `docs/PLATFORM-SUPPORT.md` for the full
-  rationale.
+  rationale, plus a top-level `## Install` section pointing at
+  `docs/INSTALL.md` and showing the curl-pipe convenience line.
+- `docs/PLATFORM-SUPPORT.md` Linux x86_64 / aarch64 section
+  records that x86_64 has a prebuilt tarball; aarch64 remains
+  build-from-source in `v0.4.x` and is a `v0.4.1+` candidate
+  pending operator validation. "Not planned for v0.4.x" section
+  splits the old "Pre-built binary distribution, code signing,
+  notarization" bullet into two: code signing / notarization /
+  signed checksums (still deferred to `v0.5.x`) and prebuilts
+  beyond Linux x86_64 (aarch64 / macOS arm64 in `v0.4.1+`;
+  Homebrew / winget / scoop / deb / rpm in `v0.5.x+`).
+- `docs/RELEASE-CHECKLIST.md` § 8 adds a new "8a. Verify the
+  prebuilt-binary draft release" subsection covering the
+  manual-verify preflight against draft assets via
+  `gh release download`, the manual publish step (no
+  auto-publish), and a post-publish curl-pipe smoke gate.
 
 ## [0.4.0-rc4] - 2026-05-12
 
