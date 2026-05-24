@@ -206,31 +206,38 @@ This manifest is serialized to disk as a CBOR file (a compact binary format, lik
 
 ![Step 2](docs/diagrams/step2.svg)
 
-Alice now needs the blockchain to officially recognize this file. She creates and signs a `TxPayload::AllocateStorage` transaction containing:
+Alice now needs the blockchain to officially recognize this file. She creates and signs a `RegisterFilePendingV2` transaction ([crates/sum-node/src/tx_builder.rs:115-147](crates/sum-node/src/tx_builder.rs#L115-L147)) containing:
 
 - `merkle_root`: `34a749...` — the file's unique identity (32 bytes)
-- `total_size_bytes`: 10,485,760
-- `access_list`: `[Bob_address]` — only Bob is allowed to download this file. If Alice wanted the file to be public, she would leave this empty (`[]`).
-- `fee_pool`: 100 Koppa — money locked to pay storage nodes over time. This is the economic fuel that keeps nodes motivated to store the file. When the fee pool runs out, nodes are no longer rewarded for storing it.
+- `plaintext_size_bytes`: 10,485,760
+- `chunk_count`: 10
+- `visibility`: `Public` (or `Private` — see the V2 Lifecycle section below for the encrypted-file flow)
+- `access_list`: `[]` for a Public file; for Private, one `AccessEntryV2` per recipient carrying an 80-byte encrypted key bundle ([crates/sum-types/src/rpc_types.rs:122-131](crates/sum-types/src/rpc_types.rs#L122-L131))
+- `fee_deposit`: 100 Koppa — money locked to pay storage nodes over time. This is the economic fuel that keeps nodes motivated to store the file. When the fee pool runs out, nodes are no longer rewarded for storing it.
 
-Alice signs this transaction with her Ed25519 private key and broadcasts it to Val 1 or Val 2.
+Alice signs this transaction with her Ed25519 private key, broadcasts it via JSON-RPC `send_raw_transaction`, and waits for `Finalized` ([crates/sum-node/src/tx_wait.rs:88-132](crates/sum-node/src/tx_wait.rs#L88-L132)).
 
 The validators execute the transaction:
 - Verify Alice's signature
-- Deduct 100 Koppa from Alice's account
-- Write a `StorageMetadata` entry to the blockchain's state database:
+- Deduct 100 Koppa from Alice's account as the fee deposit
+- Write a `StorageMetadataV2` entry to the blockchain's state database ([crates/sum-types/src/rpc_types.rs:134-176](crates/sum-types/src/rpc_types.rs#L134-L176)):
   ```
   {
     merkle_root: 34a749...,
     owner: Alice_address,
-    total_size_bytes: 10,485,760,
-    access_list: [Bob_address],
+    plaintext_size_bytes: 10,485,760,
+    stored_size_bytes:    10,485,760,   // = plaintext for Public; plaintext + 16×chunk_count for Private
+    chunk_count: 10,
+    visibility: Public,
+    lifecycle:  Pending,                 // becomes Active after ActivateFileV2
+    access_list: [],
     fee_pool: 100,000,000,000 base units (100 Koppa),
-    created_at: block 5000
+    created_at: block 5000,
+    assignment_height: 5000              // chain captures this snapshot for deterministic chunk assignment
   }
   ```
 
-**The file now officially exists on the blockchain — but only as metadata.** The blockchain stores 32 bytes of merkle_root plus the rules (access list, fee pool). No actual PDF data touches the chain. The blockchain is a ledger of "what files exist, who owns them, who can access them, and how much money is set aside to pay for their storage."
+**The file now officially exists on the blockchain — but only as metadata, and only in `Pending` state.** The blockchain stores 32 bytes of merkle_root plus the rules (visibility, access list, fee pool). No actual PDF data touches the chain. The file becomes downloadable after Alice pushes chunks (Step 3), archives attest coverage (Step 4), and Alice submits `ActivateFileV2` to transition Pending → Active.
 
 ---
 
@@ -240,30 +247,30 @@ The validators execute the transaction:
 
 Alice runs:
 ```bash
-sum-node --client ingest file.pdf --rpc-url http://<validator>:9944
+sum-node --client --key-file alice.hex --rpc-url http://<validator>:9944 ingest-v2 file.pdf
 ```
 
 Her client connects to the P2P mesh and discovers nearby storage nodes via mDNS (multicast DNS — nodes broadcast "I'm here" on the local network). Alice does not need to register as an ArchiveNode, stake Koppa, or run storage infrastructure — she is an external user of the network.
 
-Alice does **not** push to a single node. Instead, she computes the same deterministic assignment algorithm described in Step 4 — she queries the L1 for the active node list (`storage_getActiveNodes()`), sorts them, and calculates which `R` = 3 nodes are assigned to each chunk. She then pushes each chunk directly to its 3 assigned nodes in parallel using the `/sum/storage/v1` push protocol over QUIC (a fast, encrypted transport protocol).
+Alice does **not** push to a single node. Instead, she runs the V2 deterministic assignment algorithm described in Step 4 — she queries the L1 for the active-node snapshot at `assignment_height` (`storage_getActiveNodesAtHeight`, [crates/sum-node/src/rpc_client.rs:228-234](crates/sum-node/src/rpc_client.rs#L228-L234)) and computes the top-`R` = 3 archives per chunk via `chunks_for_archive_v2` ([crates/sum-store/src/assignment_v2.rs:151-178](crates/sum-store/src/assignment_v2.rs#L151-L178)). She then pushes each chunk directly to its 3 assigned archives in parallel using the `/sum/storage/v2` push protocol over QUIC (a fast, encrypted transport protocol).
 
-For each pushed chunk, the receiving node:
-1. Verifies the CID (blake3-hashes the received bytes, checks the hash matches the claimed CID)
-2. If valid: writes the chunk to its local disk as `<cid>.chunk` and responds with an ACK
-3. If invalid: rejects the push with an error — the data is NOT stored
-4. Announces the chunk via gossipsub on `sum/storage/v1`
+Each V2 push carries the chunk bytes alongside an inline Merkle proof — `ShardRequestV2::Push { data, merkle_root, chunk_index, merkle_path }` ([crates/sum-net/src/codec.rs:176-207](crates/sum-net/src/codec.rs#L176-L207)). The receiving node validates four things via `PushValidator::validate_push` ([crates/sum-node/src/push_validator.rs:255](crates/sum-node/src/push_validator.rs#L255)) **before** writing anything to disk:
 
-Each of the `C` x `R` = 30 announcements contains:
+1. The file is registered on chain and not Abandoned (`storage_getFileInfoV2`)
+2. `chunk_index < chunk_count`
+3. The receiving archive is in the snapshot AND is one of the V2-assigned archives for this `chunk_index`
+4. `verify_merkle_proof_bytes_for_tree(blake3(data), chunk_index, merkle_path, merkle_root, chunk_count)` succeeds ([crates/sum-store/src/verify.rs:72-95](crates/sum-store/src/verify.rs#L72-L95))
+
+Only after all four checks pass does the node write the chunk to its local disk as `<cid>.chunk` ([crates/sum-store/src/store.rs:39-43](crates/sum-store/src/store.rs#L39-L43)) and respond with `PushAck`. The wire CID is never trusted — the leaf hash is derived from `data` itself.
+
+After Alice's pushes complete, she also sends the `DataManifest` to each distinct assigned archive via `ManifestPushV2` ([crates/sum-net/src/lib.rs:249-265](crates/sum-net/src/lib.rs#L249-L265)). The receiver recomputes the merkle root from the manifest's chunk descriptors and rejects on mismatch ([crates/sum-store/src/serve.rs:418-488](crates/sum-store/src/serve.rs#L418-L488)). Alice then publishes one `ChunkAnnouncement` per chunk — `C` total — on the `sum/storage/v1` Gossipsub topic ([crates/sum-store/src/announce.rs:11-20](crates/sum-store/src/announce.rs#L11-L20)) so other peers can discover the CIDs. Each announcement contains:
+
 - `merkle_root`: `34a749...` — which file this chunk belongs to
 - `chunk_index`: 0 through 9 — which piece
-- `cid`: the content address for requesting this specific chunk
-- `size`: 1,048,576 bytes (or less for a final partial chunk)
+- `chunk_cid`: the content address for requesting this specific chunk
+- `size_bytes`: 1,048,576 bytes (or less for a final partial chunk)
 
-Alice also sends the `DataManifest` to at least one node, which stores it in its manifest index (a persistent lookup table mapping merkle_root -> manifest).
-
-**Alice waits for confirmation before disconnecting.** She tracks ACK responses from each target node. Only after receiving `R` = 3 confirmations per chunk (or reaching a timeout) does she disconnect. If any chunk has fewer than `R` confirmations, Alice receives an explicit warning listing the unconfirmed chunks and nodes — she knows the upload is incomplete and should NOT delete her local copy.
-
-After all chunks are confirmed across 3 nodes each, Alice can safely disconnect. Her file exists in 3 independent copies from the moment she leaves — there is no single-point-of-failure window.
+**Alice waits for confirmation before disconnecting.** She tracks `PushAck` responses from each target archive. Only after every assigned archive has accepted each of its chunks (or the wall-clock timeout `--push-wait-secs` elapses, default 120 s — [crates/sum-node/src/main.rs:172-173](crates/sum-node/src/main.rs#L172-L173)) does she move on to Step 4's coverage poll.
 
 ---
 
@@ -271,34 +278,34 @@ After all chunks are confirmed across 3 nodes each, Alice can safely disconnect.
 
 ![Step 4](docs/diagrams/step4.svg)
 
-Each storage node runs a background task called the **MarketSyncWorker**. Every 30 seconds (configurable), it asks the blockchain two questions via RPC:
+Each storage node independently runs the **V2 deterministic assignment algorithm** that Alice already ran in Step 3 to choose her push targets. The goal: for each of the `C` = 10 chunks, determine which `R` = 3 of the `N` = 10 nodes should store a copy. No central coordinator decides this — every participant (Alice, every archive, the L1 validators) computes the same answer independently because they all use the same public on-chain inputs.
 
-1. `storage_getFundedFiles()` -> "What files have money in their fee pool?" -> Returns file `34a749...` with `chunk_count = 10`
-2. `storage_getActiveNodes()` -> "What storage nodes are registered and active?" -> Returns 10 addresses: `[N1_addr, N2_addr, ..., N10_addr]`, sorted by address bytes (alphabetical sort of raw bytes, ensuring every participant sorts identically)
+Each archive queries the L1 for the snapshot pinned at the file's `assignment_height` and reads chain params for `R`:
 
-Now each node independently runs the **deterministic assignment algorithm**. The goal: for each of the `C` = 10 chunks, determine which `R` = 3 of the `N` = 10 nodes should store a copy. No central coordinator decides this — every node computes the same answer independently because they all use the same public inputs.
+1. `storage_getActiveNodesAtHeight(assignment_height)` ([crates/sum-node/src/rpc_client.rs:228-234](crates/sum-node/src/rpc_client.rs#L228-L234)) -> "What storage nodes were active when this file was registered?" -> Returns 10 addresses: `[N1_addr, ..., N10_addr]`, canonicalized via `BTreeSet` (deduped + sorted by address bytes — every participant sorts identically).
+2. `chain_getChainParams()` ([crates/sum-types/src/rpc_types.rs:213-258](crates/sum-types/src/rpc_types.rs#L213-L258)) -> reads `assignment_replication_factor` (default 3).
 
-**The algorithm:**
+**The algorithm** (rendezvous hash, [crates/sum-store/src/assignment_v2.rs:52-112](crates/sum-store/src/assignment_v2.rs#L52-L112)):
 
-For each chunk (0 through `C-1`) and each replica (0 through `R-1`):
+For each `(chunk_index, archive)` pair, compute a score:
 
 ```
-Step A: Concatenate three values into a 40-byte input:
-   input = merkle_root (32 bytes) + chunk_index (4 bytes, big-endian) + replica (4 bytes, big-endian)
+Step A: Domain-separation context (exact bytes — consensus-critical):
+   context = "sumchain SNIP-V2 chunk-assignment v1"
 
-Step B: Hash the input:
-   hash = blake3(input) -> 32 bytes
+Step B: Derive a 32-byte key:
+   key = blake3::derive_key(context, merkle_root || chunk_index_be || archive_l1_address)
 
-Step C: Convert to a node index:
-   node_index = first_8_bytes_of_hash, interpreted as a 64-bit unsigned integer, modulo N (10)
-   assigned_node = sorted_node_list[node_index]
+Step C: Convert to a 64-bit score:
+   score = u64::from_be_bytes(key[..8])
 
-Step D: Handle collisions:
-   If this node was already assigned to this chunk by a previous replica,
-   move to the next node in the list (linear probing) until finding one not yet assigned.
+Step D: Select the R archives with the lowest scores for this chunk.
+   Tie-break: ascending by archive L1 address (canonical sort of the snapshot).
 ```
 
-**Example result** (the actual assignment depends on the hash outputs, but this illustrates the pattern):
+The context string, big-endian byte order, `blake3::derive_key` variant, and tie-break rule MUST match the L1's validation exactly. Any divergence breaks chain conformance.
+
+**Example result** (the actual assignment depends on the rendezvous-hash scores, but this illustrates the pattern):
 
 | Chunk | Replica 0 | Replica 1 | Replica 2 | Nodes NOT assigned |
 |-------|-----------|-----------|-----------|-------------------|
@@ -317,19 +324,17 @@ In this example, each node stores approximately 3 chunks (30 total assignments a
 
 **What N5 does (as an example):**
 
-1. N5 computes the assignment table above
-2. N5 filters: "which chunks have my address?" -> chunks 1, 5, 7
-3. N5 checks its local disk: it already has chunks 1, 5, 7 — Alice pushed them directly in Step 3
-4. N5 has nothing to fetch. It is already fully synchronized for this file.
+1. N5 calls `chunks_for_archive_v2(merkle_root, chunk_count, snapshot, R, my_addr)` ([crates/sum-store/src/assignment_v2.rs:151-178](crates/sum-store/src/assignment_v2.rs#L151-L178)) and gets the `BTreeSet` of chunk indices it owns -> chunks 1, 5, 7.
+2. N5 checks its local disk: it already has chunks 1, 5, 7 — Alice's V2 pushes from Step 3 each carried a Merkle proof that N5's `PushValidator` already verified before writing.
+3. N5 attests on chain by submitting `AcceptAssignmentV2` ([crates/sum-node/src/tx_builder.rs:190-205](crates/sum-node/src/tx_builder.rs#L190-L205), driven by [crates/sum-node/src/assignment_attestor.rs](crates/sum-node/src/assignment_attestor.rs)) carrying `chunk_indices: [1, 5, 7]`. The chain OR-merges those bits into N5's per-`(file, archive)` bitmap. Files whose per-archive assignment exceeds `max_chunk_indices_per_tx` (default 65,536 — [crates/sum-types/src/rpc_types.rs:228-231](crates/sum-types/src/rpc_types.rs#L228-L231)) split across multiple OR-merge txs that compose into the same bitmap.
 
-In the case where Alice's push failed for some chunks (e.g., N5 was temporarily unreachable during Step 3), N5 would:
-- Request the `DataManifest` from any peer by sending `"manifest:34a749..."` over the `/sum/storage/v1` protocol
-- Fetch missing chunks from other nodes that hold them (identified via the assignment table)
-- Verify each received chunk's CID before writing to disk
+Attestation runs as a `tokio::spawn`'d task from the V2 inbound dispatcher's manifest-push handler ([crates/sum-node/src/inbound_v2.rs](crates/sum-node/src/inbound_v2.rs)) so inbound request latency is decoupled from chain finality.
 
-**All 10 nodes perform this process simultaneously and independently.** The MarketSyncWorker acts as a self-healing mechanism — if any chunk replica is missing (due to failed pushes, node restarts, or node departures), it is automatically detected and re-fetched within one sync cycle (default 30 seconds).
+**All assigned archives perform this process independently.** Alice polls `storage_getAssignmentCoverageV2` ([crates/sum-node/src/rpc_client.rs:279-290](crates/sum-node/src/rpc_client.rs#L279-L290)) until `can_activate_now == true` (every chunk has at least one currently-`Active` accepting archive), then submits `ActivateFileV2` ([crates/sum-node/src/tx_builder.rs:150-161](crates/sum-node/src/tx_builder.rs#L150-L161)). On finalization the file transitions Pending → Active and PoR challenges become eligible after `activated_at_height + activation_grace_blocks`.
 
-After Step 4 completes, every chunk of file.pdf exists on exactly 3 nodes across the network. The file is fully distributed.
+For V2 files there is no MarketSync-driven re-fetch loop — chain-side PoR challenges plus slashing (Steps 5–7) enforce retention. The `MarketSyncWorker` background task ([crates/sum-node/src/market_sync.rs:30](crates/sum-node/src/market_sync.rs#L30), spawned from `run_listen` at [crates/sum-node/src/main.rs:661](crates/sum-node/src/main.rs#L661)) remains alive as a V1-legacy compatibility worker that polls `storage_getFundedFiles` + `storage_getActiveNodes` and self-heals V1-registered files via the older hash + linear-probe algorithm in [crates/sum-store/src/assignment.rs](crates/sum-store/src/assignment.rs); it does not drive V2 retention.
+
+After Step 4 completes, every chunk of file.pdf is held by its `R` = 3 deterministically-assigned archives, attested on chain, and the file is downloadable.
 
 ---
 
@@ -494,42 +499,43 @@ sum-node download 34a749797e853c5f3c6a678b881adee2103c66611f999082efff71bb75701b
 
 The download command handles the entire retrieval pipeline automatically:
 
-**Step 8a — Get the manifest:**
+**Step 8a — Route the download:**
 
-Bob connects to the P2P mesh and discovers nearby storage nodes via mDNS. He finds N3. Bob sends a manifest request: `"manifest:34a749797e853c5f3c6a678b881adee2103c66611f999082efff71bb75701b66"` to N3 over the `/sum/storage/v1` protocol.
+Before fetching anything, Bob's client calls `storage_getFileInfoV2(34a749...)` ([crates/sum-node/src/rpc_client.rs:209-220](crates/sum-node/src/rpc_client.rs#L209-L220)) to read the file's chain row — `visibility`, `lifecycle`, `assignment_height`, `chunk_count`, and the paginated access list. The pure router `route_download_target` ([crates/sum-node/src/download_route.rs:63-72](crates/sum-node/src/download_route.rs#L63-L72)) dispatches to one of three pipelines: `V1Legacy`, `V2Public`, or `V2Private` (fail-closed on unknown visibility). Since Alice registered file.pdf via `RegisterFilePendingV2` with `visibility = Public`, Bob takes the `V2Public` path. (The `V2Private` path is covered in the V2 Lifecycle section below.)
 
-N3 looks up the merkle_root in its manifest index and responds with the full `DataManifest` (CBOR-encoded). Bob now knows:
+**Step 8b — Get the manifest:**
+
+Bob's client builds a `V2AssignmentView` ([crates/sum-node/src/download_v2_routing.rs:92-151](crates/sum-node/src/download_v2_routing.rs#L92-L151)) — it fetches the same snapshot Alice used (`storage_getActiveNodesAtHeight(assignment_height)`), runs the same V2 rendezvous-hash algorithm from Step 4, and produces a `distinct_assigned` set of archives plus a per-chunk archive list.
+
+Bob then fans out `ManifestPullV2` ([crates/sum-net/src/lib.rs:267-276](crates/sum-net/src/lib.rs#L267-L276)) to those distinct archives. The first archive whose CBOR manifest re-derives to the expected merkle_root wins; mismatches are dropped ([crates/sum-node/src/download.rs:835-1109](crates/sum-node/src/download.rs#L835-L1109)). Bob now knows:
 - The file has `C` = 10 chunks
 - Each chunk's CID (content address), size, and offset
 - The file's total size: 10,485,760 bytes
 
-**Step 8b — Access control check:**
+**Step 8c — Access control check:**
 
-Before any node serves Bob a chunk, it queries the blockchain: `storage_getAccessList(34a749...)`. The response comes back: `access_list: [Bob_address]`.
+Before any archive serves Bob a chunk, it runs the ACL gate. For V2 the serving archive uses `merkle_root_for_cid` ([crates/sum-store/src/manifest_index.rs:241-245](crates/sum-store/src/manifest_index.rs#L241-L245)) to map the requested CID back to its file's merkle_root, then consults the access list returned by `storage_getFileInfoV2` (paginated, 256 entries per page by default).
 
-The node derives Bob's L1 address from his P2P identity. When Bob connected, the libp2p **identify** protocol automatically exchanged public keys. The node computes: `blake3(Bob_public_key)[12..32]` -> Bob's L1 address. It checks: is Bob's address in the access list? **Yes** -> access granted.
+The archive derives Bob's L1 address from his P2P identity. When Bob connected, the libp2p **identify** protocol automatically exchanged public keys. The archive computes: `blake3(Bob_public_key)[12..32]` -> Bob's L1 address ([crates/sum-net/src/identity.rs:104-113](crates/sum-net/src/identity.rs#L104-L113)). For this file `access_list` is empty (`visibility == Public`), so any peer is granted access. For a Private file, the archive checks whether Bob's address is present and unexpired in the `access_list` — see the V2 Lifecycle section for the encrypted-bundle decryption that the downloader additionally performs.
 
-If a different user (Carol) tried to download the same file, her derived L1 address would not be in `[Bob_address]`, and the serving node would drop the connection. If the access_list were empty (`[]`), it would mean the file is public and anyone could download it.
+**Step 8d — Fetch all chunks:**
 
-**Step 8c — Fetch all chunks:**
-
-Bob iterates through the manifest's 10 chunk entries. For each chunk, he sends a `ShardRequest` to any node that has it:
+Bob iterates through the manifest's 10 chunk entries. For each chunk he sends a V2 pull to one of the chunk's assigned archives:
 
 ```
-ShardRequest {
+ShardRequestV2::Pull {
   cid: "bafkr4iblchqzqis3tr73bre2atjte5bzbifrleynael4j4vvoyreohcfge",  // which chunk
-  offset: None,      // start from the beginning
-  max_bytes: None,   // send the whole thing
-  push_data: None,   // None = pull request (fetch), Some(data) = push request (store)
+  offset: 0,
+  max_bytes: 1_048_576,   // one 1 MB chunk window
 }
 ```
 
-The serving node:
+The wire codec is [crates/sum-net/src/codec.rs:176-240](crates/sum-net/src/codec.rs#L176-L240); helper at [crates/sum-net/src/lib.rs:201-219](crates/sum-net/src/lib.rs#L201-L219). The serving archive:
 1. Looks up the CID in its chunk store
 2. Memory-maps the chunk file from disk (zero-copy — no RAM allocation for the 1 MB)
-3. Sends a `ShardResponse` back with the raw bytes:
+3. Sends a `ShardResponseV2::Data` back with the raw bytes:
    ```
-   ShardResponse {
+   ShardResponseV2::Data {
      cid: "bafkr4i...",
      offset: 0,
      total_bytes: 1048576,
@@ -538,26 +544,26 @@ The serving node:
    }
    ```
 
-Bob can fetch from different nodes in parallel — chunk 0 from N3, chunk 1 from N7, chunk 2 from N1, etc. Since each chunk exists on 3 nodes, Bob has multiple sources for each one. If N3 goes offline mid-download, Bob can retry the same chunk from another node that holds it.
+Bob's V2 dispatch is per-chunk with a `max_concurrent` cap (default 10, [crates/sum-node/src/main.rs:212-214](crates/sum-node/src/main.rs#L212-L214)) and walks the chunk's assigned archives sequentially on per-archive failure ([crates/sum-node/src/download.rs:1132-1396](crates/sum-node/src/download.rs#L1132-L1396)) — there is no "any peer" fallback in V2; only chain-assigned archives are tried. Since each chunk exists on 3 deterministically-assigned archives, Bob has 3 sources per chunk.
 
-**Step 8d — Verify and reassemble:**
+**Step 8e — Verify and reassemble:**
 
 For each received chunk, Bob:
 1. BLAKE3-hashes the received bytes
-2. Verifies the hash matches the CID from the manifest — if it doesn't match, the data was corrupted or tampered with; discard and retry from another node
+2. Verifies the hash matches the CID from the manifest — if it doesn't match, the data was corrupted or tampered with; discard and try the next assigned archive
 3. Stores the verified chunk
 
 Once all `C` = 10 chunks are downloaded and verified, Bob concatenates them in order (chunk 0 + chunk 1 + ... + chunk 9) to reconstruct the original `file.pdf`. The file is byte-for-byte identical to what Alice uploaded — guaranteed by the cryptographic hashes.
 
-The download command automatically verifies the entire file by building the Merkle tree from the 10 chunk hashes and checking that the computed merkle_root matches `34a749...`. If it matches, Bob has cryptographic proof that his reconstructed file is exactly what Alice registered on the blockchain. If it doesn't match, the download reports an error.
+The download command automatically verifies the entire file by rebuilding the Merkle tree from the 10 chunk hashes and checking that the computed merkle_root matches `34a749...`. If it matches, Bob has cryptographic proof that his reconstructed file is exactly what Alice registered on the blockchain. If it doesn't match, the download reports an error.
 
 ---
 
-## V2 Lifecycle (Phase 0b — chain plan v3.2)
+## V2 Lifecycle (chain plan v3.2)
 
-Steps 0–8 above describe the **V1 protocol** (`/sum/storage/v1`), which is preserved for backwards compatibility. Phase 0b adds a **V2 lifecycle** (`/sum/storage/v2`) that closes a real gap in V1: a V1 receiving node has no way to verify a pushed chunk actually belongs to the registered file *before* it lands on disk, and no way to attest to chain that it's holding what it should. V2 fixes both with per-push Merkle proofs and a chain-recorded bitmap of attested chunks.
+Steps 0–8 above describe the **V2 protocol** (`/sum/storage/v2`) — the chain-canonical path on mainnet. This section consolidates the state-machine reference for V2, plus operator commands for recovering a stalled ingest (`resume`, `abandon`). The legacy **V1 protocol** (`/sum/storage/v1`) is preserved for backwards compatibility: V1 files have no per-push Merkle proof, no chain-recorded coverage bitmap, and rely on the `MarketSyncWorker` self-healing loop ([crates/sum-node/src/market_sync.rs](crates/sum-node/src/market_sync.rs)) plus V1 hash + linear-probe assignment ([crates/sum-store/src/assignment.rs](crates/sum-store/src/assignment.rs)).
 
-Both protocols coexist on the same libp2p swarm. The codec dispatches per-stream on the negotiated protocol name; V1 wire bytes are bit-compatible with what nodes have been speaking since the project shipped.
+Both protocols coexist on the same libp2p swarm. The `VersionedShardCodec` ([crates/sum-net/src/codec.rs:275-426](crates/sum-net/src/codec.rs#L275-L426)) dispatches per-stream on the negotiated protocol name; V1 wire bytes are bit-compatible with what nodes have been speaking since the project shipped. There is no automatic V2 → V1 fallback — a peer that doesn't advertise `/sum/storage/v2` surfaces as an `OutboundFailure` and the caller must retry V1 explicitly ([crates/sum-net/src/lib.rs:191-198](crates/sum-net/src/lib.rs#L191-L198)).
 
 ### V2 file lifecycle states
 
@@ -585,12 +591,34 @@ Both protocols coexist on the same libp2p swarm. The codec dispatches per-stream
 Alice runs `sum-node ingest-v2 file.pdf`. The pipeline executes seven stages:
 
 1. **Chunk locally** (same as V1: 1 MB chunks, BLAKE3 leaves, Merkle tree, `DataManifest`).
-2. **`RegisterFilePendingV2`** — Alice signs and submits a tx with merkle_root, chunk_count, fee deposit, visibility (Public in Phase 0b), and an empty initial access list. Wait for finalization. The chain captures `assignment_height = current_block_height` at this point — that's the snapshot that determines per-chunk assignment for the lifetime of the file.
+2. **`RegisterFilePendingV2`** ([crates/sum-node/src/tx_builder.rs:115-147](crates/sum-node/src/tx_builder.rs#L115-L147)) — Alice signs and submits a tx with merkle_root, chunk_count, fee deposit, visibility (`Public` or `Private`), and an initial access list (empty for Public; one `AccessEntryV2` per recipient for Private, including the owner). Wait for finalization. The chain captures `assignment_height = current_block_height` at this point — that's the snapshot that determines per-chunk assignment for the lifetime of the file.
 3. **Read the snapshot** via `storage_getActiveNodesAtHeight(assignment_height)` (chain plan §5.3 / Ask 15).
 4. **Push chunks with Merkle proofs inline.** Each push carries `(data, merkle_root, chunk_index, merkle_path)`. The receiving node validates four things before persisting: the file is registered and not Abandoned (`storage_getFileInfoV2`), `chunk_index < chunk_count`, the receiving archive is in the snapshot AND in the V2 deterministic assignment for this `chunk_index`, and `verify_merkle_proof_bytes_for_tree(blake3(data), chunk_index, merkle_path, merkle_root, chunk_count)` succeeds. Wire CID is never trusted — leaf hash is derived from `data`. Per (chunk, peer) retry budget is 2.
 5. **`ManifestPush`** sends the CBOR manifest to each distinct assigned archive. Receivers re-derive the merkle_root from the manifest's chunk descriptors and reject any mismatch. Receivers ACK as soon as the manifest is persisted; attestation runs as a background spawn so inbound request latency is decoupled from chain finality.
 6. **`AcceptAssignmentV2`** is what each archive submits after ManifestPush. It carries a list of `chunk_index: u32` values; chain OR-merges those bits into a per-(file, archive) bitmap. Files whose per-archive assignment exceeds `max_chunk_indices_per_tx` (default 65,536) split across multiple OR-merge txs that compose into the same bitmap.
 7. **`storage_getAssignmentCoverageV2`** poll until `can_activate_now == true` (every chunk has at least one accepting archive that's currently `Active`), then submit **`ActivateFileV2`**. File transitions Pending → Active. PoR challenges become eligible after `activated_at_height + activation_grace_blocks`.
+
+### Private V2 files
+
+Set `--visibility private` on `ingest-v2` ([crates/sum-node/src/main.rs:182-197](crates/sum-node/src/main.rs#L182-L197)) and the entire chunk + manifest payload is encrypted end-to-end before anything touches the wire or an archive's disk. The encryption envelope lives in the [`sum-crypto`](crates/sum-crypto/) crate:
+
+- **Per-file master key.** `K_file` = 32 random bytes from `OsRng` ([crates/sum-node/src/ingest_v2.rs:711-765](crates/sum-node/src/ingest_v2.rs#L711-L765)). Fresh per file.
+- **Per-chunk AEAD.** Each chunk is encrypted with ChaCha20-Poly1305 under a key derived as `HKDF-SHA256(salt=chunk_index_be, ikm=K_file, info="snip-chunk-key-v1")`; the 12-byte nonce is derived the same way with `info="snip-chunk-nonce-v1"`; AAD = `chunk_index_be` ([crates/sum-crypto/src/chunk.rs:34-73](crates/sum-crypto/src/chunk.rs#L34-L73)). The ciphertext (with 16-byte tag) is what archives store on disk and what the manifest's `blake3_hash` commits to; the plaintext hash travels separately as `plaintext_blake3_hash` ([crates/sum-types/src/storage.rs:41-48](crates/sum-types/src/storage.rs#L41-L48)).
+- **Manifest AEAD.** The CBOR manifest is encrypted under `HKDF-SHA256(salt="", ikm=K_file, info="snip-manifest-key-v1")` with an all-zero nonce and AAD = `b"snip-manifest-v1"` ([crates/sum-crypto/src/manifest.rs:46-72](crates/sum-crypto/src/manifest.rs#L46-L72)). Safe because `K_file` is fresh per file and the manifest is encrypted exactly once. Archives store the opaque ciphertext blob in a `<root>.opaque` sidecar instead of the public `.cbor` ([crates/sum-store/src/manifest_index.rs](crates/sum-store/src/manifest_index.rs)).
+- **Per-recipient key wrap.** For each `--recipient <base58_addr[:expires_at_height]>`, the client fetches the recipient's registered X25519 public key via `account_getEncryptionPublicKey` ([crates/sum-node/src/rpc_client.rs:249-269](crates/sum-node/src/rpc_client.rs#L249-L269)), runs ephemeral X25519 ECDH, derives a KEK via `HKDF-SHA256(info="snip-recipient-kek-v1")`, and wraps `K_file` with ChaCha20-Poly1305 using the recipient's 20-byte L1 address as AAD. The resulting 80-byte bundle (`eph_pub(32) || ct(32) || tag(16)`) is what populates `AccessEntryV2.encrypted_key_bundle` on chain ([crates/sum-crypto/src/recipient.rs:112-156](crates/sum-crypto/src/recipient.rs#L112-L156)). Low-order X25519 points are rejected via constant-time comparison on both wrap and unwrap.
+- **Recipient setup.** Each recipient must first publish their X25519 public key on chain via `sum-node register-encryption-key` ([crates/sum-node/src/main.rs:251-258](crates/sum-node/src/main.rs#L251-L258)). The key is derived deterministically from the recipient's Ed25519 wallet seed via HKDF (`info="snip-x25519-encryption-key-v1"` — [crates/sum-crypto/src/recipient.rs:82-95](crates/sum-crypto/src/recipient.rs#L82-L95)). The owner is auto-added to the initial access list; supplying additional `--recipient` flags makes the file owner-shared at registration time. Recipients without a registered encryption key cause ingest to abort **before** any chain state is written.
+
+**Private download** ([crates/sum-node/src/download_private.rs](crates/sum-node/src/download_private.rs)) layers four extra steps on top of Step 8:
+1. **Access lookup.** `find_my_access_entry` paginates the file's access list (256 entries per page, max 64 pages) looking for the downloader's own L1 address.
+2. **Expiry check.** `finalized_height <= expires_at` (strict — no grace) ([crates/sum-node/src/download_private.rs:163-207](crates/sum-node/src/download_private.rs#L163-L207)).
+3. **Key unwrap.** Derive own X25519 secret from the Ed25519 seed via the same HKDF used at register-time, then `unwrap_for_self(bundle)` to recover `K_file` ([crates/sum-crypto/src/recipient.rs:160-198](crates/sum-crypto/src/recipient.rs#L160-L198)).
+4. **Decrypt + verify.** Pull the opaque manifest, decrypt under `K_file`, rebuild the Merkle tree from the manifest's `plaintext_blake3_hash` descriptors and check against the chain-recorded root. Pull each ciphertext chunk (BLAKE3-verify against the manifest's `blake3_hash`), decrypt under `K_file`, verify the plaintext against `plaintext_blake3_hash`, then verify the assembled whole against `manifest.file_hash` ([crates/sum-node/src/download_private.rs:318-361](crates/sum-node/src/download_private.rs#L318-L361)).
+
+**Sharing, revoking, and updating access** are owner-only operations:
+
+- **`sum-node share <merkle_root> --recipient <addr[:height]|:none>`** ([crates/sum-node/src/main.rs:280-294](crates/sum-node/src/main.rs#L280-L294)) — the owner unwraps `K_file` from their own access bundle locally, re-wraps it for the new recipient's registered X25519 key, and submits `AddAccessV2` ([crates/sum-node/src/tx_builder.rs:218-230](crates/sum-node/src/tx_builder.rs#L218-L230)). The chain never sees `K_file`.
+- **`sum-node revoke <merkle_root> --recipient <addr>`** ([crates/sum-node/src/main.rs:296-308](crates/sum-node/src/main.rs#L296-L308)) — submits `RemoveAccessV2` ([crates/sum-node/src/tx_builder.rs:242-257](crates/sum-node/src/tx_builder.rs#L242-L257)) removing the chain-side access entry. Does **not** rotate `K_file`: a revoked recipient still holds their old bundle locally, but the chain ACL denies them on the next pull. For forward secrecy, revoke + re-ingest under a fresh key.
+- **`sum-node update-access <merkle_root> --recipient <addr:height|addr:none>`** ([crates/sum-node/src/main.rs:310-322](crates/sum-node/src/main.rs#L310-L322)) — submits `UpdateAccessV2` ([crates/sum-node/src/tx_builder.rs:269-286](crates/sum-node/src/tx_builder.rs#L269-L286)) to change only the entry's `expires_at`, byte-preserving the encrypted bundle. Requires an explicit `:<height>` or `:none` directive — a bare `<addr>` is rejected so operator intent is unambiguous.
 
 ### Resume and abandon
 
@@ -604,7 +632,7 @@ If anything after step 2 fails — a network partition, a slow chain, or a missi
 | Protocol | Triggered by | Receiver behaviour |
 |---|---|---|
 | `/sum/storage/v1` | Legacy `sum-node ingest` and the V1 `--client ingest` path | Original V1 push: verify CID, write to disk, gossip an announcement. ACL is enforced on pulls but pushes have no chain-level proof. |
-| `/sum/storage/v2` | `sum-node ingest-v2`, `resume`, `abandon`, plus the V2 dispatcher's manifest/chunk/manifest-push/manifest-pull replies | Chain-rooted: every push is Merkle-proof verified against chain state before disk write; every successful manifest push triggers an attestation tx; pulls run through the same ACL gate as V1. |
+| `/sum/storage/v2` | `sum-node ingest-v2`, `resume`, `abandon`, `share`, `revoke`, `update-access`, plus the V2 dispatcher's manifest/chunk/manifest-push/manifest-pull replies | Chain-rooted: every push is Merkle-proof verified against chain state before disk write; every successful manifest push triggers an attestation tx; pulls run through the same ACL gate as V1. |
 
 V2 is the chain-canonical path going forward. V1 stays operational for legacy traffic and read-only access to existing files; new ingest should use V2 to get chain-attestable replication.
 
@@ -683,27 +711,33 @@ mainnet pin) see [`docs/CHAIN-COMPAT.md`](docs/CHAIN-COMPAT.md).
 
 | Command | What it does |
 |---------|-------------|
-| `sum-node ingest-v2 <path>` | V2 ingest pipeline: chunk → `RegisterFilePendingV2` → push with Merkle proofs → ManifestPush → coverage poll → `ActivateFileV2`. On any post-register failure the file is left `Pending` and the command exits with operator guidance to run `resume` or `abandon`. Requires `--key-file`. |
+| `sum-node ingest-v2 <path> [--visibility public\|private] [--recipient <addr[:expires_at_height]>]...` | V2 ingest pipeline: chunk → `RegisterFilePendingV2` → push with Merkle proofs → ManifestPush → coverage poll → `ActivateFileV2`. `--visibility private` ([crates/sum-node/src/main.rs:182-187](crates/sum-node/src/main.rs#L182-L187)) generates a fresh `K_file`, encrypts every chunk + the manifest, and wraps `K_file` for the owner plus each `--recipient` ([crates/sum-node/src/main.rs:189-197](crates/sum-node/src/main.rs#L189-L197)). Each recipient's X25519 pubkey is fetched from chain via `account_getEncryptionPublicKey`; recipients without a registered key cause ingest to abort BEFORE any chain state is created. On any post-register failure the file is left `Pending` and the command exits with operator guidance to run `resume` or `abandon`. Requires `--key-file`. |
 | `sum-node resume <merkle_root_hex> <path>` | Re-run only the residual V2 work for a `Pending` file. Re-chunks the path and asserts its computed root matches the explicit `merkle_root_hex`. Detects already-`Active` (no-op) and `Abandoned` (terminal) states. Requires `--key-file`. |
 | `sum-node abandon <merkle_root_hex>` | Submit `AbandonFileV2`. Pre-checks lifecycle == Pending AND `current_height > created_at + activation_grace_blocks` before burning a tx fee; rejects in-process otherwise. Chain-only — does not require libp2p connectivity. Requires `--key-file`. |
+| `sum-node share <merkle_root_hex> --recipient <addr[:expires_at_height\|:none]>` | Owner-only: add a recipient to a Private V2 file. Recovers `K_file` locally from the owner's own access bundle on chain, wraps it for the recipient's registered X25519 key, submits `AddAccessV2` ([crates/sum-node/src/tx_builder.rs:218-230](crates/sum-node/src/tx_builder.rs#L218-L230)). The chain never sees `K_file`. Recipients without a registered encryption key cause `share` to abort BEFORE any tx is submitted. Requires `--key-file`. |
+| `sum-node revoke <merkle_root_hex> --recipient <addr>` | Owner-only: remove a recipient's chain-side access entry via `RemoveAccessV2` ([crates/sum-node/src/tx_builder.rs:242-257](crates/sum-node/src/tx_builder.rs#L242-L257)). Does NOT rotate `K_file` — the revoked recipient still holds their old bundle locally, but chain ACL denies them on the next pull. For forward secrecy, revoke + re-ingest. Requires `--key-file`. |
+| `sum-node update-access <merkle_root_hex> --recipient <addr:expires_at_height\|addr:none>` | Owner-only: change a recipient's expiry on a Private V2 file via `UpdateAccessV2` ([crates/sum-node/src/tx_builder.rs:269-286](crates/sum-node/src/tx_builder.rs#L269-L286)). The encrypted bundle is preserved byte-for-byte; only `expires_at` changes. REQUIRES an explicit `:<height>` to set or `:none` to clear — a bare `<addr>` is rejected so operator intent is unambiguous. Requires `--key-file`. |
 
 **Key flags:**
-- `--client` — Run in client mode. Ingest pushes to R=3 and exits (no serving). Listen is not available.
-- `--key-file <path>` — Ed25519 private key seed (hex-encoded). Without it, generates a random keypair (dev mode, PoR + V2 ingest/resume/abandon disabled).
+- `--client` — Run in client mode ([crates/sum-node/src/main.rs:90-95](crates/sum-node/src/main.rs#L90-L95)). Ingest pushes to R=3 and exits (no serving). Listen is not available.
+- `--key-file <path>` — Ed25519 private key seed (hex-encoded; env `SUM_KEY_FILE`). Without it, generates a random keypair (dev mode, PoR + V2 ingest/resume/abandon/share/revoke/update-access disabled).
 - `--profile <production|dev>` — fail-closed (production) vs fail-open (dev) policy on chain RPC errors. Production refuses to fall back to hardcoded `IngestParams` if `chain_getChainParams` fails; dev allows defaults with a warning.
-- `--rpc-url <url>` — SUM Chain L1 JSON-RPC endpoint (default `http://127.0.0.1:9944`)
-- `--chain-id <u64>` — chain id used to sign V1 + V2 transactions (must match the chain's `chain_id`).
-- `--attest-fee <koppa>` — fee per V2 tx (RegisterFilePendingV2 / ActivateFileV2 / AbandonFileV2 / AcceptAssignmentV2). Must be ≥ chain `min_fee`.
+- `--rpc-url <url>` — SUM Chain L1 JSON-RPC endpoint (default `http://127.0.0.1:9944`; env `SUM_RPC_URL`).
+- `--chain-id <u64>` — chain id used to sign V1 + V2 transactions (default `1337`; env `SUM_CHAIN_ID`). Most subcommands accept the flag's value as-is; `register-node` reads `chain_id` live from RPC ([crates/sum-node/src/main.rs:266-270](crates/sum-node/src/main.rs#L266-L270)) so the operator cannot mis-flag the tx against a different network and burn a fee.
+- `--attest-fee <koppa>` — `u128` fee per V2 tx (RegisterFilePendingV2 / ActivateFileV2 / AbandonFileV2 / AcceptAssignmentV2). Default `1_000_000`; env `SUM_ATTEST_FEE`. Must be ≥ chain `min_fee`.
+- `--por-poll-secs <secs>` — PoR challenge poll interval (default 10; env `SUM_POR_INTERVAL`). Controls how often the `PorWorker` calls `storage_getActiveChallenges`.
+- `--market-sync-secs <secs>` — MarketSync poll interval (default 30; env `SUM_MARKET_SYNC_INTERVAL`). V1-legacy self-healing cadence.
 - `--push-wait-secs <secs>` — V2 ingest S2 push-wave wall-clock timeout (default 120).
 - `--manifest-push-wait-secs <secs>` — V2 ingest S3 manifest-push wall-clock timeout (default 60).
 - `--activation-wait-secs <secs>` — V2 ingest S4 coverage-poll wall-clock timeout (default 300). NOT `activation_grace_blocks` — that's a chain-side parameter for `AbandonFileV2` admissibility, not for ingest progression.
-- `--upload-timeout <seconds>` — time to wait for R=3 push confirmations during V1 ingest (default 120)
-- `--gc-grace-secs <seconds>` — how long to keep unassigned chunks before garbage collection deletes them (default 3600 = 1 hour)
-- `--max-concurrent <n>` — maximum parallel chunk fetches during download (default 10)
-- `--enable-wan` — enable Kademlia DHT + TCP transport for internet-wide peer discovery
-- `--bootstrap-peer <multiaddr>` — bootstrap peer for Kademlia (repeatable or comma-separated)
-- `--tcp-port <port>` — TCP listen port for WAN connections (default 0 = OS-assigned)
-- `--relay-server` — opt in to advertising this node as a libp2p Circuit Relay v2 server (only meaningful with `--enable-wan` and on a publicly-reachable host).
+- `--upload-timeout-secs <seconds>` — time to wait for R=3 push confirmations during V1 ingest (default 120) ([crates/sum-node/src/main.rs:152-153](crates/sum-node/src/main.rs#L152-L153)).
+- `--gc-grace-secs <seconds>` — how long to keep unassigned chunks before garbage collection deletes them (default 3600 = 1 hour; env `SUM_GC_GRACE`).
+- `--max-concurrent <n>` — maximum parallel chunk fetches during download (default 10).
+- `--enable-wan` — enable Kademlia DHT + TCP transport for internet-wide peer discovery (env `SUM_ENABLE_WAN`).
+- `--bootstrap-peer <multiaddr>` — bootstrap peer for Kademlia (repeatable or comma-separated; env `SUM_BOOTSTRAP_PEERS`).
+- `--tcp-port <port>` — TCP listen port for WAN connections (default 0 = OS-assigned; env `SUM_TCP_PORT`).
+- `--udp-port <port>` — UDP listen port for the QUIC transport (default 0 = OS-assigned; env `SUM_UDP_PORT`) ([crates/sum-node/src/main.rs:115-122](crates/sum-node/src/main.rs#L115-L122)). Pin a stable port for reliable WAN QUIC dialability — e.g. behind UPnP UDP port-forward, or to give DCUtR a fixed hole-punch target. With the default `0` the OS picks a fresh ephemeral UDP port on every restart.
+- `--relay-server` — opt in to advertising this node as a libp2p Circuit Relay v2 server (only meaningful with `--enable-wan` and on a publicly-reachable host; env `SUM_RELAY_SERVER`).
 
 ---
 
@@ -748,8 +782,11 @@ The GC does not track how a chunk was acquired (push from Alice, fetch from Mark
 **WAN mode.** With `--enable-wan` and at least one `--bootstrap-peer`, nodes use Kademlia DHT for internet-wide peer discovery. TCP/Noise/Yamux transport is added alongside QUIC for NAT/firewall compatibility. Both mDNS (LAN) and Kademlia (WAN) run simultaneously — LAN peers are discovered instantly, WAN peers via DHT propagation.
 
 ```bash
-# WAN example — Node B bootstraps off Node A across the internet:
-sum-node --enable-wan --tcp-port 4001 \
+# WAN example — Node B bootstraps off Node A across the internet.
+# Pinning --udp-port matters: QUIC is always-on, and without a stable
+# UDP port DCUtR cannot reliably hole-punch the relay circuit into a
+# direct connection on restart ([crates/sum-node/src/main.rs:115-122](crates/sum-node/src/main.rs#L115-L122)).
+sum-node --enable-wan --tcp-port 4001 --udp-port 4001 \
   --bootstrap-peer /ip4/<node_a_public_ip>/tcp/4001/p2p/<node_a_peer_id> \
   listen
 ```
