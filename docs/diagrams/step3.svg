@@ -56,15 +56,11 @@
   <text x="380" y="431" text-anchor="middle" fill="#0066CC" font-size="12" font-weight="bold">Push to R=3 assigned nodes</text>
   <text x="380" y="447" text-anchor="middle" fill="#333" font-size="11">CID verified + ACK before disconnect</text>
 
-  <!-- Nodes announce via gossipsub (after receiving push) -->
-  <line x1="589" y1="373" x2="660" y2="415" stroke="#CC0000" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ah-r)"/>
-  <line x1="789" y1="373" x2="660" y2="415" stroke="#CC0000" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ah-r)"/>
-  <line x1="889" y1="453" x2="760" y2="495" stroke="#CC0000" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ah-r)"/>
-
-  <!-- Gossipsub label -->
-  <rect x="625" y="468" width="200" height="20" rx="3" fill="#fff" fill-opacity="0.9"/>
-  <text x="725" y="483" text-anchor="middle" fill="#CC0000" font-size="11" font-weight="bold">gossipsub: ChunkAnnouncement x C</text>
+  <!-- Alice announces via gossipsub (Alice is the publisher, not the receiving nodes) -->
+  <path d="M158,555 C300,590 430,575 520,510" fill="none" stroke="#0066CC" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#ah-b)"/>
+  <rect x="185" y="568" width="235" height="20" rx="3" fill="#fff" fill-opacity="0.9"/>
+  <text x="302" y="583" text-anchor="middle" fill="#0066CC" font-size="11" font-weight="bold">gossipsub: ChunkAnnouncement × C</text>
 
   <!-- Step label -->
-  <text x="30" y="695" fill="#333" font-size="13" font-style="italic">Step 3: Alice pushes chunks to R=3 assigned nodes directly. Each node verifies CID, stores, and announces. Alice waits for R confirmations before disconnecting.</text>
+  <text x="30" y="695" fill="#333" font-size="13" font-style="italic">Step 3: Alice pushes chunks to R=3 assigned nodes directly. Each node verifies and stores. Alice announces all C chunks via gossipsub then waits for confirmations before disconnecting.</text>
 </svg>

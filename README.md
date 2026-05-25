@@ -110,7 +110,7 @@ Before any file storage can happen, each storage node must register itself on th
 
 6. N1 starts the sum-storage-node daemon: `sum-node --key-file my_key.hex listen`. The daemon connects to the P2P mesh, begins discovering other nodes via mDNS, and starts its background workers (PorWorker, MarketSyncWorker).
 
-**N2 through N10 each do the exact same process independently.** After all registrations, the blockchain's state database contains 10 `NodeRecord` entries, all with `status: Active`. Anyone can verify this by querying `storage_getActiveNodes()` via RPC.
+**N2 through N10 each do the exact same process independently.** After all registrations, the blockchain's state database contains 10 `NodeRecord` entries, all with `status: Active`. Anyone can verify this by querying `storage_getActiveNodesAtHeight(height)` via RPC.
 
 ---
 
@@ -263,7 +263,7 @@ Each V2 push carries the chunk bytes alongside an inline Merkle proof — `Shard
 
 Only after all four checks pass does the node write the chunk to its local disk as `<cid>.chunk` ([crates/sum-store/src/store.rs:39-43](crates/sum-store/src/store.rs#L39-L43)) and respond with `PushAck`. The wire CID is never trusted — the leaf hash is derived from `data` itself.
 
-After Alice's pushes complete, she also sends the `DataManifest` to each distinct assigned archive via `ManifestPushV2` ([crates/sum-net/src/lib.rs:249-265](crates/sum-net/src/lib.rs#L249-L265)). The receiver recomputes the merkle root from the manifest's chunk descriptors and rejects on mismatch ([crates/sum-store/src/serve.rs:418-488](crates/sum-store/src/serve.rs#L418-L488)). Alice then publishes one `ChunkAnnouncement` per chunk — `C` total — on the `sum/storage/v1` Gossipsub topic ([crates/sum-store/src/announce.rs:11-20](crates/sum-store/src/announce.rs#L11-L20)) so other peers can discover the CIDs. Each announcement contains:
+After Alice's pushes complete, she also sends the `DataManifest` to each distinct assigned archive via `ManifestPushV2` ([crates/sum-net/src/lib.rs:249-265](crates/sum-net/src/lib.rs#L249-L265), variant defined at [crates/sum-net/src/codec.rs:201](crates/sum-net/src/codec.rs#L201)). The receiver recomputes the merkle root from the manifest's chunk descriptors and rejects on mismatch ([crates/sum-store/src/serve.rs:418-488](crates/sum-store/src/serve.rs#L418-L488)). Alice then publishes one `ChunkAnnouncement` per chunk — `C` total — on the `sum/storage/v1` Gossipsub topic ([crates/sum-store/src/announce.rs:11-20](crates/sum-store/src/announce.rs#L11-L20)) so other peers can discover the CIDs. Each announcement contains:
 
 - `merkle_root`: `34a749...` — which file this chunk belongs to
 - `chunk_index`: 0 through 9 — which piece

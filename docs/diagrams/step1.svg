@@ -48,12 +48,14 @@
   <path d="M158,540 C200,510 200,570 158,555" fill="none" stroke="#0066CC" stroke-width="2" marker-end="url(#ah-b)"/>
 
   <!-- Processing labels (with white background, above self-loop arrow) -->
-  <rect x="135" y="395" width="215" height="80" rx="5" fill="#fff" fill-opacity="0.92" stroke="#0066CC" stroke-width="1"/>
-  <text x="145" y="413" fill="#0066CC" font-size="12" font-weight="bold">1. mmap + chunk (C=10)</text>
-  <text x="145" y="431" fill="#0066CC" font-size="12" font-weight="bold">2. blake3 hash each chunk</text>
-  <text x="145" y="449" fill="#0066CC" font-size="12" font-weight="bold">3. build Merkle tree</text>
-  <text x="145" y="467" fill="#0066CC" font-size="12" font-weight="bold">4. generate merkle_root</text>
+  <rect x="135" y="355" width="305" height="130" rx="5" fill="#fff" fill-opacity="0.92" stroke="#0066CC" stroke-width="1"/>
+  <text x="145" y="373" fill="#0066CC" font-size="12" font-weight="bold">1. mmap + chunk (C=10, 1 MB each)</text>
+  <text x="145" y="391" fill="#0066CC" font-size="12" font-weight="bold">2. blake3 each chunk → 32 B leaf hash</text>
+  <text x="145" y="409" fill="#0066CC" font-size="12" font-weight="bold">3. build Merkle tree (odd → duplicate)</text>
+  <text x="145" y="427" fill="#0066CC" font-size="12" font-weight="bold">4. compute merkle_root (32 B file ID)</text>
+  <text x="145" y="445" fill="#0066CC" font-size="12" font-weight="bold">5. wrap each leaf hash as CIDv1 (chunk addr)</text>
+  <text x="145" y="463" fill="#0066CC" font-size="12" font-weight="bold">6. write DataManifest to disk (CBOR)</text>
 
   <!-- Step label -->
-  <text x="30" y="695" fill="#333" font-size="13" font-style="italic">Step 1: Alice ingests file.pdf locally. No network activity — chunking, hashing, and Merkle tree are all computed on her machine.</text>
+  <text x="30" y="695" fill="#333" font-size="13" font-style="italic">Step 1: Alice ingests file.pdf locally. No network activity — chunks, hashes, Merkle tree, CIDs, and DataManifest are all computed on her machine.</text>
 </svg>
