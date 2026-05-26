@@ -1,5 +1,7 @@
 # Storage-Node-Interface-Protocol
 
+[![license: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT) [![rust edition 2024](https://img.shields.io/badge/rust-2024-orange)](Cargo.toml) [![toolchain 1.85](https://img.shields.io/badge/toolchain-1.85-orange)](rust-toolchain.toml) [![SNIP V2 (chain plan v3.2)](https://img.shields.io/badge/SNIP-V2_chain_plan_v3.2-brightgreen)](#v2-lifecycle-chain-plan-v32) [![archive: Linux x86_64](https://img.shields.io/badge/archive-Linux_x86__64-blue)](docs/PLATFORM-SUPPORT.md)
+
 A native decentralized storage protocol for the SUM Chain blockchain. The L1 acts as a cryptographic ledger — storing only merkle roots, access lists, and fee pools — while actual file data lives off-chain in a libp2p P2P mesh of storage nodes. Nodes earn Koppa by proving they hold data through randomized Proof of Retrievability challenges, with 3x replication enforced by a deterministic assignment algorithm that both the L1 and storage nodes compute identically from on-chain state. No smart contracts, no IPFS dependency — storage economics are settled directly at the consensus layer.
 
 ---
@@ -212,7 +214,7 @@ Alice now needs the blockchain to officially recognize this file. She creates an
 - `plaintext_size_bytes`: 10,485,760
 - `chunk_count`: 10
 - `visibility`: `Public` (or `Private` — see the V2 Lifecycle section below for the encrypted-file flow)
-- `access_list`: `[]` for a Public file; for Private, one `AccessEntryV2` per recipient carrying an 80-byte encrypted key bundle ([crates/sum-types/src/rpc_types.rs:122-131](crates/sum-types/src/rpc_types.rs#L122-L131))
+- `initial_access`: `[]` for a Public file; for Private, one `AccessEntryV2` per recipient carrying an 80-byte encrypted key bundle ([crates/sum-types/src/rpc_types.rs:122-131](crates/sum-types/src/rpc_types.rs#L122-L131)). The transaction variant names this field `initial_access` ([sum-chain `crates/primitives/src/storage_metadata.rs:208`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/primitives/src/storage_metadata.rs#L208)); the executor persists it under `StorageMetadataV2.access_list` ([sum-chain `crates/primitives/src/storage_metadata.rs:609`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/primitives/src/storage_metadata.rs#L609)) — same content, different field name on the input vs. the state.
 - `fee_deposit`: 100 Koppa — money locked to pay storage nodes over time. This is the economic fuel that keeps nodes motivated to store the file. When the fee pool runs out, nodes are no longer rewarded for storing it.
 
 Alice signs this transaction with her Ed25519 private key, broadcasts it via JSON-RPC `send_raw_transaction`, and waits for `Finalized` ([crates/sum-node/src/tx_wait.rs:88-132](crates/sum-node/src/tx_wait.rs#L88-L132)).
@@ -220,7 +222,7 @@ Alice signs this transaction with her Ed25519 private key, broadcasts it via JSO
 The validators execute the transaction:
 - Verify Alice's signature
 - Deduct 100 Koppa from Alice's account as the fee deposit
-- Write a `StorageMetadataV2` entry to the blockchain's state database ([crates/sum-types/src/rpc_types.rs:134-176](crates/sum-types/src/rpc_types.rs#L134-L176)):
+- Write a `StorageMetadataV2` entry to the blockchain's state database ([sum-chain `crates/primitives/src/storage_metadata.rs:587-612`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/primitives/src/storage_metadata.rs#L587-L612); the RPC-wire mirror that clients query is `StorageFileInfoV2` at [crates/sum-types/src/rpc_types.rs:134-176](crates/sum-types/src/rpc_types.rs#L134-L176)):
   ```
   {
     merkle_root: 34a749...,
@@ -342,71 +344,83 @@ After Step 4 completes, every chunk of file.pdf is held by its `R` = 3 determini
 
 ![Step 5](docs/diagrams/step5.svg)
 
-Every `CHALLENGE_INTERVAL_BLOCKS` = 100 blocks (roughly 100 seconds), the validators automatically generate a storage challenge. This is built into the block execution logic — no human triggers it. It is the mechanism by which the blockchain verifies that storage nodes are actually holding the data they were assigned.
+> **Scope note (current code).** The PoR challenge generator at `crates/state/src/storage_metadata.rs:734-820` currently enumerates only **V1-registered files** (`CF_STORAGE_METADATA`). V2 files registered via `RegisterFilePendingV2` (such as `file.pdf` in Steps 1–4) are not yet selected for PoR challenges — V2 PoR is on the roadmap but unimplemented. The mechanics below describe what is in code today; the same shape is expected to extend to V2 files once wired up. See [issue #26](https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/issues/26) for the open question on target selection.
 
-**How a challenge is generated (inside Val 1's block execution at block 5100):**
+Every `CHALLENGE_INTERVAL_BLOCKS` = 100 blocks (`crates/primitives/src/storage_metadata.rs:21`), the validators automatically generate a storage challenge during block execution (`crates/state/src/executor.rs:2326`). No extrinsic, no human trigger — `execute_block` calls `generate_challenge` when `height % CHALLENGE_INTERVAL_BLOCKS == 0`.
 
-1. **Seed generation:** The validator takes the previous block's hash (block 5099) and combines it with the string `"storage_challenge"` and the current block height to produce a deterministic but unpredictable seed:
-   ```
-   seed = blake3(block_5099_hash + "storage_challenge" + block_height_bytes)
-   ```
-   This seed is deterministic (all validators compute the same value) but unpredictable (nobody can predict it before block 5099 is finalized).
+**How a challenge is generated (block height `H`, with `H % 100 == 0`):**
 
-2. **Select a random file:** The validator queries all funded files (files with fee_pool > 0). It uses bytes from the seed to pick one:
-   ```
-   file_index = seed[0..8] as u64 % number_of_funded_files
-   selected_file = funded_files[file_index]  ->  file "34a749..." (C = 10 chunks)
-   ```
+1. **Filter to eligible nodes and files** (`crates/state/src/storage_metadata.rs:741-756`):
+   - `active_nodes` = every `ArchiveNode` with `status == Active`. For our example, `N` = 10.
+   - `eligible_roots` = V1 files whose `fee_pool > 0` (`crates/state/src/storage_metadata.rs:1894`).
+   If either set is empty, no challenge is issued at this height.
 
-3. **Select a random chunk:**
+2. **Seed generation** (`crates/state/src/storage_metadata.rs:759-762`):
    ```
-   chunk_index = seed[8..12] as u32 % C  ->  chunk 7
+   seed = blake3(parent_hash || "storage_challenge" || height.to_be_bytes())
    ```
+   The seed is a 32-byte BLAKE3 digest. Deterministic — every validator computes the same value. Unpredictable — no one can compute it before the parent block is finalized.
 
-4. **Determine who is assigned to chunk 7:** The validator runs the exact same deterministic assignment algorithm from Step 4, using the same sorted node list. Result: chunk 7 is assigned to [N10, N5, N8].
-
-5. **Select a random assigned node:**
+3. **Select the file** (`crates/state/src/storage_metadata.rs:767-770`):
    ```
-   target_index = seed[12..20] as u64 % 3  ->  index 1  ->  N5
+   file_index = u64::from_be_bytes(seed[0..8]) % eligible_roots.len()
    ```
 
-6. **Write the challenge to the state database:**
+4. **Select the chunk** (`crates/state/src/storage_metadata.rs:785-787`):
+   ```
+   chunk_index = u32::from_be_bytes(seed[8..12]) % chunk_count
+   ```
+   Suppose this yields chunk 7.
+
+5. **Select the target node** (`crates/state/src/storage_metadata.rs:790-794`):
+   ```
+   node_index = u64::from_be_bytes(seed[12..20]) % active_nodes.len()
+   target_node = active_nodes[node_index].address
+   ```
+   **The target is drawn uniformly from all active ArchiveNodes — not restricted to the chunk's assigned replica set.** The chain does not consult the assignment algorithm at this stage. With `N` = 10 and `R` = 3, only ~30% of challenges land on a node the assignment algorithm chose as a replica for that chunk; the remaining ~70% land on unassigned nodes. Bytes 20–31 of the seed are unused.
+
+   Suppose `node_index` resolves to `N2` — a node that the V2 rendezvous-hash algorithm did **not** select as one of the three replicas for chunk 7.
+
+6. **Write the challenge to state** (`crates/state/src/storage_metadata.rs:797-815`):
    ```
    StorageChallenge {
-     challenge_id: blake3(merkle_root + chunk_index + block_height),  // unique ID
-     merkle_root: 34a749...,
-     chunk_index: 7,
-     target_node: N5_address,
-     created_at_height: 5100,
-     expires_at_height: 5150    // CHALLENGE_TTL_BLOCKS = 50
+     challenge_id:      blake3(merkle_root || chunk_index.to_be_bytes() || height.to_be_bytes()),
+     merkle_root:       34a749...,
+     chunk_index:       7,
+     target_node:       N2_address,
+     created_at_height: H,        // e.g. 5100
+     expires_at_height: H + 50,   // CHALLENGE_TTL_BLOCKS = 50 — crates/primitives/src/storage_metadata.rs:18
    }
    ```
 
-**N5 now has 50 blocks to prove it holds chunk 7 of file `34a749...`.** If it fails, it loses 5% of its staked Koppa.
+**Consequences for `target_node`:**
 
-Note: The validators only challenge nodes that the assignment algorithm says should hold that chunk. N2, which is not assigned to chunk 7, will never be challenged for it.
+- The target has 50 blocks to submit a `SubmitStorageProof` transaction carrying the chunk hash plus a Merkle path that verifies against `merkle_root`. The submission path at `crates/state/src/storage_metadata.rs:623-696` checks only three things: `challenge.target_node == sender` (line 641), `current_height <= challenge.expires_at_height` (line 648), and that the Merkle proof reconstructs `merkle_root` (line 692). **No assignment-membership check.** Any submitter equal to `target_node` whose proof verifies clears the challenge and earns the payout from the file's `fee_pool`.
+- If 50 blocks elapse with no valid proof, `process_expired_challenges` at `crates/state/src/executor.rs:2245-2308` slashes `SLASH_PERCENTAGE` = 5% of the node's `staked_balance` (`crates/primitives/src/storage_metadata.rs:27`) and flips its `NodeStatus` to `Slashed`. The slash is unconditional on assignment — the only field that drives it is `challenge.target_node`.
+
+**Implication for operators:** Because the target may be a node that does not currently hold the chunk on disk, every active ArchiveNode must be prepared either (a) to already hold the chunk, or (b) to fetch it within 50 blocks from a peer that does — peers can be discovered via the `ChunkAnnouncement` gossip from Step 3 — and submit the proof in time. Today the assignment algorithm determines who *persistently stores* a chunk, but the PoR mechanism can challenge any active ArchiveNode to *retrieve and prove* it. Whether that behaviour should remain or be tightened to only challenge assigned replicas is the open design question in [issue #26](https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/issues/26).
 
 ---
 
-### Step 6 — N5 responds with a cryptographic proof
+### Step 6 — N2 responds with a cryptographic proof
 
 ![Step 6](docs/diagrams/step6.svg)
 
-N5's **PorWorker** (a background async task) polls the blockchain every few seconds: `storage_getActiveChallenges(my_address)`. It sees the challenge targeting it for chunk 7 of file `34a749...`.
+N2's **PorWorker** ([crates/sum-node/src/por_worker.rs:24-36](crates/sum-node/src/por_worker.rs#L24-L36); spawned from [crates/sum-node/src/main.rs:651-658](crates/sum-node/src/main.rs#L651-L658)) polls the blockchain every few seconds: `storage_getActiveChallenges(my_address)` ([crates/sum-node/src/rpc_client.rs:96-102](crates/sum-node/src/rpc_client.rs#L96-L102)). It sees the challenge targeting it for chunk 7 of file `34a749...`.
 
-N5 must now prove it holds chunk 7 without sending the entire 1 MB chunk on-chain (that would be far too expensive — blockchains are for small data, not megabytes). Instead, it constructs a **Merkle proof**: a compact set of sibling hashes that lets the validator mathematically verify that chunk 7 belongs to this file.
+N2 must now prove it holds chunk 7 without sending the entire 1 MB chunk on-chain (that would be far too expensive — blockchains are for small data, not megabytes). Instead, it constructs a **Merkle proof**: a compact set of sibling hashes that lets the validator mathematically verify that chunk 7 belongs to this file.
 
-**What N5 does:**
+**What N2 does:**
 
-1. **Read the chunk from disk:** N5 reads the file `<chunk_7_cid>.chunk` from its local store — 1,048,576 bytes.
+1. **Read the chunk from disk:** N2 reads the file `<chunk_7_cid>.chunk` from its local store — 1,048,576 bytes ([crates/sum-node/src/por_worker.rs:175-187](crates/sum-node/src/por_worker.rs#L175-L187)).
 
-2. **Hash the chunk:** `chunk_hash = blake3(chunk_7_bytes)` -> 32 bytes. This proves "I have data whose hash is this value."
+2. **Hash the chunk:** `chunk_hash = blake3(chunk_7_bytes)` -> 32 bytes ([crates/sum-node/src/por_worker.rs:190](crates/sum-node/src/por_worker.rs#L190)). This proves "I have data whose hash is this value."
 
-3. **Load the DataManifest** for file `34a749...` from the manifest index. The manifest contains all 10 chunk hashes.
+3. **Load the DataManifest** for file `34a749...` from the manifest index ([crates/sum-node/src/por_worker.rs:168-173](crates/sum-node/src/por_worker.rs#L168-L173)). The manifest contains all 10 chunk hashes.
 
-4. **Rebuild the Merkle tree** from the 10 stored chunk hashes (not the chunk data — just the 32-byte hashes, which are in the manifest).
+4. **Rebuild the Merkle tree** from the 10 stored chunk hashes ([crates/sum-node/src/por_worker.rs:193-198](crates/sum-node/src/por_worker.rs#L193-L198)) — not the chunk data, just the 32-byte hashes that are in the manifest.
 
-5. **Generate the Merkle proof:** Call `generate_proof(chunk_index = 7)`. This walks from chunk 7's leaf up to the root, collecting the **sibling hash** at each level — the minimum information needed to reconstruct the path to the root:
+5. **Generate the Merkle proof:** Call `generate_proof(chunk_index = 7)` ([crates/sum-store/src/merkle.rs:89-115](crates/sum-store/src/merkle.rs#L89-L115); invoked at [crates/sum-node/src/por_worker.rs:199](crates/sum-node/src/por_worker.rs#L199)). This walks from chunk 7's leaf up to the root, collecting the **sibling hash** at each level — the minimum information needed to reconstruct the path to the root:
    ```
    Proof for chunk 7 (index 7, binary = 0111):
 
@@ -420,18 +434,20 @@ N5 must now prove it holds chunk 7 without sending the entire 1 MB chunk on-chai
 
    This is much smaller than sending the 1 MB chunk. The proof is `O(log2(C))` hashes — for 10 chunks, that's 4 hashes (128 bytes).
 
-6. **Build the transaction:**
+6. **Build the transaction:** The `SubmitStorageProof` operation is the inner enum variant — defined chain-side at [sum-chain `crates/primitives/src/storage_metadata.rs:102-113`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/primitives/src/storage_metadata.rs#L102-L113). It is wrapped in `StorageMetadataTxData` ([sum-chain `crates/primitives/src/storage_metadata.rs:118-120`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/primitives/src/storage_metadata.rs#L118-L120)) and carried by `TxPayload::StorageMetadata(...)` ([sum-chain `crates/primitives/src/transaction.rs:392`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/primitives/src/transaction.rs#L392)). The SNIP-side mirror that builds this is at [crates/sum-node/src/tx_builder.rs:453-459](crates/sum-node/src/tx_builder.rs#L453-L459):
    ```
-   TxPayload::SubmitStorageProof {
-     challenge_id: <from the challenge>,
-     merkle_root: 34a749...,
-     chunk_index: 7,
-     chunk_hash: <32 bytes>,
-     merkle_path: [<32 bytes>, <32 bytes>, <32 bytes>, <32 bytes>]
-   }
+   TxPayload::StorageMetadata(StorageMetadataTxData {
+       operation: StorageMetadataOperation::SubmitStorageProof {
+           challenge_id: <from the challenge>,
+           merkle_root:  34a749...,
+           chunk_index:  7,
+           chunk_hash:   <32 bytes>,
+           merkle_path:  [<32 bytes>, <32 bytes>, <32 bytes>, <32 bytes>],
+       },
+   })
    ```
 
-7. **Serialize, sign, and broadcast:** N5 serializes the transaction in the exact binary format the L1 expects (bincode v1 — a compact binary encoding that both sides must agree on byte-for-byte), hashes the serialized bytes with blake3, signs the hash with its Ed25519 private key, and broadcasts the signed transaction to the validators.
+7. **Serialize, sign, and broadcast:** N2 serializes the transaction in the exact binary format the L1 expects — **bincode v1** (`bincode = "1.3"` in both `Cargo.toml`s; called as `bincode1::serialize` at [crates/sum-node/src/tx_builder.rs:336](crates/sum-node/src/tx_builder.rs#L336)) — hashes the serialized bytes with blake3, signs the hash with its Ed25519 private key, and broadcasts the signed transaction to the validators ([crates/sum-node/src/tx_builder.rs:335-340](crates/sum-node/src/tx_builder.rs#L335-L340)).
 
 ---
 
@@ -439,13 +455,13 @@ N5 must now prove it holds chunk 7 without sending the entire 1 MB chunk on-chai
 
 ![Step 7](docs/diagrams/step7.svg)
 
-Val 1 receives N5's proof transaction in the mempool and includes it in the next block. During block execution:
+Val 1 receives N2's `SubmitStorageProof` transaction in the mempool and includes it in the next block. During block execution the chain runs `execute_submit_proof` ([sum-chain `crates/state/src/storage_metadata.rs:623-696`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L623-L696)):
 
-1. **Validate the challenge exists** in the state database and that N5 is the target node.
+1. **Validate the challenge exists** in the state database and that N2 is the target node — `challenge.target_node == *sender` ([sum-chain `crates/state/src/storage_metadata.rs:641`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L641)).
 
-2. **Check expiry:** Current block height must be less than `expires_at_height` (5150). If the block is 5151 or later, the proof is too late.
+2. **Check expiry:** current block height must be ≤ `expires_at_height` (= `H + 50`). If the block is `H + 51` or later, the proof is too late ([sum-chain `crates/state/src/storage_metadata.rs:648`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L648)).
 
-3. **Verify the Merkle proof** — reconstruct the path from the chunk hash to the root using the sibling hashes:
+3. **Verify the Merkle proof** — reconstruct the path from the chunk hash to the root using the sibling hashes. The chain's verifier lives at [sum-chain `crates/state/src/storage_metadata.rs:174`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L174) and is invoked from `execute_submit_proof` at [`storage_metadata.rs:692`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L692):
    ```
    Start: current = chunk_hash
 
@@ -456,7 +472,7 @@ Val 1 receives N5's proof transaction in the mempool and includes it in the next
             current = blake3(proof[1] + current)        // H(4,5) + H(6,7)
 
    Level 2: index 1 (3/2=1), bit 2 is 0 -> current is LEFT child
-            current = blake3(current + proof[2])        // H(0-3) + H(4-7) -- CORRECTED
+            current = blake3(current + proof[2])        // H(0-3) + H(4-7)
 
    Level 3: index 0 (1/2=0), bit 3 is 0 -> current is LEFT child
             current = blake3(current + proof[3])        // H(0-7) + H(8-9)
@@ -464,25 +480,25 @@ Val 1 receives N5's proof transaction in the mempool and includes it in the next
    Final check: does current == merkle_root stored on-chain (34a749...)? -> YES
    ```
 
-   The bit-checking rule `(chunk_index >> level) & 1` determines whether the current hash is the left or right child at each level. This must match exactly between the storage node's proof generation and the validator's verification — one bug here and every proof fails.
+   The bit-checking rule `(chunk_index >> level) & 1` ([sum-chain `crates/state/src/storage_metadata.rs:186-193`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L186-L193)) determines whether the current hash is the left or right child at each level. This must match exactly between the storage node's proof generation and the validator's verification — one bug here and every proof fails.
 
-4. **Verify proof length:** The number of sibling hashes must equal `ceil(log2(C))`. For `C` = 10, that's 4. Too few or too many -> reject.
+4. **Verify proof length:** the number of sibling hashes must equal `ceil(log2(C))` ([sum-chain `crates/state/src/storage_metadata.rs:677-682`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L677-L682)). For `C` = 10, that's 4. Too few or too many → reject.
 
-5. **Settlement (proof valid):**
-   - Transfer `CHALLENGE_REWARD` = 10 Koppa from the file's `fee_pool` to N5's account
-   - `fee_pool` decreases: 100 Koppa -> 90 Koppa
-   - Delete the challenge from the state database
-   - N5's stake remains untouched
+5. **Settlement (proof valid)** ([sum-chain `crates/state/src/storage_metadata.rs:698-715`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L698-L715)):
+   - Transfer `CHALLENGE_REWARD` = 10 Koppa (= `10_000_000_000` base units, [sum-chain `crates/primitives/src/storage_metadata.rs:24`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/primitives/src/storage_metadata.rs#L24)) from the file's `fee_pool` to N2's account
+   - `fee_pool` decreases: 100 Koppa → 90 Koppa ([`storage_metadata.rs:706`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L706); credit at [`storage_metadata.rs:710`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L710))
+   - Delete the challenge from the state database ([`storage_metadata.rs:715`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L715))
+   - N2's stake remains untouched
 
-6. **Settlement (proof missing — what happens if N5 never responds):**
-   If block 5150 arrives and no valid proof has been submitted:
-   - The validator's `process_expired_challenges()` runs at the **start** of block 5150 (before any user transactions, preventing front-running)
-   - `SLASH_PERCENTAGE` = 5% of N5's staked balance is destroyed
-   - N5's status is set to `Slashed` — it is no longer considered an active node
-   - The challenge is deleted
-   - N5 receives nothing from the fee pool
+6. **Settlement (proof missing — what happens if N2 never responds):**
+   If block `H + 51` arrives and no valid proof has been submitted:
+   - The validator's `process_expired_challenges()` ([sum-chain `crates/state/src/executor.rs:2245-2308`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/executor.rs#L2245-L2308)) runs at the **start** of the block, before any user transactions ([sum-chain `crates/state/src/executor.rs:2143-2148`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/executor.rs#L2143-L2148) — the in-source comment is explicit: *"Slash expired challenges BEFORE user transactions … prevents a node from front-running a slash by submitting a last-second proof and a withdrawal in the same block"*)
+   - `SLASH_PERCENTAGE` = 5% of N2's `staked_balance` is destroyed ([sum-chain `crates/state/src/executor.rs:2263-2268`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/executor.rs#L2263-L2268); constant at [sum-chain `crates/primitives/src/storage_metadata.rs:27`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/primitives/src/storage_metadata.rs#L27))
+   - N2's `NodeStatus` is set to `Slashed` ([sum-chain `crates/state/src/executor.rs:2269`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/executor.rs#L2269)) — it is no longer considered an active node
+   - The challenge is deleted ([sum-chain `crates/state/src/executor.rs:2307`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/executor.rs#L2307))
+   - N2 receives nothing from the fee pool
 
-This cycle repeats continuously — every 100 blocks, a new random challenge targets a random chunk on a random assigned node. Over time, honest nodes that actually store their assigned data accumulate Koppa. Nodes that cheat (claim to store data but don't) get repeatedly slashed until their stake is depleted and they are ejected from the network.
+This cycle repeats continuously — every 100 blocks, a new random challenge targets a random chunk on a random **active** ArchiveNode (uniform over all active archives; not restricted to the chunk's assigned replicas — see Step 5). Over time, honest nodes that actually store their assigned data accumulate Koppa. Nodes that cheat (claim to store data but don't) get repeatedly slashed until their stake is depleted and they are ejected from the network.
 
 ---
 
@@ -497,26 +513,26 @@ Bob runs:
 sum-node download 34a749797e853c5f3c6a678b881adee2103c66611f999082efff71bb75701b66 --output ./file.pdf
 ```
 
-The download command handles the entire retrieval pipeline automatically:
+The `Download` subcommand ([crates/sum-node/src/main.rs:206-218](crates/sum-node/src/main.rs#L206-L218)) handles the entire retrieval pipeline automatically:
 
 **Step 8a — Route the download:**
 
-Before fetching anything, Bob's client calls `storage_getFileInfoV2(34a749...)` ([crates/sum-node/src/rpc_client.rs:209-220](crates/sum-node/src/rpc_client.rs#L209-L220)) to read the file's chain row — `visibility`, `lifecycle`, `assignment_height`, `chunk_count`, and the paginated access list. The pure router `route_download_target` ([crates/sum-node/src/download_route.rs:63-72](crates/sum-node/src/download_route.rs#L63-L72)) dispatches to one of three pipelines: `V1Legacy`, `V2Public`, or `V2Private` (fail-closed on unknown visibility). Since Alice registered file.pdf via `RegisterFilePendingV2` with `visibility = Public`, Bob takes the `V2Public` path. (The `V2Private` path is covered in the V2 Lifecycle section below.)
+Before fetching anything, Bob's client calls `storage_getFileInfoV2(34a749...)` ([crates/sum-node/src/rpc_client.rs:209-220](crates/sum-node/src/rpc_client.rs#L209-L220)) to read the file's chain row — `visibility`, `lifecycle`, `assignment_height`, `chunk_count`, and the paginated access list. The pure router `route_download_target` ([crates/sum-node/src/download_route.rs:63-72](crates/sum-node/src/download_route.rs#L63-L72)) dispatches to one of three pipelines: `V1Legacy`, `V2Public`, or `V2Private` (fail-closed on unknown visibility via `RouteError::UnknownV2Visibility` at [download_route.rs:69-71](crates/sum-node/src/download_route.rs#L69-L71)). Since Alice registered file.pdf via `RegisterFilePendingV2` with `visibility = Public`, Bob takes the `V2Public` path. (The `V2Private` path is covered in the V2 Lifecycle section below.)
 
 **Step 8b — Get the manifest:**
 
 Bob's client builds a `V2AssignmentView` ([crates/sum-node/src/download_v2_routing.rs:92-151](crates/sum-node/src/download_v2_routing.rs#L92-L151)) — it fetches the same snapshot Alice used (`storage_getActiveNodesAtHeight(assignment_height)`), runs the same V2 rendezvous-hash algorithm from Step 4, and produces a `distinct_assigned` set of archives plus a per-chunk archive list.
 
-Bob then fans out `ManifestPullV2` ([crates/sum-net/src/lib.rs:267-276](crates/sum-net/src/lib.rs#L267-L276)) to those distinct archives. The first archive whose CBOR manifest re-derives to the expected merkle_root wins; mismatches are dropped ([crates/sum-node/src/download.rs:835-1109](crates/sum-node/src/download.rs#L835-L1109)). Bob now knows:
+Bob then fans out `ManifestPullV2` ([crates/sum-net/src/lib.rs:267-276](crates/sum-net/src/lib.rs#L267-L276)) to those distinct archives. The first archive whose CBOR manifest re-derives to the expected merkle_root wins; mismatches are dropped. The root-mismatch check lives in `decode_v2_manifest_bytes` ([crates/sum-node/src/download_v2_routing.rs:177-190](crates/sum-node/src/download_v2_routing.rs#L177-L190)) which returns `ManifestDecodeError::RootMismatch` when `manifest.merkle_root != expected_root`; the surrounding fan-out orchestrator at [crates/sum-node/src/download.rs:835-1109](crates/sum-node/src/download.rs#L835-L1109) drops failed candidates by not advancing their status to success. Bob now knows:
 - The file has `C` = 10 chunks
 - Each chunk's CID (content address), size, and offset
 - The file's total size: 10,485,760 bytes
 
 **Step 8c — Access control check:**
 
-Before any archive serves Bob a chunk, it runs the ACL gate. For V2 the serving archive uses `merkle_root_for_cid` ([crates/sum-store/src/manifest_index.rs:241-245](crates/sum-store/src/manifest_index.rs#L241-L245)) to map the requested CID back to its file's merkle_root, then consults the access list returned by `storage_getFileInfoV2` (paginated, 256 entries per page by default).
+Before any archive serves Bob a chunk, it runs the ACL gate ([crates/sum-node/src/acl.rs:199-250](crates/sum-node/src/acl.rs#L199-L250)). For V2 the serving archive uses `merkle_root_for_cid` ([crates/sum-store/src/manifest_index.rs:241-245](crates/sum-store/src/manifest_index.rs#L241-L245)) to map the requested CID back to its file's merkle_root, then consults the access list returned by `storage_getFileInfoV2` (paginated, default offset=0, limit=256 — see [rpc_client.rs:206](crates/sum-node/src/rpc_client.rs#L206)).
 
-The archive derives Bob's L1 address from his P2P identity. When Bob connected, the libp2p **identify** protocol automatically exchanged public keys. The archive computes: `blake3(Bob_public_key)[12..32]` -> Bob's L1 address ([crates/sum-net/src/identity.rs:104-113](crates/sum-net/src/identity.rs#L104-L113)). For this file `access_list` is empty (`visibility == Public`), so any peer is granted access. For a Private file, the archive checks whether Bob's address is present and unexpired in the `access_list` — see the V2 Lifecycle section for the encrypted-bundle decryption that the downloader additionally performs.
+The archive derives Bob's L1 address from his P2P identity. When Bob connected, the libp2p **identify** protocol ([crates/sum-net/src/behaviour.rs:27](crates/sum-net/src/behaviour.rs#L27)) automatically exchanged public keys. The archive computes: `blake3(Bob_public_key)[12..32]` -> Bob's L1 address (`l1_address_from_peer_public_key` at [crates/sum-net/src/identity.rs:104-113](crates/sum-net/src/identity.rs#L104-L113)). For this file `access_list` is empty (`visibility == Public`), so any peer is granted access. For a Private file, the archive checks whether Bob's address is present and unexpired in the `access_list` — see the V2 Lifecycle section for the encrypted-bundle decryption that the downloader additionally performs.
 
 **Step 8d — Fetch all chunks:**
 
@@ -530,10 +546,10 @@ ShardRequestV2::Pull {
 }
 ```
 
-The wire codec is [crates/sum-net/src/codec.rs:176-240](crates/sum-net/src/codec.rs#L176-L240); helper at [crates/sum-net/src/lib.rs:201-219](crates/sum-net/src/lib.rs#L201-L219). The serving archive:
+The wire codec is [crates/sum-net/src/codec.rs:176-240](crates/sum-net/src/codec.rs#L176-L240); helper `pull_chunk_v2` at [crates/sum-net/src/lib.rs:201-219](crates/sum-net/src/lib.rs#L201-L219). The serving archive ([crates/sum-store/src/serve.rs:343-357](crates/sum-store/src/serve.rs#L343-L357)):
 1. Looks up the CID in its chunk store
-2. Memory-maps the chunk file from disk (zero-copy — no RAM allocation for the 1 MB)
-3. Sends a `ShardResponseV2::Data` back with the raw bytes:
+2. Memory-maps the chunk file from disk via `store.mmap(cid)` (zero-copy — the response slice is taken directly from the mmap'd buffer at `&mapped[offset..end]`, no RAM allocation for the 1 MB)
+3. Sends a `ShardResponseV2::Data` back with the raw bytes ([codec.rs:213-220](crates/sum-net/src/codec.rs#L213-L220)):
    ```
    ShardResponseV2::Data {
      cid: "bafkr4i...",
@@ -544,18 +560,18 @@ The wire codec is [crates/sum-net/src/codec.rs:176-240](crates/sum-net/src/codec
    }
    ```
 
-Bob's V2 dispatch is per-chunk with a `max_concurrent` cap (default 10, [crates/sum-node/src/main.rs:212-214](crates/sum-node/src/main.rs#L212-L214)) and walks the chunk's assigned archives sequentially on per-archive failure ([crates/sum-node/src/download.rs:1132-1396](crates/sum-node/src/download.rs#L1132-L1396)) — there is no "any peer" fallback in V2; only chain-assigned archives are tried. Since each chunk exists on 3 deterministically-assigned archives, Bob has 3 sources per chunk.
+Bob's V2 dispatch is per-chunk with a `max_concurrent` cap (default 10, [crates/sum-node/src/main.rs:212-214](crates/sum-node/src/main.rs#L212-L214)) and walks the chunk's assigned archives sequentially on per-archive failure ([crates/sum-node/src/download.rs:1132-1396](crates/sum-node/src/download.rs#L1132-L1396)) — there is no "any peer" fallback in V2; only chain-assigned archives are tried. The exhaustion path at [download.rs:1346-1350](crates/sum-node/src/download.rs#L1346-L1350) bails with `"exhausted all {} V2-assigned archives"` once `next_attempt_idx >= assigned.len()`. Since each chunk exists on 3 deterministically-assigned archives, Bob has 3 sources per chunk.
 
 **Step 8e — Verify and reassemble:**
 
-For each received chunk, Bob:
-1. BLAKE3-hashes the received bytes
-2. Verifies the hash matches the CID from the manifest — if it doesn't match, the data was corrupted or tampered with; discard and try the next assigned archive
+For each received chunk, Bob ([crates/sum-node/src/download.rs:1319-1320](crates/sum-node/src/download.rs#L1319-L1320)):
+1. BLAKE3-hashes the received bytes: `let actual_hash = *blake3::hash(&data).as_bytes();`
+2. Verifies it matches the manifest's chunk-descriptor `blake3_hash` — `if actual_hash != cd.blake3_hash` → discard and try the next assigned archive. (The CID is just a self-describing wrapper around this same blake3 hash, so this also verifies the CID.)
 3. Stores the verified chunk
 
 Once all `C` = 10 chunks are downloaded and verified, Bob concatenates them in order (chunk 0 + chunk 1 + ... + chunk 9) to reconstruct the original `file.pdf`. The file is byte-for-byte identical to what Alice uploaded — guaranteed by the cryptographic hashes.
 
-The download command automatically verifies the entire file by rebuilding the Merkle tree from the 10 chunk hashes and checking that the computed merkle_root matches `34a749...`. If it matches, Bob has cryptographic proof that his reconstructed file is exactly what Alice registered on the blockchain. If it doesn't match, the download reports an error.
+The download command automatically verifies the entire file by rebuilding the Merkle tree from the 10 chunk hashes and checking that the computed merkle_root matches the chain's value ([crates/sum-node/src/download.rs:777-804](crates/sum-node/src/download.rs#L777-L804); the equality check `computed_root.as_bytes() == &manifest.merkle_root` is at line 790). If it matches, Bob has cryptographic proof that his reconstructed file is exactly what Alice registered on the blockchain. If it doesn't match, the download reports an error.
 
 ---
 
@@ -584,7 +600,7 @@ Both protocols coexist on the same libp2p swarm. The `VersionedShardCodec` ([cra
                               └──────┘ └──────────┘
 ```
 
-`AbandonFileV2` is admissible only when `current_height > created_at + activation_grace_blocks` (chain plan v3.2 §3.5, strict greater-than). On success, 90 % of the registration fee deposit refunds to the owner and 10 % is burned.
+`AbandonFileV2` is admissible only when `current_height > created_at + activation_grace_blocks` (chain plan v3.2 §3.5, strict greater-than). On success, the chain burns the configured `abandonment_fee_percent` of the fee deposit; the rest refunds to the owner ([sum-chain `crates/state/src/storage_metadata.rs:1654-1656`](https://github.com/SUM-INNOVATION/sum-chain/blob/main/crates/state/src/storage_metadata.rs#L1654-L1656)).
 
 ### V2 ingest walkthrough
 
@@ -610,7 +626,7 @@ Set `--visibility private` on `ingest-v2` ([crates/sum-node/src/main.rs:182-197]
 
 **Private download** ([crates/sum-node/src/download_private.rs](crates/sum-node/src/download_private.rs)) layers four extra steps on top of Step 8:
 1. **Access lookup.** `find_my_access_entry` paginates the file's access list (256 entries per page, max 64 pages) looking for the downloader's own L1 address.
-2. **Expiry check.** `finalized_height <= expires_at` (strict — no grace) ([crates/sum-node/src/download_private.rs:163-207](crates/sum-node/src/download_private.rs#L163-L207)).
+2. **Expiry check.** `finalized_height <= expires_at` (inclusive — no grace beyond `expires_at`) ([crates/sum-node/src/download_private.rs:163-207](crates/sum-node/src/download_private.rs#L163-L207)).
 3. **Key unwrap.** Derive own X25519 secret from the Ed25519 seed via the same HKDF used at register-time, then `unwrap_for_self(bundle)` to recover `K_file` ([crates/sum-crypto/src/recipient.rs:160-198](crates/sum-crypto/src/recipient.rs#L160-L198)).
 4. **Decrypt + verify.** Pull the opaque manifest, decrypt under `K_file`, rebuild the Merkle tree from the manifest's `plaintext_blake3_hash` descriptors and check against the chain-recorded root. Pull each ciphertext chunk (BLAKE3-verify against the manifest's `blake3_hash`), decrypt under `K_file`, verify the plaintext against `plaintext_blake3_hash`, then verify the assembled whole against `manifest.file_hash` ([crates/sum-node/src/download_private.rs:318-361](crates/sum-node/src/download_private.rs#L318-L361)).
 
@@ -723,7 +739,7 @@ mainnet pin) see [`docs/CHAIN-COMPAT.md`](docs/CHAIN-COMPAT.md).
 - `--key-file <path>` — Ed25519 private key seed (hex-encoded; env `SUM_KEY_FILE`). Without it, generates a random keypair (dev mode, PoR + V2 ingest/resume/abandon/share/revoke/update-access disabled).
 - `--profile <production|dev>` — fail-closed (production) vs fail-open (dev) policy on chain RPC errors. Production refuses to fall back to hardcoded `IngestParams` if `chain_getChainParams` fails; dev allows defaults with a warning.
 - `--rpc-url <url>` — SUM Chain L1 JSON-RPC endpoint (default `http://127.0.0.1:9944`; env `SUM_RPC_URL`).
-- `--chain-id <u64>` — chain id used to sign V1 + V2 transactions (default `1337`; env `SUM_CHAIN_ID`). Most subcommands accept the flag's value as-is; `register-node` reads `chain_id` live from RPC ([crates/sum-node/src/main.rs:266-270](crates/sum-node/src/main.rs#L266-L270)) so the operator cannot mis-flag the tx against a different network and burn a fee.
+- `--chain-id <u64>` — chain id used to sign V1 + V2 transactions (default `1337`; env `SUM_CHAIN_ID`). Most subcommands accept the flag's value as-is; `register-node` reads `chain_id` live from RPC ([crates/sum-node/src/main.rs:2066](crates/sum-node/src/main.rs#L2066)) so the operator cannot mis-flag the tx against a different network and burn a fee.
 - `--attest-fee <koppa>` — `u128` fee per V2 tx (RegisterFilePendingV2 / ActivateFileV2 / AbandonFileV2 / AcceptAssignmentV2). Default `1_000_000`; env `SUM_ATTEST_FEE`. Must be ≥ chain `min_fee`.
 - `--por-poll-secs <secs>` — PoR challenge poll interval (default 10; env `SUM_POR_INTERVAL`). Controls how often the `PorWorker` calls `storage_getActiveChallenges`.
 - `--market-sync-secs <secs>` — MarketSync poll interval (default 30; env `SUM_MARKET_SYNC_INTERVAL`). V1-legacy self-healing cadence.
