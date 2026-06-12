@@ -1,5 +1,11 @@
 # Storage-Node-Interface-Protocol
 
+[![license](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue)](LICENSE-MIT)
+[![version](https://img.shields.io/badge/version-0.4.0--rc4-blue)](CHANGELOG.md)
+[![rust edition](https://img.shields.io/badge/rust-2024-orange)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
+[![toolchain](https://img.shields.io/badge/toolchain-1.85.0-orange)](rust-toolchain.toml)
+[![SNIP](https://img.shields.io/badge/SNIP-V2_gated-brightgreen)](docs/CHAIN-COMPAT.md)
+
 A native decentralized storage protocol for the SUM Chain blockchain. The L1 acts as a cryptographic ledger — storing only merkle roots, access lists, and fee pools — while actual file data lives off-chain in a libp2p P2P mesh of storage nodes. Nodes earn Koppa by proving they hold data through randomized Proof of Retrievability challenges, with 3x replication enforced by a deterministic assignment algorithm that both the L1 and storage nodes compute identically from on-chain state. No smart contracts, no IPFS dependency — storage economics are settled directly at the consensus layer.
 
 ---
