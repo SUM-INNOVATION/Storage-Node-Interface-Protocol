@@ -100,10 +100,10 @@ All of Approach 1, plus:
 
 ### How it works
 
-Alice encrypts `file.pdf` with a symmetric key (XChaCha20-Poly1305) before chunking. Only Alice and authorized recipients hold the key. Nodes store, serve, and prove ciphertext. The key is shared out-of-band (not on-chain).
+Alice encrypts `file.pdf` with a symmetric key (ChaCha20-Poly1305) before chunking. Only Alice and authorized recipients hold the key. Nodes store, serve, and prove ciphertext. The key is shared out-of-band (not on-chain).
 
 ```
-key = random 256-bit XChaCha20-Poly1305 key
+key = random 256-bit ChaCha20-Poly1305 key
 encrypted_file = encrypt(key, file.pdf)
 chunks = chunk(encrypted_file)     ← nodes store ciphertext, never plaintext
 merkle_root = merkle_tree(chunks)  ← computed over ciphertext
@@ -184,7 +184,7 @@ The fundamental problem is that nodes hold data on untrusted hardware. No amount
 
 ### Implementation Notes
 
-- **Algorithm:** XChaCha20-Poly1305 (authenticated encryption, 256-bit key, 192-bit nonce)
+- **Algorithm:** ChaCha20-Poly1305 (RFC 8439, authenticated encryption, 256-bit key, 96-bit nonce)
 - **Crate:** `chacha20poly1305` in Rust
 - **Key derivation:** `key = blake3(ed25519_seed ++ merkle_root_of_plaintext ++ "sumchain-file-key")` — deterministic from Alice's wallet seed, so she never needs to remember a separate password
 - **Where it fits:** Wraps the existing chunker pipeline. `encrypt(file) → chunk(ciphertext) → hash → merkle_tree`. Decryption is the reverse on download: `fetch_chunks → reassemble_ciphertext → decrypt(key, ciphertext) → plaintext`
