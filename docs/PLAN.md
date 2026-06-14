@@ -15,7 +15,7 @@ These structures are compiled directly into the SUM Chain Rust node binary.
         - access_list: Vector of allowed Ed25519 addresses (empty = public).
         - storage_fee_pool: Locked Koppa to pay nodes over time.
 2. The File Ingestion Pipeline (Client-Side to Network)
-    1. Encrypt (Optional): If the file is private, encrypt locally via XChaCha20-Poly1305.
+    1. Encrypt (Optional): If the file is private, encrypt locally via ChaCha20-Poly1305.
     2. Chunk & Hash: Split the file into uniform blocks (e.g., 1 MB). Hash each block with BLAKE3 to create leaf nodes.
     3. Merkle DAG: Build the Merkle Tree. The resulting merkle_root becomes the file's absolute network identity.
     4. Allocate Transaction: The client broadcasts a TxPayload::AllocateStorage transaction to the Validators, containing the merkle_root, the access_list, and the storage_fee_pool.
@@ -70,7 +70,7 @@ Goal: Close remaining gaps, improve storage efficiency, enable WAN connectivity,
 Phase 5: Client-Side Encryption for Private Files [NOT STARTED — see docs/SECURITY-ANALYSIS.md]
 Goal: Make data confidentiality independent of node honesty. Nodes store ciphertext, never plaintext.
     The current ACL (access_list on StorageMetadata) is enforced off-chain by node code. A malicious node
-    operator can bypass the check and read/serve plaintext data. Client-side encryption (XChaCha20-Poly1305)
+    operator can bypass the check and read/serve plaintext data. Client-side encryption (ChaCha20-Poly1305)
     before chunking eliminates this — nodes hold ciphertext that is useless without the decryption key.
     The ACL becomes a bandwidth optimization, not the security boundary.
     See docs/SECURITY-ANALYSIS.md for full analysis of three approaches (deterministic+ACL, opt-in, encryption)
