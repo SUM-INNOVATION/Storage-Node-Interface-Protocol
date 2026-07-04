@@ -374,6 +374,7 @@ async fn main() -> Result<()> {
         enable_wan: cli.enable_wan,
         bootstrap_peers: cli.bootstrap_peers.clone(),
         relay_server: cli.relay_server,
+        client_mode: false,
     };
 
     match cli.command {

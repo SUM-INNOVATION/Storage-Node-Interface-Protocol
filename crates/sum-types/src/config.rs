@@ -29,6 +29,11 @@ pub struct NetConfig {
     /// Only enable on publicly-reachable hosts (VPS, port-forwarded home
     /// server). Does nothing unless `enable_wan` is also true.
     pub relay_server: bool,
+    /// Outbound-only client (mobile/embedded): skip gossipsub topic
+    /// subscriptions. Push/pull request-response and Kademlia/mDNS
+    /// discovery are unaffected; the ManifestPush path — not gossip
+    /// announcements — is what archives rely on for V2 ingest.
+    pub client_mode: bool,
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────

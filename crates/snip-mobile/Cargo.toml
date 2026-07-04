@@ -22,6 +22,8 @@ cli = ["uniffi/cli"]
 
 [dependencies]
 sum-node   = { path = "../sum-node" }
+sum-net    = { workspace = true }
+sum-store  = { workspace = true }
 sum-types  = { workspace = true }
 sum-crypto = { workspace = true }
 uniffi     = { version = "0.29", features = ["tokio"] }
@@ -32,6 +34,11 @@ anyhow     = { workspace = true }
 hex        = { workspace = true }
 blake3     = { workspace = true }
 zeroize    = { workspace = true }
+
+[dev-dependencies]
+tempfile   = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

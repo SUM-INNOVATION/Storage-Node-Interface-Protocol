@@ -1,0 +1,35 @@
+{
+  "file_len": 3670016,
+  "merkle_root_hex": "0x66dd2fefe94b4cac4fc3d102f9cad46a90f6d631c095072af976eb0c41f7a3ba",
+  "node_addresses": [
+    "2ZEw5Hcv1hTb6YUQJ69y1V7uhcoGXMxWf",
+    "47Us9aEq2PvBC5wobBJw1yEpQEbRPVCo4",
+    "5fioDrrk36NmHdRCtGTu2TMj6rPZVfW9c",
+    "7DxjJ9Uf3nqMPAtcBMcs2wUdoUBkF1pE1",
+    "8nCfNS6a4VHwUiN1USmq3RbYW5yvhMghi",
+    "ALSbSiiV5BkXaFqQmXvo3uiTChn4jzqVh",
+    "BtgXX1LQ5tD7foJp4d5m4PqMuKaKdnZR8"
+  ],
+  "assignments": [
+    [
+      "BtgXX1LQ5tD7foJp4d5m4PqMuKaKdnZR8",
+      "47Us9aEq2PvBC5wobBJw1yEpQEbRPVCo4",
+      "5fioDrrk36NmHdRCtGTu2TMj6rPZVfW9c"
+    ],
+    [
+      "5fioDrrk36NmHdRCtGTu2TMj6rPZVfW9c",
+      "2ZEw5Hcv1hTb6YUQJ69y1V7uhcoGXMxWf",
+      "ALSbSiiV5BkXaFqQmXvo3uiTChn4jzqVh"
+    ],
+    [
+      "BtgXX1LQ5tD7foJp4d5m4PqMuKaKdnZR8",
+      "5fioDrrk36NmHdRCtGTu2TMj6rPZVfW9c",
+      "ALSbSiiV5BkXaFqQmXvo3uiTChn4jzqVh"
+    ],
+    [
+      "5fioDrrk36NmHdRCtGTu2TMj6rPZVfW9c",
+      "2ZEw5Hcv1hTb6YUQJ69y1V7uhcoGXMxWf",
+      "ALSbSiiV5BkXaFqQmXvo3uiTChn4jzqVh"
+    ]
+  ]
+}

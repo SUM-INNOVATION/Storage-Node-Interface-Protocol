@@ -1,0 +1,53 @@
+name: mobile-release
+
+# Tag-triggered XCFramework release for wallet consumption:
+#   git tag snip-mobile-v0.4.0 && git push origin snip-mobile-v0.4.0
+# Produces SnipCore.xcframework.zip + its SwiftPM checksum as release
+# assets; the wallet pins them in a url+checksum binaryTarget.
+
+on:
+  push:
+    tags:
+      - "snip-mobile-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build XCFramework
+        run: ./scripts/build-xcframework.sh
+
+      - name: Run snip-mobile tests
+        run: cargo test -p snip-mobile
+
+      - name: Zip and checksum
+        id: package
+        run: |
+          cd bindings/SnipCore
+          zip -r -y SnipCore.xcframework.zip SnipCore.xcframework
+          CHECKSUM=$(swift package compute-checksum SnipCore.xcframework.zip)
+          echo "checksum=$CHECKSUM" >> "$GITHUB_OUTPUT"
+          echo "SwiftPM checksum: $CHECKSUM"
+
+      - name: Create release with assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bindings/SnipCore/SnipCore.xcframework.zip
+          body: |
+            SnipCore.xcframework for iOS (device + simulator).
+
+            SwiftPM binaryTarget checksum:
+            `${{ steps.package.outputs.checksum }}`

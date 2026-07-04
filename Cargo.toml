@@ -140,3 +140,16 @@ type_complexity = "allow"
 # rendered output is unaffected.
 doc_overindented_list_items = "allow"
 doc_lazy_continuation = "allow"
+
+# ─── Mobile profile ──────────────────────────────────────────────────────────
+#
+# Size-optimized profile for the snip-mobile XCFramework slices. Node
+# builds keep the default release profile; binary size only matters
+# when the library ships inside an app bundle.
+[profile.mobile]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

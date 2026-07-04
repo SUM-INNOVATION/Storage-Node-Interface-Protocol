@@ -60,7 +60,9 @@ impl SumNet {
     /// [`identity::keypair_from_seed`].
     pub async fn new(config: NetConfig, keypair: Keypair) -> Result<Self> {
         let mut sum_swarm = SumSwarm::build(&config, keypair)?;
-        sum_swarm.subscribe_all_topics()?;
+        if !config.client_mode {
+            sum_swarm.subscribe_all_topics()?;
+        }
 
         // Bootstrap Kademlia DHT when WAN mode is enabled.
         if config.enable_wan {

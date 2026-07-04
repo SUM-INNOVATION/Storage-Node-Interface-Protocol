@@ -36,3 +36,8 @@ SNIP_*.txt
 
 # Internal Reference
 .claude/
+
+# Generated mobile bindings (built by scripts/build-xcframework.sh)
+bindings/SnipCore/SnipCore.xcframework/
+bindings/SnipCore/Sources/
+bindings/SnipCore/*.zip
