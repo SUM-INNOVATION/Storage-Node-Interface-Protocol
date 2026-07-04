@@ -6,6 +6,7 @@ members = [
     "crates/sum-store",
     "crates/sum-node",
     "crates/sum-crypto",
+    "crates/snip-mobile",
 ]
 
 [workspace.package]
