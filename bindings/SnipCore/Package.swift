@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "SnipCore",
-    platforms: [.iOS(.v16), .macOS(.v13)],
+    platforms: [.iOS(.v16)],
     products: [
         .library(name: "SnipCore", targets: ["SnipCore"])
     ],
