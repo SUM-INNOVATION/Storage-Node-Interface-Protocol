@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "e2e-helper"
 path = "src/bin/e2e_helper.rs"
 
+[features]
+default = ["mdns"]
+mdns = ["sum-net/mdns", "sum-store/mdns"]
+
 [dependencies]
 sum-types          = { workspace = true }
 sum-net            = { workspace = true }

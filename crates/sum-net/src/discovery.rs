@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use libp2p::{PeerId, StreamProtocol, gossipsub, kad, mdns};
+use libp2p::{PeerId, StreamProtocol, gossipsub, kad};
+#[cfg(feature = "mdns")]
+use libp2p::mdns;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -37,6 +39,7 @@ pub fn build_kademlia(local_peer_id: PeerId) -> kad::Behaviour<kad::store::Memor
 /// Wires newly-discovered peers into Gossipsub (via `add_explicit_peer`) and
 /// emits the appropriate [`SumNetEvent`] for each distinct PeerId.
 /// Called directly from the swarm event loop to keep that loop thin.
+#[cfg(feature = "mdns")]
 pub fn handle_mdns_event(
     event: mdns::Event,
     gossipsub: &mut gossipsub::Behaviour,

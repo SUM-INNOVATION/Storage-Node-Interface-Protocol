@@ -48,7 +48,6 @@ libp2p = { version = "0.55", features = [
     "tcp",
     "dns",
     "kad",
-    "mdns",
     "gossipsub",
     "identify",
     "autonat",
@@ -112,9 +111,9 @@ chrono  = { version = "0.4",  features = ["serde"] }
 # ─── Internal Crates ─────────────────────────────────────────────────────────
 
 sum-types  = { path = "crates/sum-types" }
-sum-net    = { path = "crates/sum-net" }
-sum-store  = { path = "crates/sum-store" }
-sum-node   = { path = "crates/sum-node" }
+sum-net    = { path = "crates/sum-net", default-features = false }
+sum-store  = { path = "crates/sum-store", default-features = false }
+sum-node   = { path = "crates/sum-node", default-features = false }
 sum-crypto = { path = "crates/sum-crypto" }
 
 # ─── Workspace lints ──────────────────────────────────────────────────────────

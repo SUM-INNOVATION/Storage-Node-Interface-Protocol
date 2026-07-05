@@ -6,9 +6,13 @@ license.workspace    = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["mdns"]
+mdns = ["sum-net/mdns"]
+
 [dependencies]
 sum-types  = { workspace = true }
-sum-net    = { workspace = true }
+sum-net            = { workspace = true }
 libp2p     = { workspace = true }
 memmap2    = { workspace = true }
 blake3     = { workspace = true }

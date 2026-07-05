@@ -28,20 +28,50 @@ cargo run -p snip-mobile --features cli --bin uniffi-bindgen -- \
     generate --library "target/debug/lib${CRATE}.dylib" \
     --language swift --out-dir "$GEN_DIR"
 
-echo "── 3/4 assembling XCFramework"
-# xcodebuild wants one headers dir per slice containing the C header +
-# a modulemap named exactly module.modulemap.
-HDR="$GEN_DIR/include"
-rm -rf "$HDR"
-mkdir -p "$HDR"
-cp "$GEN_DIR/${CRATE}FFI.h" "$HDR/"
-cp "$GEN_DIR/${CRATE}FFI.modulemap" "$HDR/module.modulemap"
+echo "── 3/4 assembling XCFramework (framework-style)"
+# Framework-style slices so the modulemap lives inside the framework
+# bundle: library-style xcframeworks copy headers into the shared
+# products include/ dir, which collides with other packages doing the
+# same (e.g. Clibsodium).
+FW_WORK="$GEN_DIR/frameworks"
+rm -rf "$FW_WORK"
+for SLICE in aarch64-apple-ios aarch64-apple-ios-sim; do
+    FW="$FW_WORK/$SLICE/${CRATE}FFI.framework"
+    mkdir -p "$FW/Headers" "$FW/Modules"
+    cp "target/$SLICE/$PROFILE/lib${CRATE}.a" "$FW/${CRATE}FFI"
+    cp "$GEN_DIR/${CRATE}FFI.h" "$FW/Headers/"
+    cat > "$FW/Modules/module.modulemap" <<MODEOF
+framework module ${CRATE}FFI {
+    umbrella header "${CRATE}FFI.h"
+    export *
+    module * { export * }
+}
+MODEOF
+    cat > "$FW/Info.plist" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.sumchain.snip-mobile-ffi</string>
+	<key>CFBundleName</key>
+	<string>${CRATE}FFI</string>
+	<key>CFBundlePackageType</key>
+	<string>FMWK</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>MinimumOSVersion</key>
+	<string>16.0</string>
+</dict>
+</plist>
+PLISTEOF
+done
 
 rm -rf "$PKG_DIR/SnipCore.xcframework"
 mkdir -p "$PKG_DIR"
 xcodebuild -create-xcframework \
-    -library "target/aarch64-apple-ios/$PROFILE/lib${CRATE}.a" -headers "$HDR" \
-    -library "target/aarch64-apple-ios-sim/$PROFILE/lib${CRATE}.a" -headers "$HDR" \
+    -framework "$FW_WORK/aarch64-apple-ios/${CRATE}FFI.framework" \
+    -framework "$FW_WORK/aarch64-apple-ios-sim/${CRATE}FFI.framework" \
     -output "$PKG_DIR/SnipCore.xcframework"
 
 echo "── 4/4 laying out SwiftPM package"

@@ -21,7 +21,7 @@ required-features = ["cli"]
 cli = ["uniffi/cli"]
 
 [dependencies]
-sum-node   = { path = "../sum-node" }
+sum-node   = { path = "../sum-node", default-features = false }
 sum-net    = { workspace = true }
 sum-store  = { workspace = true }
 sum-types  = { workspace = true }

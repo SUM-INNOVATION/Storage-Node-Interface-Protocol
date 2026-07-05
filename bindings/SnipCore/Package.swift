@@ -12,7 +12,13 @@ let package = Package(
         .target(
             name: "SnipCore",
             dependencies: ["SnipCoreFFI"],
-            path: "Sources/SnipCore"
+            path: "Sources/SnipCore",
+            linkerSettings: [
+                // libp2p's transports reference SystemConfiguration symbols
+                // (reachability, dynamic store); all are exported by the
+                // iOS SDK but the framework must be linked explicitly.
+                .linkedFramework("SystemConfiguration")
+            ]
         ),
     ]
 )

@@ -6,6 +6,12 @@ license.workspace    = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["mdns"]
+# LAN discovery; excluded on iOS where if-watch links macOS-only
+# SystemConfiguration symbols.
+mdns = ["libp2p/mdns"]
+
 [dependencies]
 sum-types  = { workspace = true }
 libp2p     = { workspace = true }

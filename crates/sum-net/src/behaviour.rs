@@ -1,7 +1,9 @@
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, mdns, relay, request_response,
+    autonat, dcutr, gossipsub, identify, kad, relay, request_response,
     swarm::NetworkBehaviour,
 };
+#[cfg(feature = "mdns")]
+use libp2p::mdns;
 
 use crate::codec::VersionedShardCodec;
 
@@ -22,6 +24,7 @@ use crate::codec::VersionedShardCodec;
 /// - `Dcutr(dcutr::Event)`
 #[derive(NetworkBehaviour)]
 pub struct LocalMeshBehaviour {
+    #[cfg(feature = "mdns")]
     pub mdns: mdns::tokio::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub identify: identify::Behaviour,

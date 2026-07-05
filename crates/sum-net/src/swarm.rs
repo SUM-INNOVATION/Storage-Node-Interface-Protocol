@@ -4,10 +4,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
+#[cfg(feature = "mdns")]
+use libp2p::mdns;
 use libp2p::{
     Multiaddr, PeerId, SwarmBuilder, dcutr, gossipsub, identify,
     identity::Keypair,
-    kad, mdns,
+    kad,
     multiaddr::Protocol,
     request_response::{self, ProtocolSupport, ResponseChannel},
     swarm::SwarmEvent,
@@ -186,6 +188,7 @@ impl SumSwarm {
                 > {
                     let local_peer_id = key.public().to_peer_id();
 
+                    #[cfg(feature = "mdns")]
                     let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
 
                     let gossipsub_behaviour = gossipsub::Behaviour::new(
@@ -225,6 +228,7 @@ impl SumSwarm {
                     let dcutr = dcutr::Behaviour::new(local_peer_id);
 
                     Ok(LocalMeshBehaviour {
+                        #[cfg(feature = "mdns")]
                         mdns,
                         gossipsub: gossipsub_behaviour,
                         identify,
@@ -240,22 +244,29 @@ impl SumSwarm {
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
             .build();
 
-        // QUIC listener (always)
-        let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", config.udp_listen_port)
-            .parse()
-            .context("invalid QUIC listen multiaddr")?;
-        swarm
-            .listen_on(quic_addr)
-            .context("failed to bind QUIC listener")?;
-
-        // TCP listener (WAN mode only)
-        if config.enable_wan {
-            let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", config.tcp_listen_port)
-                .parse()
-                .context("invalid TCP listen multiaddr")?;
+        // Listeners. Outbound-only clients (mobile) skip these entirely:
+        // dialing needs no listener, and unspecified-address listeners are
+        // what drives if-watch interface watching at runtime — undesirable
+        // inside an app sandbox.
+        if !config.client_mode {
+            // QUIC listener (always in node mode)
+            let quic_addr: Multiaddr =
+                format!("/ip4/0.0.0.0/udp/{}/quic-v1", config.udp_listen_port)
+                    .parse()
+                    .context("invalid QUIC listen multiaddr")?;
             swarm
-                .listen_on(tcp_addr)
-                .context("failed to bind TCP listener")?;
+                .listen_on(quic_addr)
+                .context("failed to bind QUIC listener")?;
+
+            // TCP listener (WAN mode only)
+            if config.enable_wan {
+                let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", config.tcp_listen_port)
+                    .parse()
+                    .context("invalid TCP listen multiaddr")?;
+                swarm
+                    .listen_on(tcp_addr)
+                    .context("failed to bind TCP listener")?;
+            }
         }
 
         Ok(Self {
@@ -456,6 +467,7 @@ impl SumSwarm {
     ) {
         match event {
             // ── mDNS ──────────────────────────────────────────────────────────
+            #[cfg(feature = "mdns")]
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::Mdns(e)) => {
                 discovery::handle_mdns_event(
                     e,
