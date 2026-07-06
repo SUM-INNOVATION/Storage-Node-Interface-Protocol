@@ -89,7 +89,7 @@ What the script does, in order:
    `${PREFIX}/bin` (default `$HOME/.local/bin`).
 6. Warns if the install dir is not on `$PATH`.
 
-The script itself lives at [`scripts/install.sh`](../scripts/install.sh)
+The script itself lives at [`scripts/install.sh`](../../scripts/install.sh)
 in the repository. The release-asset copy is bit-identical to the
 copy at the matching tag.
 

@@ -3,7 +3,7 @@
 Concise field guide for operators standing up a SNIP archive node on
 mainnet. Pairs with — and references — the canonical documents:
 
-- [`CHAIN-COMPAT.md`](CHAIN-COMPAT.md) "Mainnet pin / deployed chain"
+- [`CHAIN-COMPAT.md`](../reference/CHAIN-COMPAT.md) "Mainnet pin / deployed chain"
   — wire facts (`chain_id`, RPC, `v2_enabled_from_height`, TxPayload
   tags, intentionally-used RPC methods).
 - [`OPERATOR-RUNBOOK.md`](OPERATOR-RUNBOOK.md) — runbook with

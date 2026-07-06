@@ -2,7 +2,7 @@
 
 This document is the source of truth for which operating systems
 and environments SNIP supports, in which roles, and at what
-maturity level. The compact summary in [`README.md`](../README.md)
+maturity level. The compact summary in [`README.md`](../../README.md)
 points back here for the full rationale and per-environment setup
 recipes.
 
@@ -92,7 +92,7 @@ validation window. A prebuilt aarch64 tarball is a candidate for
 `v0.4.1+` once that validation lands.
 
 For the full mainnet archive bring-up flow see
-[`MAINNET-BRINGUP.md`](MAINNET-BRINGUP.md).
+[`MAINNET-BRINGUP.md`](../operations/MAINNET-BRINGUP.md).
 
 ### macOS (Apple Silicon)
 

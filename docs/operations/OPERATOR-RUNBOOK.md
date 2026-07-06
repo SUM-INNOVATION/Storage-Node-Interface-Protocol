@@ -1,7 +1,7 @@
 # Operator runbook
 
 How to run, monitor, and recover a SNIP node. Pairs with
-[`README.md`](../README.md) (design rationale) and
+[`README.md`](../../README.md) (design rationale) and
 [`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md) (release flow).
 
 > All command examples use placeholders — `<merkle-root-hex>`,
@@ -16,14 +16,14 @@ How to run, monitor, and recover a SNIP node. Pairs with
 Before starting any node, confirm:
 
 1. **Toolchain.** `rustc --version` matches
-   [`rust-toolchain.toml`](../rust-toolchain.toml). The repo pins
+   [`rust-toolchain.toml`](../../rust-toolchain.toml). The repo pins
    `stable`; pre-`1.85` toolchains will not build (`edition = "2024"`).
 2. **Workspace path.** The repo MUST live on a non-iCloud, non-cloud-
    synced filesystem. Cloud-sync layers will silently evict source
    files and `Cargo.toml` artifacts during builds, causing
    `crate ... required to be available in rlib format` errors that
    survive `cargo clean`.
-3. **Chain compatibility.** Read [`CHAIN-COMPAT.md`](CHAIN-COMPAT.md).
+3. **Chain compatibility.** Read [`CHAIN-COMPAT.md`](../reference/CHAIN-COMPAT.md).
    Confirm the internal chain release tag SNIP is built against
    matches the chain you're connecting to. Live-chain pinning is
    provided out-of-band by chain ops.
@@ -56,7 +56,7 @@ keypair and runs in dev mode (PoR disabled, warning logged at
 startup) — never acceptable in production.
 
 > The seed never leaves disk; logs print only the derived peer ID
-> and L1 address (verified by [`PRIVACY-AUDIT.md`](PRIVACY-AUDIT.md)).
+> and L1 address (verified by [`PRIVACY-AUDIT.md`](../reference/PRIVACY-AUDIT.md)).
 > Treat the seed file like a wallet private key: off-machine
 > backup, no chat, no tickets, no PRs.
 
@@ -131,7 +131,7 @@ cargo run --release -p sum-node -- \
 ## Mainnet bring-up
 
 Sequence for bringing a brand-new archive operator onto live
-mainnet. Read [`CHAIN-COMPAT.md`](CHAIN-COMPAT.md) "Mainnet pin /
+mainnet. Read [`CHAIN-COMPAT.md`](../reference/CHAIN-COMPAT.md) "Mainnet pin /
 deployed chain" first — the values quoted below are operator-
 visible facts confirmed at the pinned chain commit.
 
@@ -356,7 +356,7 @@ V2 client integration testing. It is NOT production, NOT a public
 testnet, and NOT representative of liveness or security
 characteristics. Use it only to validate that SNIP talks to the
 chain wire shape correctly at the pinned commit
-([`CHAIN-COMPAT.md`](CHAIN-COMPAT.md)).
+([`CHAIN-COMPAT.md`](../reference/CHAIN-COMPAT.md)).
 
 Validator keys are generated on first boot into a Docker named
 volume. No validator signing material, faucet privates, or test
@@ -568,7 +568,7 @@ the next workstream.
   - `info,sum_node::download_private=debug` — debug just the Private
     download path.
   - `warn` — production noise floor.
-- **Metrics.** [`metrics.rs`](../crates/sum-node/src/metrics.rs)
+- **Metrics.** [`metrics.rs`](../../crates/sum-node/src/metrics.rs)
   exposes `MetricsSnapshot` (chunks served, peers connected, fetches
   in flight, GC churn). Currently log-only; a Prometheus exporter
   is on the roadmap. Inspect via
@@ -605,6 +605,6 @@ the next workstream.
   on-disk cache of ciphertext + bundle remains decryptable. For
   forward secrecy, revoke + re-ingest under a fresh `K_file`.
 - Logs do not contain seed, `K_file`, X25519 secret, or plaintext.
-  Pinned by [`PRIVACY-AUDIT.md`](PRIVACY-AUDIT.md) and the audit
-  guardrail in [`scripts/audit-logs.sh`](../scripts/audit-logs.sh)
+  Pinned by [`PRIVACY-AUDIT.md`](../reference/PRIVACY-AUDIT.md) and the audit
+  guardrail in [`scripts/audit-logs.sh`](../../scripts/audit-logs.sh)
   (lands in WS4).

@@ -50,7 +50,7 @@ applies to every future re-pin: the SHA must be from a chain
 history that contains no validator keys, dev seeds, faucet
 privates, or any other signing material.
 
-Re-pinning procedure is in [`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md).
+Re-pinning procedure is in [`RELEASE-CHECKLIST.md`](../operations/RELEASE-CHECKLIST.md).
 
 ## Mainnet pin / deployed chain
 
@@ -173,9 +173,9 @@ URL is to gate on the smoke check before any first write.
 > end-to-end is the next workstream; until it lands, operators
 > can still smoke-check the running mirror via
 > `make smoke RPC=http://localhost:8545`. See
-> [`OPERATOR-RUNBOOK.md`](OPERATOR-RUNBOOK.md) for bring-up /
+> [`OPERATOR-RUNBOOK.md`](../operations/OPERATOR-RUNBOOK.md) for bring-up /
 > stop / wipe commands and
-> [`RELEASE-CHECKLIST.md`](RELEASE-CHECKLIST.md) § 5 for the
+> [`RELEASE-CHECKLIST.md`](../operations/RELEASE-CHECKLIST.md) § 5 for the
 > release-flow integration.
 
 ## V2 enablement gate (load-bearing)
@@ -203,7 +203,7 @@ match params.v2_enabled_from_height {
 null to 0 to simplify" regression would silently flip a V2-disabled
 chain into a V2-permitting one and burn fees on submissions the
 chain will reject. The `chain_params_v2_enabled_from_height_zero_is_some_zero`
-test in [`crates/sum-types/src/rpc_types.rs`](../crates/sum-types/src/rpc_types.rs)
+test in [`crates/sum-types/src/rpc_types.rs`](../../crates/sum-types/src/rpc_types.rs)
 exists specifically to catch that regression.
 
 ## Pinned wire-format constants (public protocol)
@@ -232,7 +232,7 @@ identify any environment.
 
 Variant-tag stability is enforced by the `v2_op_variant_indices_are_stable`
 and `payload_v2_variant_indices_are_stable` tests in
-[`crates/sum-node/src/tx_builder.rs`](../crates/sum-node/src/tx_builder.rs).
+[`crates/sum-node/src/tx_builder.rs`](../../crates/sum-node/src/tx_builder.rs).
 A diff to these tests is a hard chain-compat break and MUST land in
 its own commit referencing the chain release tag.
 
@@ -240,7 +240,7 @@ its own commit referencing the chain release tag.
 
 The bincode-v1 byte layout of every V2 transaction SNIP submits is
 pinned by deterministic fixtures in
-[`crates/sum-node/src/tx_builder.rs`](../crates/sum-node/src/tx_builder.rs):
+[`crates/sum-node/src/tx_builder.rs`](../../crates/sum-node/src/tx_builder.rs):
 
 - `fixture_register_encryption_key_bytes`
 - `fixture_register_file_pending_v2_bytes`
@@ -263,7 +263,7 @@ chain-team coordination.
 
 ## RPC contract tests
 
-Pinned in [`crates/sum-node/src/rpc_client.rs`](../crates/sum-node/src/rpc_client.rs)
+Pinned in [`crates/sum-node/src/rpc_client.rs`](../../crates/sum-node/src/rpc_client.rs)
 under `rpc_client::contract_tests`:
 
 - `storage_get_file_info_v2_decodes_success_shape`
@@ -275,7 +275,7 @@ under `rpc_client::contract_tests`:
 - `account_get_encryption_public_key_tolerates_legacy_shapes`
 
 `ChainParamsInfo` deserialization is pinned in
-[`crates/sum-types/src/rpc_types.rs`](../crates/sum-types/src/rpc_types.rs):
+[`crates/sum-types/src/rpc_types.rs`](../../crates/sum-types/src/rpc_types.rs):
 
 - `chain_params_decodes_canonical_shape`
 - `chain_params_v2_enabled_from_height_null_is_none`
@@ -335,4 +335,4 @@ is run before each release.
 5. Run `make release-check` (linux CI gate). When local-mirror
    E2E is unblocked, run that suite against the new chain commit
    too; until then, fixture + contract tests are the gate.
-6. Update [`CHANGELOG.md`](../CHANGELOG.md).
+6. Update [`CHANGELOG.md`](../../CHANGELOG.md).

@@ -2,7 +2,7 @@
 
 Run these checks in order before tagging and shipping a SNIP release.
 Anything that fails blocks the release; anything that warns goes in
-[`CHANGELOG.md`](../CHANGELOG.md) under "Known issues."
+[`CHANGELOG.md`](../../CHANGELOG.md) under "Known issues."
 
 > Examples below use placeholders for environment-specific values:
 > `<internal-chain-release-tag>`, `<chain-rpc-host>`,
@@ -13,7 +13,7 @@ Anything that fails blocks the release; anything that warns goes in
 ## 0. CI gate (one-time setup, then automated)
 
 Every PR runs `make release-check` on `ubuntu-24.04` via
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml). The job
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml). The job
 is named exactly `release-check (linux)` so a GitHub branch-
 protection rule can require it by stable name.
 
@@ -66,12 +66,12 @@ Equivalent to:
 
 If `lint-strict` fails on a warning class that can't be fixed in
 this release, do NOT add a blanket `#[allow]`. Document the
-exemption in the commit message and in [`Cargo.toml`](../Cargo.toml)
+exemption in the commit message and in [`Cargo.toml`](../../Cargo.toml)
 `[workspace.lints.clippy]` with rationale.
 
 ## 3. Chain compatibility
 
-- [ ] [`CHAIN-COMPAT.md`](CHAIN-COMPAT.md) "Pinned chain version"
+- [ ] [`CHAIN-COMPAT.md`](../reference/CHAIN-COMPAT.md) "Pinned chain version"
       row holds an actual SHA. The SHA MUST be from a chain
       history that contains no committed signing material; if
       chain ops rewrote history to scrub secrets, confirm the
@@ -161,7 +161,7 @@ verify all three:
 3. **Each WS2b role address has a non-zero balance** (only
    applies if you brought the mirror up with the funded-test-
    accounts overlay; see
-   [`OPERATOR-RUNBOOK.md`](../docs/OPERATOR-RUNBOOK.md)
+   [`OPERATOR-RUNBOOK.md`](OPERATOR-RUNBOOK.md)
    "Funded test accounts" for the per-role balance check
    loop).
 
@@ -175,7 +175,7 @@ docker-compose -f deploy/snip-local-mirror.yaml down -v    # wipe + regen keys
 ```
 
 Optional fresh-genesis funded accounts: see
-[`OPERATOR-RUNBOOK.md`](../docs/OPERATOR-RUNBOOK.md)
+[`OPERATOR-RUNBOOK.md`](OPERATOR-RUNBOOK.md)
 "Funded test accounts (optional, fresh-genesis only)". The
 overlay file MUST use numeric balances (`{ "<base58>": <int>,
 ... }`), not string-encoded balances. Compose volume mounts MUST
@@ -224,7 +224,7 @@ recovery, V1 legacy compatibility.
       for forbidden tokens (`k_file`, `seed`, `x25519_secret`,
       `bundle_hex`, `encrypted_key_bundle`, raw `plaintext`) inside
       log-macro format strings.
-- [ ] Each row in [`PRIVACY-AUDIT.md`](PRIVACY-AUDIT.md) still has a
+- [ ] Each row in [`PRIVACY-AUDIT.md`](../reference/PRIVACY-AUDIT.md) still has a
       pinning test reference; new threats added since last release
       have new rows.
 
@@ -259,7 +259,7 @@ section defines *what* must be true to promote; that guide describes
       but not sufficient.
 
 - [ ] **Mainnet read-only smoke.** Against the live mainnet RPC at
-      the chain commit listed in [`CHAIN-COMPAT.md`](CHAIN-COMPAT.md)
+      the chain commit listed in [`CHAIN-COMPAT.md`](../reference/CHAIN-COMPAT.md)
       "Mainnet pin / deployed chain":
 
       ```bash
@@ -304,9 +304,9 @@ final `vX.Y.Z` tag.
 
 ## 8. Tag and ship
 
-- [ ] Bump version in [`Cargo.toml`](../Cargo.toml)
+- [ ] Bump version in [`Cargo.toml`](../../Cargo.toml)
       `[workspace.package].version`.
-- [ ] Update [`CHANGELOG.md`](../CHANGELOG.md):
+- [ ] Update [`CHANGELOG.md`](../../CHANGELOG.md):
   - Move "Unreleased" entries under a new
     `## [vX.Y.Z] — YYYY-MM-DD`.
   - Restate Phase / chain-version compatibility against
@@ -318,7 +318,7 @@ final `vX.Y.Z` tag.
 ### 8a. Verify the prebuilt-binary draft release
 
 Pushing the tag triggers
-[`.github/workflows/release.yml`](../.github/workflows/release.yml),
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml),
 which builds the Linux x86_64 release binaries, packages them as
 `snip-vX.Y.Z-linux-x86_64.tar.gz`, computes `SHA256SUMS`, and
 uploads those plus `scripts/install.sh` to a **draft** GitHub
