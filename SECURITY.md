@@ -13,7 +13,7 @@
 
 Report vulnerabilities by emailing the SUM Innovation security team:
 
-**security@suminnovation.xyz**
+**michael@suminnovation.xyz**
 
 Include:
 - A description of the vulnerability and its impact
