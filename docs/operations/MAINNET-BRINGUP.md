@@ -69,7 +69,7 @@ Each host:
 ```bash
 git clone https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol.git
 cd Storage-Node-Interface-Protocol
-git checkout v0.4.0-rc3    # or the current release-candidate tag
+git checkout v0.4.0-rc4    # or the current release-candidate tag
 
 make release-check
 # fmt + lint + tests + release build + audit-logs; must end with `release-check: ok`
@@ -424,7 +424,7 @@ pass and Private V2 has its own throwaway round-trip on record.
 - Seed files: never in git, never in chat, never in tickets, never
   in plaintext backups. `chmod 600`; off-machine backup only if
   encrypted at rest.
-- Mainnet `chain_id` is `1`. Local mirror `chain_id` is `31337`.
+- Mainnet `chain_id` is `1`. Local mirror `chain_id` is `1337`.
   If you ever see a smoke output reporting the wrong `chain_id`,
   you are pointed at the wrong RPC — STOP, do not write.
 - The chain side's RocksDB / Docker / validator-binary
@@ -458,8 +458,8 @@ When promoting:
   output reported, and the three archive L1 addresses from § 6.
 - Cut `v0.4.0` as a new annotated tag at the **latest
   release-candidate commit** that has passed all four gates —
-  not necessarily `rc3`. If a follow-up rc lands docs or other
-  changes after rc3 (this guide is itself one such follow-up),
+  not necessarily `rc4`. If a follow-up rc lands docs or other
+  changes after rc4 (this guide is itself one such follow-up),
   promote from the rc that includes them.
 
 If any gate fails, fix on a follow-up branch, ship a higher rc,

@@ -59,7 +59,7 @@ are WSL2 and Crostini respectively.
 
 ### Linux x86_64 / aarch64 (primary)
 
-Validated on mainnet (`v0.4.0-rc3` bring-up: three archive nodes
+Validated on mainnet (`v0.4.0-rc4` bring-up: three archive nodes
 on Hetzner CX21 VPSs, first Public V2 round-trip byte-identical).
 
 **Linux x86_64 has a prebuilt tarball.** This is the only cell

@@ -141,7 +141,7 @@ Confirm at runtime, never assume.
 
 | Field                      | Mainnet                   | Local mirror              |
 |----------------------------|---------------------------|---------------------------|
-| `chain_id`                 | `1`                       | `31337`                   |
+| `chain_id`                 | `1`                       | `1337`                    |
 | RPC                        | `https://rpc.sumchain.io` | `http://localhost:8545`   |
 | `v2_enabled_from_height`   | `5200000`                 | `0` (V2 from genesis)     |
 
@@ -386,7 +386,7 @@ make smoke RPC=http://localhost:8545
 
 Expected:
 
-- `chain_getChainParams` returns `chain_id = 31337` and
+- `chain_getChainParams` returns `chain_id = 1337` and
   `v2_enabled_from_height = 0` → SNIP reports
   `V2 state: ENABLED_FROM_GENESIS`.
 - `chain_getBlockHeight(["finalized"])` returns
@@ -499,7 +499,7 @@ compose override file:
 After bringing the mirror up with the overlay, verify three
 properties before running any test:
 
-1. **`chain_id` returns `31337`** — confirms the mirror booted
+1. **`chain_id` returns `1337`** — confirms the mirror booted
    and the RPC endpoint matches the documented value.
 2. **Block height advances** — confirms the validator is
    producing blocks (not stuck mid-genesis).
