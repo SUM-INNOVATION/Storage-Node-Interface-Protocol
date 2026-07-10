@@ -72,8 +72,28 @@ Set `--visibility private` on `ingest-v2` ([crates/sum-node/src/main.rs:182-197]
 
 If anything after step 2 fails — a network partition, a slow chain, or a missing manifest ACK — the file is left `Pending` on chain. Two operator commands recover:
 
-- **`sum-node resume <merkle_root> <path>`** — re-chunks the file (asserts the path's computed merkle_root equals the one passed; otherwise typed `RootMismatch`), reads chain state, and runs only the residual work. If the file is already `Active`, no-op (reports the chain-recorded heights). If `Abandoned`, terminal. Otherwise pulls `coverage.missing_indices` (paginated via `missing_offset`) and runs a partial push wave restricted to those chunk indices, then re-runs ManifestPush (idempotent on receivers), then waits for coverage, then activates.
+- **`sum-node resume <merkle_root> <path>`** — re-chunks the file (asserts the path's computed merkle_root equals the one passed; otherwise typed `RootMismatch`), reads chain state, and runs only the residual work. If the file is already `Active`, no-op (reports the chain-recorded heights). If `Abandoned`, terminal. Otherwise pulls `coverage.missing_indices` (paginated via `missing_offset`) and runs a partial push wave restricted to those chunk indices, then re-runs ManifestPush (idempotent on receivers), then waits for coverage, then activates. `resume` always re-queries `storage_getActiveNodesAtHeight(assignment_height)` — the pinned height from `storage_getFileInfoV2` — so successive `resume` calls hit the same historical snapshot.
 - **`sum-node abandon <merkle_root>`** — pre-checks lifecycle is Pending and `current_height > created_at + activation_grace_blocks` before submitting (otherwise returns `NotAdmissible` with the earliest admissible height; saves a wasted tx fee). On success, the file is permanently Abandoned and 90 % of the deposit refunds.
+
+### Runtime `R` and boundary handling
+
+The V2 replication factor is not a compile-time constant. Every write path derives `R` from `chain_getChainParams.assignment_replication_factor` at process entry (`main.rs::run_listen`, `run_ingest_v2`, `run_resume_v2`, `run_ingest`, `run_download`) and threads it as `V2Params::assignment_replication_factor` through the pipeline, PushValidator, AssignmentAttestor, MarketSync, and GC. The dev-fallback constant `DEFAULT_REPLICATION_FACTOR` (formerly `REPLICATION_FACTOR`) is used ONLY in `NodeProfile::Dev` when the RPC fails; production hard-fails.
+
+Effective replication is `min(configured_r, eligible_snapshot.len())` — the same clamp that `sum-chain/crates/primitives/src/storage_metadata.rs:299-302` applies chain-side. Two boundary cases have explicit disposition:
+
+- **`R = 0`** — no assignment can be built for any chunk. The fresh ingest paths (`IngestPipeline::run`, `run_private`) and `resume` return `IngestOutcome::Failed { stage: Register }` BEFORE any RPC. No `RegisterFilePendingV2` is submitted; the on-chain Pending file (if any) is unchanged.
+- **Pinned assignment snapshot empty after `filter_active_archives`** — S1 has already finalized, but `storage_getActiveNodesAtHeight(assignment_height)` returns zero eligible archives. The pipeline returns `IngestOutcome::PendingNeedsAction { suggested: Abandon }` with the manifest preserved. The pinned assignment height is historical and immutable: subsequent `resume` calls will observe the same empty snapshot. External `ReassignChunksV2` (post-#62 chain call) is the only chain-side recovery; it is not implemented in this release, so the operator recourse is `abandon`.
+
+### Post-#62 `AssignmentCoverageV2` fields (observability)
+
+`AssignmentCoverageV2` carries four fields introduced by upstream `sum-chain` issue #62:
+
+- `assignment_epochs: Vec<u64>` — every epoch for which the chain has recorded coverage on this file.
+- `latest_assignment_epoch: u64` — the epoch whose targets the chain considers current for admission.
+- `reassignment_needed: bool` — the chain has decided the file needs `ReassignChunksV2`.
+- `per_epoch: Vec<AssignmentEpochCoverageV2>` — per-epoch shape of covered/missing indices.
+
+All four decode with `#[serde(default)]` so legacy chain responses that omit them continue to work. `AssignmentCoverageV2::resolved_latest_epoch()` returns `Some(latest_assignment_epoch)` when at least one epoch is populated, `None` otherwise — this lets callers distinguish a legacy response from a post-#62 response with a real epoch-0 result. Aggregate `can_activate_now` semantics are unchanged post-#62 (see upstream `storage_metadata.rs:2181-2200`). SNIP consumes these fields for observability only; `ReassignChunksV2` submission is not implemented and is tracked in the roadmap.
 
 ### V2 vs V1 — when does each one fire?
 
