@@ -221,8 +221,12 @@ impl AttestTriggerRpc for L1RpcClient {
 
     async fn fetch_snapshot(&self, height: u64) -> Result<Vec<[u8; 20]>> {
         let raw = L1RpcClient::storage_get_active_nodes_at_height(self, height).await?;
-        let mut decoded = Vec::with_capacity(raw.len());
-        for record in raw {
+        // Apply the shared eligibility contract before address decode
+        // so the attestor's snapshot input excludes Slashed/Unbonding/
+        // Withdrawn/unknown-future and Validator rows.
+        let filtered = sum_types::rpc_types::filter_active_archives(raw);
+        let mut decoded = Vec::with_capacity(filtered.len());
+        for record in filtered {
             let addr = l1_address_from_base58(&record.address)?;
             decoded.push(addr);
         }

@@ -571,6 +571,8 @@ async fn fetch_manifest_v2(
                 "storage_getActiveNodesAtHeight: {e}"
             ))
         })?;
+    // Apply the shared eligibility contract before address decode.
+    let snapshot_records = sum_types::rpc_types::filter_active_archives(snapshot_records);
     let mut snapshot: Vec<[u8; 20]> = Vec::with_capacity(snapshot_records.len());
     for n in &snapshot_records {
         let addr = sum_net::identity::l1_address_from_base58(&n.address).map_err(|e| {
@@ -581,8 +583,8 @@ async fn fetch_manifest_v2(
     snapshot.sort();
     if snapshot.is_empty() {
         return Err(PrivateDownloadError::ManifestFetch(anyhow::anyhow!(
-            "snapshot at assignment_height={} has no active archives — \
-             cannot route manifest request",
+            "snapshot at assignment_height={} has no eligible ArchiveNode/Active \
+             archives — cannot route manifest request",
             info.assignment_height
         )));
     }
@@ -915,6 +917,8 @@ async fn fetch_all_ciphertext_chunks_v2(
         .storage_get_active_nodes_at_height(info.assignment_height)
         .await
         .map_err(|e| (0u32, anyhow::anyhow!("storage_getActiveNodesAtHeight: {e}")))?;
+    // Apply the shared eligibility contract before address decode.
+    let snapshot_records = sum_types::rpc_types::filter_active_archives(snapshot_records);
     let mut snapshot: Vec<[u8; 20]> = Vec::with_capacity(snapshot_records.len());
     for n in &snapshot_records {
         let addr = sum_net::identity::l1_address_from_base58(&n.address)
@@ -926,7 +930,8 @@ async fn fetch_all_ciphertext_chunks_v2(
         return Err((
             0,
             anyhow::anyhow!(
-                "snapshot at assignment_height={} has no active archives — cannot route chunk requests",
+                "snapshot at assignment_height={} has no eligible ArchiveNode/Active \
+                 archives — cannot route chunk requests",
                 info.assignment_height
             ),
         ));

@@ -95,6 +95,53 @@ exemption in the commit message and in [`Cargo.toml`](../../Cargo.toml)
       ```bash
       cargo test -p sum-types chain_params_v2_enabled_from_height
       ```
+- [ ] No stale `REPLICATION_FACTOR` constant references, no
+      hard-coded `3` in eligibility / assignment call sites, no
+      unfiltered raw `NodeRecordInfo` slices reaching an assignment
+      consumer. Run the audit:
+      ```bash
+      rg -n --glob '!target' --glob '!docs' --glob '!CHANGELOG.md' \
+        --glob '!tests/**' \
+        -e '\bREPLICATION_FACTOR\b' \
+        -e 'assignment_replication_factor\s*:\s*3\b' \
+        -e 'assigned_archives\([^)]*,\s*3\s*\)' \
+        -e 'compute_chunk_assignment\([^)]*,\s*3\s*\)' \
+        -e 'chunks_for_archive_v2\([^)]*,\s*3\s*[,)]'
+      ```
+      Allowlist (rg hits below are load-bearing and safe):
+        * `crates/sum-types/src/storage.rs` — `pub const DEFAULT_REPLICATION_FACTOR`
+          plus the single-line `#[deprecated]` alias
+          `REPLICATION_FACTOR` (kept to avoid breaking downstream
+          constants; new call sites use `DEFAULT_REPLICATION_FACTOR`).
+        * `crates/sum-node/src/runtime_params.rs` — one reference to
+          the deprecated alias inside a `#[allow(deprecated)]` test
+          that verifies the alias still resolves to the same value.
+        * `crates/sum-store/src/assignment*.rs` — inline unit-test
+          modules (`#[cfg(test)] mod tests`) drive the pure
+          assignment kernel with deterministic replication factors;
+          these are not production callers.
+        * `crates/sum-node/src/*/tests` — deliberate boundary-test
+          fixtures (`assignment_replication_factor: 5` / `: 2` /
+          `: 7`, plus `assigned_archives(..., 3)` /
+          `chunks_for_archive_v2(..., 3, ...)` for R>N and R<N
+          coverage).
+      Any hit outside the allowlist is a regression: replace with
+      the runtime `R` threaded from
+      `RuntimeChainParams::assignment_replication_factor` before
+      merging.
+- [ ] The four post-#62 `AssignmentCoverageV2` fields deserialize
+      from a legacy (pre-#62) chain response — no panics, defaults
+      to the empty-epoch shape:
+      ```bash
+      cargo test -p sum-types resolved_latest_epoch
+      cargo test -p sum-types coverage_v2_forward_compat
+      ```
+- [ ] R=0 preflight and pinned-empty-snapshot recovery paths
+      still fire — regression coverage lives at
+      `crates/sum-node/src/ingest_v2.rs`:
+      ```bash
+      cargo test -p sum-node v2_ingest_r_0 v2_resume_r_0 v2_ingest_post_s1_empty v2_resume_reuses
+      ```
 
 ## 4. Live-chain smoke (manual, read-only)
 

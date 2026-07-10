@@ -47,6 +47,46 @@ scheduler are described in [`../protocol/proof-of-retrievability.md`](../protoco
   [`crates/sum-node/src/rpc_client.rs`](../../crates/sum-node/src/rpc_client.rs)
   `contract_tests` and [`crates/sum-types/src/rpc_types.rs`](../../crates/sum-types/src/rpc_types.rs).
 
+## Active-archive eligibility contract
+
+Every SNIP consumer of a `storage_getActiveNodes` /
+`storage_getActiveNodesAtHeight` response narrows the returned
+records to exactly-eligible archives before any address decode. The
+contract is:
+
+```
+role == "ArchiveNode" && status == "Active"
+```
+
+matched byte-for-byte against the strings the chain produces via
+`format!("{:?}", NodeRole)` / `format!("{:?}", NodeStatus)`.
+Records with role `"Validator"` or with status `"Slashed"`,
+`"Unbonding"`, `"Withdrawn"`, or any future unknown-status string
+are ineligible.
+
+Implemented as `NodeRecordInfo::is_active_archive(&self) -> bool`
+and the shared filter helper `filter_active_archives(...)` in
+[`crates/sum-types/src/rpc_types.rs`](../../crates/sum-types/src/rpc_types.rs).
+
+**Consumer audit** — the filter is applied at every SNIP site that
+treats an active-nodes response as assignment-eligible input:
+
+| Consumer | Site |
+|---|---|
+| V1 upload orchestrator | `crates/sum-node/src/upload.rs::run` |
+| V1 download holder map | `crates/sum-node/src/download.rs::build_holder_map` |
+| MarketSync (V1 self-heal) + GC retained-set | `crates/sum-node/src/market_sync.rs::sync_cycle` |
+| V2 ingest / resume snapshot | `crates/sum-node/src/ingest_v2.rs::fetch_assignment_inputs` and `run_resume_v2` snapshot |
+| V2 push validator admission cache | `crates/sum-node/src/push_validator.rs::fetch_snapshot` |
+| V2 public routing | `crates/sum-node/src/download_v2_routing.rs::build_v2_assignment_view` |
+| V2 private manifest routing | `crates/sum-node/src/download_private.rs` (manifest fetch + chunk fanout) |
+| V2 inbound attest trigger | `crates/sum-node/src/inbound_v2.rs::AttestTriggerRpc::fetch_snapshot` |
+| Operator readiness gate | `crates/sum-node/src/bin/e2e_helper.rs::build_active_nodes_report` — uses `is_active_archive` for `--require-archives`, keeps role×status tally for operator visibility |
+
+The receive-side V2 attestor (`assignment_attestor.rs`) inherits an
+already-filtered snapshot from the dispatcher above and does not
+apply an additional filter.
+
 ## What SNIP does not read
 
 SNIP does not depend on `sum-chain`-internal storage layouts (CF

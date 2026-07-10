@@ -70,6 +70,29 @@ Add one that lands the file in `Pending`, waits past
 `activation_grace_blocks`, and confirms the abandon lifecycle
 against the running mirror.
 
+### Chain-side `ReassignChunksV2` support (post-#62 epoch recovery)
+
+Upstream `sum-chain` issue #62 introduces per-epoch reassignment
+metadata (`assignment_epochs`, `latest_assignment_epoch`,
+`reassignment_needed`, `per_epoch`). SNIP now reads these fields
+for observability only via `AssignmentCoverageV2` and
+`AssignmentEpochCoverageV2` at
+[`crates/sum-types/src/rpc_types.rs`](../../crates/sum-types/src/rpc_types.rs).
+The `ReassignChunksV2` chain call itself is NOT implemented in this
+release; today the only supported recovery from a pinned empty
+assignment snapshot is external abandon.
+
+**Acceptance criteria** (whenever this ships):
+- New CLI subcommand or extension of `resume` that submits
+  `ReassignChunksV2` with the correct epoch reference.
+- End-to-end mirror scenario that lands a file with epoch-0
+  empty-snapshot, calls the new path, and confirms the file
+  activates against a fresh epoch snapshot.
+- Documentation update to the "Post-S1 pinned empty snapshot
+  recovery" row in
+  [`../status/implementation-status.md`](../status/implementation-status.md)
+  so the recovery path is no longer marked "external-only".
+
 ## Medium-term (candidates for v0.4.2+ / v0.5.x)
 
 ### Forward secrecy on revoke — `K_file` rotation

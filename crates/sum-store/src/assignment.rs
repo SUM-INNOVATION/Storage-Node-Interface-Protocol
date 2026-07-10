@@ -7,8 +7,6 @@
 //! to hash each (chunk, replica) pair into a position in the sorted node list,
 //! with linear probing on collision.
 
-use sum_types::storage::REPLICATION_FACTOR;
-
 /// Deterministically assign nodes to each chunk of a file.
 ///
 /// For each chunk, exactly `min(replication_factor, active_nodes.len())` unique
@@ -83,15 +81,6 @@ pub fn chunks_for_node(assignment: &[Vec<[u8; 20]>], node_address: &[u8; 20]) ->
 /// Given a full assignment, return the nodes assigned to a specific chunk.
 pub fn nodes_for_chunk(assignment: &[Vec<[u8; 20]>], chunk_index: u32) -> Option<&Vec<[u8; 20]>> {
     assignment.get(chunk_index as usize)
-}
-
-/// Convenience: compute assignment with default REPLICATION_FACTOR.
-pub fn compute_default_assignment(
-    merkle_root: &[u8; 32],
-    chunk_count: u64,
-    active_nodes: &[[u8; 20]],
-) -> Vec<Vec<[u8; 20]>> {
-    compute_chunk_assignment(merkle_root, chunk_count, active_nodes, REPLICATION_FACTOR)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

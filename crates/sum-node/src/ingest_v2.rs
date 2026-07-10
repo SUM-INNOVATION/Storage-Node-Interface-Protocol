@@ -821,6 +821,25 @@ where
 
     /// Run the full S0–S6 pipeline against `path`.
     pub async fn run(&self, path: &Path) -> IngestOutcome {
+        // ── R=0 preflight (#33) ────────────────────────────────────
+        // Mirror of `main.rs::run_ingest_v2` Preflight A, positioned as a
+        // structural guarantee at the pipeline boundary: if the
+        // runtime replication factor is 0, no assignment can be built
+        // for any chunk, so we MUST NOT emit a RegisterFilePendingV2
+        // transaction. Runs before every downstream RPC and CPU-heavy
+        // step (V2 gate, S0 chunking, S1 send).
+        if self.params.assignment_replication_factor == 0 {
+            return IngestOutcome::Failed {
+                stage: IngestStage::Register,
+                manifest: None,
+                source: anyhow::anyhow!(
+                    "ingest-v2: assignment_replication_factor is 0; refusing to \
+                     register a file with no assignment targets. No S1 tx was \
+                     submitted; no chain state created; no fees spent."
+                ),
+            };
+        }
+
         // ── V2-enabled gate ────────────────────────────────────────
         // Cheap RPC + cheap comparison; runs before any work that
         // would burn CPU (chunking) or fees (S1 tx).
@@ -888,6 +907,46 @@ where
                 };
             }
         };
+
+        // ── Post-S1 pinned-empty-snapshot guard (#33) ──────────────
+        //
+        // The authoritative snapshot at `info.assignment_height` has
+        // been fetched and filtered by `filter_active_archives`. If
+        // no eligible archives remain at that HISTORICAL height, no
+        // push can be routed and no push will be attempted. The file
+        // remains Pending on chain. Return `PendingNeedsAction` with
+        // `SuggestedAction::Abandon` — the pinned snapshot is
+        // permanent for epoch 0 (`storage_getActiveNodesAtHeight(H)`
+        // is a historical query) so subsequent ordinary `resume`
+        // cannot repair it. External `ReassignChunksV2` is an
+        // unsupported (chain-side) recovery.
+        if snapshot.is_empty() {
+            warn!(
+                assignment_height = info.assignment_height,
+                "post-S1: pinned assignment snapshot has 0 eligible archives — \
+                 no push will be dispatched; file remains Pending on chain"
+            );
+            return IngestOutcome::PendingNeedsAction {
+                merkle_root,
+                manifest,
+                failed_stage: IngestStage::Push,
+                last_coverage: None,
+                under_replicated_chunks: None,
+                suggested: SuggestedAction::Abandon,
+                source: Some(anyhow::anyhow!(
+                    "file is registered as Pending, but its pinned assignment snapshot at \
+                     height {H} contains no eligible archives (role=ArchiveNode && status=Active) \
+                     after filtering. That historical snapshot will not change when archives \
+                     join later — storage_getActiveNodesAtHeight({H}) queries chain history at a \
+                     fixed height. No chunks were pushed. Abandon the Pending file when \
+                     admissible (current_height > created_at + activation_grace_blocks), or \
+                     invoke an external ReassignChunksV2 through a chain-side builder to append \
+                     a new assignment epoch (SNIP does not implement that client-side recovery \
+                     path in this release).",
+                    H = info.assignment_height,
+                )),
+            };
+        }
 
         // Full ingest: push every chunk. Resume narrows this to
         // missing_indices via `s2_push_chunks(..., &missing_set)`.
@@ -990,6 +1049,19 @@ where
     /// merkle_root (idempotent on chain), or (b) `abandon` (chain-only,
     /// recovers fee deposit).
     pub async fn run_private(&self, path: &Path, spec: PrivateIngestSpec) -> IngestOutcome {
+        // ── R=0 preflight (#33) — see `run` for rationale ──────────
+        if self.params.assignment_replication_factor == 0 {
+            return IngestOutcome::Failed {
+                stage: IngestStage::Register,
+                manifest: None,
+                source: anyhow::anyhow!(
+                    "ingest-v2 (private): assignment_replication_factor is 0; \
+                     refusing to encrypt and register a file with no assignment \
+                     targets. No S1 tx was submitted; no chain state created."
+                ),
+            };
+        }
+
         // ── V2-enabled gate ────────────────────────────────────────
         // Private ingest is significantly more expensive (full file
         // encryption). Gate before encryption so a chain that hasn't
@@ -1081,6 +1153,31 @@ where
                 };
             }
         };
+
+        // ── Post-S1 pinned-empty-snapshot guard (#33, Private) ─────
+        if snapshot.is_empty() {
+            warn!(
+                assignment_height = info.assignment_height,
+                "post-S1 (private): pinned assignment snapshot has 0 eligible archives"
+            );
+            return IngestOutcome::PendingNeedsAction {
+                merkle_root,
+                manifest,
+                failed_stage: IngestStage::Push,
+                last_coverage: None,
+                under_replicated_chunks: None,
+                suggested: SuggestedAction::Abandon,
+                source: Some(anyhow::anyhow!(
+                    "private file is registered as Pending, but its pinned assignment snapshot \
+                     at height {H} contains no eligible archives (role=ArchiveNode && \
+                     status=Active) after filtering. That historical snapshot will not change \
+                     when archives join later. No chunks were pushed. Abandon when admissible, \
+                     or invoke an external ReassignChunksV2 (SNIP does not implement that \
+                     client-side recovery path in this release).",
+                    H = info.assignment_height,
+                )),
+            };
+        }
 
         let chunks_to_push: BTreeSet<u32> = (0..manifest.chunk_count).collect();
         let distinct_assigned = match self
@@ -1291,12 +1388,17 @@ where
     ) -> Result<(StorageFileInfoV2, Vec<[u8; 20]>)> {
         let root_hex = format!("0x{}", hex::encode(merkle_root));
         let info = self.rpc.storage_get_file_info_v2(&root_hex).await?;
+        // Fetch the authoritative snapshot at the file's pinned
+        // `assignment_height`, then apply the shared eligibility
+        // contract before any address decode. Non-ArchiveNode or
+        // non-Active records never reach the assignment computation.
         let raw = self
             .rpc
             .storage_get_active_nodes_at_height(info.assignment_height)
             .await?;
-        let mut snapshot = Vec::with_capacity(raw.len());
-        for record in &raw {
+        let filtered = sum_types::rpc_types::filter_active_archives(raw);
+        let mut snapshot = Vec::with_capacity(filtered.len());
+        for record in &filtered {
             let addr = sum_net::l1_address_from_base58(&record.address)?;
             snapshot.push(addr);
         }
@@ -1650,6 +1752,26 @@ where
     // the wrong file for the recorded root. Never auto-recoverable.
 
     pub async fn resume(&self, merkle_root: [u8; 32], file_path: &Path) -> IngestOutcome {
+        // ── R=0 preflight (#33) ────────────────────────────────────
+        // Resume never emits a S1 RegisterFilePendingV2 (that already
+        // happened on the original ingest), but it does drive S2/S3
+        // pushes and S5 ActivateFileV2. Under R=0 no target set can
+        // form, so we short-circuit here to match `run`'s guarantee:
+        // no send_raw_transaction, no push_chunk_v2, no push_manifest_v2.
+        // The Pending file on chain is unchanged.
+        if self.params.assignment_replication_factor == 0 {
+            return IngestOutcome::Failed {
+                stage: IngestStage::Register,
+                manifest: None,
+                source: anyhow::anyhow!(
+                    "resume: assignment_replication_factor is 0; refusing to \
+                     resume a Pending file with no assignment targets. \
+                     No S2/S3 push and no S5 tx submitted. \
+                     The Pending file on chain is unchanged."
+                ),
+            };
+        }
+
         // V2-enabled gate first — resume's S5 ActivateFileV2 is a V2
         // tx and would burn fees if V2 isn't activated yet.
         if let Err(e) = self.check_v2_enabled().await {
@@ -1868,15 +1990,18 @@ where
             };
         }
 
-        // Snapshot. Same as W10a.
+        // Snapshot. Same as W10a. Apply the shared eligibility contract
+        // before address decode so non-ArchiveNode/non-Active records
+        // never reach resume's assignment computation.
         let snapshot = match self
             .rpc
             .storage_get_active_nodes_at_height(info.assignment_height)
             .await
         {
             Ok(raw) => {
-                let mut snap = Vec::with_capacity(raw.len());
-                for record in &raw {
+                let filtered = sum_types::rpc_types::filter_active_archives(raw);
+                let mut snap = Vec::with_capacity(filtered.len());
+                for record in &filtered {
                     match sum_net::l1_address_from_base58(&record.address) {
                         Ok(addr) => snap.push(addr),
                         Err(e) => {
@@ -1908,6 +2033,40 @@ where
                 };
             }
         };
+
+        // ── Resume pinned-empty-snapshot guard (#33) ───────────────
+        //
+        // `storage_getActiveNodesAtHeight(assignment_height)` is a
+        // historical query: the snapshot at that fixed height is
+        // IMMUTABLE. Repeated `resume` calls will always observe the
+        // same snapshot. If it filters to zero eligible archives,
+        // ordinary retry cannot repair it. The file remains Pending;
+        // suggest Abandon (SNIP-side) or external ReassignChunksV2
+        // (chain-side; not implemented here). No push, no
+        // re-registration.
+        if snapshot.is_empty() {
+            warn!(
+                assignment_height = info.assignment_height,
+                "resume: pinned assignment snapshot has 0 eligible archives (immutable)"
+            );
+            return IngestOutcome::PendingNeedsAction {
+                merkle_root,
+                manifest,
+                failed_stage: IngestStage::Push,
+                last_coverage: None,
+                under_replicated_chunks: None,
+                suggested: SuggestedAction::Abandon,
+                source: Some(anyhow::anyhow!(
+                    "resume: pinned assignment snapshot at height {H} contains no eligible \
+                     archives after filtering. Historical chain state at that height is \
+                     immutable — subsequent `resume` calls will observe the same empty \
+                     snapshot. The file remains Pending on chain. Abandon when admissible, \
+                     or invoke an external ReassignChunksV2 to append a new assignment epoch \
+                     (SNIP does not implement that client-side recovery path in this release).",
+                    H = info.assignment_height,
+                )),
+            };
+        }
 
         // Coverage probe — drives whether to skip S2/S3 entirely.
         let coverage = match self
@@ -2513,6 +2672,13 @@ mod tests {
             missing_offset: 0,
             missing_indices: vec![],
             per_archive: vec![],
+            // #34: post-#62 epoch fields default to the legacy shape
+            // in this helper; specific tests that need epoch data
+            // build coverage responses inline.
+            assignment_epochs: vec![],
+            latest_assignment_epoch: 0,
+            reassignment_needed: false,
+            per_epoch: vec![],
         }
     }
 
@@ -5044,6 +5210,405 @@ mod tests {
              — `_ciphertext_temp` must remain a tempfile::NamedTempFile so the \
              abort path is automatically cleaned up",
             temp_path
+        );
+    }
+
+    // ── #33 V2 lifecycle boundary tests ─────────────────────────────
+    //
+    // Four behavioral guarantees the reviewer required:
+    //
+    //   * R=0 preflight fires BEFORE S1: `send_raw_transaction` count
+    //     stays at 0 (no register tx submitted, no chain state
+    //     created).
+    //   * Resume under R=0 short-circuits BEFORE any tx or push: no
+    //     `send_raw_transaction`, no `push_chunk_v2`, no
+    //     `push_manifest_v2`.
+    //   * Post-S1 pinned empty snapshot returns
+    //     `PendingNeedsAction { suggested: Abandon }` with the manifest
+    //     preserved and no chunk pushes attempted.
+    //   * Resume queries `storage_getActiveNodesAtHeight(H)` where H is
+    //     the pinned `assignment_height` from `storage_getFileInfoV2`;
+    //     repeated resume calls hit the same height (historical
+    //     snapshots are immutable).
+
+    /// R=0 preflight — fresh Public ingest MUST NOT submit S1.
+    #[tokio::test]
+    async fn v2_ingest_r_0_fails_before_s1_and_never_calls_send_raw_transaction() {
+        let bytes = vec![0xAB; 2 * 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let rpc = Arc::new(MockRpc::default());
+        // Nothing queued — if the pipeline attempted S1 the mock would
+        // return "no send response queued", which is NOT what we want
+        // to observe. The preflight must return before send is invoked.
+        let net = Arc::new(MockNet::new());
+
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = 0;
+
+        let pipeline = build_pipeline(rpc.clone(), net.clone(), HashMap::new(), my_addr, params);
+        match pipeline.run(&path).await {
+            IngestOutcome::Failed {
+                stage,
+                manifest,
+                source,
+            } => {
+                assert_eq!(stage, IngestStage::Register);
+                assert!(
+                    manifest.is_none(),
+                    "R=0 preflight fires before S0 chunking → no manifest to preserve"
+                );
+                let msg = source.to_string();
+                assert!(
+                    msg.contains("assignment_replication_factor is 0"),
+                    "diagnostic must name the offending parameter, got: {msg}"
+                );
+                assert!(
+                    msg.contains("No S1 tx was submitted"),
+                    "diagnostic must state that no S1 tx was submitted, got: {msg}"
+                );
+            }
+            other => panic!("expected Failed on R=0 preflight, got {other:?}"),
+        }
+
+        // The hard behavioral assertion: nothing was ever sent.
+        assert_eq!(
+            rpc.sent_txs.lock().unwrap().len(),
+            0,
+            "R=0 preflight MUST short-circuit BEFORE any send_raw_transaction call"
+        );
+        assert_eq!(
+            net.push_count(),
+            0,
+            "R=0 preflight MUST short-circuit BEFORE any chunk push"
+        );
+        assert_eq!(
+            net.manifest_push_count(),
+            0,
+            "R=0 preflight MUST short-circuit BEFORE any manifest push"
+        );
+    }
+
+    /// R=0 preflight — resume MUST NOT push chunks/manifest or submit S5.
+    #[tokio::test]
+    async fn v2_resume_r_0_never_registers_or_pushes() {
+        // Manifest reused from the run happy-path fixture — resume
+        // needs a chunkable file on disk.
+        let bytes = vec![0xCD; 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+        let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
+        let merkle_root = manifest_dryrun.merkle_root;
+
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let rpc = Arc::new(MockRpc::default());
+        // Register a Pending file at some assignment_height so a
+        // non-preflight resume would try to snapshot + push.
+        rpc.add_file(
+            &format!("0x{}", hex::encode(merkle_root)),
+            pending_file_info(&merkle_root, manifest_dryrun.chunk_count, 50),
+        );
+        rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+        let net = Arc::new(MockNet::new());
+
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = 0;
+
+        let pipeline = build_pipeline(rpc.clone(), net.clone(), HashMap::new(), my_addr, params);
+        match pipeline.resume(merkle_root, &path).await {
+            IngestOutcome::Failed { stage, source, .. } => {
+                assert_eq!(stage, IngestStage::Register);
+                let msg = source.to_string();
+                assert!(
+                    msg.contains("assignment_replication_factor is 0"),
+                    "diagnostic must name the offending parameter, got: {msg}"
+                );
+                assert!(
+                    msg.contains("Pending file on chain is unchanged"),
+                    "diagnostic must state the on-chain lifecycle is not mutated, got: {msg}"
+                );
+            }
+            other => panic!("expected Failed on R=0 resume preflight, got {other:?}"),
+        }
+
+        assert_eq!(
+            rpc.sent_txs.lock().unwrap().len(),
+            0,
+            "resume R=0 MUST NOT submit any transaction"
+        );
+        assert_eq!(net.push_count(), 0, "resume R=0 MUST NOT push any chunk");
+        assert_eq!(
+            net.manifest_push_count(),
+            0,
+            "resume R=0 MUST NOT push the manifest"
+        );
+    }
+
+    /// Post-S1 pinned empty snapshot — S1 finalized, then the
+    /// authoritative snapshot at `assignment_height` contains only
+    /// non-eligible records (all Slashed). The pipeline must return
+    /// `PendingNeedsAction { suggested: Abandon }` with the manifest
+    /// preserved and NO chunk pushes attempted. Also asserts the S1
+    /// register tx WAS submitted, so we're truly observing the
+    /// post-S1 path and not the R=0 pre-S1 preflight.
+    #[tokio::test]
+    async fn v2_ingest_post_s1_empty_snapshot_preserves_pending_and_advises_abandon() {
+        let bytes = vec![0x77; 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+        let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
+        let merkle_root = manifest_dryrun.merkle_root;
+
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+
+        // A snapshot where every archive is Slashed — filter_active_archives
+        // will drop all five, producing an empty eligible list.
+        let all_slashed: Vec<NodeRecordInfo> = snapshot
+            .iter()
+            .map(|a| NodeRecordInfo {
+                address: l1_address_base58(a),
+                role: "ArchiveNode".into(),
+                staked_balance: 1_000_000_000,
+                status: "Slashed".into(),
+                registered_at: 1,
+            })
+            .collect();
+
+        let rpc = Arc::new(MockRpc::default());
+        rpc.set_nonce(&l1_address_base58(&my_addr), 1);
+        // S1 finalizes normally — the emptiness only surfaces during S2 setup.
+        rpc.enqueue_send("0xtx-register");
+        rpc.enqueue_status(TxStatusV2::Finalized { block_height: 100 });
+        rpc.add_file(
+            &format!("0x{}", hex::encode(merkle_root)),
+            pending_file_info(&merkle_root, manifest_dryrun.chunk_count, 50),
+        );
+        rpc.add_snapshot(50, all_slashed);
+
+        let net = Arc::new(MockNet::new());
+
+        let pipeline = build_pipeline(
+            rpc.clone(),
+            net.clone(),
+            HashMap::new(),
+            my_addr,
+            params_for_test(defaults_for_tests()),
+        );
+        match pipeline.run(&path).await {
+            IngestOutcome::PendingNeedsAction {
+                merkle_root: r,
+                manifest,
+                failed_stage,
+                suggested,
+                source,
+                ..
+            } => {
+                assert_eq!(r, merkle_root);
+                assert_eq!(manifest.merkle_root, merkle_root);
+                assert_eq!(failed_stage, IngestStage::Push);
+                assert_eq!(
+                    suggested,
+                    SuggestedAction::Abandon,
+                    "pinned historical snapshot is immutable — Resume would hit the same empty set"
+                );
+                let msg = source
+                    .expect("post-S1 empty snapshot must carry a diagnostic")
+                    .to_string();
+                assert!(
+                    msg.contains("historical snapshot will not change"),
+                    "diagnostic must state that the pinned snapshot is immutable, got: {msg}"
+                );
+                assert!(
+                    msg.contains("No chunks were pushed"),
+                    "diagnostic must state that no push was attempted, got: {msg}"
+                );
+            }
+            other => panic!("expected PendingNeedsAction{{Abandon}}, got {other:?}"),
+        }
+
+        // Behavioral assertions:
+        //   * S1 tx WAS submitted (this is post-S1, not the R=0 preflight)
+        //   * No chunk pushes (empty snapshot → no targets)
+        //   * No manifest pushes (nothing to hand off to)
+        //   * No S5 activate tx (chain still says Pending)
+        assert_eq!(
+            rpc.sent_txs.lock().unwrap().len(),
+            1,
+            "S1 register tx MUST have been submitted (this is the post-S1 path)"
+        );
+        assert_eq!(
+            net.push_count(),
+            0,
+            "post-S1 empty snapshot MUST NOT push any chunk"
+        );
+        assert_eq!(
+            net.manifest_push_count(),
+            0,
+            "post-S1 empty snapshot MUST NOT push the manifest"
+        );
+    }
+
+    /// Resume queries the pinned assignment height from
+    /// `storage_getFileInfoV2` and calls
+    /// `storage_getActiveNodesAtHeight(H)` with THAT height — not the
+    /// current block height, not a re-derived value. Two resume calls
+    /// on the same Pending file MUST hit the same historical height.
+    #[tokio::test]
+    async fn v2_resume_reuses_pinned_historical_assignment_height() {
+        let bytes = vec![0x99; 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+        let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
+        let merkle_root = manifest_dryrun.merkle_root;
+
+        // The historical height we WANT resume to reuse across calls.
+        const PINNED_HEIGHT: u64 = 50;
+
+        // Wrapper RPC that records snapshot heights probed by the pipeline.
+        // Delegates the actual data plane to the standard MockRpc.
+        #[derive(Default)]
+        struct HeightRecordingRpc {
+            inner: MockRpc,
+            snapshot_heights: StdMutex<Vec<u64>>,
+        }
+        #[async_trait]
+        impl V2RpcClient for HeightRecordingRpc {
+            async fn storage_get_file_info_v2(
+                &self,
+                merkle_root_hex: &str,
+            ) -> Result<StorageFileInfoV2> {
+                self.inner.storage_get_file_info_v2(merkle_root_hex).await
+            }
+            async fn storage_get_active_nodes_at_height(
+                &self,
+                height: u64,
+            ) -> Result<Vec<NodeRecordInfo>> {
+                self.snapshot_heights.lock().unwrap().push(height);
+                self.inner.storage_get_active_nodes_at_height(height).await
+            }
+        }
+        #[async_trait]
+        impl TxStatusSource for HeightRecordingRpc {
+            async fn get_transaction_status(&self, tx_hash: &str) -> Result<TxStatusV2> {
+                self.inner.get_transaction_status(tx_hash).await
+            }
+        }
+        #[async_trait]
+        impl AttestorRpc for HeightRecordingRpc {
+            async fn send_raw_transaction(&self, hex: &str) -> Result<String> {
+                self.inner.send_raw_transaction(hex).await
+            }
+        }
+        #[async_trait]
+        impl V2IngestRpc for HeightRecordingRpc {
+            async fn storage_get_assignment_coverage_v2(
+                &self,
+                root: &str,
+                off: Option<u32>,
+                lim: Option<u32>,
+            ) -> Result<AssignmentCoverageV2> {
+                self.inner
+                    .storage_get_assignment_coverage_v2(root, off, lim)
+                    .await
+            }
+            async fn chain_get_block_height(&self) -> Result<BlockHeightInfo> {
+                // Deliberately return a height that is NOT the pinned
+                // assignment_height, so any code path that used the
+                // "current" height would leave a visible fingerprint.
+                Ok(BlockHeightInfo {
+                    height: 999_999,
+                    finality: "finalized".into(),
+                })
+            }
+            async fn get_nonce(&self, addr: &str) -> Result<u64> {
+                self.inner.get_nonce(addr).await
+            }
+        }
+
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
+
+        let rpc = Arc::new(HeightRecordingRpc::default());
+        rpc.inner.add_file(
+            &format!("0x{}", hex::encode(merkle_root)),
+            pending_file_info(&merkle_root, manifest_dryrun.chunk_count, PINNED_HEIGHT),
+        );
+        // Pre-populate the pinned-height snapshot AND, deliberately, a
+        // different one at the "current" height — if resume ever probed
+        // the wrong height, the test would still succeed with wrong
+        // data. This ensures the height-selection is what we test.
+        rpc.inner
+            .add_snapshot(PINNED_HEIGHT, snapshot.iter().map(node_record).collect());
+        rpc.inner.add_snapshot(
+            999_999,
+            vec![node_record(&[0xDE; 20])], // sentinel — wrong snapshot at current height
+        );
+        rpc.inner.set_nonce(&l1_address_base58(&my_addr), 1);
+        // S5 activate — for the successful first resume call.
+        rpc.inner.enqueue_send("0xtx-activate-1");
+        rpc.inner
+            .enqueue_status(TxStatusV2::Finalized { block_height: 200 });
+        rpc.inner
+            .enqueue_coverage(coverage_active(manifest_dryrun.chunk_count, true));
+
+        let net = Arc::new(MockNet::new());
+        // Ack every chunk × peer so resume actually runs through S2/S3/S5.
+        ack_chunks_for_all(&net, merkle_root, manifest_dryrun.chunk_count, &peers).await;
+        ack_manifest_for_all(&net, merkle_root, &peers).await;
+
+        let pipeline: IngestPipeline<HeightRecordingRpc, MockNet, StaticPeers> =
+            IngestPipeline::new(
+                rpc.clone(),
+                net.clone(),
+                Arc::new(StaticPeers {
+                    map: arch_to_peer.clone(),
+                }),
+                [42u8; 32],
+                my_addr,
+                params_for_test(defaults_for_tests()),
+            );
+
+        // First resume — success path, snapshot fetched at PINNED_HEIGHT.
+        let outcome = pipeline.resume(merkle_root, &path).await;
+        assert!(
+            matches!(
+                outcome,
+                IngestOutcome::Activated { .. } | IngestOutcome::ResumedActivated { .. }
+            ),
+            "first resume must Activate under the healthy pinned snapshot, got {outcome:?}",
+        );
+        let first = rpc.snapshot_heights.lock().unwrap().clone();
+        assert!(
+            first.iter().all(|h| *h == PINNED_HEIGHT),
+            "resume MUST only probe the pinned assignment_height, got: {first:?}",
+        );
+        assert!(
+            !first.is_empty(),
+            "resume must have queried the snapshot at least once"
+        );
+
+        // Second resume — the chain now shows the file Activated, but
+        // the pipeline still probes the same historical height for its
+        // decision. This asserts that any subsequent resume call on
+        // the same root uses the identical H.
+        let outcome2 = pipeline.resume(merkle_root, &path).await;
+        // Depending on internal caching this may Activate again, or
+        // return Failed with "already Active" — both branches ultimately
+        // read `assignment_height` from the same file_info, so the
+        // recorded probe height is the load-bearing assertion.
+        let _ = outcome2;
+        let all_heights = rpc.snapshot_heights.lock().unwrap().clone();
+        assert!(
+            all_heights.iter().all(|h| *h == PINNED_HEIGHT),
+            "repeated resume calls MUST reuse the same historical height {PINNED_HEIGHT}, \
+             recorded probes: {all_heights:?}",
         );
     }
 }

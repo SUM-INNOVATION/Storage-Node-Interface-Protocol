@@ -102,6 +102,10 @@ pub async fn build_v2_assignment_view(
             height: info.assignment_height,
             source: e,
         })?;
+    // Apply the shared eligibility contract before address decode so
+    // Slashed/Unbonding/Withdrawn/unknown-future and Validator rows
+    // are excluded from the V2 assignment view.
+    let snapshot_records = sum_types::rpc_types::filter_active_archives(snapshot_records);
     let mut snapshot: Vec<[u8; 20]> = Vec::with_capacity(snapshot_records.len());
     for n in &snapshot_records {
         let addr = sum_net::identity::l1_address_from_base58(&n.address).map_err(|e| {

@@ -21,7 +21,7 @@ use sum_store::{
     FetchManager, FetchOutcome, MerkleTree, compute_chunk_assignment, nodes_for_chunk,
 };
 use sum_types::rpc_types::StorageFileInfoV2;
-use sum_types::storage::{DataManifest, REPLICATION_FACTOR};
+use sum_types::storage::DataManifest;
 
 use crate::download_v2_routing::{
     ManifestDecodeError, V2AssignmentError, V2AssignmentView, build_v2_assignment_view,
@@ -39,6 +39,11 @@ pub struct DownloadOrchestrator {
     rpc: Arc<L1RpcClient>,
     max_concurrent: usize,
     timeout: Duration,
+    /// Live-chain replication factor sourced from
+    /// `ChainParamsInfo::assignment_replication_factor` at operation
+    /// entry. Used by the V1 holder-map computation so V1 download
+    /// routes to the same archive set the chain assigned.
+    replication_factor: u32,
 }
 
 /// Result of a download operation.
@@ -90,6 +95,7 @@ impl DownloadOrchestrator {
         rpc: Arc<L1RpcClient>,
         max_concurrent: usize,
         timeout: Duration,
+        replication_factor: u32,
     ) -> Self {
         Self {
             merkle_root_hex,
@@ -97,6 +103,7 @@ impl DownloadOrchestrator {
             rpc,
             max_concurrent,
             timeout,
+            replication_factor,
         }
     }
 
@@ -569,12 +576,16 @@ impl DownloadOrchestrator {
     ) -> HashMap<u32, Vec<PeerId>> {
         let mut holder_map: HashMap<u32, Vec<PeerId>> = HashMap::new();
 
-        // Try to get active nodes from L1 for assignment-based routing
+        // Try to get active nodes from L1 for assignment-based routing.
+        // Apply the shared eligibility contract so V1 holder-map
+        // computation excludes Slashed/Unbonding/Withdrawn and
+        // non-Archive records.
         let nodes_result = self.rpc.get_active_nodes().await;
         let Ok(node_records) = nodes_result else {
             warn!("could not get active nodes from L1 — using gossipsub-based peer selection");
             return holder_map;
         };
+        let node_records = sum_types::rpc_types::filter_active_archives(node_records);
 
         // Parse addresses, sort
         let mut node_addrs: Vec<[u8; 20]> = Vec::new();
@@ -594,7 +605,7 @@ impl DownloadOrchestrator {
             &manifest.merkle_root,
             chunk_count,
             &node_addrs,
-            REPLICATION_FACTOR,
+            self.replication_factor,
         );
 
         // Build reverse map: L1 address → PeerId

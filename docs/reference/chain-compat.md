@@ -134,7 +134,7 @@ flowing, but SNIP itself stays on this set.
 | `send_raw_transaction`              | submit signed bincode-v1 tx (returns tx hash)                  |
 | `chain_getTransactionStatus`        | poll for `Finalized` / `Failed` / `Dropped` after submission   |
 | `storage_getFileInfoV2`             | resolve V2 chain row (visibility, lifecycle, access list)      |
-| `storage_getActiveNodesAtHeight`    | snapshot of `ArchiveNode/Active` rows at a chain height        |
+| `storage_getActiveNodesAtHeight`    | snapshot of node records at a chain height; SNIP filters by the eligibility contract on the SNIP side (see below) |
 | `chain_getChainParams`              | read `chain_id`, `assignment_replication_factor`, etc.         |
 | `account_getEncryptionPublicKey`    | resolve a recipient's registered X25519 pubkey                 |
 | `chain_getBlockHeight`              | read finalized head for V2 enablement gate + finality budgets  |
@@ -145,6 +145,25 @@ and per-tx receipt aliases). **SNIP does not use them.** Staying on
 the canonical `send_raw_transaction` + `chain_getTransactionStatus`
 pair keeps the wire surface SNIP depends on small and review-able;
 an alias divergence on the chain side is then a no-op for SNIP.
+
+### NodeRecord role and status wire shape
+
+The chain formats `NodeRecordInfo.role` and `.status` via
+`format!("{:?}", …)` over its internal enums (upstream
+`sum-chain/crates/rpc/src/server.rs:7595-7839`). The current strings
+SNIP recognises are:
+
+- `role`: `"ArchiveNode"`, `"Validator"`.
+- `status`: `"Active"`, `"Slashed"`, `"Unbonding"`, `"Withdrawn"`.
+
+Both fields deserialize as `String`, so any future chain-added
+variant lands as its raw string without a SNIP-side release — the
+value stays observable through `NodeRecordInfo.role` / `.status`
+and is treated as ineligible for assignment. The eligibility
+contract (`role == "ArchiveNode" && status == "Active"`) is
+described in
+[`../architecture/chain-integration.md`](../architecture/chain-integration.md)
+"Active-archive eligibility contract."
 
 ### Mainnet vs local-mirror
 
