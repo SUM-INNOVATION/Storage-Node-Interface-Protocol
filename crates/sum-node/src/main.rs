@@ -1504,7 +1504,7 @@ async fn run_ingest_v2(
                      these MUST NOT be used against a real chain"
                 );
                 sum_node::ingest_v2::IngestParams {
-                    assignment_replication_factor: 3,
+                    assignment_replication_factor: sum_types::storage::DEFAULT_REPLICATION_FACTOR,
                     max_chunk_indices_per_tx: 65_536,
                     max_chunk_count_per_file: 1_048_576,
                     chain_id: chain_id_arg,
@@ -1701,7 +1701,7 @@ async fn build_v2_ingest_params(
             NodeProfile::Dev => {
                 warn!(%e, "chain_getChainParams failed in dev profile; using V2Params::DEFAULTS");
                 Ok(sum_node::ingest_v2::IngestParams {
-                    assignment_replication_factor: 3,
+                    assignment_replication_factor: sum_types::storage::DEFAULT_REPLICATION_FACTOR,
                     max_chunk_indices_per_tx: 65_536,
                     max_chunk_count_per_file: 1_048_576,
                     chain_id: chain_id_arg,

@@ -7,14 +7,6 @@
 //! to hash each (chunk, replica) pair into a position in the sorted node list,
 //! with linear probing on collision.
 
-// Only test code and the (deprecated) `compute_default_assignment`
-// wrapper reference the workspace's fallback replication factor
-// constant. Production callers pass an explicit `replication_factor`
-// argument sourced from `ChainParamsInfo::assignment_replication_factor`
-// via `sum_node::runtime_params::RuntimeChainParams`.
-#[allow(unused_imports)]
-use sum_types::storage::DEFAULT_REPLICATION_FACTOR;
-
 /// Deterministically assign nodes to each chunk of a file.
 ///
 /// For each chunk, exactly `min(replication_factor, active_nodes.len())` unique
@@ -89,30 +81,6 @@ pub fn chunks_for_node(assignment: &[Vec<[u8; 20]>], node_address: &[u8; 20]) ->
 /// Given a full assignment, return the nodes assigned to a specific chunk.
 pub fn nodes_for_chunk(assignment: &[Vec<[u8; 20]>], chunk_index: u32) -> Option<&Vec<[u8; 20]>> {
     assignment.get(chunk_index as usize)
-}
-
-/// Convenience wrapper that uses the workspace fallback
-/// [`DEFAULT_REPLICATION_FACTOR`]. **Dev / test only.** Production
-/// callers MUST call [`compute_chunk_assignment`] directly with an R
-/// value sourced from
-/// `ChainParamsInfo::assignment_replication_factor` via
-/// `sum_node::runtime_params::RuntimeChainParams`. Retained for
-/// backwards compatibility during the deprecation window.
-#[deprecated(
-    note = "production code MUST pass R from ChainParamsInfo::assignment_replication_factor via RuntimeChainParams; \
-            this wrapper uses the fallback default and is dev/test-only."
-)]
-pub fn compute_default_assignment(
-    merkle_root: &[u8; 32],
-    chunk_count: u64,
-    active_nodes: &[[u8; 20]],
-) -> Vec<Vec<[u8; 20]>> {
-    compute_chunk_assignment(
-        merkle_root,
-        chunk_count,
-        active_nodes,
-        DEFAULT_REPLICATION_FACTOR,
-    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

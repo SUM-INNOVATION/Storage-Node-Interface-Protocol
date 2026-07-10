@@ -900,6 +900,132 @@ mod tests {
         assert_eq!(summary.last_finalized_nonce(), Some(502));
     }
 
+    // ── #33 required behavior tests ──────────────────────────────────
+    //
+    // Two boundary cases the reviewer flagged: `assignment_replication_factor`
+    // is now a runtime input, so the attestor must (a) follow a
+    // non-default R end-to-end and (b) respect the upstream min(R, N)
+    // clamp when R > snapshot.len().
+
+    /// Non-default R (R=2, 3-archive snapshot): the intersection between
+    /// the archive's assigned chunks and the held set must reflect the
+    /// non-default replication factor, and the *submitted batch content*
+    /// must exactly match `chunks_for_archive_v2` computed with that
+    /// same R. Also asserts a tx WAS sent (call-ordering check the
+    /// reviewer required).
+    #[tokio::test]
+    async fn attestor_r_2_n_3_submits_expected_intersection() {
+        let snapshot: Vec<[u8; 20]> = (0..3)
+            .map(|i| {
+                let mut a = [0u8; 20];
+                a[0] = 0xD0 + i;
+                a
+            })
+            .collect();
+        let my_addr = snapshot[0];
+        let root = [0x21; 32];
+        let chunk_count = 24u32;
+
+        // Pre-compute the expected intersection so we can assert the
+        // attestor agrees byte-for-byte.
+        let assigned: BTreeSet<u32> =
+            chunks_for_archive_v2(&root, chunk_count, &snapshot, 2, &my_addr);
+        assert!(
+            !assigned.is_empty() && assigned.len() < chunk_count as usize,
+            "R=2/N=3 must yield a proper subset of chunks — got {} of {chunk_count}",
+            assigned.len(),
+        );
+        let held: BTreeSet<u32> = (0..chunk_count).collect();
+        let expected: BTreeSet<u32> = assigned.intersection(&held).copied().collect();
+
+        // Cap = expected.len() → exactly one batch, so `chunk_indices`
+        // maps 1:1 to `expected`.
+        let cap = expected.len() as u32;
+        let rpc = MockRpc::new();
+        rpc.enqueue_send_ok("0xtx-r2");
+        rpc.enqueue_status_ok(TxStatusV2::Finalized { block_height: 4242 });
+        let mut attestor = make_attestor(rpc, my_addr, cap);
+        attestor.params.assignment_replication_factor = 2;
+
+        let summary = attestor
+            .attest(req(root, chunk_count, snapshot, held, 900))
+            .await;
+
+        assert!(
+            summary.fully_attested(),
+            "attestor should have finalized: {:?}",
+            summary.error,
+        );
+        // Behavior: exactly one send_raw_transaction call.
+        assert_eq!(
+            attestor.rpc.sent_count(),
+            1,
+            "attestor MUST have submitted exactly one tx for R=2"
+        );
+        assert_eq!(summary.batches.len(), 1);
+        let batch = &summary.batches[0];
+        assert_eq!(
+            batch.chunk_indices,
+            expected.iter().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(batch.nonce, 900);
+    }
+
+    /// R > N: upstream `chunks_for_archive_v2` clamps to
+    /// `min(R, snapshot.len)`. R=7 vs N=3 must behave identically to
+    /// R=3 vs N=3 — every chunk assigned to every archive — so the
+    /// attestor's submitted batch covers the full held set.
+    #[tokio::test]
+    async fn attestor_r_7_n_3_clamps_to_min_r_n_and_covers_all_held() {
+        let snapshot: Vec<[u8; 20]> = (0..3)
+            .map(|i| {
+                let mut a = [0u8; 20];
+                a[0] = 0xE0 + i;
+                a
+            })
+            .collect();
+        let my_addr = snapshot[1];
+        let root = [0x22; 32];
+        let chunk_count = 12u32;
+
+        // With min(R, N) = 3 = N, every chunk is assigned to every
+        // archive — so `chunks_for_archive_v2` returns the full range.
+        let assigned_r_min: BTreeSet<u32> =
+            chunks_for_archive_v2(&root, chunk_count, &snapshot, 3, &my_addr);
+        let assigned_r_7: BTreeSet<u32> =
+            chunks_for_archive_v2(&root, chunk_count, &snapshot, 7, &my_addr);
+        assert_eq!(
+            assigned_r_min, assigned_r_7,
+            "min(R, N) contract: R=7/N=3 must equal R=3/N=3",
+        );
+        assert_eq!(
+            assigned_r_7.len(),
+            chunk_count as usize,
+            "R>=N must assign every chunk to every archive"
+        );
+
+        let held: BTreeSet<u32> = (0..chunk_count).collect();
+
+        let rpc = MockRpc::new();
+        rpc.enqueue_send_ok("0xtx-r7");
+        rpc.enqueue_status_ok(TxStatusV2::Finalized { block_height: 999 });
+        let mut attestor = make_attestor(rpc, my_addr, chunk_count);
+        attestor.params.assignment_replication_factor = 7;
+
+        let summary = attestor
+            .attest(req(root, chunk_count, snapshot, held, 42))
+            .await;
+
+        assert!(summary.fully_attested(), "{:?}", summary.error);
+        assert_eq!(attestor.rpc.sent_count(), 1);
+        assert_eq!(summary.batches.len(), 1);
+        assert_eq!(
+            summary.batches[0].chunk_indices,
+            (0..chunk_count).collect::<Vec<u32>>(),
+            "R>N must attest to every chunk in the held set"
+        );
+    }
+
     /// Reviewer-required: `max_chunk_indices_per_tx = 0` must NOT panic
     /// — release builds run on real chains, and a misconfigured
     /// `V2Params` should never bring the node down. Surface as a

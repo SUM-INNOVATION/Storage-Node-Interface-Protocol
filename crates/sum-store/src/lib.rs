@@ -15,8 +15,6 @@ pub mod store;
 pub mod verify;
 
 pub use announce::{ChunkAnnouncement, decode_announcement, encode_announcement};
-#[allow(deprecated)]
-pub use assignment::compute_default_assignment;
 pub use assignment::{chunks_for_node, compute_chunk_assignment, nodes_for_chunk};
 pub use chunker::BinaryChunker;
 pub use content_id::cid_from_data;

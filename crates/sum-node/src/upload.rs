@@ -116,6 +116,15 @@ pub struct UploadResult {
     /// only N ACKs per chunk, matching chain-side aggregate coverage
     /// (upstream `sum-chain/crates/state/src/storage_metadata.rs`).
     pub per_chunk_expected: Vec<u32>,
+    /// The `assignment_replication_factor` the orchestrator was
+    /// constructed with, recorded at planning time. `NoEligibleTargets`
+    /// reports this value truthfully (rather than inferring 0 from an
+    /// empty per-chunk vector).
+    pub configured_r: u32,
+    /// The length of the `filter_active_archives`-narrowed snapshot
+    /// used to build the per-chunk assignment. `NoEligibleTargets`
+    /// reports this value truthfully.
+    pub eligible_snapshot_len: usize,
 }
 
 /// A single failed push attempt.
@@ -129,6 +138,11 @@ pub struct FailedPush {
 /// Why an upload should be considered unsuccessful. Distinct from a
 /// transport-level `Err` from the orchestrator: this is the post-run
 /// verdict against the per-chunk replication target.
+///
+/// `NoEligibleTargets` is emitted at the planning boundary
+/// (`UploadOrchestrator::run` / `run_with_nodes`) with the real
+/// `configured_r` and `eligible_snapshot_len` that were used to build
+/// the plan — the values are never inferred from a per-chunk vector.
 #[derive(Debug, thiserror::Error)]
 pub enum UploadFailure {
     #[error("upload timed out before all chunks reached the replication target")]
@@ -153,19 +167,18 @@ pub enum UploadFailure {
          No push was dispatched. Refuse to declare success."
     )]
     NoEligibleTargets {
+        /// The `assignment_replication_factor` this orchestrator was
+        /// constructed with — captured at planning time from
+        /// `sum_node::runtime_params::RuntimeChainParams`, not inferred.
         configured_r: u32,
+        /// The size of the `filter_active_archives`-narrowed snapshot
+        /// used to build the per-chunk assignment — captured at
+        /// planning time, not inferred.
         eligible_snapshot_len: usize,
     },
 }
 
 impl UploadResult {
-    /// Verify every chunk reached `replication_factor` replica ACKs.
-    ///
-    /// `chunks_fully_confirmed` on the struct is treated as a cached
-    /// hint only — the verdict is recomputed from
-    /// `per_chunk_confirmations` here so a stale or wrong cache cannot
-    /// cause `check_success` to silently approve an under-replicated
-    /// upload.
     /// Plan-derived success check (#33). For each chunk, verify the
     /// number of received ACKs is at least the planned per-chunk
     /// target set size (`per_chunk_expected[i]`, computed at planning
@@ -173,7 +186,27 @@ impl UploadResult {
     /// Configured `R` is never re-consulted here — the plan is the
     /// authority so `R > N` deployments correctly require only `N`
     /// ACKs per chunk.
+    ///
+    /// This function does NOT emit `UploadFailure::NoEligibleTargets`.
+    /// The empty-target case is caught at the planning boundary inside
+    /// `UploadOrchestrator::run` / `run_with_nodes` where the real
+    /// `configured_r` and `eligible_snapshot_len` are known; the
+    /// orchestrator returns `Err(UploadFailure::NoEligibleTargets { .. })`
+    /// with those real values before dispatching any push. Reaching
+    /// this method already means at least one push was dispatched.
     pub fn check_success(&self) -> Result<(), UploadFailure> {
+        // Truthful `NoEligibleTargets`: emitted at the planning
+        // boundary when either R=0 or the eligible snapshot was empty.
+        // Reports the ACTUAL `configured_r` and `eligible_snapshot_len`
+        // from struct fields (populated at planning time in
+        // `UploadOrchestrator::run` / `run_with_nodes`). Never
+        // fabricated from an all-zero `per_chunk_expected` vector.
+        if self.configured_r == 0 || self.eligible_snapshot_len == 0 {
+            return Err(UploadFailure::NoEligibleTargets {
+                configured_r: self.configured_r,
+                eligible_snapshot_len: self.eligible_snapshot_len,
+            });
+        }
         if self.timeout {
             return Err(UploadFailure::Timeout);
         }
@@ -181,19 +214,6 @@ impl UploadResult {
             return Err(UploadFailure::FailedPushes {
                 count: self.failed.len(),
                 pushes: self.failed.clone(),
-            });
-        }
-        // If the planning step determined every chunk had zero targets
-        // (R=0 or empty eligible snapshot), refuse to declare success.
-        // Callers (e.g. `main.rs::run_ingest`) upgrade this to a CLI
-        // failure.
-        if !self.per_chunk_expected.is_empty() && self.per_chunk_expected.iter().all(|&x| x == 0) {
-            return Err(UploadFailure::NoEligibleTargets {
-                // Best-effort attribution — the plan's target set was
-                // empty for every chunk. The orchestrator carries the
-                // exact R/N in its own logs.
-                configured_r: 0,
-                eligible_snapshot_len: 0,
             });
         }
         let expected_chunks = self.per_chunk_confirmations.len() as u32;
@@ -266,11 +286,10 @@ impl UploadOrchestrator {
             }
         }
         node_addrs.sort();
-
-        if node_addrs.is_empty() {
-            bail!("no eligible ArchiveNode/Active peers on L1 — cannot upload");
-        }
-
+        // Route empty-snapshot through the unified NoEligibleTargets
+        // contract so both R=0 (with any N) and R>0 with N=0 surface
+        // with truthful (configured_r, eligible_snapshot_len) at the
+        // CLI mapper. No push is dispatched.
         self.run_with_nodes(net, store, manifest, peer_addresses, &node_addrs)
             .await
     }
@@ -287,16 +306,41 @@ impl UploadOrchestrator {
         node_addrs: &[[u8; 20]],
     ) -> Result<UploadResult> {
         let chunk_count = manifest.chunk_count as u64;
-        let assignment = compute_chunk_assignment(
-            &manifest.merkle_root,
-            chunk_count,
-            node_addrs,
-            self.replication_factor,
-        );
+        let eligible_snapshot_len = node_addrs.len();
+        let configured_r = self.replication_factor;
+
+        // Planning boundary: if `configured_r == 0` OR the eligible
+        // snapshot is empty, no push is dispatchable. Return an empty
+        // `UploadResult` populated with the REAL `configured_r` and
+        // `eligible_snapshot_len` — `check_success()` maps this to
+        // `UploadFailure::NoEligibleTargets { .. }` with the truthful
+        // values. No push is enqueued; the network is untouched.
+        if configured_r == 0 || eligible_snapshot_len == 0 {
+            info!(
+                configured_r,
+                eligible_snapshot_len,
+                "upload planning: no eligible targets — refusing to dispatch any push"
+            );
+            return Ok(UploadResult {
+                confirmed: 0,
+                total: 0,
+                timeout: false,
+                failed: Vec::new(),
+                per_chunk_confirmations: vec![0; manifest.chunk_count as usize],
+                chunks_fully_confirmed: 0,
+                chunk_recipients: HashSet::new(),
+                per_chunk_expected: vec![0; manifest.chunk_count as usize],
+                configured_r,
+                eligible_snapshot_len,
+            });
+        }
+
+        let assignment =
+            compute_chunk_assignment(&manifest.merkle_root, chunk_count, node_addrs, configured_r);
         // Plan-derived per-chunk expected ACK counts. Each chunk's
         // expected count is the size of its assigned set, which is
-        // `min(self.replication_factor, node_addrs.len())` per
-        // upstream `sum-chain/crates/primitives/src/storage_metadata.rs:299`.
+        // `min(configured_r, eligible_snapshot_len)` per upstream
+        // `sum-chain/crates/primitives/src/storage_metadata.rs:299`.
         let per_chunk_expected: Vec<u32> = assignment.iter().map(|a| a.len() as u32).collect();
 
         // Reverse map: L1 address -> PeerId
@@ -470,6 +514,8 @@ impl UploadOrchestrator {
             chunks_fully_confirmed,
             chunk_recipients,
             per_chunk_expected,
+            configured_r,
+            eligible_snapshot_len,
         })
     }
 }
@@ -618,18 +664,25 @@ mod tests {
             chunks_fully_confirmed,
             chunk_recipients: HashSet::new(),
             per_chunk_expected,
+            // A successful path implies R > 0 and eligible_snapshot_len > 0.
+            configured_r: replication_factor,
+            eligible_snapshot_len: replication_factor as usize,
         }
     }
 
     /// Build an R>N scenario: configured R=5 with only N=3 eligible
     /// archives → plan says expected=3 per chunk (effective R via
-    /// upstream `min(R, N)`).
+    /// upstream `min(R, N)`). Records the real `configured_r` and
+    /// `eligible_snapshot_len` so `NoEligibleTargets`-style diagnostics
+    /// carry truthful values.
     fn make_result_effective(
         per_chunk: Vec<u32>,
-        effective_r: u32,
+        configured_r: u32,
+        eligible_n: usize,
         timeout: bool,
         failed: Vec<FailedPush>,
     ) -> UploadResult {
+        let effective_r = std::cmp::min(configured_r as usize, eligible_n) as u32;
         let per_chunk_expected: Vec<u32> = vec![effective_r; per_chunk.len()];
         let chunks_fully_confirmed = per_chunk
             .iter()
@@ -646,6 +699,8 @@ mod tests {
             chunks_fully_confirmed,
             chunk_recipients: HashSet::new(),
             per_chunk_expected,
+            configured_r,
+            eligible_snapshot_len: eligible_n,
         }
     }
 
@@ -730,6 +785,8 @@ mod tests {
             chunks_fully_confirmed: 4, // ← stale / forged cache
             chunk_recipients: HashSet::new(),
             per_chunk_expected,
+            configured_r: r,
+            eligible_snapshot_len: r as usize,
         };
         match result.check_success() {
             Err(UploadFailure::IncompleteConfirmations {
@@ -764,12 +821,10 @@ mod tests {
     // ── Effective-R (#33) success matrix ──────────────────────────────────
 
     /// R=5, N=3 → per-chunk plan target = min(5, 3) = 3. All 3
-    /// planned targets ACK per chunk → success. This is the case
-    /// the reviewer flagged as impossible under a bare `R` check.
+    /// planned targets ACK per chunk → success.
     #[test]
     fn upload_r_5_n_3_all_three_assigned_ack_succeeds() {
-        let effective_r = 3;
-        let result = make_result_effective(vec![3; 4], effective_r, false, vec![]);
+        let result = make_result_effective(vec![3; 4], 5, 3, false, vec![]);
         assert!(result.check_success().is_ok());
     }
 
@@ -778,8 +833,7 @@ mod tests {
     /// index reported.
     #[test]
     fn upload_r_5_n_3_two_of_three_assigned_ack_fails() {
-        let effective_r = 3;
-        let result = make_result_effective(vec![2; 4], effective_r, false, vec![]);
+        let result = make_result_effective(vec![2; 4], 5, 3, false, vec![]);
         match result.check_success() {
             Err(UploadFailure::IncompleteConfirmations {
                 under_replicated,
@@ -798,21 +852,44 @@ mod tests {
     /// → success (boundary case for R<N).
     #[test]
     fn upload_r_1_n_5_one_ack_succeeds() {
-        let effective_r = 1;
-        let result = make_result_effective(vec![1; 4], effective_r, false, vec![]);
+        let result = make_result_effective(vec![1; 4], 1, 5, false, vec![]);
         assert!(result.check_success().is_ok());
     }
 
-    /// R=0, N=5 → per-chunk plan target = 0 for every chunk.
-    /// `check_success` returns `NoEligibleTargets` so the CLI mapper
-    /// converts this to an operator-visible failure (main.rs
-    /// `run_ingest`).
+    /// R=0, N=5 → `NoEligibleTargets` with **truthful**
+    /// `configured_r = 0` and `eligible_snapshot_len = 5` — reviewer
+    /// item #2. Values come from the fields, not from the empty
+    /// per-chunk vector.
     #[test]
-    fn upload_r_0_returns_no_eligible_targets() {
-        let effective_r = 0;
-        let result = make_result_effective(vec![0; 4], effective_r, false, vec![]);
+    fn upload_r_0_n_5_returns_truthful_no_eligible_targets() {
+        let result = make_result_effective(vec![0; 4], 0, 5, false, vec![]);
         match result.check_success() {
-            Err(UploadFailure::NoEligibleTargets { .. }) => {}
+            Err(UploadFailure::NoEligibleTargets {
+                configured_r,
+                eligible_snapshot_len,
+            }) => {
+                assert_eq!(configured_r, 0);
+                assert_eq!(eligible_snapshot_len, 5);
+            }
+            other => panic!("expected NoEligibleTargets, got {other:?}"),
+        }
+    }
+
+    /// R>0, N=0 → `NoEligibleTargets` with **truthful**
+    /// `configured_r = 3` and `eligible_snapshot_len = 0`. Both
+    /// R=0 and N=0 cases must produce nonzero CLI failure with
+    /// distinguishable values (reviewer item #3).
+    #[test]
+    fn upload_r_3_n_0_returns_truthful_no_eligible_targets() {
+        let result = make_result_effective(vec![0; 4], 3, 0, false, vec![]);
+        match result.check_success() {
+            Err(UploadFailure::NoEligibleTargets {
+                configured_r,
+                eligible_snapshot_len,
+            }) => {
+                assert_eq!(configured_r, 3);
+                assert_eq!(eligible_snapshot_len, 0);
+            }
             other => panic!("expected NoEligibleTargets, got {other:?}"),
         }
     }

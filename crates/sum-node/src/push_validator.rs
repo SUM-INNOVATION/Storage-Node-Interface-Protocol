@@ -1006,6 +1006,293 @@ mod tests {
         assert!(matches!(err, PushReject::BadChainShape(_)), "got {err:?}");
     }
 
+    // ── #33 required behavior tests ──────────────────────────────────
+    //
+    // These tests exercise the eligibility/assignment boundary at
+    // non-default replication factors and prove that:
+    //
+    //   * min(R, snapshot_len) is honored (upstream contract).
+    //   * The shared `filter_active_archives` gates raw records before
+    //     the assignment lookup — Slashed/Unbonding/Withdrawn or
+    //     non-ArchiveNode entries never enter the admitted set.
+    //   * A sender not in the pinned snapshot is rejected regardless of
+    //     what R the params carry.
+
+    /// Build a 3-archive snapshot where every eligible node is
+    /// ArchiveNode/Active.
+    fn three_archives() -> Vec<[u8; 20]> {
+        (0..3)
+            .map(|i| {
+                let mut a = [0u8; 20];
+                a[0] = 0xB0 + i;
+                a
+            })
+            .collect()
+    }
+
+    /// Set up an R=5 / N=3 fixture: three active archives in the pinned
+    /// snapshot, replication factor 5. Each of the three archives is
+    /// admissible to every chunk because `min(R, N) = 3 = N`.
+    #[tokio::test]
+    async fn push_validator_r_5_n_3_admits_all_three_eligible_archives() {
+        let snapshot = three_archives();
+        let tree = TreeFixture::new(8, 0x61);
+        let assignment_height = 1_100;
+        let params = V2Params {
+            assignment_replication_factor: 5,
+            max_chunk_indices_per_tx: V2Params::DEFAULTS.max_chunk_indices_per_tx,
+        };
+
+        // Sanity: `assigned_archives` returns all three for every chunk
+        // when R > N — this is the min(R, N) contract we assert on.
+        for i in 0..tree.chunk_count {
+            let assigned = assigned_archives(&tree.root, &snapshot, i, 5);
+            assert_eq!(
+                assigned.len(),
+                3,
+                "R=5, N=3 must produce min(5, 3)=3 assignees for chunk {i}"
+            );
+        }
+
+        for me in &snapshot {
+            let rpc = MockRpc::default();
+            rpc.add_file(
+                &format!("0x{}", hex::encode(tree.root)),
+                file_info(
+                    &tree.root,
+                    tree.chunk_count,
+                    LifecycleV2::PENDING,
+                    assignment_height,
+                ),
+            );
+            rpc.add_snapshot(
+                assignment_height,
+                snapshot.iter().map(node_record).collect(),
+            );
+            let validator = PushValidator::new(rpc, *me, params);
+
+            // Every chunk in [0, chunk_count) must admit `me`.
+            for i in 0..tree.chunk_count {
+                validator
+                    .validate_push(tree.root, i, tree.data(i), &tree.proof(i))
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "R=5, N=3: archive {} must be admitted for chunk {i} (got {e:?})",
+                            hex::encode(me),
+                        )
+                    });
+            }
+        }
+    }
+
+    /// R=2 / N=3: for at least one chunk in the tree, the shared
+    /// rendezvous hash places exactly two of the three archives in the
+    /// admitted set. The remaining archive is eligible (present in the
+    /// snapshot, ArchiveNode/Active) but not assigned, and its push
+    /// MUST be rejected with `NotAssigned`.
+    #[tokio::test]
+    async fn push_validator_r_2_n_3_rejects_eligible_but_unassigned_archive() {
+        let snapshot = three_archives();
+        let tree = TreeFixture::new(16, 0x62);
+        let assignment_height = 1_200;
+        let params = V2Params {
+            assignment_replication_factor: 2,
+            max_chunk_indices_per_tx: V2Params::DEFAULTS.max_chunk_indices_per_tx,
+        };
+
+        // Find a (chunk_index, unassigned_archive) pair by exhausting the
+        // tree. With R=2/N=3 a majority of chunks have exactly one
+        // unassigned archive.
+        let mut victim: Option<(u32, [u8; 20])> = None;
+        'outer: for i in 0..tree.chunk_count {
+            let assigned = assigned_archives(&tree.root, &snapshot, i, 2);
+            assert_eq!(
+                assigned.len(),
+                2,
+                "R=2, N=3 must produce exactly min(2,3)=2 assignees for chunk {i}"
+            );
+            for me in &snapshot {
+                if !assigned.iter().any(|a| a == me) {
+                    victim = Some((i, *me));
+                    break 'outer;
+                }
+            }
+        }
+        let (chunk_index, unassigned) =
+            victim.expect("expected at least one chunk with an unassigned eligible archive");
+
+        let rpc = MockRpc::default();
+        rpc.add_file(
+            &format!("0x{}", hex::encode(tree.root)),
+            file_info(
+                &tree.root,
+                tree.chunk_count,
+                LifecycleV2::ACTIVE,
+                assignment_height,
+            ),
+        );
+        rpc.add_snapshot(
+            assignment_height,
+            snapshot.iter().map(node_record).collect(),
+        );
+        let validator = PushValidator::new(rpc, unassigned, params);
+
+        let err = validator
+            .validate_push(
+                tree.root,
+                chunk_index,
+                tree.data(chunk_index),
+                &tree.proof(chunk_index),
+            )
+            .await
+            .expect_err("eligible-but-unassigned archive must be rejected");
+        match err {
+            PushReject::NotAssigned {
+                chunk_index: ci, ..
+            } => assert_eq!(ci, chunk_index),
+            other => panic!("expected NotAssigned, got {other:?}"),
+        }
+    }
+
+    /// Filter contract: raw snapshot records that are Slashed,
+    /// Unbonding, Withdrawn, or non-ArchiveNode MUST be excluded from
+    /// the admitted set. A push whose sender is such a record is
+    /// rejected as `NotInSnapshot` (post-filter the snapshot no longer
+    /// contains that address). This is the concrete guarantee behind
+    /// [[chain-integration-eligibility]].
+    #[tokio::test]
+    async fn push_validator_rejects_inactive_or_non_archive_sender() {
+        // Base snapshot: one Active archive plus four sender addresses
+        // whose records must be filtered out before assignment.
+        let active_addr = {
+            let mut a = [0u8; 20];
+            a[0] = 0xC0;
+            a
+        };
+        let slashed_addr = [0xC1; 20];
+        let unbonding_addr = [0xC2; 20];
+        let withdrawn_addr = [0xC3; 20];
+        let non_archive_addr = [0xC4; 20];
+
+        let mut records = vec![node_record(&active_addr)];
+        records.push(NodeRecordInfo {
+            address: l1_address_base58(&slashed_addr),
+            role: "ArchiveNode".into(),
+            staked_balance: 1_000_000_000,
+            status: "Slashed".into(),
+            registered_at: 1,
+        });
+        records.push(NodeRecordInfo {
+            address: l1_address_base58(&unbonding_addr),
+            role: "ArchiveNode".into(),
+            staked_balance: 1_000_000_000,
+            status: "Unbonding".into(),
+            registered_at: 1,
+        });
+        records.push(NodeRecordInfo {
+            address: l1_address_base58(&withdrawn_addr),
+            role: "ArchiveNode".into(),
+            staked_balance: 0,
+            status: "Withdrawn".into(),
+            registered_at: 1,
+        });
+        records.push(NodeRecordInfo {
+            address: l1_address_base58(&non_archive_addr),
+            role: "ValidatorNode".into(),
+            staked_balance: 1_000_000_000,
+            status: "Active".into(),
+            registered_at: 1,
+        });
+
+        let tree = TreeFixture::new(4, 0x63);
+        let assignment_height = 1_300;
+
+        for (label, sender, expected_status) in [
+            ("slashed", slashed_addr, "Slashed"),
+            ("unbonding", unbonding_addr, "Unbonding"),
+            ("withdrawn", withdrawn_addr, "Withdrawn"),
+            ("non-archive", non_archive_addr, "Active/ValidatorNode"),
+        ] {
+            let rpc = MockRpc::default();
+            rpc.add_file(
+                &format!("0x{}", hex::encode(tree.root)),
+                file_info(
+                    &tree.root,
+                    tree.chunk_count,
+                    LifecycleV2::ACTIVE,
+                    assignment_height,
+                ),
+            );
+            rpc.add_snapshot(assignment_height, records.clone());
+            let validator = PushValidator::new(rpc, sender, V2Params::DEFAULTS);
+
+            let result = validator
+                .validate_push(tree.root, 0, tree.data(0), &tree.proof(0))
+                .await;
+            match result {
+                Ok(_) => panic!(
+                    "{label} ({expected_status}) sender must be rejected, but validate_push accepted the push",
+                ),
+                Err(PushReject::NotInSnapshot { height, .. }) => {
+                    assert_eq!(
+                        height, assignment_height,
+                        "{label} ({expected_status}) must report the pinned snapshot height",
+                    );
+                }
+                Err(other) => panic!("{label} sender expected NotInSnapshot, got {other:?}"),
+            }
+        }
+    }
+
+    /// A sender that never appears in the raw snapshot at all (not just
+    /// filtered out) is rejected as `NotInSnapshot`. This is the
+    /// symmetric case to the filter check: the shared eligibility
+    /// contract can only admit addresses the snapshot names.
+    #[tokio::test]
+    async fn push_validator_rejects_sender_absent_from_snapshot() {
+        let snapshot = five_archives();
+        let sender = [0xEE; 20]; // deliberately not in `snapshot`
+        assert!(
+            !snapshot.iter().any(|a| a == &sender),
+            "sender must NOT collide with any archive in the base snapshot"
+        );
+
+        let tree = TreeFixture::new(8, 0x64);
+        let assignment_height = 1_400;
+
+        let rpc = MockRpc::default();
+        rpc.add_file(
+            &format!("0x{}", hex::encode(tree.root)),
+            file_info(
+                &tree.root,
+                tree.chunk_count,
+                LifecycleV2::ACTIVE,
+                assignment_height,
+            ),
+        );
+        rpc.add_snapshot(
+            assignment_height,
+            snapshot.iter().map(node_record).collect(),
+        );
+        let validator = PushValidator::new(rpc, sender, V2Params::DEFAULTS);
+
+        let err = validator
+            .validate_push(tree.root, 0, tree.data(0), &tree.proof(0))
+            .await
+            .expect_err("sender absent from snapshot must reject");
+        match err {
+            PushReject::NotInSnapshot {
+                height,
+                my_addr_hex,
+            } => {
+                assert_eq!(height, assignment_height);
+                assert_eq!(my_addr_hex, hex::encode(sender));
+            }
+            other => panic!("expected NotInSnapshot, got {other:?}"),
+        }
+    }
+
     /// Bad chain shape: file_info response carries a `merkle_root` that
     /// doesn't match what we asked about. Must surface BadChainShape.
     #[tokio::test]
