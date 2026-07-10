@@ -16,7 +16,7 @@ use sum_net::{PeerId, SumNet};
 use sum_store::gc::GarbageCollector;
 use sum_store::{SumStore, chunks_for_node, compute_chunk_assignment, nodes_for_chunk};
 use sum_types::rpc_types::StorageFileInfo;
-use sum_types::storage::{CHUNK_SIZE, REPLICATION_FACTOR};
+use sum_types::storage::CHUNK_SIZE;
 
 use crate::rpc_client::L1RpcClient;
 
@@ -41,6 +41,12 @@ pub struct MarketSyncWorker {
     last_l1_poll: Instant,
     /// Consecutive RPC failures (for exponential backoff).
     consecutive_failures: u32,
+    /// Live-chain replication factor sourced from
+    /// `ChainParamsInfo::assignment_replication_factor` at process
+    /// startup (`main.rs::run_listen`). Fetch ownership and GC
+    /// retained-set both derive from a single assignment call at this
+    /// R, guaranteeing no divergence.
+    replication_factor: u32,
 }
 
 impl MarketSyncWorker {
@@ -50,6 +56,7 @@ impl MarketSyncWorker {
         l1_address_base58: String,
         poll_interval: Duration,
         gc_grace_period: Duration,
+        replication_factor: u32,
     ) -> Self {
         Self {
             rpc,
@@ -59,6 +66,7 @@ impl MarketSyncWorker {
             gc: GarbageCollector::new(gc_grace_period),
             last_l1_poll: Instant::now(),
             consecutive_failures: 0,
+            replication_factor,
         }
     }
 
@@ -203,8 +211,12 @@ impl MarketSyncWorker {
         }
 
         // Compute assignment
-        let assignment =
-            compute_chunk_assignment(&root_bytes, chunk_count, node_addrs, REPLICATION_FACTOR);
+        let assignment = compute_chunk_assignment(
+            &root_bytes,
+            chunk_count,
+            node_addrs,
+            self.replication_factor,
+        );
 
         // Which chunks is THIS node assigned?
         let my_chunks = chunks_for_node(&assignment, &self.l1_address);
@@ -341,8 +353,12 @@ impl MarketSyncWorker {
                 continue;
             }
 
-            let assignment =
-                compute_chunk_assignment(&root_bytes, chunk_count, node_addrs, REPLICATION_FACTOR);
+            let assignment = compute_chunk_assignment(
+                &root_bytes,
+                chunk_count,
+                node_addrs,
+                self.replication_factor,
+            );
 
             let my_chunks = chunks_for_node(&assignment, &self.l1_address);
 

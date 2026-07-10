@@ -32,7 +32,7 @@ use sum_node::rpc_client::L1RpcClient;
 use sum_node::upload::{UploadNet, UploadOrchestrator};
 use sum_store::SumStore;
 use sum_types::config::StoreConfig;
-use sum_types::storage::{ChunkDescriptor, DataManifest, REPLICATION_FACTOR};
+use sum_types::storage::{ChunkDescriptor, DEFAULT_REPLICATION_FACTOR, DataManifest};
 
 // ── MockUploadNet ────────────────────────────────────────────────────────────
 
@@ -207,7 +207,7 @@ async fn upload_peak_in_flight_is_bounded_by_max_in_flight_times_replication() {
 
     // Build R distinct (PeerId, L1 address) pairs so the assignment finds
     // R replicas for every chunk.
-    let n_peers = (REPLICATION_FACTOR as usize).max(4);
+    let n_peers = (DEFAULT_REPLICATION_FACTOR as usize).max(4);
     let peers: Vec<(PeerId, [u8; 20])> = (0..n_peers).map(|_| random_peer()).collect();
     let peer_addresses: HashMap<PeerId, [u8; 20]> = peers.iter().copied().collect();
     let mut node_addrs: Vec<[u8; 20]> = peers.iter().map(|(_, a)| *a).collect();
@@ -215,8 +215,9 @@ async fn upload_peak_in_flight_is_bounded_by_max_in_flight_times_replication() {
 
     let mock = MockUploadNet::new();
     let rpc = Arc::new(L1RpcClient::new("http://invalid".into()));
-    let orchestrator = UploadOrchestrator::new(rpc, Duration::from_secs(30))
-        .with_max_in_flight_chunks(max_in_flight);
+    let orchestrator =
+        UploadOrchestrator::new(rpc, Duration::from_secs(30), DEFAULT_REPLICATION_FACTOR)
+            .with_max_in_flight_chunks(max_in_flight);
 
     let result = orchestrator
         .run_with_nodes(&mock, &store, &manifest, &peer_addresses, &node_addrs)
@@ -226,7 +227,7 @@ async fn upload_peak_in_flight_is_bounded_by_max_in_flight_times_replication() {
     // ── Assertion 1: every push was confirmed.
     assert_eq!(
         result.confirmed as usize,
-        n_chunks * REPLICATION_FACTOR as usize,
+        n_chunks * DEFAULT_REPLICATION_FACTOR as usize,
         "expected R*n confirmations"
     );
     assert_eq!(result.failed.len(), 0, "no failures expected");
@@ -237,10 +238,10 @@ async fn upload_peak_in_flight_is_bounded_by_max_in_flight_times_replication() {
     // The orchestrator processes one slice at a time and drains ACKs before
     // moving on, so the upper bound is `max_in_flight * R`.
     let peak = mock.peak_in_flight.load(Ordering::SeqCst);
-    let bound = max_in_flight * REPLICATION_FACTOR as usize;
+    let bound = max_in_flight * DEFAULT_REPLICATION_FACTOR as usize;
     assert!(
         peak <= bound,
-        "peak in-flight {peak} exceeds bound {bound} (max_in_flight={max_in_flight}, R={REPLICATION_FACTOR})"
+        "peak in-flight {peak} exceeds bound {bound} (max_in_flight={max_in_flight}, R={DEFAULT_REPLICATION_FACTOR})"
     );
     // Sanity: with multiple chunks, peak should be > 0.
     assert!(
@@ -255,7 +256,7 @@ async fn upload_peak_in_flight_is_bounded_by_max_in_flight_times_replication() {
     let pushes = mock.pushes.lock().await.clone();
     assert_eq!(
         pushes.len(),
-        n_chunks * REPLICATION_FACTOR as usize,
+        n_chunks * DEFAULT_REPLICATION_FACTOR as usize,
         "expected R*n total pushes"
     );
 
@@ -271,7 +272,7 @@ async fn upload_peak_in_flight_is_bounded_by_max_in_flight_times_replication() {
     for (cid, ptrs) in &by_cid {
         assert_eq!(
             ptrs.len(),
-            REPLICATION_FACTOR as usize,
+            DEFAULT_REPLICATION_FACTOR as usize,
             "chunk {cid} should have R recorded pushes"
         );
         let first = ptrs[0];
@@ -299,7 +300,8 @@ async fn upload_with_max_in_flight_one_still_completes() {
     let mock = MockUploadNet::new();
     let rpc = Arc::new(L1RpcClient::new("http://invalid".into()));
     let orchestrator =
-        UploadOrchestrator::new(rpc, Duration::from_secs(30)).with_max_in_flight_chunks(1);
+        UploadOrchestrator::new(rpc, Duration::from_secs(30), DEFAULT_REPLICATION_FACTOR)
+            .with_max_in_flight_chunks(1);
 
     let result = orchestrator
         .run_with_nodes(&mock, &store, &manifest, &peer_addresses, &node_addrs)
@@ -308,10 +310,13 @@ async fn upload_with_max_in_flight_one_still_completes() {
 
     assert_eq!(
         result.confirmed as usize,
-        n_chunks * REPLICATION_FACTOR as usize
+        n_chunks * DEFAULT_REPLICATION_FACTOR as usize
     );
     let peak = mock.peak_in_flight.load(Ordering::SeqCst);
-    assert!(peak <= REPLICATION_FACTOR as usize, "peak {peak} > R");
+    assert!(
+        peak <= DEFAULT_REPLICATION_FACTOR as usize,
+        "peak {peak} > R"
+    );
 }
 
 #[tokio::test]
@@ -325,7 +330,8 @@ async fn upload_empty_manifest_succeeds() {
 
     let mock = MockUploadNet::new();
     let rpc = Arc::new(L1RpcClient::new("http://invalid".into()));
-    let orchestrator = UploadOrchestrator::new(rpc, Duration::from_secs(5));
+    let orchestrator =
+        UploadOrchestrator::new(rpc, Duration::from_secs(5), DEFAULT_REPLICATION_FACTOR);
 
     let result = orchestrator
         .run_with_nodes(&mock, &store, &manifest, &peer_addresses, &node_addrs)

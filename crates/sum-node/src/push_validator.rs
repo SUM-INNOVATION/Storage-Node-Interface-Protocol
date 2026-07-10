@@ -108,10 +108,27 @@ impl Default for V2Params {
 }
 
 impl V2Params {
+    /// Dev-profile seed and test fixture ONLY. Every production
+    /// runtime path builds `V2Params` from
+    /// `sum_node::runtime_params::RuntimeChainParams` via
+    /// `V2Params::from_runtime`, whose `assignment_replication_factor`
+    /// comes from the live `chain_getChainParams` response.
     pub const DEFAULTS: V2Params = V2Params {
-        assignment_replication_factor: 3,
+        assignment_replication_factor: sum_types::storage::DEFAULT_REPLICATION_FACTOR,
         max_chunk_indices_per_tx: 65_536,
     };
+
+    /// Construct from validated runtime chain params. This is the
+    /// production constructor; every production PushValidator /
+    /// AssignmentAttestor site uses it. `max_chunk_indices_per_tx` is
+    /// not yet plumbed from chain params (a separate follow-up); the
+    /// documented default is used.
+    pub fn from_runtime(rt: &crate::runtime_params::RuntimeChainParams) -> Self {
+        Self {
+            assignment_replication_factor: rt.assignment_replication_factor,
+            max_chunk_indices_per_tx: 65_536,
+        }
+    }
 }
 
 /// Subset of the V2 RPC client the validator depends on. Defined as a

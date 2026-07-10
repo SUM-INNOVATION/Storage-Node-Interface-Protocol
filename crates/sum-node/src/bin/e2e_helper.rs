@@ -845,10 +845,7 @@ async fn build_active_nodes_report(
     // observable), but the `--require-archives` gate keys off the
     // exact contract, not a two-string lookup that would silently
     // pass if either bucket key ever changed.
-    let active_archives = nodes
-        .iter()
-        .filter(|n| n.is_active_archive())
-        .count();
+    let active_archives = nodes.iter().filter(|n| n.is_active_archive()).count();
 
     Ok(ActiveNodesReport {
         height: effective_height,

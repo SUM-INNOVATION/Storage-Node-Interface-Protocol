@@ -648,6 +648,46 @@ async fn run_listen(
     if let Some(seed) = seed {
         let l1_addr = identity::l1_address_from_keypair(&keypair);
         let l1_base58 = identity::l1_address_base58(&l1_addr);
+
+        // Fetch chain params ONCE at startup and cache in a shared
+        // Arc<RuntimeChainParams>. Every long-running worker below
+        // receives R from this cached value. Production profile
+        // hard-fails on RPC error; dev profile falls back to
+        // `RuntimeChainParams::dev_fallback()` with a WARN naming the
+        // R value in use.
+        let runtime_params = match rpc.chain_get_chain_params().await {
+            Ok(cp) => {
+                let rt = sum_node::runtime_params::RuntimeChainParams::from_chain(&cp);
+                info!(
+                    r = rt.assignment_replication_factor,
+                    chain_id = rt.chain_id,
+                    "listen: cached RuntimeChainParams from chain_getChainParams"
+                );
+                Arc::new(rt)
+            }
+            Err(e) => match cli.profile {
+                NodeProfile::Production => {
+                    anyhow::bail!(
+                        "listen: production profile requires chain_getChainParams to \
+                         succeed before spawning V2 workers; refusing to silently \
+                         fall back to a hardcoded assignment_replication_factor. \
+                         RPC error: {e}"
+                    );
+                }
+                NodeProfile::Dev => {
+                    let rt = sum_node::runtime_params::RuntimeChainParams::dev_fallback();
+                    warn!(
+                        %e,
+                        r = rt.assignment_replication_factor,
+                        "listen: dev profile — chain_getChainParams failed; \
+                         falling back to RuntimeChainParams::dev_fallback (R shown). \
+                         Never acceptable in production."
+                    );
+                    Arc::new(rt)
+                }
+            },
+        };
+
         let por = PorWorker::new(
             rpc.clone(),
             seed,
@@ -657,13 +697,16 @@ async fn run_listen(
         let store_clone = store.clone();
         let por_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move { por.run(store_clone, por_shutdown).await });
-        // Spawn MarketSync worker
+        // Spawn MarketSync worker — receives the cached
+        // `assignment_replication_factor` so V1 self-heal and GC
+        // retained-set both compute at the live chain R.
         let market_sync = MarketSyncWorker::new(
             rpc.clone(),
             l1_addr,
             l1_base58.clone(),
             Duration::from_secs(cli.market_sync_secs),
             Duration::from_secs(cli.gc_grace_secs),
+            runtime_params.assignment_replication_factor,
         );
         let store_clone2 = store.clone();
         let net_clone = net.clone();
@@ -680,22 +723,20 @@ async fn run_listen(
         // so V1+V2 traffic land in the same on-disk store under the
         // same lock — no split-brain between protocol versions.
         //
-        // `chain_id` and `fee_per_tx` are placeholders until W10 wires
-        // them from the per-tx context; for now we use the same values
-        // PoR/MarketSync use. `chain_getChainParams` will replace
-        // `V2Params::DEFAULTS` in W10 if the RPC lands in time.
-        let validator = Arc::new(PushValidator::new(
-            (*rpc).clone(),
-            l1_addr,
-            V2Params::DEFAULTS,
-        ));
+        // `chain_id` and `fee_per_tx` remain plumbed from the CLI (see
+        // docs/roadmap/roadmap.md "Runtime chain_id derivation"). The
+        // `assignment_replication_factor` field of V2Params is now
+        // sourced from the cached RuntimeChainParams — no more
+        // silent V2Params::DEFAULTS in production.
+        let v2_params = V2Params::from_runtime(&runtime_params);
+        let validator = Arc::new(PushValidator::new((*rpc).clone(), l1_addr, v2_params));
         let attestor = Arc::new(AssignmentAttestor::new(
             (*rpc).clone(),
             seed,
             l1_addr,
             cli.chain_id,
             cli.attest_fee,
-            V2Params::DEFAULTS,
+            v2_params,
         ));
         // V2 reuses the same `AclChecker` as V1 — chain governs access,
         // protocol version doesn't.
@@ -986,11 +1027,37 @@ async fn run_ingest(
         }
     }
 
-    // Push to R=3 assigned nodes via UploadOrchestrator. The same RPC
+    // Push to R assigned nodes via UploadOrchestrator. The same RPC
     // client is reused below by the post-ingest serve loop's ACL checker.
+    //
+    // Fetch chain params ONCE at operation entry (#33). Production
+    // profile hard-fails on RPC error; dev profile falls back to
+    // RuntimeChainParams::dev_fallback with a WARN.
     let rpc = Arc::new(L1RpcClient::new(rpc_url));
-    let orchestrator =
-        UploadOrchestrator::new(rpc.clone(), Duration::from_secs(upload_timeout_secs));
+    let runtime_params = match rpc.chain_get_chain_params().await {
+        Ok(cp) => sum_node::runtime_params::RuntimeChainParams::from_chain(&cp),
+        Err(e) => match profile {
+            NodeProfile::Production => anyhow::bail!(
+                "ingest: production profile requires chain_getChainParams to succeed \
+                 before planning the upload; refusing silent fallback. RPC error: {e}"
+            ),
+            NodeProfile::Dev => {
+                let rt = sum_node::runtime_params::RuntimeChainParams::dev_fallback();
+                warn!(
+                    %e,
+                    r = rt.assignment_replication_factor,
+                    "ingest: dev profile — chain_getChainParams failed; \
+                     falling back to RuntimeChainParams::dev_fallback"
+                );
+                rt
+            }
+        },
+    };
+    let orchestrator = UploadOrchestrator::new(
+        rpc.clone(),
+        Duration::from_secs(upload_timeout_secs),
+        runtime_params.assignment_replication_factor,
+    );
 
     info!(
         peers = peer_addresses.len(),
@@ -1012,8 +1079,12 @@ async fn run_ingest(
         "upload complete"
     );
 
-    // Strict success criterion: every chunk must reach R replicas.
-    if let Err(failure) = upload_result.check_success(sum_types::storage::REPLICATION_FACTOR) {
+    // Plan-derived success criterion (#33): every chunk must reach the
+    // planned number of replica ACKs from `per_chunk_expected`. Bare
+    // configured R is never re-consulted; success is evaluated against
+    // the actual plan. R=0 or empty snapshot surfaces as
+    // `UploadFailure::NoEligibleTargets` (see main.rs mapping below).
+    if let Err(failure) = upload_result.check_success() {
         // Surface every failed push for operator triage.
         for f in &upload_result.failed {
             warn!(chunk_index = f.chunk_index, cid = %f.cid, error = %f.error, "push failed");
@@ -1308,8 +1379,42 @@ async fn run_ingest_v2(
     recipient_specs: Vec<String>,
 ) -> Result<()> {
     let l1_addr = identity::l1_address_from_keypair(&keypair);
+    let rpc_early = Arc::new(L1RpcClient::new(rpc_url.clone()));
+
+    // ── Preflight A (#33): fresh V2 ingest with R=0 fails BEFORE S1 ──
+    //
+    // Fetch chain params once. If `assignment_replication_factor == 0`,
+    // no assignment can be built for any chunk; refuse to register the
+    // file so no chain state is created and no fees are burned. This
+    // must run before any network scaffolding or S1 submission.
+    match rpc_early.chain_get_chain_params().await {
+        Ok(cp) => {
+            if cp.assignment_replication_factor == 0 {
+                anyhow::bail!(
+                    "ingest-v2: chain_getChainParams.assignment_replication_factor is 0; \
+                     refusing to register a file with no assignment targets. \
+                     No chain state created; no fees spent."
+                );
+            }
+        }
+        Err(e) => {
+            if matches!(profile, NodeProfile::Production) {
+                anyhow::bail!(
+                    "ingest-v2: production profile requires chain_getChainParams to \
+                     succeed before S1 registration; refusing silent fallback. \
+                     RPC error: {e}"
+                );
+            }
+            warn!(
+                %e,
+                "ingest-v2: dev profile — chain_getChainParams failed; \
+                 proceeding with V2Params::DEFAULTS fallback (preflight A skipped)"
+            );
+        }
+    }
+
     let net = Arc::new(SumNet::new(net_config, keypair).await?);
-    let rpc = Arc::new(L1RpcClient::new(rpc_url));
+    let rpc = rpc_early;
 
     // ── Peer discovery (same pattern as V1 run_ingest) ──────────────
     info!("waiting for peers on the LAN...");
@@ -1632,8 +1737,47 @@ async fn run_resume_v2(
 ) -> Result<()> {
     let merkle_root = parse_merkle_root_hex(&merkle_root_hex)?;
     let l1_addr = identity::l1_address_from_keypair(&keypair);
+    let rpc_early = Arc::new(L1RpcClient::new(rpc_url.clone()));
+
+    // ── Resume Case A (#33): R=0 reports the existing Pending file ──
+    //
+    // Unlike fresh ingest, the file is already Pending on chain. We
+    // do NOT claim registration was refused. We report the existing
+    // lifecycle and suggest abandon (SNIP-side) or external
+    // ReassignChunksV2 (chain-side; not implemented here).
+    match rpc_early.chain_get_chain_params().await {
+        Ok(cp) if cp.assignment_replication_factor == 0 => {
+            // Fetch the existing file info to include assignment_height
+            // in the diagnostic.
+            let root_hex = format!("0x{}", hex::encode(merkle_root));
+            let assignment_height = rpc_early
+                .storage_get_file_info_v2(&root_hex, None, None)
+                .await
+                .ok()
+                .map(|info| info.assignment_height);
+            anyhow::bail!(
+                "resume: cannot proceed — chain_getChainParams.\
+                 assignment_replication_factor is 0; no push plan can be produced. \
+                 The file remains Pending on chain (assignment_height={:?}). \
+                 Abandon may be admissible per activation_grace_blocks; \
+                 SNIP does not implement client-side ReassignChunksV2.",
+                assignment_height,
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            if matches!(profile, NodeProfile::Production) {
+                anyhow::bail!(
+                    "resume: production profile requires chain_getChainParams; \
+                     refusing silent fallback. RPC error: {e}"
+                );
+            }
+            warn!(%e, "resume: dev profile — chain_getChainParams failed; continuing");
+        }
+    }
+
     let net = Arc::new(SumNet::new(net_config, keypair).await?);
-    let rpc = Arc::new(L1RpcClient::new(rpc_url));
+    let rpc = rpc_early;
 
     // Same peer-discovery scaffolding as run_ingest_v2 — resume needs
     // peers for the partial S2 push wave.
@@ -2294,12 +2438,30 @@ async fn run_download(
     let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
     let peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    // Fetch chain params ONCE at operation entry (#33) so V1 download's
+    // holder-map computation uses the live R. Production profile
+    // hard-fails; dev profile falls back with WARN.
+    // Fetch chain params ONCE at operation entry (#33). Download is
+    // fail-closed on chain-param RPC error regardless of profile —
+    // silent fallback to a hardcoded R would compute the wrong
+    // per-chunk holder map and route requests to the wrong archives.
+    let runtime_r = match rpc.chain_get_chain_params().await {
+        Ok(cp) => {
+            sum_node::runtime_params::RuntimeChainParams::from_chain(&cp)
+                .assignment_replication_factor
+        }
+        Err(e) => anyhow::bail!(
+            "download: chain_getChainParams failed; refusing to build V1 holder \
+             map with a hardcoded replication factor. RPC error: {e}"
+        ),
+    };
     let orchestrator = DownloadOrchestrator::new(
         merkle_root,
         output.clone(),
         rpc,
         max_concurrent,
         Duration::from_secs(timeout_secs),
+        runtime_r,
     );
 
     let result = match path {

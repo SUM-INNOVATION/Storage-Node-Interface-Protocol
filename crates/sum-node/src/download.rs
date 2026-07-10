@@ -21,7 +21,7 @@ use sum_store::{
     FetchManager, FetchOutcome, MerkleTree, compute_chunk_assignment, nodes_for_chunk,
 };
 use sum_types::rpc_types::StorageFileInfoV2;
-use sum_types::storage::{DataManifest, REPLICATION_FACTOR};
+use sum_types::storage::DataManifest;
 
 use crate::download_v2_routing::{
     ManifestDecodeError, V2AssignmentError, V2AssignmentView, build_v2_assignment_view,
@@ -39,6 +39,11 @@ pub struct DownloadOrchestrator {
     rpc: Arc<L1RpcClient>,
     max_concurrent: usize,
     timeout: Duration,
+    /// Live-chain replication factor sourced from
+    /// `ChainParamsInfo::assignment_replication_factor` at operation
+    /// entry. Used by the V1 holder-map computation so V1 download
+    /// routes to the same archive set the chain assigned.
+    replication_factor: u32,
 }
 
 /// Result of a download operation.
@@ -90,6 +95,7 @@ impl DownloadOrchestrator {
         rpc: Arc<L1RpcClient>,
         max_concurrent: usize,
         timeout: Duration,
+        replication_factor: u32,
     ) -> Self {
         Self {
             merkle_root_hex,
@@ -97,6 +103,7 @@ impl DownloadOrchestrator {
             rpc,
             max_concurrent,
             timeout,
+            replication_factor,
         }
     }
 
@@ -598,7 +605,7 @@ impl DownloadOrchestrator {
             &manifest.merkle_root,
             chunk_count,
             &node_addrs,
-            REPLICATION_FACTOR,
+            self.replication_factor,
         );
 
         // Build reverse map: L1 address → PeerId

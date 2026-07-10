@@ -9,9 +9,36 @@ use serde::{Deserialize, Serialize};
 /// Every file is sliced into uniform 1 MB chunks (last chunk may be smaller).
 pub const CHUNK_SIZE: u64 = 1_048_576;
 
-/// Replication factor: each chunk is stored on this many nodes.
-/// Must match the L1 constant in sum-chain/crates/primitives/src/storage_metadata.rs.
-pub const REPLICATION_FACTOR: u32 = 3;
+/// Fallback replication factor used ONLY by dev-profile paths when
+/// `chain_getChainParams` is unreachable. Every production runtime path
+/// MUST read `ChainParamsInfo::assignment_replication_factor` at runtime
+/// and thread it through
+/// `sum_node::runtime_params::RuntimeChainParams`. See
+/// `docs/architecture/chain-integration.md` for the eligibility
+/// contract and R plumbing story.
+///
+/// The mainnet chain currently ships this value as `3`; other
+/// deployments may configure any `u32`. Chain-side assignment uses
+/// `min(configured_r, active_snapshot.len())` and returns empty for
+/// `r == 0` (upstream
+/// `sum-chain/crates/primitives/src/storage_metadata.rs:299-302`);
+/// SNIP mirrors that domain exactly, so this constant is not
+/// consulted for validation.
+pub const DEFAULT_REPLICATION_FACTOR: u32 = 3;
+
+/// Deprecated alias for [`DEFAULT_REPLICATION_FACTOR`]. Kept one
+/// release cycle to accommodate downstream code that pinned the old
+/// name. Production code paths must NOT consume it; a repository
+/// audit at release time confirms that only the constant definition
+/// site, `RuntimeChainParams::dev_fallback`, and `#[cfg(test)]` code
+/// reference either name.
+#[deprecated(
+    note = "renamed to DEFAULT_REPLICATION_FACTOR; production code MUST read \
+            ChainParamsInfo::assignment_replication_factor at runtime. Only \
+            sum_node::runtime_params::RuntimeChainParams::dev_fallback may \
+            consume DEFAULT_REPLICATION_FACTOR."
+)]
+pub const REPLICATION_FACTOR: u32 = DEFAULT_REPLICATION_FACTOR;
 
 // ── Chunk Descriptor ─────────────────────────────────────────────────────────
 

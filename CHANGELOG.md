@@ -8,6 +8,50 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 ## [Unreleased]
 
 ### Fixed
+- **Runtime replication factor plumbing** (closes #33). SNIP no
+  longer hardcodes `R = 3` in receive-side and V1 code paths. Every
+  production runtime consumer receives the live
+  `ChainParamsInfo::assignment_replication_factor` via a new
+  `sum_node::runtime_params::RuntimeChainParams` struct, cached once
+  at process startup (`run_listen`) or operation entry
+  (`run_ingest`, `run_ingest_v2`, `run_download`, `run_resume_v2`).
+  Production profile hard-fails when `chain_getChainParams` fails
+  (no silent fallback to `R = 3`); dev profile falls back to
+  `RuntimeChainParams::dev_fallback` with a WARN naming the R value
+  in use. `PushValidator` / `AssignmentAttestor` constructed via
+  `V2Params::from_runtime`; `MarketSyncWorker`, `DownloadOrchestrator`,
+  and `UploadOrchestrator` accept the runtime R directly.
+- **Plan-derived upload success semantics** (part of #33). The V1
+  upload orchestrator now stores `per_chunk_expected: Vec<u32>`
+  computed at planning time from
+  `assigned_archives(..., min(configured_r, N))`. `UploadResult::check_success`
+  compares per-chunk ACKs to that plan target — bare configured R
+  is never re-consulted, so R > N deployments correctly require
+  only N ACKs per chunk (matching upstream chain aggregate
+  coverage). A new `UploadFailure::NoEligibleTargets` variant
+  surfaces the "R = 0 or empty snapshot" state to the CLI mapper.
+- **V2 R = 0 preflight before S1** (part of #33). Fresh
+  `ingest-v2` refuses to submit `RegisterFilePendingV2` when
+  `assignment_replication_factor == 0`; no chain state created,
+  no fees spent. Message is truthful (registration refused).
+  `resume` under R = 0 reports the existing Pending lifecycle
+  and suggests abandon / external `ReassignChunksV2` — never
+  claims registration was prevented (which would be wrong because
+  S1 already finalized on the prior invocation).
+- **Constant rename with deprecated alias** (part of #33).
+  `sum_types::storage::REPLICATION_FACTOR` renamed to
+  `DEFAULT_REPLICATION_FACTOR`; the old name kept as a
+  `#[deprecated(note = "...")]` alias for one release cycle to
+  avoid breaking downstream compilations. **No production code
+  path consumes either name.** The `since` field is intentionally
+  omitted so the release-cutting PR can populate it with the
+  actual tag. Non-consumption invariant is enforced by the
+  release-checklist audit command
+  `rg -n '\b(REPLICATION_FACTOR|DEFAULT_REPLICATION_FACTOR)\b' crates -g '*.rs'`
+  — the only allowed matches are the constant definition site in
+  `crates/sum-types/src/storage.rs`,
+  `RuntimeChainParams::dev_fallback`, and test code under
+  `#[cfg(test)]` or `tests/`.
 - **NodeRecord eligibility contract enforcement** (closes #32).
   SNIP now defensively filters `storage_getActiveNodes` /
   `storage_getActiveNodesAtHeight` responses by the
