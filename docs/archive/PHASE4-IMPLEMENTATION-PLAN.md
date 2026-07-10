@@ -1,3 +1,13 @@
+> **ARCHIVED — historical planning document.** Preserved for context.
+> The download command, garbage collection, and resilient upload
+> workstreams described here have all shipped. Do not treat this
+> document as current. See
+> [`docs/status/implementation-status.md`](../status/implementation-status.md)
+> for the current feature matrix and
+> [`docs/archive/README.md`](README.md) for the archive index.
+
+---
+
 # Phase 4 Execution Plan: Download Command, Garbage Collection & Resilient Upload
 
 ## Context

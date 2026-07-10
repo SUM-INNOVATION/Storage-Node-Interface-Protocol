@@ -1,3 +1,12 @@
+> **ARCHIVED — historical planning document.** Preserved for context.
+> The WAN discovery + production hardening workstreams described
+> here have shipped. Current-day networking material lives in
+> [`docs/architecture/networking.md`](../architecture/networking.md).
+> Do not treat statements in this file as current. See
+> [`docs/archive/README.md`](README.md) for the archive index.
+
+---
+
 # WAN Discovery + Production Hardening Implementation
 
 ## Overview

@@ -1,3 +1,13 @@
+> **ARCHIVED — historical planning document.** Preserved for context.
+> Phases 1 and 2 have shipped (`--client` mode, `UploadOrchestrator`
+> wired into `run_ingest`); Phase 3 (lightweight-swarm client) remains
+> future work. Do not treat "NOT STARTED" / "DONE" annotations in
+> this file as current status. See the current feature matrix in
+> [`docs/status/implementation-status.md`](../status/implementation-status.md);
+> see [`docs/archive/README.md`](README.md) for the archive index.
+
+---
+
 # Client Mode Gap: Alice Should Not Be a Storage Node
 
 ## Context
