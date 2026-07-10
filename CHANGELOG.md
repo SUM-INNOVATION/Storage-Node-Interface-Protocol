@@ -7,6 +7,29 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ## [Unreleased]
 
+### Added
+- **AssignmentCoverageV2 epoch fields** (closes #34). Adds four
+  `#[serde(default)]` fields (`assignment_epochs`,
+  `latest_assignment_epoch`, `reassignment_needed`, `per_epoch`) to
+  `AssignmentCoverageV2` and a new `AssignmentEpochCoverageV2` type
+  (upstream `sum-chain` issue #62). Pre-#62 chain responses (which
+  omit the fields entirely) deserialize cleanly at the default
+  values. `AssignmentCoverageV2::resolved_latest_epoch() ->
+  Option<u64>` disambiguates legacy responses (empty
+  `assignment_epochs`) from post-#62 responses. Aggregate
+  `can_activate_now` and `missing_indices` semantics are preserved
+  per upstream (verified against
+  `sum-chain/crates/state/src/storage_metadata.rs:2181-2200`), so
+  existing consumers (`s4_wait_coverage`,
+  `collect_missing_indices`) require no behavior change.
+  Consumer response to `reassignment_needed` and client-side
+  `ReassignChunksV2` remain follow-ups; this change is
+  observability + wire-compat only. `#[serde(default)]` cannot
+  detect malformed partial metadata — SNIP trusts the upstream
+  invariant that `epochs.last() == latest_assignment_epoch` when
+  the field is present; this trade-off is documented in the type's
+  docstring.
+
 ### Fixed
 - **Runtime replication factor plumbing** (closes #33). SNIP no
   longer hardcodes `R = 3` in receive-side and V1 code paths. Every

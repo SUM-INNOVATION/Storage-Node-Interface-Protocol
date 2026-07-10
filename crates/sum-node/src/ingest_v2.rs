@@ -2521,6 +2521,13 @@ mod tests {
             missing_offset: 0,
             missing_indices: vec![],
             per_archive: vec![],
+            // #34: post-#62 epoch fields default to the legacy shape
+            // in this helper; specific tests that need epoch data
+            // build coverage responses inline.
+            assignment_epochs: vec![],
+            latest_assignment_epoch: 0,
+            reassignment_needed: false,
+            per_epoch: vec![],
         }
     }
 
