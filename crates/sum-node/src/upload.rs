@@ -209,8 +209,13 @@ impl UploadOrchestrator {
         manifest: &DataManifest,
         peer_addresses: &HashMap<PeerId, [u8; 20]>,
     ) -> Result<UploadResult> {
-        // Fetch active node directory from L1.
+        // Fetch active node directory from L1 and narrow to
+        // exactly-eligible archives per the shared eligibility contract
+        // (`role == "ArchiveNode" && status == "Active"`). Any
+        // Slashed/Unbonding/Withdrawn/unknown-future or Validator record
+        // is dropped before address decode.
         let node_records = self.rpc.get_active_nodes().await?;
+        let node_records = sum_types::rpc_types::filter_active_archives(node_records);
         let mut node_addrs: Vec<[u8; 20]> = Vec::new();
         for record in &node_records {
             if let Ok(addr) = identity::l1_address_from_base58(&record.address) {
@@ -220,7 +225,7 @@ impl UploadOrchestrator {
         node_addrs.sort();
 
         if node_addrs.is_empty() {
-            bail!("no active nodes on L1 — cannot upload");
+            bail!("no eligible ArchiveNode/Active peers on L1 — cannot upload");
         }
 
         self.run_with_nodes(net, store, manifest, peer_addresses, &node_addrs)

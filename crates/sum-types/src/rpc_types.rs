@@ -40,19 +40,96 @@ pub struct ChallengeInfo {
     pub expires_at_height: u64,
 }
 
-/// Node record returned by `storage_getNodeRecord`.
+/// Node record returned by `storage_getNodeRecord` and every entry of
+/// `storage_getActiveNodes` / `storage_getActiveNodesAtHeight`.
+///
+/// The chain formats `role` and `status` via `format!("{:?}", …)` over
+/// its `NodeRole` / `NodeStatus` enums (upstream
+/// `sum-chain/crates/rpc/src/server.rs:7595-7839`,
+/// `sum-chain/crates/primitives/src/node_registry.rs`), producing the
+/// strings compared by [`NodeRecordInfo::is_active_archive`] and
+/// [`NodeRecordInfo::known_status`]. Fields remain typed as `String`
+/// so unknown future variants added on the chain side deserialize
+/// without error and remain observable through the raw string —
+/// consumers that need eligibility use the exact-match helpers below.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRecordInfo {
     /// Node's L1 address in base58.
     pub address: String,
-    /// Role: "ArchiveNode" or "Validator".
+    /// Role string — `"ArchiveNode"` and `"Validator"` today (chain's
+    /// `NodeRole` enum has these two variants); unknown-future values
+    /// pass through as the raw string and are treated as ineligible.
     pub role: String,
     /// Staked balance in Koppa base units.
     pub staked_balance: u64,
-    /// Status: "Active" or "Slashed".
+    /// Status string — `"Active"`, `"Slashed"`, `"Unbonding"`, and
+    /// `"Withdrawn"` are the four current chain variants; unknown-future
+    /// values pass through as the raw string and are treated as
+    /// ineligible.
     pub status: String,
     /// Block height at which the node registered.
     pub registered_at: u64,
+}
+
+impl NodeRecordInfo {
+    /// The SNIP-wide eligibility contract for including this record in
+    /// a V1 or V2 chunk-assignment set, a push admission cache, or an
+    /// operator readiness gate.
+    ///
+    /// Returns `true` iff `role == "ArchiveNode"` **and**
+    /// `status == "Active"`. Any other combination — Validator,
+    /// Unbonding, Withdrawn, Slashed, or any unknown-future value —
+    /// returns `false`.
+    ///
+    /// Every SNIP consumer of `Vec<NodeRecordInfo>` that treats input
+    /// as "assignment-eligible archives" MUST filter through this
+    /// helper (or equivalently through [`filter_active_archives`])
+    /// before any address decode or assignment computation.
+    pub fn is_active_archive(&self) -> bool {
+        self.role == "ArchiveNode" && self.status == "Active"
+    }
+
+    /// `Some` for a status the workspace recognises at this release;
+    /// `None` for any future chain-added status not yet enumerated on
+    /// SNIP's side. Callers that need to display the raw string keep
+    /// reading [`NodeRecordInfo::status`].
+    pub fn known_status(&self) -> Option<KnownNodeStatus> {
+        match self.status.as_str() {
+            "Active" => Some(KnownNodeStatus::Active),
+            "Slashed" => Some(KnownNodeStatus::Slashed),
+            "Unbonding" => Some(KnownNodeStatus::Unbonding),
+            "Withdrawn" => Some(KnownNodeStatus::Withdrawn),
+            _ => None,
+        }
+    }
+}
+
+/// The four `NodeStatus` variants the chain currently emits (upstream
+/// `sum-chain/crates/primitives/src/node_registry.rs`). Callers that
+/// receive a future chain-added status observe [`NodeRecordInfo::status`]
+/// directly; there is no closed-enum wire representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownNodeStatus {
+    Active,
+    Slashed,
+    Unbonding,
+    Withdrawn,
+}
+
+/// Narrow a `storage_getActiveNodes[AtHeight]` response to exactly-
+/// eligible archives per [`NodeRecordInfo::is_active_archive`]. Preserves
+/// order and does NOT dedupe (callers that need dedupe do it after
+/// address decode).
+///
+/// This is the workspace's single point of eligibility filtering. Every
+/// consumer of a snapshot response that treats input as assignment-
+/// eligible archives applies this helper before address decode; the
+/// consumer audit is recorded in `docs/reference/chain-compat.md`.
+pub fn filter_active_archives(records: Vec<NodeRecordInfo>) -> Vec<NodeRecordInfo> {
+    records
+        .into_iter()
+        .filter(NodeRecordInfo::is_active_archive)
+        .collect()
 }
 
 // ── V2 RPC types (chain plan v3.2) ───────────────────────────────────────────
@@ -913,5 +990,108 @@ mod tests {
         let cp: ChainParamsInfo = serde_json::from_str(json).unwrap();
         assert_eq!(cp.v2_enabled_from_height, Some(0));
         assert_ne!(cp.v2_enabled_from_height, None);
+    }
+
+    // ── #32: eligibility contract ────────────────────────────────────────
+
+    fn record(role: &str, status: &str) -> NodeRecordInfo {
+        NodeRecordInfo {
+            address: format!("addr_{role}_{status}"),
+            role: role.into(),
+            staked_balance: 1_000_000_000,
+            status: status.into(),
+            registered_at: 1,
+        }
+    }
+
+    #[test]
+    fn is_active_archive_true_only_for_archive_and_active() {
+        let combos = [
+            // Only this combination is eligible.
+            ("ArchiveNode", "Active", true),
+            // ArchiveNode with a non-Active status: ineligible.
+            ("ArchiveNode", "Slashed", false),
+            ("ArchiveNode", "Unbonding", false),
+            ("ArchiveNode", "Withdrawn", false),
+            // Unknown-future status is ineligible.
+            ("ArchiveNode", "Frozen", false),
+            // Non-ArchiveNode roles are ineligible even when Active.
+            ("Validator", "Active", false),
+            ("Validator", "Slashed", false),
+            ("BogusRole", "Active", false),
+            // Blank strings never satisfy the contract.
+            ("", "Active", false),
+            ("ArchiveNode", "", false),
+        ];
+        for (role, status, expected) in combos {
+            let r = record(role, status);
+            assert_eq!(
+                r.is_active_archive(),
+                expected,
+                "is_active_archive for ({role:?}, {status:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn known_status_maps_the_four_known_variants() {
+        assert_eq!(
+            record("ArchiveNode", "Active").known_status(),
+            Some(KnownNodeStatus::Active)
+        );
+        assert_eq!(
+            record("ArchiveNode", "Slashed").known_status(),
+            Some(KnownNodeStatus::Slashed)
+        );
+        assert_eq!(
+            record("ArchiveNode", "Unbonding").known_status(),
+            Some(KnownNodeStatus::Unbonding)
+        );
+        assert_eq!(
+            record("ArchiveNode", "Withdrawn").known_status(),
+            Some(KnownNodeStatus::Withdrawn)
+        );
+        // Unknown-future status.
+        assert_eq!(record("ArchiveNode", "Frozen").known_status(), None);
+    }
+
+    #[test]
+    fn node_record_info_deserializes_unknown_status_as_string() {
+        // Chain adds a future variant SNIP doesn't know yet — SNIP must
+        // still deserialize the record without error, expose the raw
+        // string via `.status`, and treat it as ineligible.
+        let json = r#"{
+            "address": "SomeAddr",
+            "role": "ArchiveNode",
+            "staked_balance": 1000000000,
+            "status": "Frozen",
+            "registered_at": 42
+        }"#;
+        let info: NodeRecordInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.status, "Frozen");
+        assert_eq!(info.known_status(), None);
+        assert!(!info.is_active_archive());
+    }
+
+    #[test]
+    fn filter_active_archives_narrows_mixed_snapshot() {
+        // Every possible (role, status) combination from the eligibility
+        // test above; exactly one — ArchiveNode/Active — should survive.
+        let input = vec![
+            record("ArchiveNode", "Active"),
+            record("ArchiveNode", "Slashed"),
+            record("ArchiveNode", "Unbonding"),
+            record("ArchiveNode", "Withdrawn"),
+            record("ArchiveNode", "Frozen"),
+            record("Validator", "Active"),
+            record("Validator", "Slashed"),
+            record("BogusRole", "Active"),
+            record("", "Active"),
+            record("ArchiveNode", ""),
+        ];
+        let out = filter_active_archives(input);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, "ArchiveNode");
+        assert_eq!(out[0].status, "Active");
     }
 }

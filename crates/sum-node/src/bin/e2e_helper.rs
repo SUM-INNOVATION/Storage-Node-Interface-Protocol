@@ -839,11 +839,16 @@ async fn build_active_nodes_report(
         .map_err(|e| anyhow::anyhow!("storage_getActiveNodesAtHeight({effective_height}): {e}"))?;
 
     let by_role_status = tally_active_nodes(&nodes);
-    let active_archives = by_role_status
-        .get("ArchiveNode")
-        .and_then(|inner| inner.get("Active"))
-        .copied()
-        .unwrap_or(0);
+    // Count eligible archives via the shared `is_active_archive`
+    // contract. The tally is preserved above for operator visibility
+    // (Unbonding, Withdrawn, and unknown-future buckets remain
+    // observable), but the `--require-archives` gate keys off the
+    // exact contract, not a two-string lookup that would silently
+    // pass if either bucket key ever changed.
+    let active_archives = nodes
+        .iter()
+        .filter(|n| n.is_active_archive())
+        .count();
 
     Ok(ActiveNodesReport {
         height: effective_height,
@@ -1641,6 +1646,35 @@ mod tests {
             by_role_status: BTreeMap::new(),
         };
         assert_eq!(active_nodes_exit_code(&report, Some(3)), 2);
+    }
+
+    /// The `--require-archives` gate counts eligibility via the
+    /// shared `is_active_archive` contract (`role == "ArchiveNode"
+    /// && status == "Active"`), so exactly one row survives from a
+    /// mixed inventory that includes the four known statuses, a
+    /// future unknown status, and a Validator. The tally still shows
+    /// every bucket so operators keep visibility.
+    #[test]
+    fn active_nodes_gate_counts_only_active_archives() {
+        let nodes = vec![
+            n("ArchiveNode", "Active"),
+            n("ArchiveNode", "Slashed"),
+            n("ArchiveNode", "Unbonding"),
+            n("ArchiveNode", "Withdrawn"),
+            n("ArchiveNode", "Frozen"),
+            n("Validator", "Active"),
+        ];
+        // Contract-count uses is_active_archive.
+        let contract_count = nodes.iter().filter(|r| r.is_active_archive()).count();
+        assert_eq!(contract_count, 1);
+        // Tally still surfaces every bucket for operator visibility.
+        let tally = tally_active_nodes(&nodes);
+        assert!(tally["ArchiveNode"].contains_key("Active"));
+        assert!(tally["ArchiveNode"].contains_key("Slashed"));
+        assert!(tally["ArchiveNode"].contains_key("Unbonding"));
+        assert!(tally["ArchiveNode"].contains_key("Withdrawn"));
+        assert!(tally["ArchiveNode"].contains_key("Frozen"));
+        assert!(tally["Validator"].contains_key("Active"));
     }
 
     /// Human-format renders `key: value` lines mirroring the smoke

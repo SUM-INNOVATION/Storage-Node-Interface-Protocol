@@ -112,12 +112,16 @@ impl MarketSyncWorker {
         net: &Arc<SumNet>,
         peer_addresses: &Arc<RwLock<HashMap<PeerId, [u8; 20]>>>,
     ) -> Result<()> {
-        // 1. Get funded files and active nodes from L1
+        // 1. Get funded files and active nodes from L1. Apply the
+        // shared eligibility contract to narrow to exactly-eligible
+        // archives before assignment; fetch and GC both derive from
+        // this filtered list, so no divergence is possible.
         let files = self.rpc.get_funded_files().await?;
         let node_records = self.rpc.get_active_nodes().await?;
+        let node_records = sum_types::rpc_types::filter_active_archives(node_records);
 
         if files.is_empty() || node_records.is_empty() {
-            debug!("no funded files or no active nodes — skipping sync");
+            debug!("no funded files or no eligible archives — skipping sync");
             return Ok(());
         }
 

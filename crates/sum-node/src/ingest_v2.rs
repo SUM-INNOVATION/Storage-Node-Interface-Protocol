@@ -1291,12 +1291,17 @@ where
     ) -> Result<(StorageFileInfoV2, Vec<[u8; 20]>)> {
         let root_hex = format!("0x{}", hex::encode(merkle_root));
         let info = self.rpc.storage_get_file_info_v2(&root_hex).await?;
+        // Fetch the authoritative snapshot at the file's pinned
+        // `assignment_height`, then apply the shared eligibility
+        // contract before any address decode. Non-ArchiveNode or
+        // non-Active records never reach the assignment computation.
         let raw = self
             .rpc
             .storage_get_active_nodes_at_height(info.assignment_height)
             .await?;
-        let mut snapshot = Vec::with_capacity(raw.len());
-        for record in &raw {
+        let filtered = sum_types::rpc_types::filter_active_archives(raw);
+        let mut snapshot = Vec::with_capacity(filtered.len());
+        for record in &filtered {
             let addr = sum_net::l1_address_from_base58(&record.address)?;
             snapshot.push(addr);
         }
@@ -1868,15 +1873,18 @@ where
             };
         }
 
-        // Snapshot. Same as W10a.
+        // Snapshot. Same as W10a. Apply the shared eligibility contract
+        // before address decode so non-ArchiveNode/non-Active records
+        // never reach resume's assignment computation.
         let snapshot = match self
             .rpc
             .storage_get_active_nodes_at_height(info.assignment_height)
             .await
         {
             Ok(raw) => {
-                let mut snap = Vec::with_capacity(raw.len());
-                for record in &raw {
+                let filtered = sum_types::rpc_types::filter_active_archives(raw);
+                let mut snap = Vec::with_capacity(filtered.len());
+                for record in &filtered {
                     match sum_net::l1_address_from_base58(&record.address) {
                         Ok(addr) => snap.push(addr),
                         Err(e) => {

@@ -7,6 +7,26 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ## [Unreleased]
 
+### Fixed
+- **NodeRecord eligibility contract enforcement** (closes #32).
+  SNIP now defensively filters `storage_getActiveNodes` /
+  `storage_getActiveNodesAtHeight` responses by the
+  eligibility contract `role == "ArchiveNode" && status ==
+  "Active"` at every assignment consumer. Adds
+  `NodeRecordInfo::is_active_archive`,
+  `NodeRecordInfo::known_status`, `KnownNodeStatus`, and the
+  shared `filter_active_archives` helper in
+  `crates/sum-types/src/rpc_types.rs`; wire representation
+  stays `String` for both fields so future unknown chain
+  variants (e.g. after the archive-unbonding gate #20 activates
+  at height 8,900,000) deserialize without a SNIP release,
+  remain observable via the raw string, and are treated as
+  ineligible. Applied at V1 upload/download, MarketSync + GC,
+  V2 ingest / resume snapshot, V2 push-validator admission
+  cache, V2 public + private routing, V2 attest trigger, and
+  the operator `--require-archives` gate. The consumer audit is
+  documented in `docs/architecture/chain-integration.md`.
+
 ### Changed (docs — audit)
 - **Documentation restructure and audit** (closes #29, #31). The
   `docs/` tree is reorganised into subject-area subdirectories

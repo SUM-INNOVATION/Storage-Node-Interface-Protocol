@@ -569,12 +569,16 @@ impl DownloadOrchestrator {
     ) -> HashMap<u32, Vec<PeerId>> {
         let mut holder_map: HashMap<u32, Vec<PeerId>> = HashMap::new();
 
-        // Try to get active nodes from L1 for assignment-based routing
+        // Try to get active nodes from L1 for assignment-based routing.
+        // Apply the shared eligibility contract so V1 holder-map
+        // computation excludes Slashed/Unbonding/Withdrawn and
+        // non-Archive records.
         let nodes_result = self.rpc.get_active_nodes().await;
         let Ok(node_records) = nodes_result else {
             warn!("could not get active nodes from L1 — using gossipsub-based peer selection");
             return holder_map;
         };
+        let node_records = sum_types::rpc_types::filter_active_archives(node_records);
 
         // Parse addresses, sort
         let mut node_addrs: Vec<[u8; 20]> = Vec::new();

@@ -397,8 +397,12 @@ impl<C: V2RpcClient> PushValidator<C> {
             .await
             .map_err(|e| PushReject::SnapshotLookup { height, source: e })?;
 
-        let mut decoded: Vec<[u8; 20]> = Vec::with_capacity(raw.len());
-        for record in &raw {
+        // Apply the shared eligibility contract before address decode so
+        // any non-ArchiveNode/non-Active record — including future
+        // unknown status strings — is excluded from the admission cache.
+        let filtered = sum_types::rpc_types::filter_active_archives(raw);
+        let mut decoded: Vec<[u8; 20]> = Vec::with_capacity(filtered.len());
+        for record in &filtered {
             let addr = l1_address_from_base58(&record.address).map_err(|e| {
                 PushReject::BadChainShape(format!(
                     "snapshot at h={height} contained unparseable address {:?}: {e}",
