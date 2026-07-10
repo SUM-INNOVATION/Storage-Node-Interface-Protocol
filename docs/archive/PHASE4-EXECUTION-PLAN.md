@@ -1,3 +1,15 @@
+> **ARCHIVED — historical planning document.** Preserved for context.
+> Phase 4 Objectives 1, 2, 4, 5 have shipped (see CHANGELOG for the
+> WS2b V2 migration + production hardening arcs). Objective 3
+> (Reed-Solomon erasure coding) remains future work — tracked as a
+> live item in [`docs/roadmap/roadmap.md`](../roadmap/roadmap.md).
+> Do not treat "DONE" / "NOT STARTED" annotations in this file as
+> current status. See the current feature matrix in
+> [`docs/status/implementation-status.md`](../status/implementation-status.md);
+> see [`docs/archive/README.md`](README.md) for the archive index.
+
+---
+
 # Phase 4 Execution Plan: Scale-Out — Reed-Solomon, WAN Discovery & Production Hardening
 
 ## Overview

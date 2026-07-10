@@ -1,9 +1,9 @@
-# Discoverable operator commands for SUM-Storage-Node-Protocol.
+# Discoverable operator commands for Storage-Node-Interface-Protocol.
 # Targets are thin wrappers around cargo / scripts; nothing is hidden.
 # Run `make` (no args) to print this help.
 
 .DEFAULT_GOAL := help
-.PHONY: help fmt lint lint-strict test build release-check smoke audit-logs e2e-mirror
+.PHONY: help fmt lint lint-strict test build release-check smoke audit-logs check-docs-links check-cli-doc e2e-mirror
 
 help:
 	@printf "Targets:\n"
@@ -13,7 +13,9 @@ help:
 	@printf "  lint-strict              cargo clippy --workspace --all-targets -- -D warnings\n"
 	@printf "  build                    cargo build --release -p sum-node\n"
 	@printf "  audit-logs               scripts/audit-logs.sh (privacy guardrail)\n"
-	@printf "  release-check            fmt + lint-strict + test + build + audit-logs\n"
+	@printf "  check-docs-links         scripts/check-docs-links.sh (Markdown link resolver)\n"
+	@printf "  check-cli-doc            scripts/check-cli-doc.sh (clap flags vs docs/reference/cli.md)\n"
+	@printf "  release-check            fmt + lint-strict + test + build + audit-logs + docs checks\n"
 	@printf "  smoke RPC=URL            read-only chain smoke (extra args via SMOKE_ARGS=...)\n"
 	@printf "                           e.g. make smoke RPC=http://localhost:8545 SMOKE_ARGS=--require-v2\n"
 	@printf "  e2e-mirror               manual local-mirror E2E suite (assumes mirror running)\n"
@@ -37,7 +39,13 @@ build:
 audit-logs:
 	scripts/audit-logs.sh
 
-release-check: fmt lint-strict test build audit-logs
+check-docs-links:
+	scripts/check-docs-links.sh
+
+check-cli-doc: build
+	scripts/check-cli-doc.sh
+
+release-check: fmt lint-strict test build audit-logs check-docs-links check-cli-doc
 	@printf "release-check: ok\n"
 
 smoke:

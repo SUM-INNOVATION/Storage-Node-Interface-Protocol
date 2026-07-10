@@ -3,9 +3,87 @@
 Notable changes to SNIP. The format follows Keep a Changelog
 ([keepachangelog.com](https://keepachangelog.com/en/1.1.0/)) and
 loosely Semantic Versioning. Chain-version compatibility is tracked
-in [`docs/CHAIN-COMPAT.md`](docs/CHAIN-COMPAT.md).
+in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ## [Unreleased]
+
+### Changed (docs — audit)
+- **Documentation restructure and audit** (closes #29, #31). The
+  `docs/` tree is reorganised into subject-area subdirectories
+  (`getting-started/`, `protocol/`, `architecture/`, `operator/`,
+  `client/`, `reference/`, `security/`, `compatibility/`,
+  `release/`, `status/`, `roadmap/`, `archive/`), with historical
+  planning documents moved to `docs/archive/` under an ARCHIVED
+  preamble and normative material either in place (edited) or
+  extracted into new topic pages. The root README is now a concise
+  landing page pointing into the new tree.
+- **V2 Proof-of-Retrievability targeting is documented correctly.**
+  The README previously described V2 PoR challenge targeting as
+  unimplemented, citing a stale `sum-chain` source range. That
+  claim is removed. The new canonical page
+  [`docs/protocol/proof-of-retrievability.md`](docs/protocol/proof-of-retrievability.md)
+  distinguishes shipped V2 assignment-aware challenge targeting
+  (upstream `sum-chain` issue #97, gated by `assignment_targeting`
+  on `chain_getChainParams`) from the still-planned bounded
+  coverage scheduler (upstream `sum-chain` issue #81,
+  design-only). The gate value on any given deployment is described
+  as "verify at runtime" — SNIP documentation does not restate the
+  current mainnet value as a constant. Cross-repository chain
+  references cite symbols rather than line ranges to degrade more
+  gracefully.
+- **Chain-ID safety callouts.** Every mainnet-directed example in
+  [`docs/operator/mainnet-bringup.md`](docs/operator/mainnet-bringup.md)
+  and [`docs/operator/runbook.md`](docs/operator/runbook.md) now
+  passes `--chain-id 1` explicitly on the write commands that
+  consume the CLI-supplied `chain_id` directly
+  (`register-encryption-key`, `share`, `revoke`, `update-access`,
+  `abandon`, and `listen`'s background `AssignmentAttestor`).
+  [`docs/reference/config-flags.md`](docs/reference/config-flags.md)
+  "Chain ID safety" enumerates which code paths consume the CLI
+  value vs. read `chain_id` from RPC.
+- **Feature-status matrix.** New
+  [`docs/status/implementation-status.md`](docs/status/implementation-status.md)
+  lists every user-visible feature with shipped/planned status and
+  entry-point references; new
+  [`docs/roadmap/roadmap.md`](docs/roadmap/roadmap.md) collects
+  forward-looking items including a listener-side runtime fix that
+  should read `chain_id` from RPC in every V2 tx-signing path.
+- **Terminology.** SNIP uses "Proof of Retrievability" (PoR)
+  consistently. Upstream issue titles that use "Proof-of-Retention"
+  are preserved verbatim when cited, with a one-time terminology
+  note at the top of the PoR page.
+- **CLI reference.** [`docs/reference/cli.md`](docs/reference/cli.md)
+  is now the sole source of truth for `sum-node` and `e2e-helper`
+  subcommands and flags. Adds previously-undocumented
+  `--download-timeout-secs` and `--manifest-push-timeout-secs`;
+  fixes the V1 `ingest` row's `--client` branch behavior.
+- Every operator-runbook `e2e-helper register-node` example now
+  includes `--allow-live-chain-write`.
+- Sum-chain-repo path references in
+  [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md)
+  and [`docs/release/release-checklist.md`](docs/release/release-checklist.md)
+  are prefixed `sum-chain:` (or accompanied by an inline
+  "in the chain repo" clarifier) to disambiguate from local paths.
+- Root-level `docs/*.md` compatibility stubs left at every moved
+  authoritative path so external links continue to resolve for one
+  release cycle.
+- Compressed workspace `Cargo.toml` `repository` URL from
+  `SUM-Storage-Node-Protocol` to `Storage-Node-Interface-Protocol`
+  (actual GitHub name). All five workspace crates inherit and
+  now advertise the correct URL.
+
+### Added (docs — audit)
+- `scripts/check-docs-links.sh`. Mechanical link checker: every
+  relative Markdown link inside `docs/**/*.md`, `README.md`, and
+  `CHANGELOG.md` must resolve to an existing file. Ignores
+  external URLs, mailto, pure fragment links, and code-formatted
+  cross-repository paths prefixed `sum-chain:`. Reports source
+  file, line, and unresolved target on failure. Wired into
+  `make release-check`.
+- `scripts/check-cli-doc.sh`. Verifies every clap flag on
+  `sum-node` and `e2e-helper` has a row under its subcommand
+  section in `docs/reference/cli.md`. Wired into
+  `make release-check`.
 
 ### Added
 - Prebuilt Linux x86_64 binary tarball published as a GitHub

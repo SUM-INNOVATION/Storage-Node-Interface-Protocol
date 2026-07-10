@@ -3842,7 +3842,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sum-crypto"
-version = "0.1.0"
+version = "0.4.0-rc4"
 dependencies = [
  "chacha20poly1305",
  "hex",
@@ -3857,7 +3857,7 @@ dependencies = [
 
 [[package]]
 name = "sum-net"
-version = "0.1.0"
+version = "0.4.0-rc4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3876,7 +3876,7 @@ dependencies = [
 
 [[package]]
 name = "sum-node"
-version = "0.1.0"
+version = "0.4.0-rc4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3909,7 +3909,7 @@ dependencies = [
 
 [[package]]
 name = "sum-store"
-version = "0.1.0"
+version = "0.4.0-rc4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3933,7 +3933,7 @@ dependencies = [
 
 [[package]]
 name = "sum-types"
-version = "0.1.0"
+version = "0.4.0-rc4"
 dependencies = [
  "blake3",
  "chrono",

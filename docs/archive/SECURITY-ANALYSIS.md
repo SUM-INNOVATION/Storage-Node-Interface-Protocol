@@ -1,3 +1,16 @@
+> **ARCHIVED — historical planning document.** Preserved for context.
+> The "recommended approach" section proposes a symmetric-only
+> ChaCha20-Poly1305 design with out-of-band key sharing. The shipped
+> Private V2 implementation uses a different design: X25519 hybrid
+> encryption with per-recipient wrapped `K_file` bundles on chain
+> (see [`docs/security/privacy-audit.md`](../security/privacy-audit.md)
+> and [`docs/security/threat-model.md`](../security/threat-model.md)
+> for the current-day statement). Do not treat the recommendation in
+> this file as current. See [`docs/archive/README.md`](README.md) for
+> the archive index.
+
+---
+
 # Security Analysis: Storage Access Control & Encryption
 
 ## Context

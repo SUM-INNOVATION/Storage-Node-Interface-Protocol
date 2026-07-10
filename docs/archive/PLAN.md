@@ -1,3 +1,14 @@
+> **ARCHIVED — historical planning document.** Preserved for context.
+> Describes an earlier design state (V1 transaction shapes, Phase 5
+> encryption listed as "not started") that has been superseded by
+> the Private V2 chain-plan-v3.2 workstream and the shipped
+> encryption + access-control implementation. Do not treat statements
+> in this file as current. See the current feature matrix in
+> [`docs/status/implementation-status.md`](../status/implementation-status.md);
+> see [`docs/archive/README.md`](README.md) for the archive index.
+
+---
+
 Here is the complete architectural structure and phased implementation plan for the SUM Chain Native Decentralized Storage Protocol.
 This design keeps the Layer-1 state trie lightweight by ensuring no actual file data touches the blockchain. The chain acts strictly as the cryptographic source of truth, the financial settlement layer, and the access control enforcer.
 
