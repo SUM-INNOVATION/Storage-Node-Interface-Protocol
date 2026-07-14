@@ -536,9 +536,21 @@ async fn require_private_v2_owner(
         .storage_get_file_info_v2(root_hex, Some(0), Some(ACCESS_PAGE_SIZE))
         .await
     {
-        Ok(i) => i,
+        Ok(Some(i)) => i,
+        // Clean not-found: the chain has no V2 row for this root. This is
+        // the "not registered as V2" reason — distinct from a transport
+        // failure below.
+        Ok(None) => {
+            return Err(AccessOpError::NotV2 {
+                source: anyhow::anyhow!(
+                    "storage_getFileInfoV2 returned no row for {root_hex} (not registered as V2)"
+                ),
+            });
+        }
+        // Transport / RPC failure — surface as a transport error, not as
+        // a "not V2" verdict (the lookup never completed).
         Err(e) => {
-            return Err(AccessOpError::NotV2 { source: e });
+            return Err(AccessOpError::Rpc(e));
         }
     };
     if !info.visibility.is_private() {
@@ -582,10 +594,16 @@ async fn find_access_entry(
     }
     for page_idx in 1..ACCESS_MAX_PAGES {
         let offset = page_idx * ACCESS_PAGE_SIZE;
-        let page = rpc
+        let page = match rpc
             .storage_get_file_info_v2(root_hex, Some(offset), Some(ACCESS_PAGE_SIZE))
             .await
-            .map_err(AccessOpError::Rpc)?;
+        {
+            Ok(Some(page)) => page,
+            // A later page returned null — the V2 row is gone mid-scan.
+            // Terminal: the target simply isn't in the access list.
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(AccessOpError::Rpc(e)),
+        };
         if let Some(e) = page.access_list.iter().find(|e| e.address == target_b58) {
             return Ok(Some(e.clone()));
         }

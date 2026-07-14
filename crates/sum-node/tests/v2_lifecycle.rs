@@ -119,13 +119,12 @@ impl MockRpc {
 
 #[async_trait]
 impl V2RpcClient for MockRpc {
-    async fn storage_get_file_info_v2(&self, merkle_root_hex: &str) -> Result<StorageFileInfoV2> {
-        self.files
-            .lock()
-            .unwrap()
-            .get(merkle_root_hex)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown root: {merkle_root_hex}"))
+    async fn storage_get_file_info_v2(
+        &self,
+        merkle_root_hex: &str,
+    ) -> Result<Option<StorageFileInfoV2>> {
+        // Missing root → clean not-found (Ok(None)); present → Ok(Some).
+        Ok(self.files.lock().unwrap().get(merkle_root_hex).cloned())
     }
     async fn storage_get_active_nodes_at_height(&self, height: u64) -> Result<Vec<NodeRecordInfo>> {
         self.snapshots
@@ -206,7 +205,10 @@ struct ArcRpc(Arc<MockRpc>);
 
 #[async_trait]
 impl V2RpcClient for ArcRpc {
-    async fn storage_get_file_info_v2(&self, merkle_root_hex: &str) -> Result<StorageFileInfoV2> {
+    async fn storage_get_file_info_v2(
+        &self,
+        merkle_root_hex: &str,
+    ) -> Result<Option<StorageFileInfoV2>> {
         self.0.storage_get_file_info_v2(merkle_root_hex).await
     }
     async fn storage_get_active_nodes_at_height(&self, height: u64) -> Result<Vec<NodeRecordInfo>> {

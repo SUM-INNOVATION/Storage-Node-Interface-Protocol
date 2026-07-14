@@ -6,7 +6,7 @@
 //! real running chain mirror at `http://localhost:8545`.
 //!
 //! Preconditions checked at runtime:
-//!   * Mirror up + V2 enabled (chain_id 31337, finality advancing).
+//!   * Mirror up + V2 enabled (chain_id 1337, finality advancing).
 //!   * `e2e_keys/` populated by `e2e-helper generate-e2e-keys`.
 //!   * Mirror brought up with the matching `extra-alloc.json`
 //!     overlay so role addresses are funded.
@@ -74,7 +74,7 @@ fn spawn_ingest_and_extract_root(
         "--rpc-url".into(),
         e2e_rpc_url(),
         "--chain-id".into(),
-        "31337".into(),
+        "1337".into(),
         "ingest-v2".into(),
         file_path.display().to_string(),
         "--visibility".into(),
@@ -160,7 +160,7 @@ fn spawn_archive_listen(role: &str, store_dir: &std::path::Path) -> std::process
         "--rpc-url",
         &e2e_rpc_url(),
         "--chain-id",
-        "31337",
+        "1337",
         "listen",
     ]);
     cmd.stdout(Stdio::piped());
@@ -267,7 +267,7 @@ async fn ensure_encryption_key_registered(rpc: &L1RpcClient, role: &str) {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "register-encryption-key",
         ],
         &[],
@@ -473,7 +473,7 @@ async fn register_encryption_key() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "register-encryption-key",
         ],
         &[],
@@ -537,7 +537,7 @@ async fn public_ingest_then_download_round_trip() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "download",
             &root_hex,
             "--output",
@@ -597,7 +597,7 @@ async fn private_owner_only_ingest_then_owner_download() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "download",
             &root_hex,
             "--output",
@@ -663,7 +663,7 @@ async fn private_shared_recipient_ingest_then_recipient_download() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "download",
             &root_hex,
             "--output",
@@ -723,7 +723,7 @@ async fn share_post_ingest_admits_new_recipient() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "share",
             &root_hex,
             "--recipient",
@@ -750,7 +750,7 @@ async fn share_post_ingest_admits_new_recipient() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "download",
             &root_hex,
             "--output",
@@ -806,7 +806,7 @@ async fn revoke_denies_recipient_after_finality() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "download",
             &root_hex,
             "--output",
@@ -829,7 +829,7 @@ async fn revoke_denies_recipient_after_finality() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "revoke",
             &root_hex,
             "--recipient",
@@ -855,7 +855,7 @@ async fn revoke_denies_recipient_after_finality() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "download",
             &root_hex,
             "--output",
@@ -931,7 +931,7 @@ async fn update_access_extend_expiry_admits_past_original_cutoff() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "update-access",
             &root_hex,
             "--recipient",
@@ -957,7 +957,7 @@ async fn update_access_extend_expiry_admits_past_original_cutoff() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "download",
             &root_hex,
             "--output",
@@ -1014,7 +1014,7 @@ async fn update_access_clear_expiry_grants_indefinite_access() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "update-access",
             &root_hex,
             "--recipient",
@@ -1040,7 +1040,7 @@ async fn update_access_clear_expiry_grants_indefinite_access() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "download",
             &root_hex,
             "--output",
@@ -1109,7 +1109,7 @@ async fn resume_pending_completes_to_active() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "ingest-v2",
             pt_path.to_str().unwrap(),
             "--visibility",
@@ -1145,7 +1145,7 @@ async fn resume_pending_completes_to_active() {
             "--rpc-url",
             &e2e_rpc_url(),
             "--chain-id",
-            "31337",
+            "1337",
             "resume",
             &prefixed,
             pt_path.to_str().unwrap(),
@@ -1164,7 +1164,8 @@ async fn resume_pending_completes_to_active() {
     let info = rpc
         .storage_get_file_info_v2(&prefixed, None, None)
         .await
-        .expect("storage_getFileInfoV2 after resume");
+        .expect("storage_getFileInfoV2 after resume")
+        .expect("V2 row must be present after resume");
     assert!(
         info.lifecycle.is_active(),
         "file lifecycle after resume must be Active, got {:?}",

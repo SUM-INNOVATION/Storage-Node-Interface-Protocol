@@ -70,7 +70,7 @@ lifecycle: Active
 
 Record the `merkle_root` — you will need it to download.
 
-For local-mirror substitute `--chain-id 31337`. Both values are
+For local-mirror substitute `--chain-id 1337`. Both values are
 required today for the paths that consume the CLI value — see
 [`../reference/config-flags.md`](../reference/config-flags.md)
 "Chain ID safety."

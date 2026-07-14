@@ -17,7 +17,8 @@ so a future contributor knows what "done" looks like.
 `share`, `revoke`, `update-access`, `abandon`, the ingest-v2 dev-
 fallback branch, and the listener-side `AssignmentAttestor` — read
 `chain_id` from the CLI `--chain-id` value. The workspace default
-is `1337`; mainnet is `1`; local-mirror is `31337`. Documentation
+and the shared devnet / local-mirror are both `1337`; mainnet is
+`1`. Documentation
 instructs mainnet operators to pass `--chain-id 1` on every write
 example, but nothing prevents an omission.
 

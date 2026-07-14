@@ -289,7 +289,7 @@ pub struct BlockHeightInfo {
 /// change would be a hard fork.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainParamsInfo {
-    /// Chain identifier (mainnet / testnet / local-mirror = 31337).
+    /// Chain identifier (mainnet = 1 / local-mirror / shared devnet = 1337).
     pub chain_id: u64,
     /// Block production cadence (e.g. 2,000 ms for the local mirror).
     pub block_time_ms: u64,

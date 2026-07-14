@@ -1754,6 +1754,7 @@ async fn run_resume_v2(
                 .storage_get_file_info_v2(&root_hex, None, None)
                 .await
                 .ok()
+                .flatten()
                 .map(|info| info.assignment_height);
             anyhow::bail!(
                 "resume: cannot proceed — chain_getChainParams.\
@@ -2394,7 +2395,8 @@ async fn run_download(
     let v2_info = rpc
         .storage_get_file_info_v2(&root_hex, None, None)
         .await
-        .ok();
+        .ok()
+        .flatten();
 
     // Private + missing seed → bail before SumNet::new.
     if let Some(info) = v2_info.as_ref() {

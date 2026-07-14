@@ -135,10 +135,14 @@ impl V2Params {
 /// trait so tests can mock without spinning up an HTTP responder.
 #[async_trait::async_trait]
 pub trait V2RpcClient: Send + Sync {
+    /// `Ok(Some)` — the chain has a V2 row for this root.
+    /// `Ok(None)` — the chain authoritatively reports no V2 row
+    /// (not registered). `Err` — RPC / transport failure. Callers MUST
+    /// keep the not-found (`None`) and failure (`Err`) channels distinct.
     async fn storage_get_file_info_v2(
         &self,
         merkle_root_hex: &str,
-    ) -> anyhow::Result<StorageFileInfoV2>;
+    ) -> anyhow::Result<Option<StorageFileInfoV2>>;
 
     async fn storage_get_active_nodes_at_height(
         &self,
@@ -164,13 +168,21 @@ pub struct ValidatedPush {
 /// (W5 will); locally we use this enum as the call-site discriminant.
 #[derive(Debug, thiserror::Error)]
 pub enum PushReject {
-    /// `storage_getFileInfoV2(root)` returned an RPC error — typically
-    /// "file not registered" but could also be a transport failure.
-    /// Either way: do not store the chunk. Caller may retry with
-    /// backoff; chain registration may still be in-flight on the owner
-    /// side.
+    /// `storage_getFileInfoV2(root)` failed at the RPC / transport layer
+    /// — a JSON-RPC error, HTTP error, or transport failure. Distinct
+    /// from [`PushReject::NotRegistered`] (a clean `Ok(None)`): here the
+    /// lookup itself did not complete, so the file's registration status
+    /// is unknown. Do not store the chunk; caller may retry with backoff.
     #[error("file_info lookup failed for root: {0}")]
     UnknownRoot(#[source] anyhow::Error),
+
+    /// `storage_getFileInfoV2(root)` returned `Ok(None)` — the chain
+    /// authoritatively reports no V2 row for this root (not registered).
+    /// The lookup succeeded, so this is distinct from
+    /// [`PushReject::UnknownRoot`]: the chain registration for this file
+    /// simply doesn't exist yet. Do not store the chunk.
+    #[error("file not registered on chain: {0}")]
+    NotRegistered(String),
 
     /// File is in lifecycle Abandoned. Push must be rejected even if
     /// the proof is valid; downstream attestation would be dropped on
@@ -366,11 +378,14 @@ impl<C: V2RpcClient> PushValidator<C> {
         }
 
         let root_hex = format!("0x{}", hex::encode(merkle_root));
-        let info = self
-            .rpc
-            .storage_get_file_info_v2(&root_hex)
-            .await
-            .map_err(PushReject::UnknownRoot)?;
+        let info = match self.rpc.storage_get_file_info_v2(&root_hex).await {
+            // Present V2 row → validate below.
+            Ok(Some(info)) => info,
+            // Clean not-found signal → distinct "not registered" reject.
+            Ok(None) => return Err(PushReject::NotRegistered(root_hex)),
+            // RPC / transport failure → transport reject.
+            Err(e) => return Err(PushReject::UnknownRoot(e)),
+        };
 
         // Chain self-consistency: the `merkle_root` field in the
         // response MUST equal what we asked about. A mismatch is a
@@ -468,6 +483,10 @@ mod tests {
     struct MockRpc {
         file_infos: StdMutex<HashMap<String, StorageFileInfoV2>>,
         snapshots: StdMutex<HashMap<u64, Vec<NodeRecordInfo>>>,
+        /// Roots for which `storage_get_file_info_v2` returns an RPC /
+        /// transport `Err` (distinct from a missing root, which is the
+        /// clean `Ok(None)` not-found signal).
+        error_roots: StdMutex<std::collections::HashSet<String>>,
         file_info_calls: StdMutex<Vec<String>>,
         snapshot_calls: StdMutex<Vec<u64>>,
     }
@@ -478,6 +497,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(root_hex.to_string(), info);
+        }
+        /// Force `storage_get_file_info_v2(root_hex)` to fail with a
+        /// transport-style error.
+        fn fail_file(&self, root_hex: &str) {
+            self.error_roots
+                .lock()
+                .unwrap()
+                .insert(root_hex.to_string());
         }
         fn add_snapshot(&self, height: u64, nodes: Vec<NodeRecordInfo>) {
             self.snapshots.lock().unwrap().insert(height, nodes);
@@ -495,17 +522,21 @@ mod tests {
         async fn storage_get_file_info_v2(
             &self,
             merkle_root_hex: &str,
-        ) -> anyhow::Result<StorageFileInfoV2> {
+        ) -> anyhow::Result<Option<StorageFileInfoV2>> {
             self.file_info_calls
                 .lock()
                 .unwrap()
                 .push(merkle_root_hex.to_string());
-            self.file_infos
+            if self.error_roots.lock().unwrap().contains(merkle_root_hex) {
+                anyhow::bail!("transport failure for root: {merkle_root_hex}");
+            }
+            // Missing root → clean not-found (Ok(None)); present → Ok(Some).
+            Ok(self
+                .file_infos
                 .lock()
                 .unwrap()
                 .get(merkle_root_hex)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("unknown root: {merkle_root_hex}"))
+                .cloned())
         }
 
         async fn storage_get_active_nodes_at_height(
@@ -735,19 +766,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_root_rejects() {
+    async fn unregistered_root_rejects_as_not_registered() {
         // Build the validator, but never register the root in the mock.
         let snapshot = five_archives();
         let my_addr = snapshot[2];
         let tree = TreeFixture::new(8, 0x22);
         let rpc = MockRpc::default();
-        // No file_info entry — RPC will return Err("unknown root").
+        // No file_info entry — RPC returns Ok(None) (clean not-found),
+        // which maps to the distinct `NotRegistered` reject.
         let validator = PushValidator::new(rpc, my_addr, V2Params::DEFAULTS);
 
         let err = validator
             .validate_push(tree.root, 0, tree.data(0), &tree.proof(0))
             .await
             .expect_err("unregistered root must reject");
+        assert!(
+            matches!(err, PushReject::NotRegistered(_)),
+            "got {err:?}, expected NotRegistered"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_info_transport_error_rejects_as_unknown_root() {
+        // A transport / RPC failure (distinct from a clean not-found)
+        // must surface as the transport reject, NOT NotRegistered.
+        let snapshot = five_archives();
+        let my_addr = snapshot[2];
+        let tree = TreeFixture::new(8, 0x22);
+        let rpc = MockRpc::default();
+        let root_hex = format!("0x{}", hex::encode(tree.root));
+        rpc.fail_file(&root_hex);
+        let validator = PushValidator::new(rpc, my_addr, V2Params::DEFAULTS);
+
+        let err = validator
+            .validate_push(tree.root, 0, tree.data(0), &tree.proof(0))
+            .await
+            .expect_err("transport failure must reject");
         assert!(
             matches!(err, PushReject::UnknownRoot(_)),
             "got {err:?}, expected UnknownRoot"
@@ -887,9 +941,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_merkle_root_in_request_is_unknown_root() {
+    async fn wrong_merkle_root_in_request_is_not_registered() {
         // Push carries a root the chain doesn't know. We register a
-        // *different* root in the mock so the requested one is unknown.
+        // *different* root in the mock so the requested one is unknown
+        // (Ok(None) → NotRegistered).
         let fx = build_fixture(LifecycleV2::ACTIVE);
         // Build a different tree with a different root.
         let other_tree = TreeFixture::new(4, 0x99);
@@ -901,7 +956,7 @@ mod tests {
             .validate_push(other_tree.root, 0, other_tree.data(0), &other_tree.proof(0))
             .await
             .expect_err("wire root not registered → reject");
-        assert!(matches!(err, PushReject::UnknownRoot(_)), "got {err:?}");
+        assert!(matches!(err, PushReject::NotRegistered(_)), "got {err:?}");
         // Sanity: the original root still validates from the same
         // validator — we didn't poison anything.
         fx.validator

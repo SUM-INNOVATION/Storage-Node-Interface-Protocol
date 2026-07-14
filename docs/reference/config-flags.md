@@ -35,7 +35,7 @@ no documented deployment:**
 
 - Mainnet `chain_id` is `1`. See
   [`chain-compat.md`](chain-compat.md) "Mainnet pin / deployed chain."
-- Local mirror `chain_id` is `31337`. See
+- Local mirror `chain_id` is `1337`. See
   [`chain-compat.md`](chain-compat.md) "Pinned chain version."
 
 ### What consumes `--chain-id` today
@@ -75,7 +75,7 @@ fees on each attempted `AcceptAssignmentV2`.
   `sum-node` invocation until this behavior is corrected in
   runtime code (see [`../roadmap/roadmap.md`](../roadmap/roadmap.md)
   "Runtime: read `chain_id` from RPC for every V2 tx-signing path").
-- **On local mirror**, always pass `--chain-id 31337`.
+- **On local mirror**, always pass `--chain-id 1337`.
 - Prefer `SUM_CHAIN_ID` as an environment variable on hosts that
   run the binary from systemd / launchd, so a single misconfiguration
   cannot propagate silently across commands.

@@ -705,13 +705,20 @@ async fn build_smoke_report(rpc: &L1RpcClient, rpc_url: &str, opts: &SmokeOpts) 
     // Opt-in: storage_getFileInfoV2.
     match opts.known_root.as_deref() {
         Some(root) => match rpc.storage_get_file_info_v2(root, None, None).await {
-            Ok(info) => checks.push(CheckResult {
+            Ok(Some(info)) => checks.push(CheckResult {
                 name: "storage_getFileInfoV2".into(),
                 status: "ok",
                 detail: format!(
                     "lifecycle={:?}, visibility={:?}, chunk_count={}",
                     info.lifecycle, info.visibility, info.chunk_count
                 ),
+            }),
+            // Null result: the endpoint responded correctly, the file just
+            // isn't registered. The RPC contract is satisfied.
+            Ok(None) => checks.push(CheckResult {
+                name: "storage_getFileInfoV2".into(),
+                status: "ok",
+                detail: "no V2 row (null result — file not registered)".into(),
             }),
             Err(e) => checks.push(CheckResult {
                 name: "storage_getFileInfoV2".into(),

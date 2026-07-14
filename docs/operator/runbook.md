@@ -71,7 +71,7 @@ startup) — never acceptable in production.
 > export SUM_CHAIN_ID=1                            # mainnet
 > # OR for local-mirror:
 > # export SUM_RPC_URL=http://localhost:8545
-> # export SUM_CHAIN_ID=31337
+> # export SUM_CHAIN_ID=1337
 > export RUST_LOG=info
 > ```
 >
@@ -100,7 +100,7 @@ cargo run --release -p sum-node --bin e2e-helper -- \
 # 3. Register the X25519 encryption pubkey (required to receive
 #    Private V2 file shares). Idempotent on chain, but each invocation
 #    submits a transaction and pays the fee — do not re-run casually.
-#    Pass --chain-id explicitly: 1 for mainnet, 31337 for the local
+#    Pass --chain-id explicitly: 1 for mainnet, 1337 for the local
 #    mirror. See docs/reference/config-flags.md "Chain ID safety."
 cargo run --release -p sum-node -- \
     --chain-id 1 register-encryption-key
@@ -160,7 +160,7 @@ Confirm at runtime, never assume.
 
 | Field                      | Mainnet                   | Local mirror              |
 |----------------------------|---------------------------|---------------------------|
-| `chain_id`                 | `1`                       | `31337`                   |
+| `chain_id`                 | `1`                       | `1337`                   |
 | RPC                        | `https://rpc.sumchain.io` | `http://localhost:8545`   |
 | `v2_enabled_from_height`   | `5200000`                 | `0` (V2 from genesis)     |
 
@@ -416,7 +416,7 @@ make smoke RPC=http://localhost:8545
 
 Expected:
 
-- `chain_getChainParams` returns `chain_id = 31337` and
+- `chain_getChainParams` returns `chain_id = 1337` and
   `v2_enabled_from_height = 0` → SNIP reports
   `V2 state: ENABLED_FROM_GENESIS`.
 - `chain_getBlockHeight(["finalized"])` returns
@@ -529,7 +529,7 @@ compose override file:
 After bringing the mirror up with the overlay, verify three
 properties before running any test:
 
-1. **`chain_id` returns `31337`** — confirms the mirror booted
+1. **`chain_id` returns `1337`** — confirms the mirror booted
    and the RPC endpoint matches the documented value.
 2. **Block height advances** — confirms the validator is
    producing blocks (not stuck mid-genesis).

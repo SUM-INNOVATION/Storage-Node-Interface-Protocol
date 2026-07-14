@@ -49,8 +49,8 @@ scheduler are described in [`../protocol/proof-of-retrievability.md`](../protoco
 
 ## Active-archive eligibility contract
 
-Every SNIP consumer of a `storage_getActiveNodes` /
-`storage_getActiveNodesAtHeight` response narrows the returned
+Every SNIP consumer of a `storage_getActiveNodesAtHeight` response
+narrows the returned
 records to exactly-eligible archives before any address decode. The
 contract is:
 

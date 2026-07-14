@@ -280,11 +280,11 @@ pub struct StaticAccessRpc {
 
 #[async_trait]
 impl AccessListSource for StaticAccessRpc {
-    async fn fetch_page(&self, _: &str, _: u32, _: u32) -> Result<StorageFileInfoV2> {
+    async fn fetch_page(&self, _: &str, _: u32, _: u32) -> Result<Option<StorageFileInfoV2>> {
         // First-page short-circuit means this is rarely called. The
         // existing `find_my_access_entry_no_access_short_first_page`
         // test pins that branch.
-        Ok(self.first_page.clone())
+        Ok(Some(self.first_page.clone()))
     }
 }
 
@@ -383,8 +383,8 @@ pub async fn mirror_running_or_skip(rpc: &L1RpcClient) {
         )
     });
     assert_eq!(
-        params.chain_id, 31337,
-        "e2e: mirror reports chain_id={}, expected 31337 (per docs/CHAIN-COMPAT.md)",
+        params.chain_id, 1337,
+        "e2e: mirror reports chain_id={}, expected 1337 (per docs/CHAIN-COMPAT.md)",
         params.chain_id
     );
     let v2 = params.v2_enabled_from_height;
