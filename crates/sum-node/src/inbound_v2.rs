@@ -195,7 +195,7 @@ impl V2RpcClient for L1RpcClient {
     async fn storage_get_file_info_v2(
         &self,
         merkle_root_hex: &str,
-    ) -> Result<sum_types::rpc_types::StorageFileInfoV2> {
+    ) -> Result<Option<sum_types::rpc_types::StorageFileInfoV2>> {
         L1RpcClient::storage_get_file_info_v2(self, merkle_root_hex, None, None).await
     }
 
@@ -211,7 +211,12 @@ impl V2RpcClient for L1RpcClient {
 impl AttestTriggerRpc for L1RpcClient {
     async fn fetch_file_shape(&self, merkle_root: &[u8; 32]) -> Result<FileShape> {
         let key = format!("0x{}", hex::encode(merkle_root));
-        let info = L1RpcClient::storage_get_file_info_v2(self, &key, None, None).await?;
+        // A missing V2 row (`Ok(None)`) is an error for the attest-trigger
+        // path: there is no file shape to attest against. Map it to a
+        // descriptive Err rather than folding it into a default row.
+        let info = L1RpcClient::storage_get_file_info_v2(self, &key, None, None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("file not registered on chain: {key}"))?;
         Ok(FileShape {
             chunk_count: info.chunk_count,
             assignment_height: info.assignment_height,
@@ -979,13 +984,9 @@ mod tests {
         async fn storage_get_file_info_v2(
             &self,
             merkle_root_hex: &str,
-        ) -> anyhow::Result<StorageFileInfoV2> {
-            self.files
-                .lock()
-                .unwrap()
-                .get(merkle_root_hex)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("unknown root: {merkle_root_hex}"))
+        ) -> anyhow::Result<Option<StorageFileInfoV2>> {
+            // Missing root → clean not-found (Ok(None)); present → Ok(Some).
+            Ok(self.files.lock().unwrap().get(merkle_root_hex).cloned())
         }
         async fn storage_get_active_nodes_at_height(
             &self,
@@ -1255,7 +1256,7 @@ mod tests {
         async fn storage_get_file_info_v2(
             &self,
             merkle_root_hex: &str,
-        ) -> anyhow::Result<StorageFileInfoV2> {
+        ) -> anyhow::Result<Option<StorageFileInfoV2>> {
             self.0.storage_get_file_info_v2(merkle_root_hex).await
         }
         async fn storage_get_active_nodes_at_height(

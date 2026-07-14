@@ -15,7 +15,7 @@ use sum_net::identity;
 use sum_net::{PeerId, SumNet};
 use sum_store::gc::GarbageCollector;
 use sum_store::{SumStore, chunks_for_node, compute_chunk_assignment, nodes_for_chunk};
-use sum_types::rpc_types::StorageFileInfo;
+use sum_types::rpc_types::{NodeRecordInfo, StorageFileInfo};
 use sum_types::storage::CHUNK_SIZE;
 
 use crate::rpc_client::L1RpcClient;
@@ -124,8 +124,15 @@ impl MarketSyncWorker {
         // shared eligibility contract to narrow to exactly-eligible
         // archives before assignment; fetch and GC both derive from
         // this filtered list, so no divergence is possible.
+        //
+        // The active-node snapshot is pinned to the finalized head: the
+        // finalized height is read exactly once at the top of the cycle
+        // (inside `active_nodes_at_finalized_head`) — never per file — so
+        // every consumer in this cycle observes one consistent snapshot. A
+        // height-lookup failure fails the whole cycle via the same typed
+        // operation error as any other RPC failure (`?`).
         let files = self.rpc.get_funded_files().await?;
-        let node_records = self.rpc.get_active_nodes().await?;
+        let node_records = self.active_nodes_at_finalized_head().await?;
         let node_records = sum_types::rpc_types::filter_active_archives(node_records);
 
         if files.is_empty() || node_records.is_empty() {
@@ -186,6 +193,23 @@ impl MarketSyncWorker {
         }
 
         Ok(())
+    }
+
+    /// Fetch the active-archive snapshot pinned to the current finalized
+    /// head.
+    ///
+    /// Reads the finalized height exactly once via
+    /// `chain_get_block_height` (which passes `["finalized"]`), then the
+    /// height-pinned snapshot via `storage_get_active_nodes_at_height` at
+    /// exactly that height. This is the supported replacement for the
+    /// removed `storage_getActiveNodes` bulk endpoint. Both lookups
+    /// surface their typed errors; the sole caller (`sync_cycle`)
+    /// propagates them with `?`.
+    async fn active_nodes_at_finalized_head(&self) -> Result<Vec<NodeRecordInfo>> {
+        let finalized_height = self.rpc.chain_get_block_height().await?.height;
+        self.rpc
+            .storage_get_active_nodes_at_height(finalized_height)
+            .await
     }
 
     async fn sync_file(
@@ -605,5 +629,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Active-node routing (#37) ─────────────────────────────────────────
+
+    fn worker_with_rpc(url: String) -> MarketSyncWorker {
+        MarketSyncWorker::new(
+            Arc::new(L1RpcClient::new(url)),
+            [0u8; 20],
+            "test-node".to_string(),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            3,
+        )
+    }
+
+    /// (c) The finalized height is read EXACTLY ONCE per operation and the
+    /// active-node snapshot is pinned to precisely that height.
+    #[tokio::test]
+    async fn active_nodes_reads_finalized_height_exactly_once() {
+        use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+        let server = start_mock_rpc(routes([
+            (
+                "chain_getBlockHeight",
+                MockResponse::Result(serde_json::json!({"height": 777, "finality": "finalized"})),
+            ),
+            (
+                "storage_getActiveNodesAtHeight",
+                MockResponse::Result(serde_json::json!([])),
+            ),
+        ]))
+        .await;
+        let worker = worker_with_rpc(server.url());
+        let nodes = worker
+            .active_nodes_at_finalized_head()
+            .await
+            .expect("snapshot must decode");
+        assert!(nodes.is_empty());
+        assert_eq!(
+            server.method_count("chain_getBlockHeight"),
+            1,
+            "exactly one finalized-height read per operation"
+        );
+        assert_eq!(
+            server.first_params("storage_getActiveNodesAtHeight"),
+            Some(serde_json::json!([777])),
+            "active-node snapshot pinned to the finalized height"
+        );
+    }
+
+    /// (d) A finalized-height lookup failure propagates as the operation's
+    /// typed error (market-sync's `sync_cycle` forwards it with `?`); the
+    /// at-height snapshot is never queried.
+    #[tokio::test]
+    async fn active_nodes_propagates_height_failure() {
+        use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+        let server = start_mock_rpc(routes([
+            (
+                "chain_getBlockHeight",
+                MockResponse::error("finalized height unavailable"),
+            ),
+            (
+                "storage_getActiveNodesAtHeight",
+                MockResponse::Result(serde_json::json!([])),
+            ),
+        ]))
+        .await;
+        let worker = worker_with_rpc(server.url());
+        let res = worker.active_nodes_at_finalized_head().await;
+        assert!(
+            res.is_err(),
+            "height failure must propagate, not be swallowed"
+        );
+        assert_eq!(
+            server.method_count("storage_getActiveNodesAtHeight"),
+            0,
+            "no at-height query once the height read failed"
+        );
     }
 }

@@ -19,7 +19,7 @@ operator-facing source of truth for how SNIP and chain stay aligned.
 |---------------------------------------|------------------------------------------------------|
 | Chain commit (internal private chain) | `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0`           |
 | Local-mirror RPC                      | `http://localhost:8545`                              |
-| Local-mirror `chain_id`               | `31337` (verify at runtime via `chain_getChainParams`) |
+| Local-mirror `chain_id`               | `1337` (verify at runtime via `chain_getChainParams`) |
 | Local-mirror `v2_enabled_from_height` | emits `0` (V2 enabled from genesis)                  |
 | Local-mirror block cadence            | ~2 seconds                                           |
 | Live-chain `v2_enabled_from_height`   | published with the live release tag                  |
@@ -172,7 +172,7 @@ single-validator devnet, NOT mainnet. Operator-visible differences:
 
 | Field                          | Mainnet                  | Local mirror             |
 |--------------------------------|--------------------------|--------------------------|
-| `chain_id`                     | `1`                      | `31337`                  |
+| `chain_id`                     | `1`                      | `1337`                  |
 | `v2_enabled_from_height`       | `5200000`                | `0` (V2 from genesis)    |
 | Block cadence                  | ~3 s                     | ~2 s                     |
 | Pre-funded test addresses      | none                     | yes (overlay-funded)     |
@@ -309,7 +309,7 @@ enabled from genesis." Tests SHOULD assert that SNIP deserializes
 this as `Some(0)` and admits — not as `None` and not as a bare `u64`
 that silently defaults.
 
-The mirror's documented `chain_id` is `31337`, recorded in the
+The mirror's documented `chain_id` is `1337`, recorded in the
 "Pinned chain version" table above. Operators SHOULD still call
 `chain_getChainParams` against the running mirror at the start of
 any tx-signing test and abort if the returned id doesn't match —

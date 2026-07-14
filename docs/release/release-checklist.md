@@ -197,10 +197,10 @@ docker-compose -f deploy/snip-local-mirror.yaml up -d --build
 Health check (read-only, no tx). After bringing the mirror up,
 verify all three:
 
-1. **chain_id returns `31337`** and finality is `"finalized"`:
+1. **chain_id returns `1337`** and finality is `"finalized"`:
    ```bash
    make smoke RPC=http://localhost:8545 SMOKE_ARGS=--require-v2
-   # Expect: chain_id=31337, V2 state ENABLED_FROM_GENESIS.
+   # Expect: chain_id=1337, V2 state ENABLED_FROM_GENESIS.
    ```
 2. **Block height advances** (~2s block cadence). The smoke
    line `chain_getBlockHeight ........... OK (finalized

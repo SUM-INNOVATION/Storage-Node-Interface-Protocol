@@ -58,10 +58,12 @@ impl RuntimeChainParams {
     /// crates -g '*.rs'`) confirms non-consumption.
     pub fn dev_fallback() -> Self {
         Self {
-            // Matches the historical dev-mirror chain_id documented in
-            // docs/reference/chain-compat.md. Operators overriding this
-            // via --chain-id supersede dev_fallback for tx-signing.
-            chain_id: 31337,
+            // Shared ecosystem-devnet chain_id, documented in
+            // docs/reference/chain-compat.md. Note this value is NOT
+            // consumed by tx-signing (which uses `cli.chain_id` / the
+            // live-RPC value); operators overriding via --chain-id
+            // supersede dev_fallback regardless.
+            chain_id: 1337,
             assignment_replication_factor: sum_types::storage::DEFAULT_REPLICATION_FACTOR,
         }
     }
@@ -106,6 +108,15 @@ mod tests {
     /// documented `DEFAULT_REPLICATION_FACTOR` and nothing else. This
     /// is the ONE constant reference allowed in production runtime
     /// code; the release-checklist audit tracks it explicitly.
+    /// #39: the shared ecosystem-devnet fallback chain_id is 1337 (not
+    /// the legacy 31337), matching the CLI `--chain-id` default and the
+    /// chain-compat docs. Signing does not consume this value, so this is
+    /// an operator-consistency alignment, not a signing change.
+    #[test]
+    fn dev_fallback_chain_id_is_1337() {
+        assert_eq!(RuntimeChainParams::dev_fallback().chain_id, 1337);
+    }
+
     #[test]
     fn dev_fallback_uses_documented_default_replication_factor() {
         let rt = RuntimeChainParams::dev_fallback();

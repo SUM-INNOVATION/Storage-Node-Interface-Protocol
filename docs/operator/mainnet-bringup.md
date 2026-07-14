@@ -447,7 +447,7 @@ pass and Private V2 has its own throwaway round-trip on record.
 - Seed files: never in git, never in chat, never in tickets, never
   in plaintext backups. `chmod 600`; off-machine backup only if
   encrypted at rest.
-- Mainnet `chain_id` is `1`. Local mirror `chain_id` is `31337`.
+- Mainnet `chain_id` is `1`. Local mirror `chain_id` is `1337`.
   If you ever see a smoke output reporting the wrong `chain_id`,
   you are pointed at the wrong RPC — STOP, do not write.
 - The chain side's RocksDB / Docker / validator-binary

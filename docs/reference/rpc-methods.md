@@ -23,7 +23,7 @@ coordination with the chain team.
 | `storage_getFileInfoV2` | Read a V2 file's row: visibility, lifecycle, access list, fee pool | Route Public vs Private; verify preconditions before write; ACL check on serve |
 | `storage_getActiveNodesAtHeight` | Snapshot of active-`ArchiveNode` rows at a chain height | V2 ingest assignment; three-archive bootstrap gate |
 | `storage_getAssignmentCoverageV2` | Coverage bitmap + `can_activate_now` predicate for a Pending V2 file | Ingest S4 coverage poll |
-| `storage_getActiveNodes` | Snapshot of active archives at the finalized head (V1) | V1 MarketSync path |
+| `storage_getActiveNodes` | Legacy bare snapshot (unsupported/removed on chain) | **No longer called by SNIP** — V1 MarketSync, upload, and legacy download read the finalized height and call `storage_getActiveNodesAtHeight` |
 | `storage_getFundedFiles` | V1 files with `fee_pool > 0` | V1 MarketSync path |
 | `storage_getActiveChallenges` | Pending PoR challenges targeting a specific address | `PorWorker` background loop |
 | `account_getEncryptionPublicKey` | Resolve a recipient's registered X25519 pubkey | Private V2 ingest; `share` preflight |

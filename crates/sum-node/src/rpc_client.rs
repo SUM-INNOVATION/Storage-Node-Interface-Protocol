@@ -106,12 +106,6 @@ impl L1RpcClient {
         self.call("storage_getFundedFiles", json!([])).await
     }
 
-    /// Get all active ArchiveNodes, sorted deterministically by address bytes.
-    /// Used to compute the deterministic chunk assignment.
-    pub async fn get_active_nodes(&self) -> Result<Vec<NodeRecordInfo>> {
-        self.call("storage_getActiveNodes", json!([])).await
-    }
-
     /// Get the node registry record for an address.
     pub async fn get_node_record(&self, node_addr_base58: &str) -> Result<Option<NodeRecordInfo>> {
         self.call("storage_getNodeRecord", json!([node_addr_base58]))
@@ -152,9 +146,11 @@ impl L1RpcClient {
     // ── V2 RPC endpoints (chain plan v3.2 §4) ─────────────────────────────
     //
     // These complement the V1 methods above; legacy V1 files keep using
-    // `get_access_list`, `get_active_nodes`, etc. Phase 0b's ingest /
-    // push validator / attestor / finality waiter call the V2 variants
-    // exclusively.
+    // `get_access_list`, `get_funded_files`, etc. Active-node lookups are
+    // routed through `storage_get_active_nodes_at_height` against the
+    // finalized head rather than the unsupported `storage_getActiveNodes`.
+    // Phase 0b's ingest / push validator / attestor / finality waiter call
+    // the V2 variants exclusively.
 
     /// `chain_getBlockHeight(["finalized"])` — finalized chain head.
     ///
@@ -194,13 +190,19 @@ impl L1RpcClient {
 
     /// `storage_getFileInfoV2` — V2 file row + paginated access list.
     ///
-    /// Per chain plan v3.2 §4 the response signature is non-nullable
-    /// (`-> StorageFileInfoV2`); "file not found" surfaces as a
-    /// JSON-RPC error rather than `null`. We therefore return
-    /// `Result<StorageFileInfoV2>` and let the underlying RPC error
-    /// path carry "not found" up to the caller. Callers that want to
-    /// distinguish "not registered" from "transport error" should
-    /// inspect the error message (chain plan §10 receipt-code mapping).
+    /// "File not found" surfaces as a JSON `null` result, which decodes
+    /// to `Ok(None)`; a present row decodes to `Ok(Some(..))`. The three
+    /// return states are therefore explicit and distinguishable:
+    ///
+    ///   * present row (JSON object) → `Ok(Some(StorageFileInfoV2))`
+    ///   * absent row (JSON `null`) → `Ok(None)`
+    ///   * malformed row (object of the wrong shape) → decode `Err`
+    ///   * JSON-RPC error response → typed RPC `Err`
+    ///   * transport / HTTP failure → typed transport `Err`
+    ///
+    /// Callers must handle `Ok(None)` explicitly (a "not registered"
+    /// signal distinct from any error) rather than folding not-found into
+    /// the error channel.
     ///
     /// `access_offset`/`access_limit` paginate the access list; pass
     /// `None`/`None` for the chain default (offset=0, limit=256).
@@ -211,7 +213,7 @@ impl L1RpcClient {
         merkle_root_hex: &str,
         access_offset: Option<u32>,
         access_limit: Option<u32>,
-    ) -> Result<StorageFileInfoV2> {
+    ) -> Result<Option<StorageFileInfoV2>> {
         self.call(
             "storage_getFileInfoV2",
             json!([merkle_root_hex, access_offset, access_limit]),
@@ -271,6 +273,19 @@ impl L1RpcClient {
     /// `storage_getAssignmentCoverageV2` — bitmap coverage state for
     /// a Pending/Active V2 file.
     ///
+    /// "File not found" surfaces as a JSON `null` result → `Ok(None)`; a
+    /// present coverage row decodes to `Ok(Some(..))`. The return states
+    /// mirror `storage_get_file_info_v2`:
+    ///
+    ///   * present row (JSON object) → `Ok(Some(AssignmentCoverageV2))`
+    ///   * absent row (JSON `null`) → `Ok(None)`
+    ///   * malformed row (object of the wrong shape) → decode `Err`
+    ///   * JSON-RPC error response → typed RPC `Err`
+    ///   * transport / HTTP failure → typed transport `Err`
+    ///
+    /// Callers must handle `Ok(None)` explicitly (a terminal "not found"
+    /// signal) rather than treating not-found as an opaque error.
+    ///
     /// `missing_offset` is a **chunk-index lower bound**, not an offset
     /// into the missing list. Callers paginating uncovered chunks should
     /// cycle `missing_offset = last_returned_index + 1` per chain plan
@@ -281,7 +296,7 @@ impl L1RpcClient {
         merkle_root_hex: &str,
         missing_offset: Option<u32>,
         missing_limit: Option<u32>,
-    ) -> Result<AssignmentCoverageV2> {
+    ) -> Result<Option<AssignmentCoverageV2>> {
         self.call(
             "storage_getAssignmentCoverageV2",
             json!([merkle_root_hex, missing_offset, missing_limit]),
@@ -329,13 +344,14 @@ fn extract_tx_hash(raw: &Value) -> Result<String> {
 // port, serves a single canned response, and asserts the client's
 // behavior.
 //
-// **Why a contract test for `storage_getFileInfoV2` matters**: chain
-// plan v3.2 §4 declares the response signature as `-> StorageFileInfoV2`
-// (non-nullable). If the chain instead returns `null` in the `result`
-// field for unknown roots, our non-Option client decoding will surface
-// a JSON deserialization error — distinct from a JSON-RPC error. The
-// test pins the "JSON-RPC error → client `Err`" path explicitly so the
-// shape contract can't drift unnoticed.
+// **Why a contract test for `storage_getFileInfoV2` matters**: the
+// method returns `Result<Option<StorageFileInfoV2>>`, so the wire shape
+// maps to three distinct client states that callers rely on being kept
+// apart: a present row (object → `Ok(Some)`), an absent row (`null` →
+// `Ok(None)`), and a malformed row / JSON-RPC error / transport failure
+// (all → `Err`). The tests below pin each of these paths so the shape
+// contract — especially "`null` is not-found, not an error" — can't
+// drift unnoticed.
 #[cfg(test)]
 mod contract_tests {
     use super::*;
@@ -370,10 +386,10 @@ mod contract_tests {
         url
     }
 
-    /// Happy path: chain returns a complete `StorageFileInfoV2` JSON.
-    /// Client must decode without error and surface a `StorageFileInfoV2`.
+    /// Valid object → `Ok(Some(..))`. Client must decode without error
+    /// and surface the row wrapped in `Some`.
     #[tokio::test]
-    async fn storage_get_file_info_v2_decodes_success_shape() {
+    async fn storage_get_file_info_v2_object_is_some() {
         let body = r#"{
             "jsonrpc": "2.0",
             "id": 1,
@@ -402,7 +418,8 @@ mod contract_tests {
                 None,
             )
             .await
-            .expect("client must decode success shape");
+            .expect("client must decode success shape")
+            .expect("present row must be Some");
         assert_eq!(info.chunk_count, 10);
         assert!(info.lifecycle.is_pending());
         assert!(info.visibility.is_public());
@@ -440,13 +457,11 @@ mod contract_tests {
         );
     }
 
-    /// Defensive: if the chain returns `result: null` (i.e. behaves
-    /// like the V1 `storage_getAccessList` and the chain plan literal
-    /// is wrong), our non-Option decoding produces a deserialization
-    /// error. The test pins this behavior so a future ambiguity gets
-    /// caught here, not in production.
+    /// `null` result → `Ok(None)`: the chain reports the file has no V2
+    /// row. This MUST decode as `Ok(None)` (a distinct not-found signal),
+    /// never as an `Err` and never as a fabricated default row.
     #[tokio::test]
-    async fn storage_get_file_info_v2_null_result_is_decode_error() {
+    async fn storage_get_file_info_v2_null_is_none() {
         let body = r#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_string();
         let url = one_shot_responder(body).await;
         let client = L1RpcClient::new(url);
@@ -456,12 +471,172 @@ mod contract_tests {
                 None,
                 None,
             )
+            .await
+            .expect("null result must decode as Ok(None), not Err");
+        assert!(
+            result.is_none(),
+            "null result must be Ok(None); got {result:?}"
+        );
+    }
+
+    /// Malformed object (valid JSON, wrong shape for `StorageFileInfoV2`)
+    /// → decode `Err`. A wrong-shaped object must NOT be silently coerced
+    /// to `None`; it is a real error the caller fails closed on.
+    #[tokio::test]
+    async fn storage_get_file_info_v2_malformed_object_is_err() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"unexpected":"shape"}}"#.to_string();
+        let url = one_shot_responder(body).await;
+        let client = L1RpcClient::new(url);
+        let result = client
+            .storage_get_file_info_v2(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                None,
+                None,
+            )
             .await;
-        // Either we get an Err (JSON deserialize fails on null → struct)
-        // OR something else completely unexpected. We assert Err.
         assert!(
             result.is_err(),
-            "non-Option client must NOT silently accept null; got {result:?}"
+            "malformed object must be a decode Err, not Ok(None); got {result:?}"
+        );
+    }
+
+    /// Transport failure (socket accepted then closed with no HTTP
+    /// response) → transport `Err`. Never `Ok(None)`.
+    #[tokio::test]
+    async fn storage_get_file_info_v2_transport_failure_is_err() {
+        use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+        let server =
+            start_mock_rpc(routes([("storage_getFileInfoV2", MockResponse::Hangup)])).await;
+        let client = L1RpcClient::new(server.url());
+        let result = client
+            .storage_get_file_info_v2(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "transport failure must be an Err, not Ok(None); got {result:?}"
+        );
+    }
+
+    // ── storage_getAssignmentCoverageV2 contract tests (#38) ─────────────
+
+    /// A complete coverage row body. `per_archive` is required; the epoch
+    /// fields default when absent.
+    fn coverage_v2_body() -> String {
+        r#"{
+            "chunk_count": 10,
+            "covered_count": 10,
+            "can_activate_now": true,
+            "missing_total": 0,
+            "missing_offset": 0,
+            "missing_indices": [],
+            "per_archive": []
+        }"#
+        .to_string()
+    }
+
+    /// Valid object → `Ok(Some(..))`.
+    #[tokio::test]
+    async fn storage_get_assignment_coverage_v2_object_is_some() {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{}}}"#,
+            coverage_v2_body()
+        );
+        let url = one_shot_responder(body).await;
+        let client = L1RpcClient::new(url);
+        let cov = client
+            .storage_get_assignment_coverage_v2(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                None,
+                None,
+            )
+            .await
+            .expect("client must decode coverage shape")
+            .expect("present coverage row must be Some");
+        assert_eq!(cov.chunk_count, 10);
+        assert!(cov.can_activate_now);
+    }
+
+    /// `null` result → `Ok(None)` (not-found signal, not an error).
+    #[tokio::test]
+    async fn storage_get_assignment_coverage_v2_null_is_none() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_string();
+        let url = one_shot_responder(body).await;
+        let client = L1RpcClient::new(url);
+        let result = client
+            .storage_get_assignment_coverage_v2(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                None,
+                None,
+            )
+            .await
+            .expect("null result must decode as Ok(None)");
+        assert!(
+            result.is_none(),
+            "null coverage must be Ok(None); got {result:?}"
+        );
+    }
+
+    /// Malformed object (wrong shape) → decode `Err`.
+    #[tokio::test]
+    async fn storage_get_assignment_coverage_v2_malformed_object_is_err() {
+        let body =
+            r#"{"jsonrpc":"2.0","id":1,"result":{"chunk_count":"not-a-number"}}"#.to_string();
+        let url = one_shot_responder(body).await;
+        let client = L1RpcClient::new(url);
+        let result = client
+            .storage_get_assignment_coverage_v2(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "malformed coverage object must be a decode Err; got {result:?}"
+        );
+    }
+
+    /// JSON-RPC error response → typed RPC `Err`.
+    #[tokio::test]
+    async fn storage_get_assignment_coverage_v2_jsonrpc_error_is_err() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal error"}}"#
+            .to_string();
+        let url = one_shot_responder(body).await;
+        let client = L1RpcClient::new(url);
+        let result = client
+            .storage_get_assignment_coverage_v2(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                None,
+                None,
+            )
+            .await;
+        assert!(result.is_err(), "JSON-RPC error must be an Err");
+    }
+
+    /// Transport failure → transport `Err` (never `Ok(None)`).
+    #[tokio::test]
+    async fn storage_get_assignment_coverage_v2_transport_failure_is_err() {
+        use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+        let server = start_mock_rpc(routes([(
+            "storage_getAssignmentCoverageV2",
+            MockResponse::Hangup,
+        )]))
+        .await;
+        let client = L1RpcClient::new(server.url());
+        let result = client
+            .storage_get_assignment_coverage_v2(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "transport failure must be an Err, not Ok(None); got {result:?}"
         );
     }
 
@@ -627,6 +802,108 @@ mod contract_tests {
                 err.to_string().contains("non-string non-object"),
                 "error for {bogus} should mention shape: {err}"
             );
+        }
+    }
+
+    // ── Active-node routing wire-shape tests (#37) ───────────────────────
+
+    /// (a) `chain_get_block_height` MUST call `chain_getBlockHeight` with
+    /// exactly `["finalized"]` — never latest/head — and decode the
+    /// height. The finalized param is safety-critical: latest/head would
+    /// make active-node snapshots racy.
+    #[tokio::test]
+    async fn chain_get_block_height_uses_finalized_param() {
+        use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+        let server = start_mock_rpc(routes([(
+            "chain_getBlockHeight",
+            MockResponse::Result(json!({"height": 4242, "finality": "finalized"})),
+        )]))
+        .await;
+        let client = L1RpcClient::new(server.url());
+        let info = client
+            .chain_get_block_height()
+            .await
+            .expect("finalized height must decode");
+        assert_eq!(info.height, 4242);
+        assert_eq!(info.finality, "finalized");
+        assert_eq!(
+            server.first_params("chain_getBlockHeight"),
+            Some(json!(["finalized"])),
+            "must request the finalized head explicitly"
+        );
+    }
+
+    /// (b) `storage_get_active_nodes_at_height(h)` MUST call
+    /// `storage_getActiveNodesAtHeight` with exactly `[h]` — the precise
+    /// height passed by the caller.
+    #[tokio::test]
+    async fn storage_get_active_nodes_at_height_passes_exact_height() {
+        use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+        let server = start_mock_rpc(routes([(
+            "storage_getActiveNodesAtHeight",
+            MockResponse::Result(json!([])),
+        )]))
+        .await;
+        let client = L1RpcClient::new(server.url());
+        let nodes = client
+            .storage_get_active_nodes_at_height(9001)
+            .await
+            .expect("at-height snapshot must decode");
+        assert!(nodes.is_empty());
+        assert_eq!(
+            server.first_params("storage_getActiveNodesAtHeight"),
+            Some(json!([9001])),
+            "must query the exact height requested"
+        );
+        assert_eq!(
+            server.method_count("storage_getActiveNodesAtHeight"),
+            1,
+            "exactly one at-height query"
+        );
+    }
+
+    /// (g) Negative source scan: no code anywhere in this crate issues a
+    /// JSON-RPC call to the unsupported bare active-nodes method (the one
+    /// WITHOUT the `AtHeight` suffix). The bare method's fully-quoted
+    /// literal is distinct from the supported height-pinned variant, so
+    /// this catches any regression that reintroduces the orphan endpoint.
+    /// The needle is assembled at runtime so this scan never matches its
+    /// own source.
+    #[test]
+    fn no_source_calls_bare_storage_get_active_nodes() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Assemble the fully-quoted bare method literal from fragments so
+        // neither this line nor the surrounding docs contain it verbatim.
+        let bare = ["storage_get", "ActiveNodes"].concat();
+        let needle = format!("\"{bare}\"");
+        let needle = needle.as_str();
+        let mut offenders = Vec::new();
+        visit_rs_files(&src_dir, &mut |path, contents| {
+            if contents.contains(needle) {
+                offenders.push(path.display().to_string());
+            }
+        });
+        assert!(
+            offenders.is_empty(),
+            "bare storage_getActiveNodes call literal found in: {offenders:?}"
+        );
+    }
+
+    /// Recursively read every `.rs` file under `dir`, invoking `f` with
+    /// the path and file contents.
+    fn visit_rs_files(dir: &std::path::Path, f: &mut impl FnMut(&std::path::Path, &str)) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit_rs_files(&path, f);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    f(&path, &contents);
+                }
+            }
         }
     }
 }

@@ -178,12 +178,14 @@ const ACCESS_MAX_PAGES: u32 = 64; // 64 × 256 = 16,384 entries — well past an
 
 #[async_trait::async_trait]
 pub trait AccessListSource: Send + Sync {
+    /// `Ok(Some)` — the requested access-list page; `Ok(None)` — the
+    /// chain reports no V2 row (null); `Err` — RPC / transport failure.
     async fn fetch_page(
         &self,
         root_hex: &str,
         offset: u32,
         limit: u32,
-    ) -> Result<StorageFileInfoV2>;
+    ) -> Result<Option<StorageFileInfoV2>>;
 }
 
 #[async_trait::async_trait]
@@ -193,7 +195,7 @@ impl AccessListSource for L1RpcClient {
         root_hex: &str,
         offset: u32,
         limit: u32,
-    ) -> Result<StorageFileInfoV2> {
+    ) -> Result<Option<StorageFileInfoV2>> {
         L1RpcClient::storage_get_file_info_v2(self, root_hex, Some(offset), Some(limit)).await
     }
 }
@@ -224,10 +226,13 @@ pub async fn find_my_access_entry<R: AccessListSource>(
     }
     for page_idx in 1..ACCESS_MAX_PAGES {
         let offset = page_idx * ACCESS_PAGE_SIZE;
-        let page = rpc
-            .fetch_page(root_hex, offset, ACCESS_PAGE_SIZE)
-            .await
-            .map_err(PrivateDownloadError::Rpc)?;
+        let page = match rpc.fetch_page(root_hex, offset, ACCESS_PAGE_SIZE).await {
+            Ok(Some(page)) => page,
+            // A later page returned null — the V2 row is gone mid-scan.
+            // Terminal: the list is exhausted, fall through to NoAccess.
+            Ok(None) => break,
+            Err(e) => return Err(PrivateDownloadError::Rpc(e)),
+        };
         if let Some(entry) = page.access_list.iter().find(|e| e.address == my_addr_b58) {
             return Ok(entry.clone());
         }
@@ -1626,11 +1631,11 @@ mod tests {
             _root_hex: &str,
             offset: u32,
             _limit: u32,
-        ) -> Result<StorageFileInfoV2> {
+        ) -> Result<Option<StorageFileInfoV2>> {
             *self.calls.lock().unwrap() += 1;
             let page_idx = (offset / ACCESS_PAGE_SIZE) as usize;
             let page = self.pages.get(page_idx).cloned().unwrap_or_default();
-            Ok(StorageFileInfoV2 {
+            Ok(Some(StorageFileInfoV2 {
                 merkle_root: "0x00".into(),
                 owner: "owner".into(),
                 plaintext_size_bytes: 0,
@@ -1644,7 +1649,7 @@ mod tests {
                 visibility: sum_types::rpc_types::VisibilityV2::PRIVATE,
                 lifecycle: sum_types::rpc_types::LifecycleV2::ACTIVE,
                 access_list: page,
-            })
+            }))
         }
     }
 
@@ -1662,7 +1667,11 @@ mod tests {
             pages: vec![vec![entry("alice", None), entry("bob", None)]],
             calls: std::sync::Mutex::new(0),
         };
-        let first_page = rpc.fetch_page("root", 0, ACCESS_PAGE_SIZE).await.unwrap();
+        let first_page = rpc
+            .fetch_page("root", 0, ACCESS_PAGE_SIZE)
+            .await
+            .unwrap()
+            .expect("seed page present");
         let got = find_my_access_entry(&rpc, "root", "bob", &first_page)
             .await
             .unwrap();
@@ -1686,7 +1695,11 @@ mod tests {
             pages: vec![page0, page1],
             calls: std::sync::Mutex::new(0),
         };
-        let first_page = rpc.fetch_page("root", 0, ACCESS_PAGE_SIZE).await.unwrap();
+        let first_page = rpc
+            .fetch_page("root", 0, ACCESS_PAGE_SIZE)
+            .await
+            .unwrap()
+            .expect("seed page present");
         let got = find_my_access_entry(&rpc, "root", "target", &first_page)
             .await
             .unwrap();
@@ -1704,7 +1717,11 @@ mod tests {
             pages: vec![vec![entry("alice", None), entry("bob", None)]],
             calls: std::sync::Mutex::new(0),
         };
-        let first_page = rpc.fetch_page("root", 0, ACCESS_PAGE_SIZE).await.unwrap();
+        let first_page = rpc
+            .fetch_page("root", 0, ACCESS_PAGE_SIZE)
+            .await
+            .unwrap()
+            .expect("seed page present");
         let calls_before = *rpc.calls.lock().unwrap();
         let err = find_my_access_entry(&rpc, "root", "missing", &first_page)
             .await
@@ -1739,12 +1756,12 @@ mod tests {
                 _root_hex: &str,
                 offset: u32,
                 _limit: u32,
-            ) -> Result<StorageFileInfoV2> {
+            ) -> Result<Option<StorageFileInfoV2>> {
                 if offset == 0 {
                     let full_page: Vec<AccessEntryV2> = (0..ACCESS_PAGE_SIZE)
                         .map(|i| entry(&format!("u{i:03}"), None))
                         .collect();
-                    Ok(StorageFileInfoV2 {
+                    Ok(Some(StorageFileInfoV2 {
                         merkle_root: "0x00".into(),
                         owner: "owner".into(),
                         plaintext_size_bytes: 0,
@@ -1758,7 +1775,7 @@ mod tests {
                         visibility: sum_types::rpc_types::VisibilityV2::PRIVATE,
                         lifecycle: sum_types::rpc_types::LifecycleV2::ACTIVE,
                         access_list: full_page,
-                    })
+                    }))
                 } else {
                     anyhow::bail!("simulated chain RPC failure on page offset={offset}")
                 }
@@ -1766,7 +1783,11 @@ mod tests {
         }
 
         let rpc = FailingAccessRpc;
-        let first_page = rpc.fetch_page("root", 0, ACCESS_PAGE_SIZE).await.unwrap();
+        let first_page = rpc
+            .fetch_page("root", 0, ACCESS_PAGE_SIZE)
+            .await
+            .unwrap()
+            .expect("seed page present");
         let err = find_my_access_entry(&rpc, "root", "missing", &first_page)
             .await
             .expect_err("RPC failure during pagination must surface as Err");

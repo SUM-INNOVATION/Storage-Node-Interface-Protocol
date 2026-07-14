@@ -16,20 +16,21 @@
 //!     `access_list`, and if the matched entry sets `expires_at` the
 //!     finalized chain head must not yet exceed it (strict-greater rule).
 //!
-//! V2 lookup failures are split into two classes by
-//! `v2_error_is_clean_legacy_signal`:
+//! `storage_getFileInfoV2` now returns `Result<Option<StorageFileInfoV2>>`.
+//! The three outcomes route as follows — **fail closed on every error**:
 //!
-//!   * **Clean legacy signal** (JSON-RPC `-32601` "Method not found",
-//!     or chain message saying "not registered" / "file not found" /
-//!     "unknown root") → fall back to V1 `storage_getAccessList`.
-//!     Keeps legacy V1 files working without forcing them through
-//!     the V2 RPC surface.
-//!   * **Ambiguous failure** (HTTP non-200, transport error,
-//!     malformed JSON, decode error, `-32603` internal error, etc.)
-//!     → propagate as `Err`. No V1 fallback. Privacy-first: silently
-//!     downgrading to V1 on ambiguous V2 errors would let a
-//!     man-in-the-middle who can mangle V2 responses force the laxer
-//!     V1 ACL path on a Private file.
+//!   * **`Ok(Some(row))`** → apply the V2 ACL above.
+//!   * **`Ok(None)`** (JSON `null` — the V2-aware chain's authoritative
+//!     "no V2 row" representation) → the ONLY signal that permits a V1
+//!     `storage_getAccessList` fallback for a genuinely legacy file.
+//!   * **`Err` of ANY kind** — JSON-RPC `-32601` / "not registered" /
+//!     "file not found" / "unknown root", `-32603` internal error,
+//!     malformed JSON, result-decode error, HTTP non-200, transport
+//!     error, or timeout → **deny; V1 is NOT consulted**. An error is
+//!     never authoritative absence: reading one as "legacy-absent"
+//!     would let anyone who can induce a V2 error (a mangled response,
+//!     an induced timeout) downgrade a Private file from V2 ACL
+//!     enforcement to the laxer V1 path.
 //!
 //! # Profile-gated policy
 //!
@@ -39,12 +40,11 @@
 //! 1. **Unknown CID** — request CID is neither `manifest:<hex>` nor a
 //!    chunk indexed locally (Public CBOR index OR Private cid-to-root
 //!    sidecar). Production: deny. Dev: allow.
-//! 2. **File not registered on L1** — V2 reported a clean
-//!    legacy-signal AND V1 `storage_getAccessList` returned `None`.
-//!    Production: deny. Dev: allow.
-//! 3. **L1 RPC error** — `check_access` returned `Err` (V1 path
-//!    failed, OR V2 failed with an ambiguous shape that did NOT
-//!    qualify for fallback). Production: deny. Dev: allow. This is
+//! 2. **File not registered on L1** — V2 returned `Ok(None)` AND V1
+//!    `storage_getAccessList` returned `None`. Production: deny. Dev: allow.
+//! 3. **L1 RPC error** — `check_access` returned `Err`: the V1 path
+//!    failed, OR the V2 call returned ANY error (every V2 error fails
+//!    closed here). Production: deny. Dev: allow. This is
 //!    the [`AclChecker::check_access_or_default`] path used by the
 //!    listen and ingest serve loops.
 //!
@@ -114,22 +114,20 @@ impl AclChecker {
     ///        * Private V2 → require requester L1 address in
     ///          `access_list` AND `expires_at` not yet exceeded by
     ///          finalized height.
-    ///   3. If V2 lookup fails with a **clean legacy signal** —
-    ///      `code = -32601` (Method not found) or a chain message
-    ///      indicating "not registered" / "file not found" / "unknown
-    ///      root" — fall back to V1 `storage_getAccessList`. This
-    ///      keeps genuinely legacy V1 files working without forcing
-    ///      them through the V2 RPC surface.
-    ///   4. **Privacy-first fail-closed**: any other V2 failure
-    ///      shape — HTTP non-200, transport error, malformed JSON,
-    ///      result-decode error, or an unrecognised JSON-RPC error
-    ///      code (e.g. -32603 internal error) — does NOT fall back
-    ///      to V1. The error propagates so
-    ///      `check_access_or_default` denies in Production. Falling
-    ///      back on ambiguous failures would let a man-in-the-middle
-    ///      who can mangle V2 responses force the laxer V1 ACL path
-    ///      on a Private file. See `v2_error_is_clean_legacy_signal`
-    ///      below for the exact classifier.
+    ///   3. If V2 returns `Ok(None)` (JSON `null` — the chain is
+    ///      V2-aware but has no V2 row for this root) — and ONLY then —
+    ///      fall back to V1 `storage_getAccessList`. This keeps
+    ///      genuinely legacy V1 files working without forcing them
+    ///      through the V2 RPC surface.
+    ///   4. **Privacy-first fail-closed**: ANY V2 error — JSON-RPC
+    ///      `-32601` / "not registered" / "file not found" / "unknown
+    ///      root", `-32603` internal, HTTP non-200, transport error,
+    ///      malformed JSON, result-decode error, or timeout — does NOT
+    ///      fall back to V1. The error propagates so
+    ///      `check_access_or_default` denies in Production. An error is
+    ///      never authoritative absence; falling back would let anyone
+    ///      who can induce a V2 error downgrade to the laxer V1 ACL
+    ///      path on a Private file.
     pub async fn check_access(
         &self,
         peer_id: &PeerId,
@@ -156,40 +154,38 @@ impl AclChecker {
 
         // 2. V2-aware path. `storage_getFileInfoV2` returns the V2 row
         //    with visibility, AccessEntryV2 (with bundles + expires_at).
-        //    We try this first; the result classifier decides whether
-        //    a failure is a legitimate "no V2 row / V2 RPC unsupported"
-        //    legacy-signal (→ fall back to V1) or an ambiguous infra
-        //    failure (→ fail closed via the caller's policy).
+        //    ONLY an explicit `Ok(None)` (JSON `null`) is authoritative
+        //    absence and may consult V1; every `Err` fails closed.
         match self
             .rpc
             .storage_get_file_info_v2(&root_hex, None, None)
             .await
         {
-            Ok(info) => {
+            Ok(Some(info)) => {
                 return self.check_access_v2(peer_id, cid, &info).await;
             }
-            Err(e) if v2_error_is_clean_legacy_signal(&e) => {
-                // Chain told us "no V2 row" or "method not supported":
-                // file is genuinely V1-only or the chain doesn't
-                // implement V2 RPCs. Safe to consult V1.
+            Ok(None) => {
+                // Chain is V2-aware and reports no V2 row for this root
+                // (JSON `null` → `Ok(None)`). This is the ONLY authoritative
+                // not-found signal — safe to consult V1 for a legacy file.
                 tracing::debug!(
-                    %peer_id, %cid, %e,
-                    "ACL: V2 file_info reports legacy/unsupported — falling back to V1 storage_getAccessList"
+                    %peer_id, %cid,
+                    "ACL: V2 file_info returned no row (null) — falling back to V1 storage_getAccessList"
                 );
             }
             Err(e) => {
-                // Ambiguous V2 failure: transport flake, HTTP non-200,
-                // malformed JSON, decode error, internal chain error,
-                // or any other JSON-RPC error code we don't recognise
-                // as a clean legacy signal. Privacy-first policy:
-                // surface the error to the caller. Production resolves
-                // this to deny via `check_access_or_default`; falling
-                // back to V1 here would risk a downgrade attack where
-                // a malformed-V2-response forces the laxer V1 ACL
-                // path on a Private file.
+                // FAIL CLOSED on EVERY V2 error — JSON-RPC -32601 /
+                // "not registered" / "file not found" / "unknown root",
+                // -32603 internal, malformed JSON, decode error, HTTP
+                // non-200, transport error, or timeout. An error is never
+                // authoritative absence: consulting V1 here would let
+                // anyone able to induce a V2 error downgrade a Private
+                // file from V2 ACL enforcement to the laxer V1 path.
+                // Production resolves this Err to deny via
+                // `check_access_or_default`; V1 is NOT called.
                 tracing::warn!(
                     %peer_id, %cid, %e,
-                    "ACL: V2 file_info failed ambiguously — refusing V1 fallback (privacy-first)"
+                    "ACL: V2 file_info errored — denying, no V1 fallback (only Ok(None) may consult V1)"
                 );
                 return Err(e);
             }
@@ -333,58 +329,6 @@ impl AclChecker {
             }
         }
     }
-}
-
-/// Classify a `storage_getFileInfoV2` error as either a clean
-/// "legacy file / V2 unsupported" signal (→ safe to fall back to V1)
-/// or an ambiguous failure that MUST NOT trigger fallback.
-///
-/// Privacy-first rationale: silently falling back on transport flakes
-/// or malformed responses would let a man-in-the-middle (or a buggy
-/// proxy) downgrade the V2 ACL path to the laxer V1 `storage_getAccessList`,
-/// potentially granting access to a Private file the V2 chain row
-/// would deny. Production policy is to fail closed on any failure
-/// shape we can't read as an unambiguous "this file/method doesn't
-/// exist."
-///
-/// We classify by the top-level Display string. `L1RpcClient::call`
-/// emits distinct prefixes for each failure shape:
-///
-///   * `"RPC error: <json>"` — the chain returned a well-formed
-///     JSON-RPC error response. THIS is the only path eligible for
-///     fallback, AND only when the embedded code/message indicates
-///     the file or method genuinely doesn't exist.
-///   * `"RPC HTTP error <status>: ..."` — non-200 HTTP. Ambiguous.
-///   * `"RPC HTTP request failed"` — transport (DNS, connect, TLS).
-///   * `"failed to read RPC response body"` — partial body.
-///   * `"RPC response is not valid JSON"` — malformed body.
-///   * `"failed to deserialize RPC result"` — wrong shape / chain
-///     emitted a struct we don't model.
-///
-/// Only the first prefix can possibly indicate "fall back is safe."
-/// The remaining shapes ALL fail closed.
-fn v2_error_is_clean_legacy_signal(err: &anyhow::Error) -> bool {
-    let msg = format!("{err}");
-    if !msg.starts_with("RPC error:") {
-        return false;
-    }
-    // The chain emitted a JSON-RPC error response. Restrict fallback
-    // to the unambiguous cases:
-    //   * `code = -32601` (Method not found): chain is pre-V2 or
-    //     simply doesn't expose V2 RPCs on this endpoint.
-    //   * Message body says "not registered" / "not found" /
-    //     "unknown root": file genuinely doesn't have a V2 row.
-    // Any other JSON-RPC error (e.g. -32603 internal error, custom
-    // chain error codes we don't recognise) is treated as ambiguous
-    // and we fail closed — the chain may have V2 awareness but be
-    // returning errors for reasons that don't justify a downgrade.
-    let lower = msg.to_lowercase();
-    lower.contains("\"code\":-32601")
-        || lower.contains("\"code\": -32601")
-        || lower.contains("method not found")
-        || lower.contains("not registered")
-        || lower.contains("file not found")
-        || lower.contains("unknown root")
 }
 
 /// Resolve a request CID to the merkle root of the file it references.
@@ -734,12 +678,12 @@ mod tests {
         );
     }
 
-    /// V2 lookup fails with the canonical "method not found" error
-    /// code (-32601). This is the unambiguous "chain doesn't expose
-    /// V2 RPCs" signal; falling back to V1 is safe. The V1 access
-    /// list contains the peer → allow.
+    /// V2 lookup fails with `-32601` (Method not found). This is an
+    /// ERROR, not the authoritative `Ok(None)` — it MUST fail closed
+    /// with NO V1 fallback. The V1 body queued below would allow the
+    /// peer; asserting `Err` proves V1 was never consulted.
     #[tokio::test]
-    async fn v2_method_not_found_falls_back_to_v1() {
+    async fn v2_method_not_found_denies_no_v1_fallback() {
         let (_dir, idx) = empty_index();
         let root_hex_raw = "abababababababababababababababababababababababababababababababab";
         let root_hex_prefixed = format!("0x{root_hex_raw}");
@@ -757,18 +701,18 @@ mod tests {
         .await;
         let acl = build_checker(&url, vec![(peer, peer_addr)]).await;
 
-        let allowed = acl
-            .check_access(&peer, &cid, &idx)
-            .await
-            .expect("V1 fallback must succeed for method-not-found");
-        assert!(allowed, "V1 legacy-fallback path must allow listed peer");
+        let result = acl.check_access(&peer, &cid, &idx).await;
+        assert!(
+            result.is_err(),
+            "V2 -32601 error MUST deny (Err) with no V1 fallback; got {result:?}"
+        );
     }
 
-    /// V2 lookup fails with a chain-side "file not registered" message
-    /// (any error code but with a recognised legacy-signal phrase).
-    /// Same outcome as method-not-found: V1 fallback is safe.
+    /// V2 lookup fails with a chain-side "file not registered" message.
+    /// It is an ERROR, not `Ok(None)`, so it MUST deny with no V1
+    /// fallback even though the queued V1 body would allow the peer.
     #[tokio::test]
-    async fn v2_file_not_registered_falls_back_to_v1() {
+    async fn v2_file_not_registered_denies_no_v1_fallback() {
         let (_dir, idx) = empty_index();
         let root_hex_raw = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
         let root_hex_prefixed = format!("0x{root_hex_raw}");
@@ -786,11 +730,11 @@ mod tests {
         .await;
         let acl = build_checker(&url, vec![(peer, peer_addr)]).await;
 
-        let allowed = acl
-            .check_access(&peer, &cid, &idx)
-            .await
-            .expect("V1 fallback must succeed for file-not-registered");
-        assert!(allowed, "V1 legacy-fallback path must allow listed peer");
+        let result = acl.check_access(&peer, &cid, &idx).await;
+        assert!(
+            result.is_err(),
+            "V2 'file not registered' error MUST deny (Err) with no V1 fallback; got {result:?}"
+        );
     }
 
     /// **Privacy-critical regression guard**: an ambiguous V2 chain
@@ -839,8 +783,8 @@ mod tests {
     /// NOT trigger V1 fallback. We simulate it with a 200-OK
     /// response carrying a body that isn't valid JSON. The
     /// `L1RpcClient` reports this as "RPC response is not valid
-    /// JSON" — distinct from the JSON-RPC error prefix the
-    /// classifier accepts.
+    /// JSON" — an `Err`, so it fails closed (only `Ok(None)` may
+    /// consult V1).
     #[tokio::test]
     async fn v2_decode_error_does_not_fall_back_to_v1() {
         let (_dir, mut idx) = empty_index();
@@ -873,38 +817,99 @@ mod tests {
         );
     }
 
-    /// Unit-level coverage of the classifier itself, so future edits
-    /// don't widen the fallback policy by accident.
-    #[test]
-    fn v2_error_classifier_pins_safe_set() {
-        // Clean legacy signals → fallback OK.
-        let method_nf =
-            anyhow::anyhow!(r#"RPC error: {{"code":-32601,"message":"Method not found"}}"#);
-        assert!(v2_error_is_clean_legacy_signal(&method_nf));
+    /// V2 error whose message says "file not found" → still an ERROR,
+    /// not `Ok(None)` → deny, no V1 fallback.
+    #[tokio::test]
+    async fn v2_file_not_found_error_denies_no_v1_fallback() {
+        let (_dir, idx) = empty_index();
+        let root_hex_raw = "1f".repeat(32);
+        let root_hex_prefixed = format!("0x{root_hex_raw}");
+        let cid = format!("manifest:{root_hex_raw}");
+        let peer = fake_peer();
+        let peer_addr = [0x88u8; 20];
+        let peer_b58 = identity::l1_address_base58(&peer_addr);
+        let v1_body = v1_info_json(&root_hex_prefixed, &[&peer_b58], 1000);
+        let url = queued_responder(vec![
+            rpc_error(-32000, "file not found"),
+            rpc_result(&v1_body),
+        ])
+        .await;
+        let acl = build_checker(&url, vec![(peer, peer_addr)]).await;
+        let result = acl.check_access(&peer, &cid, &idx).await;
+        assert!(
+            result.is_err(),
+            "V2 'file not found' error MUST deny; got {result:?}"
+        );
+    }
 
-        let file_nr =
-            anyhow::anyhow!(r#"RPC error: {{"code":-32602,"message":"file not registered"}}"#);
-        assert!(v2_error_is_clean_legacy_signal(&file_nr));
+    /// V2 error whose message says "unknown root" → deny, no V1 fallback.
+    #[tokio::test]
+    async fn v2_unknown_root_error_denies_no_v1_fallback() {
+        let (_dir, idx) = empty_index();
+        let root_hex_raw = "2e".repeat(32);
+        let root_hex_prefixed = format!("0x{root_hex_raw}");
+        let cid = format!("manifest:{root_hex_raw}");
+        let peer = fake_peer();
+        let peer_addr = [0x88u8; 20];
+        let peer_b58 = identity::l1_address_base58(&peer_addr);
+        let v1_body = v1_info_json(&root_hex_prefixed, &[&peer_b58], 1000);
+        let url = queued_responder(vec![
+            rpc_error(-32000, "unknown root"),
+            rpc_result(&v1_body),
+        ])
+        .await;
+        let acl = build_checker(&url, vec![(peer, peer_addr)]).await;
+        let result = acl.check_access(&peer, &cid, &idx).await;
+        assert!(
+            result.is_err(),
+            "V2 'unknown root' error MUST deny; got {result:?}"
+        );
+    }
 
-        // Ambiguous JSON-RPC error → NO fallback.
-        let internal =
-            anyhow::anyhow!(r#"RPC error: {{"code":-32603,"message":"internal error"}}"#);
-        assert!(!v2_error_is_clean_legacy_signal(&internal));
+    /// V2 `null` (Ok(None)) → V1 fallback, but V1 lists a DIFFERENT
+    /// address → requester not listed → deny.
+    #[tokio::test]
+    async fn v2_null_then_v1_unlisted_peer_denies() {
+        let (_dir, idx) = empty_index();
+        let root_hex_raw = "3d".repeat(32);
+        let root_hex_prefixed = format!("0x{root_hex_raw}");
+        let cid = format!("manifest:{root_hex_raw}");
+        let peer = fake_peer();
+        let peer_addr = [0x99u8; 20];
+        let other_b58 = identity::l1_address_base58(&[0x11u8; 20]);
+        let v1_body = v1_info_json(&root_hex_prefixed, &[&other_b58], 1000);
+        let url = queued_responder(vec![rpc_result("null"), rpc_result(&v1_body)]).await;
+        let acl = build_checker(&url, vec![(peer, peer_addr)]).await;
+        let allowed = acl
+            .check_access(&peer, &cid, &idx)
+            .await
+            .expect("both RPCs returned cleanly");
+        assert!(
+            !allowed,
+            "V2 null → V1 fallback → unlisted peer must be denied"
+        );
+    }
 
-        // Transport / decode failures → NO fallback.
-        for non_legacy in [
-            "RPC HTTP error 500: server crashed",
-            "RPC HTTP request failed",
-            "failed to read RPC response body",
-            "RPC response is not valid JSON",
-            "failed to deserialize RPC result",
-        ] {
-            let err = anyhow::anyhow!("{non_legacy}");
-            assert!(
-                !v2_error_is_clean_legacy_signal(&err),
-                "must NOT classify {non_legacy:?} as legacy-signal"
-            );
-        }
+    /// V2 `null` (Ok(None)) → V1 fallback, but V1 returns a malformed
+    /// object → decode Err → deny.
+    #[tokio::test]
+    async fn v2_null_then_v1_malformed_denies() {
+        let (_dir, idx) = empty_index();
+        let root_hex_raw = "4c".repeat(32);
+        let cid = format!("manifest:{root_hex_raw}");
+        let peer = fake_peer();
+        let peer_addr = [0x99u8; 20];
+        let url = queued_responder(vec![
+            rpc_result("null"),
+            rpc_result(r#"{"unexpected":"v1shape"}"#),
+        ])
+        .await;
+        let acl = build_checker(&url, vec![(peer, peer_addr)]).await;
+        let result = acl.check_access(&peer, &cid, &idx).await;
+        assert!(
+            result.is_err(),
+            "V2 null → V1 malformed must deny (Err); got {result:?}"
+        );
     }
 
     /// Public V2 file: visibility = 0, `check_access` returns true
@@ -927,5 +932,150 @@ mod tests {
             .await
             .expect("RPC succeeded");
         assert!(allowed, "Public V2 must be open-read for any peer");
+    }
+
+    // ── ACL decision table under Result<Option<StorageFileInfoV2>> (#38) ──
+    //
+    // Rows (fail-closed in Production):
+    //   * V2 Some                            → apply V2 ACL
+    //   * V2 None + one V1 record            → V1 clean-legacy fallback
+    //   * V2 None + no V1 record             → deny (not registered)
+    //   * malformed V2 object                → deny (decode Err)
+    //   * V2 RPC error (ambiguous)           → deny (Err)
+    //   * V2 transport error                 → deny (Err)
+    //   * V2 None + V1 lookup errors         → deny (Err)  [ambiguous legacy]
+    //
+    // "V2 Some" rows are exercised by the visibility tests above; the
+    // ambiguous-RPC-error row by `v2_internal_error_does_not_fall_back_to_v1`.
+    // Note: V1 `storage_getAccessList` returns a single `Option`, so
+    // "exactly one" vs "no record" are the only representable cardinalities;
+    // a genuinely ambiguous V1 outcome can only arrive as a lookup error,
+    // which the last row denies.
+
+    /// V2 `null` (Ok(None)) → clean not-found signal → V1 fallback. The
+    /// V1 access list lists the peer → allow.
+    #[tokio::test]
+    async fn v2_null_result_with_v1_record_falls_back_and_allows() {
+        let (_dir, idx) = empty_index();
+        let root_hex_raw = "12".repeat(32);
+        let root_hex_prefixed = format!("0x{root_hex_raw}");
+        let cid = format!("manifest:{root_hex_raw}");
+
+        let peer = fake_peer();
+        let peer_addr = [0x99u8; 20];
+        let peer_b58 = identity::l1_address_base58(&peer_addr);
+
+        let v1_body = v1_info_json(&root_hex_prefixed, &[&peer_b58], 1000);
+        // First RPC: storage_getFileInfoV2 → null (Ok(None)). Second:
+        // storage_getAccessList → V1 record listing the peer.
+        let url = queued_responder(vec![rpc_result("null"), rpc_result(&v1_body)]).await;
+        let acl = build_checker(&url, vec![(peer, peer_addr)]).await;
+
+        let allowed = acl
+            .check_access(&peer, &cid, &idx)
+            .await
+            .expect("V1 fallback after V2 null must succeed");
+        assert!(
+            allowed,
+            "V2 null → V1 fallback → listed peer must be allowed"
+        );
+    }
+
+    /// V2 `null` + V1 `null` → file not registered anywhere → deny
+    /// (Production fails closed).
+    #[tokio::test]
+    async fn v2_null_result_no_v1_record_denies() {
+        let (_dir, idx) = empty_index();
+        let root_hex_raw = "34".repeat(32);
+        let cid = format!("manifest:{root_hex_raw}");
+
+        let peer = fake_peer();
+        let peer_addr = [0x99u8; 20];
+
+        let url = queued_responder(vec![rpc_result("null"), rpc_result("null")]).await;
+        let acl = build_checker(&url, vec![(peer, peer_addr)]).await;
+
+        let allowed = acl
+            .check_access(&peer, &cid, &idx)
+            .await
+            .expect("both RPCs returned cleanly");
+        assert!(!allowed, "V2 null + V1 null → deny in Production");
+    }
+
+    /// Malformed V2 object (valid JSON, wrong shape) → decode Err → NO
+    /// fallback → surfaces as Err so Production denies.
+    #[tokio::test]
+    async fn v2_malformed_object_does_not_fall_back() {
+        let (_dir, idx) = empty_index();
+        let root_hex_raw = "56".repeat(32);
+        let cid = format!("manifest:{root_hex_raw}");
+
+        let peer = fake_peer();
+        let peer_addr = [0x99u8; 20];
+
+        // Only the V2 call should be issued; the malformed object must
+        // fail closed rather than fall back to a queued V1 record.
+        let v1_body = v1_info_json(&format!("0x{root_hex_raw}"), &["ShouldNeverBeConsulted"], 1);
+        let url = queued_responder(vec![
+            rpc_result(r#"{"unexpected":"shape"}"#),
+            rpc_result(&v1_body),
+        ])
+        .await;
+        let acl = build_checker(&url, vec![(peer, peer_addr)]).await;
+
+        let result = acl.check_access(&peer, &cid, &idx).await;
+        assert!(
+            result.is_err(),
+            "malformed V2 object must surface Err (deny), got {result:?}"
+        );
+    }
+
+    /// V2 transport failure (socket accepted then closed with no HTTP
+    /// response) → Err → NO fallback → deny.
+    #[tokio::test]
+    async fn v2_transport_failure_does_not_fall_back() {
+        use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+        let (_dir, idx) = empty_index();
+        let root_hex_raw = "78".repeat(32);
+        let cid = format!("manifest:{root_hex_raw}");
+
+        let peer = fake_peer();
+        let peer_addr = [0x99u8; 20];
+
+        let server =
+            start_mock_rpc(routes([("storage_getFileInfoV2", MockResponse::Hangup)])).await;
+        let acl = build_checker(&server.url(), vec![(peer, peer_addr)]).await;
+
+        let result = acl.check_access(&peer, &cid, &idx).await;
+        assert!(
+            result.is_err(),
+            "V2 transport failure must surface Err (deny), got {result:?}"
+        );
+    }
+
+    /// V2 `null` → V1 fallback, but the V1 `storage_getAccessList` lookup
+    /// itself errors (the only way a genuinely ambiguous legacy outcome
+    /// can arise) → surfaces as Err → deny.
+    #[tokio::test]
+    async fn v2_null_then_ambiguous_v1_lookup_denies() {
+        let (_dir, idx) = empty_index();
+        let root_hex_raw = "9a".repeat(32);
+        let cid = format!("manifest:{root_hex_raw}");
+
+        let peer = fake_peer();
+        let peer_addr = [0x99u8; 20];
+
+        let url = queued_responder(vec![
+            rpc_result("null"),
+            rpc_error(-32000, "chain temporarily unavailable"),
+        ])
+        .await;
+        let acl = build_checker(&url, vec![(peer, peer_addr)]).await;
+
+        let result = acl.check_access(&peer, &cid, &idx).await;
+        assert!(
+            result.is_err(),
+            "ambiguous V1 fallback lookup must surface Err (deny), got {result:?}"
+        );
     }
 }

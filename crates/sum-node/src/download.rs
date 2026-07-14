@@ -20,7 +20,7 @@ use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_store::{
     FetchManager, FetchOutcome, MerkleTree, compute_chunk_assignment, nodes_for_chunk,
 };
-use sum_types::rpc_types::StorageFileInfoV2;
+use sum_types::rpc_types::{NodeRecordInfo, StorageFileInfoV2};
 use sum_types::storage::DataManifest;
 
 use crate::download_v2_routing::{
@@ -567,6 +567,24 @@ impl DownloadOrchestrator {
         }
     }
 
+    /// Fetch the active-archive snapshot pinned to the current finalized
+    /// head.
+    ///
+    /// Reads the finalized height exactly once via
+    /// `chain_get_block_height` (which passes `["finalized"]`), then the
+    /// height-pinned snapshot via `storage_get_active_nodes_at_height` at
+    /// exactly that height. This is the supported replacement for the
+    /// removed `storage_getActiveNodes` bulk endpoint. Both lookups
+    /// surface their typed errors as a single `Err`; `build_holder_map`
+    /// maps EITHER failure to the gossipsub fallback rather than
+    /// propagating, so a transient L1 outage cannot hard-fail a download.
+    async fn active_nodes_at_finalized_head(&self) -> Result<Vec<NodeRecordInfo>> {
+        let finalized_height = self.rpc.chain_get_block_height().await?.height;
+        self.rpc
+            .storage_get_active_nodes_at_height(finalized_height)
+            .await
+    }
+
     /// Build a map of chunk_index → PeerIds that hold that chunk.
     /// Uses the L1 assignment algorithm when possible, falls back to empty.
     async fn build_holder_map(
@@ -580,8 +598,13 @@ impl DownloadOrchestrator {
         // Apply the shared eligibility contract so V1 holder-map
         // computation excludes Slashed/Unbonding/Withdrawn and
         // non-Archive records.
-        let nodes_result = self.rpc.get_active_nodes().await;
-        let Ok(node_records) = nodes_result else {
+        //
+        // The snapshot is pinned to the finalized head. BOTH a
+        // height-lookup failure AND an at-height snapshot failure fall back
+        // to gossipsub-based peer selection (return the empty holder_map) —
+        // this returns a map, not a Result, so a transient L1 outage must
+        // never hard-error the download.
+        let Ok(node_records) = self.active_nodes_at_finalized_head().await else {
             warn!("could not get active nodes from L1 — using gossipsub-based peer selection");
             return holder_map;
         };
@@ -1404,4 +1427,116 @@ async fn fetch_v2_public_chunks(
         chunk_peer_attribution,
         peers_contacted,
     })
+}
+
+// ── build_holder_map active-node routing tests (#37) ──────────────────────────
+
+#[cfg(test)]
+mod holder_map_tests {
+    use super::*;
+    use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+
+    fn orchestrator(url: String) -> DownloadOrchestrator {
+        DownloadOrchestrator::new(
+            format!("0x{}", "11".repeat(32)),
+            PathBuf::from("/dev/null"),
+            Arc::new(L1RpcClient::new(url)),
+            4,
+            Duration::from_secs(5),
+            3,
+        )
+    }
+
+    fn empty_manifest() -> DataManifest {
+        DataManifest {
+            file_name: "f".into(),
+            file_hash: [0u8; 32],
+            total_size_bytes: 0,
+            chunk_count: 0,
+            merkle_root: [0x11u8; 32],
+            chunks: Vec::new(),
+        }
+    }
+
+    /// (c) `build_holder_map` reads the finalized height EXACTLY ONCE and
+    /// pins the active-node snapshot to precisely that height.
+    #[tokio::test]
+    async fn build_holder_map_reads_finalized_height_once_and_pins_snapshot() {
+        let server = start_mock_rpc(routes([
+            (
+                "chain_getBlockHeight",
+                MockResponse::Result(serde_json::json!({"height": 555, "finality": "finalized"})),
+            ),
+            (
+                "storage_getActiveNodesAtHeight",
+                MockResponse::Result(serde_json::json!([])),
+            ),
+        ]))
+        .await;
+        let orch = orchestrator(server.url());
+        let peers = Arc::new(RwLock::new(HashMap::new()));
+        let _ = orch.build_holder_map(&empty_manifest(), &peers).await;
+        assert_eq!(
+            server.method_count("chain_getBlockHeight"),
+            1,
+            "exactly one finalized-height read per build_holder_map"
+        );
+        assert_eq!(
+            server.first_params("storage_getActiveNodesAtHeight"),
+            Some(serde_json::json!([555])),
+            "snapshot pinned to the finalized height"
+        );
+    }
+
+    /// (f) A finalized-height lookup failure routes to the gossipsub
+    /// fallback (empty holder map) — never a hard error, since this
+    /// function returns a map, not a Result. The at-height snapshot is
+    /// never queried.
+    #[tokio::test]
+    async fn build_holder_map_falls_back_when_height_lookup_fails() {
+        let server = start_mock_rpc(routes([
+            ("chain_getBlockHeight", MockResponse::Hangup),
+            (
+                "storage_getActiveNodesAtHeight",
+                MockResponse::Result(serde_json::json!([])),
+            ),
+        ]))
+        .await;
+        let orch = orchestrator(server.url());
+        let peers = Arc::new(RwLock::new(HashMap::new()));
+        let map = orch.build_holder_map(&empty_manifest(), &peers).await;
+        assert!(
+            map.is_empty(),
+            "height failure must fall back to gossipsub (empty holder map)"
+        );
+        assert_eq!(
+            server.method_count("storage_getActiveNodesAtHeight"),
+            0,
+            "no at-height query after a height failure"
+        );
+    }
+
+    /// (f) An at-height snapshot failure ALSO routes to the gossipsub
+    /// fallback (empty holder map), not a hard error.
+    #[tokio::test]
+    async fn build_holder_map_falls_back_when_at_height_lookup_fails() {
+        let server = start_mock_rpc(routes([
+            (
+                "chain_getBlockHeight",
+                MockResponse::Result(serde_json::json!({"height": 9, "finality": "finalized"})),
+            ),
+            (
+                "storage_getActiveNodesAtHeight",
+                MockResponse::error("snapshot unavailable"),
+            ),
+        ]))
+        .await;
+        let orch = orchestrator(server.url());
+        let peers = Arc::new(RwLock::new(HashMap::new()));
+        let map = orch.build_holder_map(&empty_manifest(), &peers).await;
+        assert!(
+            map.is_empty(),
+            "at-height snapshot failure must fall back to gossipsub"
+        );
+    }
 }

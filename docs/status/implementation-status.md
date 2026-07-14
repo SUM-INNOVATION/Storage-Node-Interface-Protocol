@@ -60,7 +60,7 @@ wins.
 |---|---|---|---|
 | CLI `--chain-id` — live RPC derivation for `register-node` | Shipped | [`crates/sum-node/src/main.rs`](../../crates/sum-node/src/main.rs) `run_register_node` | `chain_id` read from `chain_getChainParams`; ignores `--chain-id` value. |
 | CLI `--chain-id` — live RPC derivation for `IngestV2` and `Resume` (production profile) | Shipped | [`crates/sum-node/src/main.rs`](../../crates/sum-node/src/main.rs) `build_v2_ingest_params` | Production profile hard-fails when `chain_getChainParams` fails; dev profile falls back to `--chain-id`. |
-| CLI `--chain-id` — live RPC derivation for `register-encryption-key`, `share`, `revoke`, `update-access`, `abandon`, and the listener-side `AssignmentAttestor` | **Planned** | See "Recommended follow-up" in the Phase 2 audit report | Today these code paths consume the CLI value directly. The workspace default is `1337`, which matches no documented environment (mainnet `chain_id = 1`, local-mirror `chain_id = 31337`). Documentation instructs operators to pass `--chain-id 1` for mainnet writes; wire this into runtime like `register-node` already does. |
+| CLI `--chain-id` — live RPC derivation for `register-encryption-key`, `share`, `revoke`, `update-access`, `abandon`, and the listener-side `AssignmentAttestor` | **Planned** | See "Recommended follow-up" in the Phase 2 audit report | Today these code paths consume the CLI value directly. The workspace default is `1337`, which matches the shared devnet / local-mirror (mainnet `chain_id = 1`). Documentation instructs operators to pass `--chain-id 1` for mainnet writes; wire this into runtime like `register-node` already does. |
 
 ## Packaging + release
 

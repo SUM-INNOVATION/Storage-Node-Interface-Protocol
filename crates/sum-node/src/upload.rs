@@ -27,6 +27,7 @@ use tracing::{info, warn};
 use sum_net::identity;
 use sum_net::{PeerId, SumNet, SumNetEvent};
 use sum_store::{SumStore, compute_chunk_assignment, nodes_for_chunk};
+use sum_types::rpc_types::NodeRecordInfo;
 use sum_types::storage::DataManifest;
 
 use crate::rpc_client::L1RpcClient;
@@ -261,6 +262,23 @@ impl UploadOrchestrator {
         self
     }
 
+    /// Fetch the active-archive snapshot pinned to the current finalized
+    /// head.
+    ///
+    /// Reads the finalized height exactly once via
+    /// `chain_get_block_height` (which passes `["finalized"]`), then the
+    /// height-pinned snapshot via `storage_get_active_nodes_at_height` at
+    /// exactly that height. This is the supported replacement for the
+    /// removed `storage_getActiveNodes` bulk endpoint. Both lookups
+    /// surface their typed errors; the caller (`run`) propagates them
+    /// with `?`.
+    async fn active_nodes_at_finalized_head(&self) -> Result<Vec<NodeRecordInfo>> {
+        let finalized_height = self.rpc.chain_get_block_height().await?.height;
+        self.rpc
+            .storage_get_active_nodes_at_height(finalized_height)
+            .await
+    }
+
     /// Push all chunks in the manifest to their assigned nodes.
     ///
     /// Returns when all pushes are confirmed (ACK responses received)
@@ -277,7 +295,13 @@ impl UploadOrchestrator {
         // (`role == "ArchiveNode" && status == "Active"`). Any
         // Slashed/Unbonding/Withdrawn/unknown-future or Validator record
         // is dropped before address decode.
-        let node_records = self.rpc.get_active_nodes().await?;
+        //
+        // The active-node snapshot is pinned to the finalized head: the
+        // finalized height is read exactly once at the top of the
+        // operation (inside `active_nodes_at_finalized_head`). A
+        // height-lookup failure propagates as this operation's typed error
+        // (`?`), the same as any other RPC failure.
+        let node_records = self.active_nodes_at_finalized_head().await?;
         let node_records = sum_types::rpc_types::filter_active_archives(node_records);
         let mut node_addrs: Vec<[u8; 20]> = Vec::new();
         for record in &node_records {
@@ -892,5 +916,59 @@ mod tests {
             }
             other => panic!("expected NoEligibleTargets, got {other:?}"),
         }
+    }
+
+    // ── Active-node routing (#37) ─────────────────────────────────────────
+
+    fn orchestrator(url: String) -> UploadOrchestrator {
+        UploadOrchestrator::new(Arc::new(L1RpcClient::new(url)), Duration::from_secs(1), 3)
+    }
+
+    /// The finalized height is read once and the active-node snapshot is
+    /// pinned to exactly that height.
+    #[tokio::test]
+    async fn active_nodes_reads_finalized_height_once() {
+        use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+        let server = start_mock_rpc(routes([
+            (
+                "chain_getBlockHeight",
+                MockResponse::Result(serde_json::json!({"height": 321, "finality": "finalized"})),
+            ),
+            (
+                "storage_getActiveNodesAtHeight",
+                MockResponse::Result(serde_json::json!([])),
+            ),
+        ]))
+        .await;
+        let orch = orchestrator(server.url());
+        orch.active_nodes_at_finalized_head()
+            .await
+            .expect("snapshot must decode");
+        assert_eq!(server.method_count("chain_getBlockHeight"), 1);
+        assert_eq!(
+            server.first_params("storage_getActiveNodesAtHeight"),
+            Some(serde_json::json!([321])),
+        );
+    }
+
+    /// (e) A finalized-height lookup failure propagates as the upload
+    /// operation's typed error (`run` forwards it with `?`); the at-height
+    /// snapshot is never queried.
+    #[tokio::test]
+    async fn active_nodes_propagates_height_failure() {
+        use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+        let server = start_mock_rpc(routes([(
+            "chain_getBlockHeight",
+            MockResponse::error("finalized height unavailable"),
+        )]))
+        .await;
+        let orch = orchestrator(server.url());
+        let res = orch.active_nodes_at_finalized_head().await;
+        assert!(res.is_err(), "height failure must propagate");
+        assert_eq!(
+            server.method_count("storage_getActiveNodesAtHeight"),
+            0,
+            "no at-height query once the height read failed"
+        );
     }
 }

@@ -321,12 +321,16 @@ impl Default for IngestParamsDefaults {
 /// W10 needs.
 #[async_trait]
 pub trait V2IngestRpc: AttestorRpc + V2RpcClient + Send + Sync {
+    /// `Ok(Some)` — a coverage row exists; `Ok(None)` — the chain
+    /// authoritatively reports no coverage row (terminal not-found);
+    /// `Err` — RPC / transport failure. Callers MUST keep the not-found
+    /// (`None`) and failure (`Err`) channels distinct.
     async fn storage_get_assignment_coverage_v2(
         &self,
         merkle_root_hex: &str,
         missing_offset: Option<u32>,
         missing_limit: Option<u32>,
-    ) -> Result<AssignmentCoverageV2>;
+    ) -> Result<Option<AssignmentCoverageV2>>;
     async fn chain_get_block_height(&self) -> Result<BlockHeightInfo>;
     async fn get_nonce(&self, addr_base58: &str) -> Result<u64>;
 }
@@ -366,7 +370,7 @@ impl V2IngestRpc for crate::rpc_client::L1RpcClient {
         merkle_root_hex: &str,
         missing_offset: Option<u32>,
         missing_limit: Option<u32>,
-    ) -> Result<AssignmentCoverageV2> {
+    ) -> Result<Option<AssignmentCoverageV2>> {
         crate::rpc_client::L1RpcClient::storage_get_assignment_coverage_v2(
             self,
             merkle_root_hex,
@@ -988,15 +992,31 @@ where
         // ── S4 ─────────────────────────────────────────────────────
         let last_coverage = match self.s4_wait_coverage(&merkle_root).await {
             Ok(cov) => cov,
-            Err(timeout) => {
+            Err(S4WaitError::Timeout { last_coverage }) => {
                 return IngestOutcome::PendingNeedsAction {
                     merkle_root,
                     manifest,
                     failed_stage: IngestStage::Coverage,
-                    last_coverage: timeout.last_coverage,
+                    last_coverage,
                     under_replicated_chunks: None,
                     suggested: SuggestedAction::Resume,
                     source: None,
+                };
+            }
+            // Terminal not-found: no coverage row exists on chain. The
+            // file cannot be activated by retrying — suggest Abandon.
+            Err(S4WaitError::NotFound) => {
+                return IngestOutcome::PendingNeedsAction {
+                    merkle_root,
+                    manifest,
+                    failed_stage: IngestStage::Coverage,
+                    last_coverage: None,
+                    under_replicated_chunks: None,
+                    suggested: SuggestedAction::Abandon,
+                    source: Some(anyhow::anyhow!(
+                        "storage_getAssignmentCoverageV2 returned no row (null) — coverage is \
+                         not tracked for this file; cannot activate"
+                    )),
                 };
             }
         };
@@ -1228,15 +1248,31 @@ where
         // ── S4 ─────────────────────────────────────────────────────
         let last_coverage = match self.s4_wait_coverage(&merkle_root).await {
             Ok(cov) => cov,
-            Err(timeout) => {
+            Err(S4WaitError::Timeout { last_coverage }) => {
                 return IngestOutcome::PendingNeedsAction {
                     merkle_root,
                     manifest,
                     failed_stage: IngestStage::Coverage,
-                    last_coverage: timeout.last_coverage,
+                    last_coverage,
                     under_replicated_chunks: None,
                     suggested: SuggestedAction::Resume,
                     source: None,
+                };
+            }
+            // Terminal not-found: no coverage row exists on chain. The
+            // file cannot be activated by retrying — suggest Abandon.
+            Err(S4WaitError::NotFound) => {
+                return IngestOutcome::PendingNeedsAction {
+                    merkle_root,
+                    manifest,
+                    failed_stage: IngestStage::Coverage,
+                    last_coverage: None,
+                    under_replicated_chunks: None,
+                    suggested: SuggestedAction::Abandon,
+                    source: Some(anyhow::anyhow!(
+                        "storage_getAssignmentCoverageV2 returned no row (null) — coverage is \
+                         not tracked for this file; cannot activate"
+                    )),
                 };
             }
         };
@@ -1387,7 +1423,18 @@ where
         merkle_root: &[u8; 32],
     ) -> Result<(StorageFileInfoV2, Vec<[u8; 20]>)> {
         let root_hex = format!("0x{}", hex::encode(merkle_root));
-        let info = self.rpc.storage_get_file_info_v2(&root_hex).await?;
+        // We just registered this file (fresh-ingest happy path), so a
+        // `null` row (`Ok(None)`) is a chain inconsistency — surface it as
+        // a clear error rather than a fabricated default row.
+        let info = self
+            .rpc
+            .storage_get_file_info_v2(&root_hex)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "storage_getFileInfoV2 returned no row for registered file {root_hex}"
+                )
+            })?;
         // Fetch the authoritative snapshot at the file's pinned
         // `assignment_height`, then apply the shared eligibility
         // contract before any address decode. Non-ArchiveNode or
@@ -1672,7 +1719,7 @@ where
     async fn s4_wait_coverage(
         &self,
         merkle_root: &[u8; 32],
-    ) -> Result<AssignmentCoverageV2, CoverageTimeout> {
+    ) -> Result<AssignmentCoverageV2, S4WaitError> {
         let root_hex = format!("0x{}", hex::encode(merkle_root));
         let deadline = Instant::now() + self.params.activation_wait_secs;
         let mut last: Option<AssignmentCoverageV2> = None;
@@ -1682,7 +1729,7 @@ where
                 .storage_get_assignment_coverage_v2(&root_hex, None, None)
                 .await
             {
-                Ok(cov) => {
+                Ok(Some(cov)) => {
                     last = Some(cov.clone());
                     if cov.can_activate_now {
                         debug!(
@@ -1694,13 +1741,21 @@ where
                         return Ok(cov);
                     }
                 }
+                // Clean terminal not-found: the chain reports no coverage
+                // row for this file (`Ok(None)`). Polling cannot make a
+                // non-existent row appear, so stop immediately — distinct
+                // from a transient RPC error (below), which we retry.
+                Ok(None) => {
+                    warn!(root = %root_hex, "S4 coverage: no coverage row (null) — terminal");
+                    return Err(S4WaitError::NotFound);
+                }
                 Err(e) => {
                     warn!(%e, "S4 coverage poll RPC error — retrying");
                 }
             }
             let now = Instant::now();
             if now >= deadline {
-                return Err(CoverageTimeout {
+                return Err(S4WaitError::Timeout {
                     last_coverage: last,
                 });
             }
@@ -1796,7 +1851,22 @@ where
             .storage_get_file_info_v2(&format!("0x{}", hex::encode(merkle_root)))
             .await
         {
-            Ok(info) => info,
+            Ok(Some(info)) => info,
+            // Terminal not-found: the chain has no V2 row for this root,
+            // so RegisterFilePendingV2 never took. No chain state exists —
+            // the caller can rebuild a fresh tx. Distinct from a transient
+            // RPC error below.
+            Ok(None) => {
+                return IngestOutcome::Failed {
+                    stage: IngestStage::Register,
+                    manifest: None,
+                    source: anyhow::anyhow!(
+                        "resume: storage_getFileInfoV2 returned no row — file 0x{} is not \
+                         registered on chain",
+                        hex::encode(merkle_root)
+                    ),
+                };
+            }
             Err(e) => {
                 return IngestOutcome::Failed {
                     stage: IngestStage::Register,
@@ -2078,7 +2148,24 @@ where
             )
             .await
         {
-            Ok(cov) => cov,
+            Ok(Some(cov)) => cov,
+            // Terminal not-found: the chain has no coverage row for this
+            // file. Retrying won't help — suggest Abandon. Distinct from a
+            // transient RPC error (retryable, below).
+            Ok(None) => {
+                return IngestOutcome::PendingNeedsAction {
+                    merkle_root,
+                    manifest,
+                    failed_stage: IngestStage::Coverage,
+                    last_coverage: None,
+                    under_replicated_chunks: None,
+                    suggested: SuggestedAction::Abandon,
+                    source: Some(anyhow::anyhow!(
+                        "resume: storage_getAssignmentCoverageV2 returned no row (null) — \
+                         coverage is not tracked for this file; cannot activate"
+                    )),
+                };
+            }
             Err(e) => {
                 return IngestOutcome::PendingNeedsAction {
                     merkle_root,
@@ -2108,7 +2195,23 @@ where
             // Note we trust `coverage.missing_indices` as authoritative;
             // pagination is collected via missing_offset until empty.
             let missing = match self.collect_missing_indices(merkle_root).await {
-                Ok(m) => m,
+                Ok(Some(m)) => m,
+                // Terminal not-found: coverage row vanished mid-pagination
+                // → suggest Abandon, distinct from the retryable RPC error.
+                Ok(None) => {
+                    return IngestOutcome::PendingNeedsAction {
+                        merkle_root,
+                        manifest,
+                        failed_stage: IngestStage::Coverage,
+                        last_coverage: Some(coverage),
+                        under_replicated_chunks: None,
+                        suggested: SuggestedAction::Abandon,
+                        source: Some(anyhow::anyhow!(
+                            "resume: storage_getAssignmentCoverageV2 returned no row (null) \
+                             while collecting missing indices — coverage no longer tracked"
+                        )),
+                    };
+                }
                 Err(e) => {
                     return IngestOutcome::PendingNeedsAction {
                         merkle_root,
@@ -2173,15 +2276,31 @@ where
             // S4 wait — same wall-clock budget as a fresh ingest.
             match self.s4_wait_coverage(&merkle_root).await {
                 Ok(cov) => cov,
-                Err(timeout) => {
+                Err(S4WaitError::Timeout { last_coverage }) => {
                     return IngestOutcome::PendingNeedsAction {
                         merkle_root,
                         manifest,
                         failed_stage: IngestStage::Coverage,
-                        last_coverage: timeout.last_coverage,
+                        last_coverage,
                         under_replicated_chunks: None,
                         suggested: SuggestedAction::Resume,
                         source: None,
+                    };
+                }
+                // Terminal not-found: no coverage row on chain → suggest
+                // Abandon, distinct from the retryable timeout above.
+                Err(S4WaitError::NotFound) => {
+                    return IngestOutcome::PendingNeedsAction {
+                        merkle_root,
+                        manifest,
+                        failed_stage: IngestStage::Coverage,
+                        last_coverage: None,
+                        under_replicated_chunks: None,
+                        suggested: SuggestedAction::Abandon,
+                        source: Some(anyhow::anyhow!(
+                            "storage_getAssignmentCoverageV2 returned no row (null) — coverage \
+                             is not tracked for this file; cannot activate"
+                        )),
                     };
                 }
             }
@@ -2226,15 +2345,30 @@ where
     /// Walk paginated `missing_indices` until `missing_indices` is empty.
     /// Pagination cycles `missing_offset = last_returned_index + 1` per
     /// chain plan v3.2 §4 line 474.
-    async fn collect_missing_indices(&self, merkle_root: [u8; 32]) -> Result<BTreeSet<u32>> {
+    ///
+    /// Returns:
+    ///   * `Ok(Some(set))` — the collected missing-index set.
+    ///   * `Ok(None)` — the chain reports no coverage row (`Ok(None)`) on
+    ///     some page: a clean terminal not-found, surfaced distinctly so
+    ///     the caller can route it to a terminal outcome rather than
+    ///     treating it as an opaque retryable error.
+    ///   * `Err` — a transient RPC / transport failure (retryable).
+    async fn collect_missing_indices(
+        &self,
+        merkle_root: [u8; 32],
+    ) -> Result<Option<BTreeSet<u32>>> {
         let root_hex = format!("0x{}", hex::encode(merkle_root));
         let mut missing: BTreeSet<u32> = BTreeSet::new();
         let mut offset: u32 = 0;
         loop {
-            let cov = self
+            let Some(cov) = self
                 .rpc
                 .storage_get_assignment_coverage_v2(&root_hex, Some(offset), None)
-                .await?;
+                .await?
+            else {
+                // Coverage row absent → terminal not-found.
+                return Ok(None);
+            };
             if cov.missing_indices.is_empty() {
                 break;
             }
@@ -2251,7 +2385,7 @@ where
                 break;
             }
         }
-        Ok(missing)
+        Ok(Some(missing))
     }
 
     // ── Abandon (W11) ───────────────────────────────────────────────
@@ -2275,7 +2409,17 @@ where
         };
         let root_hex = format!("0x{}", hex::encode(merkle_root));
         let info = match self.rpc.storage_get_file_info_v2(&root_hex).await {
-            Ok(info) => info,
+            Ok(Some(info)) => info,
+            // Terminal not-found: nothing to abandon. Report as a
+            // pre-check rejection (no tx fee burned), distinct from a
+            // transient RPC failure below.
+            Ok(None) => {
+                return AbandonOutcome::NotAdmissible {
+                    reason: format!("file {root_hex} is not registered on chain"),
+                    current_height,
+                    earliest_admissible_height: 0,
+                };
+            }
             Err(e) => return AbandonOutcome::Failed { source: e },
         };
 
@@ -2383,9 +2527,20 @@ struct PushFailure {
     source: Option<anyhow::Error>,
 }
 
+/// Terminal reasons [`V2IngestPipeline::s4_wait_coverage`] stops without
+/// observing a `can_activate_now` coverage row.
 #[derive(Debug)]
-struct CoverageTimeout {
-    last_coverage: Option<AssignmentCoverageV2>,
+enum S4WaitError {
+    /// The wall-clock activation budget elapsed while polling. Carries
+    /// the last observed coverage (if any) for diagnostics. Retryable
+    /// via `resume`.
+    Timeout {
+        last_coverage: Option<AssignmentCoverageV2>,
+    },
+    /// `storage_getAssignmentCoverageV2` returned `Ok(None)` — the chain
+    /// authoritatively reports no coverage row for this file. Terminal:
+    /// polling cannot make a non-existent row appear.
+    NotFound,
 }
 
 /// Replication check scoped to a specific subset of chunk indices.
@@ -2422,7 +2577,7 @@ mod tests {
     struct MockRpc {
         files: StdMutex<HashMap<String, StorageFileInfoV2>>,
         snapshots: StdMutex<HashMap<u64, Vec<NodeRecordInfo>>>,
-        coverages: StdMutex<VecDeque<Result<AssignmentCoverageV2, String>>>,
+        coverages: StdMutex<VecDeque<Result<Option<AssignmentCoverageV2>, String>>>,
         statuses: StdMutex<VecDeque<Result<TxStatusV2, String>>>,
         sends: StdMutex<VecDeque<Result<String, String>>>,
         nonces: StdMutex<HashMap<String, u64>>,
@@ -2438,7 +2593,17 @@ mod tests {
             self.snapshots.lock().unwrap().insert(height, nodes);
         }
         fn enqueue_coverage(&self, cov: AssignmentCoverageV2) {
-            self.coverages.lock().unwrap().push_back(Ok(cov));
+            self.coverages.lock().unwrap().push_back(Ok(Some(cov)));
+        }
+        /// Enqueue a `storage_getAssignmentCoverageV2` → `Ok(None)`
+        /// (chain reports no coverage row — terminal not-found).
+        fn enqueue_coverage_none(&self) {
+            self.coverages.lock().unwrap().push_back(Ok(None));
+        }
+        /// Enqueue a `storage_getAssignmentCoverageV2` → transport/RPC
+        /// `Err` (retryable failure, distinct from `Ok(None)`).
+        fn enqueue_coverage_err(&self, msg: &str) {
+            self.coverages.lock().unwrap().push_back(Err(msg.into()));
         }
         fn enqueue_status(&self, st: TxStatusV2) {
             self.statuses.lock().unwrap().push_back(Ok(st));
@@ -2462,13 +2627,9 @@ mod tests {
         async fn storage_get_file_info_v2(
             &self,
             merkle_root_hex: &str,
-        ) -> Result<StorageFileInfoV2> {
-            self.files
-                .lock()
-                .unwrap()
-                .get(merkle_root_hex)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("unknown root: {merkle_root_hex}"))
+        ) -> Result<Option<StorageFileInfoV2>> {
+            // Missing root → clean not-found (Ok(None)); present → Ok(Some).
+            Ok(self.files.lock().unwrap().get(merkle_root_hex).cloned())
         }
         async fn storage_get_active_nodes_at_height(
             &self,
@@ -2517,7 +2678,7 @@ mod tests {
             _merkle_root_hex: &str,
             _missing_offset: Option<u32>,
             _missing_limit: Option<u32>,
-        ) -> Result<AssignmentCoverageV2> {
+        ) -> Result<Option<AssignmentCoverageV2>> {
             *self.coverage_polls.lock().unwrap() += 1;
             let next = self
                 .coverages
@@ -3263,6 +3424,136 @@ mod tests {
             }
             other => panic!("expected PendingNeedsAction(Coverage), got {other:?}"),
         }
+        assert!(rpc.coverage_poll_count() >= 1);
+    }
+
+    /// (#38) S4 coverage returns `Ok(None)` (chain reports no coverage
+    /// row) → clean terminal not-found. The pipeline must stop
+    /// immediately with `PendingNeedsAction { Coverage, Abandon }` —
+    /// distinct from the retryable timeout/RPC-error paths — rather than
+    /// polling until the wall-clock budget elapses.
+    #[tokio::test]
+    async fn s4_coverage_null_returns_pending_needs_action_abandon() {
+        let bytes = vec![0x66; 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
+
+        let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
+        let merkle_root = manifest_dryrun.merkle_root;
+
+        let rpc = Arc::new(MockRpc::default());
+        rpc.set_nonce(&l1_address_base58(&my_addr), 1);
+        rpc.enqueue_send("0xtx-register");
+        rpc.enqueue_status(TxStatusV2::Finalized { block_height: 100 });
+        rpc.add_file(
+            &format!("0x{}", hex::encode(merkle_root)),
+            pending_file_info(&merkle_root, 1, 50),
+        );
+        rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+        // First (and only) coverage poll returns null → terminal.
+        rpc.enqueue_coverage_none();
+
+        let net = Arc::new(MockNet::new());
+        ack_chunks_for_all(&net, merkle_root, 1, &peers).await;
+        ack_manifest_for_all(&net, merkle_root, &peers).await;
+
+        // Generous S4 budget: a terminal not-found must return well
+        // before this elapses (proving we didn't keep polling).
+        let mut params = params_for_test(defaults_for_tests());
+        params.activation_wait_secs = Duration::from_secs(30);
+
+        let pipeline = build_pipeline(rpc.clone(), net, arch_to_peer, my_addr, params);
+        match pipeline.run(&path).await {
+            IngestOutcome::PendingNeedsAction {
+                failed_stage,
+                last_coverage,
+                suggested,
+                ..
+            } => {
+                assert_eq!(failed_stage, IngestStage::Coverage);
+                assert!(last_coverage.is_none(), "not-found carries no coverage");
+                assert_eq!(
+                    suggested,
+                    SuggestedAction::Abandon,
+                    "coverage null is terminal → Abandon, not Resume"
+                );
+            }
+            other => panic!("expected PendingNeedsAction(Coverage, Abandon), got {other:?}"),
+        }
+        // Exactly one coverage poll — we stopped on the null, we didn't retry.
+        assert_eq!(rpc.coverage_poll_count(), 1);
+    }
+
+    /// (#38) S4 coverage RPC errors are retryable, NOT terminal: they are
+    /// warned-and-retried until the wall-clock budget elapses, yielding
+    /// `PendingNeedsAction { Coverage, Resume }` (distinct from the
+    /// `Ok(None)` terminal Abandon path above).
+    #[tokio::test]
+    async fn s4_coverage_rpc_error_is_retryable_until_timeout() {
+        let bytes = vec![0x77; 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
+        let arch_to_peer: HashMap<_, _> = snapshot
+            .iter()
+            .zip(peers.iter())
+            .map(|(a, p)| (*a, *p))
+            .collect();
+
+        let (_mmap, manifest_dryrun) = BinaryChunker::chunk_file(&path).unwrap();
+        let merkle_root = manifest_dryrun.merkle_root;
+
+        let rpc = Arc::new(MockRpc::default());
+        rpc.set_nonce(&l1_address_base58(&my_addr), 1);
+        rpc.enqueue_send("0xtx-register");
+        rpc.enqueue_status(TxStatusV2::Finalized { block_height: 100 });
+        rpc.add_file(
+            &format!("0x{}", hex::encode(merkle_root)),
+            pending_file_info(&merkle_root, 1, 50),
+        );
+        rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+        // A few explicit RPC errors; once drained, the mock keeps
+        // erroring ("no coverage response queued"), so S4 retries to the
+        // deadline rather than terminating early.
+        for _ in 0..3 {
+            rpc.enqueue_coverage_err("transient chain RPC failure");
+        }
+
+        let net = Arc::new(MockNet::new());
+        ack_chunks_for_all(&net, merkle_root, 1, &peers).await;
+        ack_manifest_for_all(&net, merkle_root, &peers).await;
+
+        // Tight budget so the retry loop times out quickly.
+        let mut params = params_for_test(defaults_for_tests());
+        params.activation_wait_secs = Duration::from_millis(100);
+
+        let pipeline = build_pipeline(rpc.clone(), net, arch_to_peer, my_addr, params);
+        match pipeline.run(&path).await {
+            IngestOutcome::PendingNeedsAction {
+                failed_stage,
+                suggested,
+                ..
+            } => {
+                assert_eq!(failed_stage, IngestStage::Coverage);
+                assert_eq!(
+                    suggested,
+                    SuggestedAction::Resume,
+                    "coverage RPC error is retryable → Resume, not Abandon"
+                );
+            }
+            other => panic!("expected PendingNeedsAction(Coverage, Resume), got {other:?}"),
+        }
+        // Retried more than once (errors didn't terminate early).
         assert!(rpc.coverage_poll_count() >= 1);
     }
 
@@ -5477,7 +5768,7 @@ mod tests {
             async fn storage_get_file_info_v2(
                 &self,
                 merkle_root_hex: &str,
-            ) -> Result<StorageFileInfoV2> {
+            ) -> Result<Option<StorageFileInfoV2>> {
                 self.inner.storage_get_file_info_v2(merkle_root_hex).await
             }
             async fn storage_get_active_nodes_at_height(
@@ -5507,7 +5798,7 @@ mod tests {
                 root: &str,
                 off: Option<u32>,
                 lim: Option<u32>,
-            ) -> Result<AssignmentCoverageV2> {
+            ) -> Result<Option<AssignmentCoverageV2>> {
                 self.inner
                     .storage_get_assignment_coverage_v2(root, off, lim)
                     .await
