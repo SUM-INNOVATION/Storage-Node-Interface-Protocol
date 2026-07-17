@@ -68,6 +68,11 @@ cid        = "0.11"
 multihash  = "0.19"
 tempfile   = "3.14"
 
+# Shared consensus-adjacent storage primitives (CHUNK_SIZE + V2
+# assignment KDF) published by SUM Chain. Pinned EXACT so SNIP's
+# byte-level assignment/chunking domain cannot drift from the chain.
+sumchain-wire = "=0.1.1"
+
 # ─── Cryptography (sum-crypto) ──────────────────────────────────────────────
 
 # AEAD: ChaCha20-Poly1305 (RFC 8439). Used for per-chunk encryption,

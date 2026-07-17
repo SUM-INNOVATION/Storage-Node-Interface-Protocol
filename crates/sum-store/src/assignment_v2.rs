@@ -27,12 +27,29 @@
 //! alters byte-level outputs MUST be cross-checked against those
 //! vectors before merging.
 //!
+//! The assignment-set functions delegate to the published
+//! [`sumchain_wire::storage_metadata`] crate — the single home of the
+//! chain's frozen assignment KDF — so SNIP and the chain cannot drift.
+//! These are thin, byte-identical wrappers: SNIP's `[u8; 20]` ↔ wire
+//! `Address` and `[u8; 32]` ↔ wire `Hash`, with the same sort/dedup/clamp
+//! and `(score, address)` ordering. `score` is kept locally verbatim
+//! because 0.1.1 does not expose a public scorer; it is byte-identical to
+//! the wire's internal one (same context string, 56-byte input layout,
+//! big-endian `chunk_index`, and `blake3::derive_key` call).
+//!
 //! V1's [`crate::assignment::compute_chunk_assignment`] uses a linear-
 //! probing hash, **NOT** this rendezvous-hash function — they are
 //! algorithmically distinct and produce different outputs. Do not
 //! substitute one for the other.
 
 use std::collections::BTreeSet;
+
+use sumchain_wire::Address;
+use sumchain_wire::Hash;
+use sumchain_wire::storage_metadata::{
+    assigned_archives as wire_assigned_archives,
+    assigned_archives_presorted as wire_assigned_archives_presorted,
+};
 
 /// Domain-separation context for the V2 assignment KDF.
 ///
@@ -70,13 +87,17 @@ pub fn score(merkle_root: &[u8; 32], chunk_index: u32, archive: &[u8; 20]) -> u6
     ])
 }
 
-/// Canonicalize an archive snapshot: dedup + sort by 20-byte address
-/// ascending. The chain expects this exact preprocessing before
-/// scoring; without it, two snapshots that differ only in input
-/// ordering or duplicates would yield different assignments.
-fn canonicalize_snapshot(snapshot: &[[u8; 20]]) -> Vec<[u8; 20]> {
-    let set: BTreeSet<[u8; 20]> = snapshot.iter().copied().collect();
-    set.into_iter().collect()
+/// Canonicalize an archive snapshot into the wire `Address` form the
+/// batch entry points feed to [`wire_assigned_archives_presorted`]:
+/// dedup + sort by 20-byte address ascending. `Address` derives `Ord`
+/// over its inner `[u8; 20]`, so `sort` + `dedup` yields exactly the
+/// ascending-byte-order canonical form the chain expects (identical to
+/// the wire's internal `sort_by(as_bytes)` + `dedup_by(as_bytes ==)`).
+fn presorted_addresses(snapshot: &[[u8; 20]]) -> Vec<Address> {
+    let mut addrs: Vec<Address> = snapshot.iter().map(|a| Address::new(*a)).collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
 }
 
 /// Compute the top-`replication_factor` archives assigned to a single
@@ -90,25 +111,15 @@ pub fn assigned_archives(
     chunk_index: u32,
     replication_factor: u32,
 ) -> Vec<[u8; 20]> {
-    let canonical = canonicalize_snapshot(snapshot);
-    if canonical.is_empty() {
-        return Vec::new();
-    }
-    let r = (replication_factor as usize).min(canonical.len());
-
-    // Score every archive. Capacity = canonical.len() so no realloc.
-    let mut scored: Vec<(u64, [u8; 20])> = canonical
-        .iter()
-        .map(|addr| (score(merkle_root, chunk_index, addr), *addr))
-        .collect();
-
-    // Order by (score asc, address asc). Ties resolve by raw address.
-    // The canonical sort already happened above, so for any two
-    // archives with the same score the BTreeSet ordering survives the
-    // stable sort_by. Belt-and-suspenders: explicit tie-break here.
-    scored.sort_by(|x, y| x.0.cmp(&y.0).then_with(|| x.1.cmp(&y.1)));
-
-    scored.into_iter().take(r).map(|(_, addr)| addr).collect()
+    // Thin wrapper over the wire crate. `wire_assigned_archives` performs
+    // its own sort+dedup+clamp and the same `(score, address)` ordering, so
+    // the raw (unsorted) converted snapshot is passed straight through.
+    let root = Hash::new(*merkle_root);
+    let addrs: Vec<Address> = snapshot.iter().map(|a| Address::new(*a)).collect();
+    wire_assigned_archives(&root, &addrs, chunk_index, replication_factor)
+        .into_iter()
+        .map(|a| *a.as_bytes())
+        .collect()
 }
 
 /// Compute the full assignment for every chunk in `[0, chunk_count)`.
@@ -123,21 +134,17 @@ pub fn compute_assignment_v2(
     snapshot: &[[u8; 20]],
     replication_factor: u32,
 ) -> Vec<Vec<[u8; 20]>> {
-    // Canonicalize once, reuse for every chunk to avoid repeated sort+dedup.
-    let canonical = canonicalize_snapshot(snapshot);
-    let r = (replication_factor as usize).min(canonical.len());
+    // Canonicalize once, reuse for every chunk to avoid repeated sort+dedup —
+    // this is exactly what `assigned_archives_presorted` expects.
+    let root = Hash::new(*merkle_root);
+    let presorted = presorted_addresses(snapshot);
 
     (0..chunk_count)
         .map(|chunk_index| {
-            if canonical.is_empty() {
-                return Vec::new();
-            }
-            let mut scored: Vec<(u64, [u8; 20])> = canonical
-                .iter()
-                .map(|addr| (score(merkle_root, chunk_index, addr), *addr))
-                .collect();
-            scored.sort_by(|x, y| x.0.cmp(&y.0).then_with(|| x.1.cmp(&y.1)));
-            scored.into_iter().take(r).map(|(_, addr)| addr).collect()
+            wire_assigned_archives_presorted(&root, &presorted, chunk_index, replication_factor)
+                .into_iter()
+                .map(|a| *a.as_bytes())
+                .collect()
         })
         .collect()
 }
@@ -155,22 +162,21 @@ pub fn chunks_for_archive_v2(
     replication_factor: u32,
     archive: &[u8; 20],
 ) -> BTreeSet<u32> {
-    let canonical = canonicalize_snapshot(snapshot);
+    let root = Hash::new(*merkle_root);
+    let presorted = presorted_addresses(snapshot);
+    let target = Address::new(*archive);
     // Fast-out: if the archive isn't even in the canonical snapshot, it
-    // can't be assigned to anything for this file.
-    if canonical.binary_search(archive).is_err() {
+    // can't be assigned to anything for this file. `presorted` is sorted,
+    // so binary_search is valid.
+    if presorted.binary_search(&target).is_err() {
         return BTreeSet::new();
     }
-    let r = (replication_factor as usize).min(canonical.len());
 
     let mut chunks = BTreeSet::new();
     for chunk_index in 0..chunk_count {
-        let mut scored: Vec<(u64, [u8; 20])> = canonical
-            .iter()
-            .map(|addr| (score(merkle_root, chunk_index, addr), *addr))
-            .collect();
-        scored.sort_by(|x, y| x.0.cmp(&y.0).then_with(|| x.1.cmp(&y.1)));
-        if scored.iter().take(r).any(|(_, addr)| addr == archive) {
+        let assigned =
+            wire_assigned_archives_presorted(&root, &presorted, chunk_index, replication_factor);
+        if assigned.iter().any(|a| a.as_bytes() == archive) {
             chunks.insert(chunk_index);
         }
     }
