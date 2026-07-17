@@ -7,7 +7,13 @@ use serde::{Deserialize, Serialize};
 
 /// Fixed chunk size matching the SUM Chain L1 constant.
 /// Every file is sliced into uniform 1 MB chunks (last chunk may be smaller).
-pub const CHUNK_SIZE: u64 = 1_048_576;
+///
+/// Re-exported from the published `sumchain-wire` crate (the single home of
+/// the chain's frozen wire constants) so SNIP's chunk size cannot drift from
+/// the L1. The 0.1.1 constant is `u64 = 1_048_576`; the `pub use` preserves
+/// the exact name, `u64` type, and `pub` visibility so all existing call
+/// sites are untouched.
+pub use sumchain_wire::storage_metadata::CHUNK_SIZE;
 
 /// Fallback replication factor used ONLY by dev-profile paths when
 /// `chain_getChainParams` is unreachable. Every production runtime path
@@ -107,6 +113,15 @@ mod tests {
     #[test]
     fn chunk_size_matches_l1() {
         assert_eq!(CHUNK_SIZE, 1_048_576);
+    }
+
+    #[test]
+    fn chunk_size_matches_wire() {
+        // The re-export must resolve to the wire crate's constant with no
+        // width or value drift: `u64` and exactly 1 MiB.
+        assert_eq!(CHUNK_SIZE, sumchain_wire::storage_metadata::CHUNK_SIZE);
+        let _: u64 = CHUNK_SIZE;
+        assert_eq!(CHUNK_SIZE, 1_048_576u64);
     }
 
     #[test]
