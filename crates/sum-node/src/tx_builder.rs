@@ -4,7 +4,7 @@
 //! `SignedTransaction::from_hex()` (bincode v1).
 //!
 //! The transaction types are the byte-frozen production wire types from the
-//! `sumchain-wire 0.1.1` crate (`SignedTransaction`, `TxInner`,
+//! `sumchain-wire 0.2.1` crate (`SignedTransaction`, `TxInner`,
 //! `TransactionV2`, `TxPayload`, and the `node_registry` / `storage_metadata`
 //! operation enums). There are no locally-maintained mirror types: the wire
 //! crate is the single source of truth for variant ordering, field order, and
@@ -131,7 +131,7 @@ pub fn build_register_archive_node_tx(
 
 // ── V2 Builders (chain plan v3.2) ─────────────────────────────────────────────
 //
-// These target the `sumchain-wire 0.1.1` production `StorageMetadataOperationV2`
+// These target the `sumchain-wire 0.2.1` production `StorageMetadataOperationV2`
 // / `NodeRegistryOperationV2` enums, so their variant ordering and field layout
 // are guaranteed by the wire crate's own byte-frozen fixtures — there is no
 // SNIP-local mirror to keep in sync with the chain.
@@ -417,7 +417,7 @@ mod tests {
 
     // ── Shared test helpers ──────────────────────────────────────────────────
 
-    /// Decode our own output back through the `sumchain-wire 0.1.1` decoder.
+    /// Decode our own output back through the `sumchain-wire 0.2.1` decoder.
     fn decode(hex_str: &str) -> SignedTransaction {
         SignedTransaction::from_hex(hex_str).expect("wire decoder must accept our own output")
     }
@@ -1028,22 +1028,22 @@ mod tests {
         );
     }
 
-    /// The wire decoder (`bincode::deserialize`, `allow_trailing_bytes`)
-    /// tolerates trailing bytes rather than rejecting them — so this test
-    /// pins the honest behavior: decoding succeeds, but the canonical
-    /// re-serialization is strictly shorter than the padded input, making the
-    /// junk detectable by length. (We deliberately do NOT claim the decoder
-    /// rejects trailing bytes.)
+    /// `sumchain-wire 0.2.1` hardened `SignedTransaction::from_bytes` to REJECT
+    /// trailing bytes (canonical-only decode). This pins that behavior: the
+    /// canonical signed bytes decode, but the same bytes padded with trailing
+    /// junk are rejected rather than silently tolerated.
     #[test]
-    fn trailing_bytes_are_tolerated_but_not_canonical() {
-        let mut bytes = hex::decode(BL_SUBMIT_PROOF).unwrap();
-        let canonical_len = bytes.len();
-        bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let signed = SignedTransaction::from_bytes(&bytes).expect("trailing bytes are tolerated");
-        assert_eq!(
-            signed.to_bytes().len(),
-            canonical_len,
-            "canonical re-encoding must not include the trailing junk"
+    fn trailing_bytes_are_rejected() {
+        let canonical = hex::decode(BL_SUBMIT_PROOF).unwrap();
+        assert!(
+            SignedTransaction::from_bytes(&canonical).is_ok(),
+            "canonical signed bytes must decode"
+        );
+        let mut padded = canonical.clone();
+        padded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(
+            SignedTransaction::from_bytes(&padded).is_err(),
+            "sumchain-wire 0.2.1 rejects trailing bytes"
         );
     }
 

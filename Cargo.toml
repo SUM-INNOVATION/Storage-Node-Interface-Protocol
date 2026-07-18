@@ -71,7 +71,7 @@ tempfile   = "3.14"
 # Shared consensus-adjacent storage primitives (CHUNK_SIZE + V2
 # assignment KDF) published by SUM Chain. Pinned EXACT so SNIP's
 # byte-level assignment/chunking domain cannot drift from the chain.
-sumchain-wire = "=0.1.1"
+sumchain-wire = "=0.2.1"
 
 # ─── Cryptography (sum-crypto) ──────────────────────────────────────────────
 
