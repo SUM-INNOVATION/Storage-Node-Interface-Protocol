@@ -19,6 +19,7 @@ sum-types          = { workspace = true }
 sum-net            = { workspace = true }
 sum-store          = { workspace = true }
 sum-crypto         = { workspace = true }
+sumchain-wire      = { workspace = true }
 tokio              = { workspace = true }
 clap               = { workspace = true }
 tracing            = { workspace = true }
