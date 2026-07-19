@@ -1,0 +1,33 @@
+{
+  "_provenance": {
+    "purpose": "sumchain-wire 0.2.2 test-only corroboration vectors for two b0 wire encodings that were not previously frozen: a full multi-chunk ObjectCommitmentV1 and a one-slot OutputManifestV1. TEST CORROBORATION ONLY. This is NOT the B0 protocol artifact, NOT closure-golden-vectors.json, and asserts NO semantic protocol change. It does not modify any B0 protocol hash rule.",
+    "produced_by": [
+      "tools/b0-pre-validator (reference frozen b0 encoders: schema::object, schema::manifest, golden::multichunk_buf)",
+      "tools/b0-pre-independent (independent frozen b0 encoders: enc module)"
+    ],
+    "agreement": "Both independent frozen implementations emit these bytes BYTE-FOR-BYTE identically (diff of the two emitters' output is empty).",
+    "source_base_commit": "da2e44ccfdc349689646737cc66f1e17cf17f7df",
+    "source_base_commit_note": "Base tree these vectors were derived from. It is a PRE-PATCH commit and does NOT contain the emitters referenced in produced_by (those are added by the 0.2.2 patch itself); this is the base, not the producing commit.",
+    "reproduction_commands": {
+      "emitter_a": "cargo run -q --example emit_wire_0_2_2_corroboration --manifest-path tools/b0-pre-validator/Cargo.toml",
+      "emitter_b": "cargo run -q --example emit_wire_0_2_2_corroboration --manifest-path tools/b0-pre-independent/Cargo.toml",
+      "agreement_check": "emitter_a stdout == emitter_b stdout, and both equal the *.bytes fields below",
+      "sha256_check": "the b0_corroboration_0_2_2::provenance_sha256_recomputes test recomputes sha256 over the byte fields and asserts it equals the sha256 field below"
+    },
+    "sha256_definition": "sha256( hex_decode(object_commitment_multichunk.bytes) || hex_decode(one_slot_output_manifest.bytes) )",
+    "sha256": "74fd7bbff8c5c84b89f3a281007247232d9893e0f13f84c10ce0a46cf2092760"
+  },
+  "object_commitment_multichunk": {
+    "input": "ObjectCommitmentV1::commit(ObjectKind::Model, multichunk_buf) with multichunk_buf = vec of length 2*CHUNK+7 where buf[i] = ((i*31 + 7) & 0xff); CHUNK = 1048576",
+    "byte_len": 2097159,
+    "chunk_count": 3,
+    "bytes": "53554d434841494e2f52302f4f424a4543542f7631000000000000000000000001000100070020000000000003000000f95a79e71ffca185115067773e7246ac496d6aa209b540b7f60571a3ebf6690f",
+    "identity": "965179fb1827bd1ff55a085b395176b3403d7ec47225b202d4d73ddf08885ec0"
+  },
+  "one_slot_output_manifest": {
+    "input": "OutputManifestV1 { slots: [ SlotDescriptorV1 { slot_kind: ResidualStream, slot_index: 7, commitment: ObjectCommitmentV1::commit(ObjectKind::ResidualState, b\"g\") } ] }",
+    "slot_count": 1,
+    "bytes": "53554d434841494e2f52302f4d414e49464553542f7631000000000000000000010001000000000700000053554d434841494e2f52302f4f424a4543542f7631000000000000000000000001000600010000000000000001000000805a31dee1a2a0d3fbe08c612de4fe6be78166a3c4d3a4db7805ad839ed47d4d",
+    "commitment_identity": "f9d10ee4fa99a09f91de5401c9c0e3fd8a29bfe2a43f07fd04030203ceaad8d8"
+  }
+}
