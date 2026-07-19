@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// Re-exported from the published `sumchain-wire` crate (the single home of
 /// the chain's frozen wire constants) so SNIP's chunk size cannot drift from
-/// the L1. The 0.1.1 constant is `u64 = 1_048_576`; the `pub use` preserves
-/// the exact name, `u64` type, and `pub` visibility so all existing call
-/// sites are untouched.
+/// the L1. The shared wire constant is `u64` and equals `1_048_576`; the
+/// `pub use` preserves the exact name, `u64` type, and `pub` visibility so
+/// all existing call sites are untouched.
 pub use sumchain_wire::storage_metadata::CHUNK_SIZE;
 
 /// Fallback replication factor used ONLY by dev-profile paths when

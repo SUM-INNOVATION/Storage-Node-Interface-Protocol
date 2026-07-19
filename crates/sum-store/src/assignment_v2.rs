@@ -33,8 +33,9 @@
 //! These are thin, byte-identical wrappers: SNIP's `[u8; 20]` ↔ wire
 //! `Address` and `[u8; 32]` ↔ wire `Hash`, with the same sort/dedup/clamp
 //! and `(score, address)` ordering. `score` is kept locally verbatim
-//! because 0.1.1 does not expose a public scorer; it is byte-identical to
-//! the wire's internal one (same context string, 56-byte input layout,
+//! because the pinned wire API exposes membership helpers but not the raw
+//! rendezvous scorer; it is byte-identical to the wire's internal one
+//! (same context string, 56-byte input layout,
 //! big-endian `chunk_index`, and `blake3::derive_key` call).
 //!
 //! V1's [`crate::assignment::compute_chunk_assignment`] uses a linear-

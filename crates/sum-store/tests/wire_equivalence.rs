@@ -1,6 +1,6 @@
 //! S4 PR-A equivalence tests: prove SNIP's wrapped assignment KDF and its
-//! Merkle-root construction stay byte-identical to the published
-//! `sumchain-wire 0.1.1` crate they now delegate to.
+//! Merkle-root construction stay byte-identical to the pinned
+//! `sumchain-wire` crate they delegate to.
 //!
 //! These are ADD-ONLY. They do not replace the Appendix-C conformance
 //! vectors in `assignment_v2_conformance.rs` (the byte tripwire) — they
