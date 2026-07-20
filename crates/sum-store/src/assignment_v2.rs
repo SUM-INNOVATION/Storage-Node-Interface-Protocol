@@ -1,14 +1,12 @@
 //! V2 deterministic chunk-to-archive assignment.
 //!
-//! Per chain plan v3.2 §3.6 — rendezvous-hash via BLAKE3 `derive_key`:
+//! Per chain plan v3.2 §3.6 — rendezvous-hash via the chain's frozen
+//! BLAKE3 KDF. This module is a thin, byte-identical adapter over the
+//! published [`sumchain_wire::storage_metadata`] crate — the single home
+//! of the chain's assignment scorer AND its assignment-set functions — so
+//! SNIP and the chain cannot drift.
 //!
 //! ```text
-//! score(archive) = u64::from_be_bytes(
-//!     blake3::derive_key(
-//!         "sumchain SNIP-V2 chunk-assignment v1",
-//!         merkle_root(32) || chunk_index_be(4) || archive_address(20)
-//!     )[..8]
-//! )
 //! candidates = snapshot, deduped + sorted by 20-byte address ascending
 //! assigned   = candidates sorted by (score asc, address asc) → take top R
 //! ```
@@ -19,24 +17,20 @@
 //! wrong endianness, wrong `blake3` API variant, wrong tie-break order)
 //! desynchronises SNIP from the chain and breaks both push validation
 //! (chunks rejected by archives that disagree about whether they were
-//! assigned) and `ActivateFileV2` validity.
+//! assigned) and `ActivateFileV2` validity. SNIP therefore holds **no**
+//! copy of the scorer: the raw per-tuple score comes from
+//! [`sumchain_wire::storage_metadata::assignment_score`] and the
+//! assignment sets from the wire crate's `assigned_archives*` functions.
+//! These wrappers only convert SNIP's `[u8; 20]` ↔ wire `Address` and
+//! `[u8; 32]` ↔ wire `Hash`, reusing the wire crate's own sort/dedup/clamp
+//! and `(score, address)` ordering.
 //!
 //! Conformance vectors live in
 //! [`crates/sum-store/tests/assignment_v2_conformance.rs`] and pull
-//! directly from chain plan Appendix C. Any change to this module that
-//! alters byte-level outputs MUST be cross-checked against those
-//! vectors before merging.
-//!
-//! The assignment-set functions delegate to the published
-//! [`sumchain_wire::storage_metadata`] crate — the single home of the
-//! chain's frozen assignment KDF — so SNIP and the chain cannot drift.
-//! These are thin, byte-identical wrappers: SNIP's `[u8; 20]` ↔ wire
-//! `Address` and `[u8; 32]` ↔ wire `Hash`, with the same sort/dedup/clamp
-//! and `(score, address)` ordering. `score` is kept locally verbatim
-//! because the pinned wire API exposes membership helpers but not the raw
-//! rendezvous scorer; it is byte-identical to the wire's internal one
-//! (same context string, 56-byte input layout,
-//! big-endian `chunk_index`, and `blake3::derive_key` call).
+//! directly from chain plan Appendix C. They score tuples through the wire
+//! crate's public `assignment_score` and assert the exact Appendix-C
+//! bytes, so any drift from the chain's hashing lands there and not in
+//! production.
 //!
 //! V1's [`crate::assignment::compute_chunk_assignment`] uses a linear-
 //! probing hash, **NOT** this rendezvous-hash function — they are
@@ -51,42 +45,6 @@ use sumchain_wire::storage_metadata::{
     assigned_archives as wire_assigned_archives,
     assigned_archives_presorted as wire_assigned_archives_presorted,
 };
-
-/// Domain-separation context for the V2 assignment KDF.
-///
-/// **Exact bytes — do not modify.** Trailing newline, casing, or
-/// "v2" in place of "v1" all break conformance with the chain.
-pub const ASSIGNMENT_V2_CONTEXT: &str = "sumchain SNIP-V2 chunk-assignment v1";
-
-/// Score one `(merkle_root, chunk_index, archive_address)` tuple.
-///
-/// Returns the first 8 bytes of `blake3::derive_key(CTX, …)` interpreted
-/// as a big-endian `u64`. Lower scores rank archives higher in the
-/// rendezvous-hash ordering.
-///
-/// Public so conformance tests can assert exact byte values from
-/// chain plan Appendix C without going through the assignment-output
-/// API.
-pub fn score(merkle_root: &[u8; 32], chunk_index: u32, archive: &[u8; 20]) -> u64 {
-    // Stack-allocated 56-byte input — no heap, no allocator pressure
-    // when computing assignments for many chunks.
-    let mut input = [0u8; 32 + 4 + 20];
-    input[..32].copy_from_slice(merkle_root);
-    input[32..36].copy_from_slice(&chunk_index.to_be_bytes());
-    input[36..].copy_from_slice(archive);
-
-    // Note: blake3::derive_key(context, input) is the chain's exact
-    // canonical API. Equivalent to `blake3::Hasher::new_derive_key(ctx)
-    // .update(input).finalize()`. Do NOT substitute `keyed_hash` (uses
-    // a 32-byte key not a context string) or plain `hash` (no domain
-    // separation).
-    let derived = blake3::derive_key(ASSIGNMENT_V2_CONTEXT, &input);
-
-    u64::from_be_bytes([
-        derived[0], derived[1], derived[2], derived[3], derived[4], derived[5], derived[6],
-        derived[7],
-    ])
-}
 
 /// Canonicalize an archive snapshot into the wire `Address` form the
 /// batch entry points feed to [`wire_assigned_archives_presorted`]:

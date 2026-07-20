@@ -1,4 +1,4 @@
-//! SNIP #40 Phase 1 cross-validation tests (pinned `sumchain-wire = "=0.2.1"`).
+//! SNIP #40 cross-validation tests (pinned `sumchain-wire = "=0.2.2"`).
 //!
 //! These extend the `wire_equivalence.rs` cross-validation pattern to the `b0`
 //! object/manifest commitment surface. They prove that SNIP's adopted shared
@@ -7,21 +7,29 @@
 //! `sum_store::MerkleTree::build`, and the `sum_types` `DataManifest`/`ChunkDescriptor`
 //! storage types) agree with the shared commitment's Merkle root.
 //!
-//! Authoritative vectors are vendored VERBATIM from the single cross-validated
-//! upstream source `sum-chain docs/b0-pre/fixtures/encoding-golden/vectors.json`
-//! into `tests/fixtures/b0-encoding-golden-vectors.json`, hash-locked below.
+//! Two vendored, hash-locked vector sets — DISTINCT in status:
+//!   * Phase 1 (=0.2.1): the AUTHORITATIVE encoding-golden vectors from
+//!     `sum-chain docs/b0-pre/fixtures/encoding-golden/vectors.json` into
+//!     `tests/fixtures/b0-encoding-golden-vectors.json`.
+//!   * Phase 2 (=0.2.2): the two INDEPENDENTLY CROSS-VALIDATED, TEST-ONLY
+//!     corroboration vectors from
+//!     `sum-chain crates/sumchain-wire/tests/fixtures/wire-0-2-2-b0-corroboration.json`
+//!     into `tests/fixtures/wire-0-2-2-b0-corroboration.json`. These are TEST
+//!     CORROBORATION ONLY — not a B0 protocol artifact or a semantic freeze —
+//!     emitted + cross-checked by two independent frozen b0 encoders shipped with
+//!     `sumchain-wire 0.2.2`.
 //!
-//! Scope note (do NOT read this as #40 closure): this is the =0.2.1 Phase-1
-//! track only. It covers the five frozen cases: empty object, single-chunk
-//! object, two-slot output manifest, three-slot input manifest, and the
-//! three-chunk (chunk-boundary) Merkle root. Explicitly DEFERRED to a future
-//! `sumchain-wire 0.2.2` track (no authoritative bytes exist on =0.2.1 yet):
-//!   * a frozen one-slot output/input manifest vector (bytes + commitment_identity),
-//!   * a frozen full multi-chunk `ObjectCommitmentV1` vector (bytes + identity)
-//!     over a >=2-chunk buffer — today only the bare `merkle_multichunk_root` is
-//!     frozen, so the multi-chunk object case anchors ONLY root/byte_len/chunk_count.
-//! The one-slot authoritative bytes, the full multi-chunk commitment vector, and
-//! the scorer-duplicate deletion land after 0.2.2. #40 closure is NOT claimed here.
+//! Scope note (do NOT read this as #40 closure): Phase 1 covers the five
+//! encoding-golden cases (empty object, single-chunk object, two-slot output
+//! manifest, three-slot input manifest, three-chunk/chunk-boundary Merkle root).
+//! Phase 2 adds the two cases Phase 1 explicitly deferred because no corroboration
+//! vector existed on =0.2.1:
+//!   * a corroborated full multi-chunk `ObjectCommitmentV1` (bytes + identity) over
+//!     the `2*CHUNK + 7` buffer — Phase 1 could anchor only root/byte_len/chunk_count;
+//!   * a corroborated one-slot `OutputManifestV1` (bytes + commitment_identity).
+//! Both now assert the exact vendored bytes + identity, and the SNIP producer path
+//! cross-checks them. These tests alone do not close #40; closure requires the
+//! merged exact `=0.2.2` pin, removal of the duplicate scorer, and final evidence.
 //!
 //! Frozen type references use the crate-root re-exports
 //! (`sumchain_wire::{ObjectCommitmentV1, OutputManifestV1, InputManifestV1}`) and
@@ -51,8 +59,23 @@ const V: &str = include_str!("fixtures/b0-encoding-golden-vectors.json");
 /// equality BEFORE consuming any vector, so any silent edit fails loudly.
 const EXPECTED_SHA256: &str = "26a6338e3572384adfc4e0aa379f4501cb1c350a4195ce85f8056b2f378875c1";
 
+// ── Phase 2 (=0.2.2) vendored corroboration fixture + hardcoded upstream digest ──
+//
+// Vendored VERBATIM from sum-chain
+// crates/sumchain-wire/tests/fixtures/wire-0-2-2-b0-corroboration.json. It carries
+// the two b0 encodings not previously corroborated on =0.2.1: a full multi-chunk ObjectCommitmentV1
+// and a one-slot OutputManifestV1. The mutable `.sha256` sidecar next to the
+// vendored file is NOT the tripwire — this hardcoded const is.
+
+const V2: &str = include_str!("fixtures/wire-0-2-2-b0-corroboration.json");
+
+/// SHA-256 of the vendored 0.2.2 corroboration fixture, hardcoded as a drift
+/// tripwire (produced by `shasum -a 256`). The tests recompute the digest of the
+/// vendored bytes at runtime and assert equality BEFORE consuming any vector.
+const EXPECTED_SHA256_V2: &str = "ad82783ebf92fd7d4754d5d8d39e07282100d3da6d4371fd8d2800e4f86c6f68";
+
 // ── Minimal self-contained SHA-256 (FIPS 180-4) ───────────────────────────────
-// Kept in-test so this closure adds ONLY the three intended files (test + vendored
+// Kept in-test so this change adds ONLY the three intended files (test + vendored
 // fixture + sidecar) and touches no production source / Cargo manifest. Used solely
 // as an integrity tripwire over a known fixture; validated against the hardcoded
 // digest (which itself was produced by `shasum -a 256`).
@@ -180,6 +203,24 @@ fn jbare(j: &serde_json::Value, key: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("missing bare string {key}"))
         .to_string()
+}
+
+fn ju64(j: &serde_json::Value, key: &str, field: &str) -> u64 {
+    j[key][field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("missing u64 {key}.{field}"))
+}
+
+/// Assert the Phase-2 digest lock, THEN parse. Every 0.2.2 vector-consuming test
+/// starts here so the tripwire runs before any vector is read.
+fn locked_fixture_v2() -> serde_json::Value {
+    assert_eq!(
+        sha256_hex(V2.as_bytes()),
+        EXPECTED_SHA256_V2,
+        "vendored 0.2.2 corroboration fixture digest drift: the vendored file no \
+         longer matches the hardcoded upstream SHA-256"
+    );
+    serde_json::from_str(V2).expect("parse vendored 0.2.2 corroboration json")
 }
 
 fn hx(b: &[u8]) -> String {
@@ -505,4 +546,155 @@ fn three_slot_input_manifest_matches_frozen_bytes_and_commitment() {
         commitment.identity()
     );
     assert_input_slots_ascending(&decoded.slots);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Phase 2 (=0.2.2) — the two cases Phase 1 deferred (corroboration vectors now exist).
+// Vendored from sumchain-wire 0.2.2's `wire-0-2-2-b0-corroboration.json`.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── P2.0 Digest lock (standalone tripwire) ────────────────────────────────────
+
+#[test]
+fn vendored_0_2_2_corroboration_digest_matches_hardcoded_upstream_sha256() {
+    assert_eq!(
+        sha256_hex(V2.as_bytes()),
+        EXPECTED_SHA256_V2,
+        "vendored 0.2.2 corroboration fixture must hash to the hardcoded upstream digest"
+    );
+}
+
+// ── P2.1 full multi-chunk object commitment — `object_commitment_multichunk` ───
+//
+// Phase 1 could only anchor root/byte_len/chunk_count over the `2*CHUNK + 7`
+// buffer (the 0.2.1 fixture froze only the bare `merkle_multichunk_root`). The
+// 0.2.2 vector corroborates the FULL ObjectCommitmentV1 bytes + identity, so SNIP's
+// producer path is now cross-checked against them byte-for-byte.
+
+#[test]
+fn multichunk_object_commitment_matches_corroborated_bytes_identity_and_snip_merkle() {
+    let j = locked_fixture_v2();
+    let want_bytes = jstr(&j, "object_commitment_multichunk", "bytes");
+    let want_id = jstr(&j, "object_commitment_multichunk", "identity");
+    let want_byte_len = ju64(&j, "object_commitment_multichunk", "byte_len");
+    let want_chunk_count = ju64(&j, "object_commitment_multichunk", "chunk_count");
+
+    // Provenance (fixture `input`): commit(Model, multichunk_buf) with
+    // buf.len() = 2*CHUNK + 7 and buf[i] = (i*31 + 7) & 0xff. Reuse the Phase-1
+    // buffer recipe (re-derived from the documented spec, NOT from SNIP object code).
+    let buf = multichunk_buf();
+    assert_eq!(buf.len(), 2 * CHUNK + 7);
+    assert_eq!(buf.len() as u64, want_byte_len);
+
+    // SNIP-native producer path (the #40 tie-in): chunk_file -> DataManifest ->
+    // MerkleTree::build must agree with the shared commitment's root.
+    let manifest = snip_manifest(&buf);
+    assert_eq!(manifest.chunk_count as u64, want_chunk_count);
+    let snip_root = MerkleTree::build(&snip_leaves(&manifest)).root();
+    assert_eq!(snip_root.as_bytes(), &manifest.merkle_root);
+
+    // Shared commitment SNIP adopts — now assert FULL bytes + identity.
+    let oc = ObjectCommitmentV1::commit(ObjectKind::Model, &buf).unwrap();
+    let bytes = oc.encode();
+
+    // KIND
+    assert_eq!(oc.object_kind(), ObjectKind::Model);
+    assert_eq!(&bytes[..32], &OBJECT_TAG[..]);
+    // BYTE LENGTH (== 80 == vendored length)
+    assert_eq!(bytes.len(), 80);
+    assert_eq!(bytes.len(), unhex(&want_bytes).len());
+    // BYTE_LEN / CHUNK COUNT (multichunk -> 3)
+    assert_eq!(oc.byte_len(), want_byte_len);
+    assert_eq!(oc.byte_len(), (2 * CHUNK + 7) as u64);
+    assert_eq!(oc.chunk_count() as u64, want_chunk_count);
+    assert_eq!(oc.chunk_count(), 3);
+    assert_eq!(oc.chunk_count(), manifest.chunk_count);
+    // MERKLE ROOT — #40 tie-in: shared commitment root == SNIP MerkleTree root.
+    assert_eq!(oc.merkle_root(), manifest.merkle_root);
+    assert_eq!(&oc.merkle_root(), snip_root.as_bytes());
+    // EXACT ENCODED BYTES (hex vs corroborated 0.2.2 vector)
+    assert_eq!(hx(&bytes), want_bytes);
+    // FINAL COMMITMENT IDENTITY
+    assert_eq!(hx(&oc.identity()), want_id);
+
+    // Strict decode -> re-encode round-trip identity.
+    let decoded = ObjectCommitmentV1::decode_exact(&bytes).unwrap();
+    assert_eq!(decoded, oc);
+    assert_eq!(decoded.encode(), bytes);
+    assert_eq!(decoded.identity(), oc.identity());
+}
+
+// ── P2.2 one-slot output manifest — `one_slot_output_manifest` ────────────────
+
+#[test]
+fn one_slot_output_manifest_matches_corroborated_bytes_and_commitment() {
+    let j = locked_fixture_v2();
+    let want_bytes = jstr(&j, "one_slot_output_manifest", "bytes");
+    let want_commit_id = jstr(&j, "one_slot_output_manifest", "commitment_identity");
+    let want_slot_count = ju64(&j, "one_slot_output_manifest", "slot_count");
+
+    // Provenance (fixture `input`): a single ResidualStream slot at index 7 whose
+    // commitment is commit(ResidualState, b"g").
+    let manifest = OutputManifestV1 {
+        slots: vec![SlotDescriptorV1 {
+            slot_kind: SlotKind::ResidualStream,
+            slot_index: 7,
+            commitment: ObjectCommitmentV1::commit(ObjectKind::ResidualState, b"g").unwrap(),
+        }],
+    };
+    assert_eq!(manifest.slots.len() as u64, want_slot_count);
+    let bytes = manifest.try_encode().unwrap();
+
+    // KIND: leading tag + slot_kind <-> embedded object_kind binding.
+    assert_eq!(&bytes[..32], &OUTPUT_MANIFEST_TAG[..]);
+    for slot in &manifest.slots {
+        assert_eq!(slot.commitment.object_kind(), slot.slot_kind.object_kind());
+    }
+    // BYTE LENGTH (== 38 + 85*1 == vendored length)
+    assert_eq!(bytes.len(), 38 + 85);
+    assert_eq!(bytes.len(), unhex(&want_bytes).len());
+    // CHUNK COUNT via the embedded commitment (1-byte "g" -> 1 chunk).
+    for slot in &manifest.slots {
+        assert_eq!(slot.commitment.chunk_count(), 1);
+    }
+    // SLOT ORDERING: a single slot is trivially strictly ascending.
+    assert_output_slots_ascending(&manifest.slots);
+    // EXACT ENCODED BYTES
+    assert_eq!(hx(&bytes), want_bytes);
+    // FINAL COMMITMENT IDENTITY
+    let commitment = manifest.try_commitment().unwrap();
+    assert_eq!(commitment.object_kind(), ObjectKind::OutputManifest);
+    assert_eq!(hx(&commitment.identity()), want_commit_id);
+
+    // Strict decode -> re-encode round-trip identity.
+    let decoded = OutputManifestV1::decode_exact(&bytes).unwrap();
+    assert_eq!(decoded, manifest);
+    assert_eq!(decoded.try_encode().unwrap(), bytes);
+    assert_eq!(
+        decoded.try_commitment().unwrap().identity(),
+        commitment.identity()
+    );
+    assert_output_slots_ascending(&decoded.slots);
+}
+
+// ── P2.3 provenance self-check — recompute the fixture's own inner sha256 ──────
+//
+// The fixture defines `_provenance.sha256` as
+// sha256( decode(object_commitment_multichunk.bytes) || decode(one_slot_output_manifest.bytes) ).
+// Recompute it from the corroborated byte fields and assert equality — a second,
+// definition-driven corroboration that the two vectors are internally consistent.
+
+#[test]
+fn corroboration_provenance_inner_sha256_recomputes() {
+    let j = locked_fixture_v2();
+    let mut cat = unhex(&jstr(&j, "object_commitment_multichunk", "bytes"));
+    cat.extend_from_slice(&unhex(&jstr(&j, "one_slot_output_manifest", "bytes")));
+    let want = j["_provenance"]["sha256"]
+        .as_str()
+        .expect("missing _provenance.sha256");
+    assert_eq!(
+        sha256_hex(&cat),
+        want,
+        "recomputed inner provenance sha256 (object_bytes || manifest_bytes) mismatch"
+    );
 }

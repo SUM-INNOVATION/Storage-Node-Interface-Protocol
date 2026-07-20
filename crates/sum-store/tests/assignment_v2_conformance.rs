@@ -14,7 +14,10 @@
 //! the chain plan, so any discrepancy with the chain's BLAKE3 hashing
 //! lands here and not in production.
 
-use sum_store::assignment_v2::{assigned_archives, score};
+use sum_store::assignment_v2::assigned_archives;
+use sumchain_wire::Address;
+use sumchain_wire::Hash;
+use sumchain_wire::storage_metadata::assignment_score;
 
 // ── Fixture construction (matches Appendix C "Inputs") ────────────────────────
 
@@ -86,15 +89,17 @@ fn appendix_c_per_archive_scores_for_root0_chunk0() {
     ];
 
     for &(j, expected) in cases {
-        let actual = score(&r0, 0, &archive(j));
+        // The scorer now lives ONLY in the pinned sumchain-wire crate; SNIP
+        // holds no copy. Convert SNIP's raw `[u8; 32]` / `[u8; 20]` into the
+        // wire `Hash` / `Address` and score through the public entry point.
+        let actual = assignment_score(&Hash::new(r0), 0, &Address::new(archive(j)));
         assert_eq!(
             actual, expected,
-            "score(root[0], chunk_index=0, archive[{j}]) = {actual:#018x}, expected {expected:#018x}\n\
-             If this fails, the most likely causes are (per Appendix C footnote):\n\
-              (a) wrong context string (must be exactly \"sumchain SNIP-V2 chunk-assignment v1\"),\n\
-              (b) using blake3::keyed_hash(blake3::hash(CTX), input) instead of blake3::derive_key(CTX, input),\n\
-              (c) wrong chunk_index byte order (must be big-endian),\n\
-              (d) snapshot deduplication differs from the spec (must be sort-and-dedup by 20-byte address ascending)."
+            "assignment_score(root[0], chunk_index=0, archive[{j}]) = {actual:#018x}, \
+             expected {expected:#018x}\n\
+             The scorer is delegated to sumchain-wire's storage_metadata::assignment_score;\n\
+             a mismatch means the pinned wire crate diverged from chain plan Appendix C\n\
+             (unexpected for the frozen =0.2.2 pin) — verify the pin and the Appendix-C inputs."
         );
     }
 }
