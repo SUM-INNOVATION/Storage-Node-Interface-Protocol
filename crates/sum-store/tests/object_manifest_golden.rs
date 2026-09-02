@@ -1,4 +1,6 @@
-//! SNIP #40 cross-validation tests (pinned `sumchain-wire = "=0.2.2"`).
+//! SNIP #40 cross-validation tests (pinned `sumchain-wire = "=0.3.0"`; the b0
+//! corroboration vectors below are frozen and byte-identical to those shipped by
+//! wire 0.3.0, so they retain the `wire-0-2-2-b0-corroboration` vintage name).
 //!
 //! These extend the `wire_equivalence.rs` cross-validation pattern to the `b0`
 //! object/manifest commitment surface. They prove that SNIP's adopted shared
