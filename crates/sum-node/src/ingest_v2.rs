@@ -997,7 +997,7 @@ where
                     merkle_root,
                     manifest,
                     failed_stage: IngestStage::Coverage,
-                    last_coverage,
+                    last_coverage: last_coverage.map(|c| *c),
                     under_replicated_chunks: None,
                     suggested: SuggestedAction::Resume,
                     source: None,
@@ -1253,7 +1253,7 @@ where
                     merkle_root,
                     manifest,
                     failed_stage: IngestStage::Coverage,
-                    last_coverage,
+                    last_coverage: last_coverage.map(|c| *c),
                     under_replicated_chunks: None,
                     suggested: SuggestedAction::Resume,
                     source: None,
@@ -1756,7 +1756,7 @@ where
             let now = Instant::now();
             if now >= deadline {
                 return Err(S4WaitError::Timeout {
-                    last_coverage: last,
+                    last_coverage: last.map(Box::new),
                 });
             }
             let sleep_for = std::cmp::min(self.params.poll_interval, deadline - now);
@@ -2281,7 +2281,7 @@ where
                         merkle_root,
                         manifest,
                         failed_stage: IngestStage::Coverage,
-                        last_coverage,
+                        last_coverage: last_coverage.map(|c| *c),
                         under_replicated_chunks: None,
                         suggested: SuggestedAction::Resume,
                         source: None,
@@ -2535,7 +2535,11 @@ enum S4WaitError {
     /// the last observed coverage (if any) for diagnostics. Retryable
     /// via `resume`.
     Timeout {
-        last_coverage: Option<AssignmentCoverageV2>,
+        // Boxed: `AssignmentCoverageV2` (a sumchain-wire type) grew in wire 0.3.0,
+        // pushing `S4WaitError` past clippy's `result_large_err` threshold on the
+        // `s4_wait_coverage` Result. Boxing the sole large field keeps the error
+        // small without touching the unboxed `IngestOutcome` coverage fields.
+        last_coverage: Option<Box<AssignmentCoverageV2>>,
     },
     /// `storage_getAssignmentCoverageV2` returned `Ok(None)` — the chain
     /// authoritatively reports no coverage row for this file. Terminal:
