@@ -99,7 +99,7 @@ fn appendix_c_per_archive_scores_for_root0_chunk0() {
              expected {expected:#018x}\n\
              The scorer is delegated to sumchain-wire's storage_metadata::assignment_score;\n\
              a mismatch means the pinned wire crate diverged from chain plan Appendix C\n\
-             (unexpected for the frozen =0.2.2 pin) — verify the pin and the Appendix-C inputs."
+             (unexpected for the frozen =0.3.0 pin) — verify the pin and the Appendix-C inputs."
         );
     }
 }
