@@ -75,7 +75,7 @@ tempfile   = "3.14"
 # encoding is frozen, so the vendored b0 corroboration vectors are
 # byte-identical to those shipped by wire 0.3.0 (verified in the
 # sum-store cross-validation goldens).
-sumchain-wire = "=0.3.0"
+sumchain-wire = "=0.4.0"
 
 # ─── Cryptography (sum-crypto) ──────────────────────────────────────────────
 
