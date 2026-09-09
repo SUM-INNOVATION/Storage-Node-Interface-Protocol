@@ -45,6 +45,11 @@ zeroize            = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# WP-S1: the V2 range regression tests round-trip requests through the
+# real `VersionedShardCodec`, which needs the libp2p `Codec` trait and a
+# `futures::io` cursor. Test-only; no production dependency edge.
+libp2p   = { workspace = true }
+futures  = { workspace = true }
 # Minimal HTTP mock server for wire-shape regression tests. Used only
 # by the e2e_helper `smoke` subcommand tests to drive the actual HTTP
 # code path against scripted JSON responses.

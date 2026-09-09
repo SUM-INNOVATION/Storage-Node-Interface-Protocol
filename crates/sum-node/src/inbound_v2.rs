@@ -274,6 +274,35 @@ where
     attest_batch_timeout: Duration,
 }
 
+/// Resolve the byte window a V2 pull selects, as `(start, end)` indices
+/// into a `total`-byte buffer, or `None` when `offset` is past the end.
+///
+/// Preserves V2's established policy exactly: an `offset` beyond the end is
+/// an ERROR here (the V1 and Omni handlers clamp instead — that difference
+/// is deliberate and is not being standardized). `max_bytes` is a plain
+/// `u64` on this path, so there is no absent-field case.
+///
+/// The comparison happens in `u64` BEFORE any narrowing. The previous code
+/// did `offset as usize` first, so on a 32-bit target an oversized offset
+/// truncated into range and a request that must be rejected would instead
+/// have read at the wrong position. The subsequent `start + max_bytes`
+/// could also overflow, panicking under debug assertions and, with them
+/// off, wrapping to an inverted range that panicked at the slice.
+///
+/// When `Some((start, end))` is returned, `start <= end <= total`.
+fn resolve_pull_window(total: usize, offset: u64, max_bytes: u64) -> Option<(usize, usize)> {
+    // `usize` -> `u64` is lossless on every supported target.
+    let total_u64 = total as u64;
+    if offset > total_u64 {
+        return None;
+    }
+    let end = offset.saturating_add(max_bytes).min(total_u64);
+    debug_assert!(offset <= end && end <= total_u64);
+    // Both are <= `total_u64`, which came from a `usize`, so neither
+    // conversion can truncate.
+    Some((offset as usize, end as usize))
+}
+
 impl<V, A, T> V2Dispatcher<V, A, T>
 where
     V: V2RpcClient + 'static,
@@ -422,24 +451,23 @@ where
         match stores.local.get(&cid) {
             Ok(full) => {
                 let total = full.len() as u64;
-                let start = offset as usize;
-                if start > full.len() {
-                    ShardResponseV2::Data {
+                match resolve_pull_window(full.len(), offset, max_bytes) {
+                    // Beyond-EOF policy is V2's own and is unchanged: unlike
+                    // the V1/Omni handlers (which clamp), V2 reports an error.
+                    None => ShardResponseV2::Data {
                         cid,
                         offset,
                         total_bytes: total,
                         data: Vec::new(),
                         error: Some(format!("offset {offset} > total_bytes {total}")),
-                    }
-                } else {
-                    let end = (start + max_bytes as usize).min(full.len());
-                    ShardResponseV2::Data {
+                    },
+                    Some((start, end)) => ShardResponseV2::Data {
                         cid,
                         offset,
                         total_bytes: total,
                         data: full[start..end].to_vec(),
                         error: None,
-                    }
+                    },
                 }
             }
             Err(e) => ShardResponseV2::Data {
@@ -2256,5 +2284,340 @@ mod tests {
             }
             other => panic!("expected ManifestData response, got {other:?}"),
         }
+    }
+
+    // ── WP-S1: V2 pull-range regression fixtures ────────────────────────
+    //
+    // V2's beyond-EOF policy differs from V1/Omni (error, not clamp) and is
+    // preserved exactly; only the arithmetic and the ordering of the
+    // narrowing conversion changed.
+
+    #[test]
+    fn pull_window_offset_boundaries() {
+        // offset 0 / 1 / total: accepted. Beyond total: rejected (V2 policy).
+        assert_eq!(resolve_pull_window(4, 0, 4), Some((0, 4)));
+        assert_eq!(resolve_pull_window(4, 1, 4), Some((1, 4)));
+        assert_eq!(resolve_pull_window(4, 4, 4), Some((4, 4)));
+        assert_eq!(resolve_pull_window(4, 5, 4), None);
+        assert_eq!(resolve_pull_window(4, u64::MAX, 4), None);
+    }
+
+    #[test]
+    fn pull_window_max_bytes_boundaries() {
+        assert_eq!(resolve_pull_window(4, 1, 0), Some((1, 1)));
+        assert_eq!(resolve_pull_window(4, 1, 2), Some((1, 3)));
+        // exact remainder, one past it, and the overflowing extreme
+        assert_eq!(resolve_pull_window(4, 1, 3), Some((1, 4)));
+        assert_eq!(resolve_pull_window(4, 1, 4), Some((1, 4)));
+        assert_eq!(resolve_pull_window(4, 1, u64::MAX), Some((1, 4)));
+        assert_eq!(resolve_pull_window(4, 0, u64::MAX), Some((0, 4)));
+    }
+
+    #[test]
+    fn pull_window_empty_buffer() {
+        assert_eq!(resolve_pull_window(0, 0, 0), Some((0, 0)));
+        assert_eq!(resolve_pull_window(0, 0, u64::MAX), Some((0, 0)));
+        assert_eq!(resolve_pull_window(0, 1, 0), None);
+        assert_eq!(resolve_pull_window(0, u64::MAX, u64::MAX), None);
+    }
+
+    /// Narrowing-specific values, pinned in the `u64` domain where the
+    /// contract does not depend on the target's pointer width.
+    ///
+    /// `u32::MAX as u64 + 2` truncates to `1` under a 32-bit `as usize` —
+    /// a value that lands INSIDE a small buffer, which is what makes the
+    /// narrowing order observable. `u64::MAX` truncates to `u32::MAX`
+    /// (4_294_967_295), still far past any such buffer, so it is refused
+    /// either way and distinguishes nothing on its own.
+    #[test]
+    fn pull_window_narrowing_boundary_values() {
+        let narrowing = u32::MAX as u64 + 2; // 4_294_967_297
+        // As an offset on a 4-byte buffer: beyond EOF, must reject.
+        assert_eq!(resolve_pull_window(4, narrowing, 1), None);
+        assert_eq!(resolve_pull_window(4, u32::MAX as u64, 1), None);
+        // As a length: the whole remainder, never a truncated 1-byte read.
+        assert_eq!(resolve_pull_window(4, 1, narrowing), Some((1, 4)));
+        assert_eq!(resolve_pull_window(4, 0, narrowing), Some((0, 4)));
+        assert_eq!(resolve_pull_window(4, 4, narrowing), Some((4, 4)));
+        // Empty buffer: offset 0 accepted, any nonzero offset rejected.
+        assert_eq!(resolve_pull_window(0, 0, narrowing), Some((0, 0)));
+        assert_eq!(resolve_pull_window(0, narrowing, narrowing), None);
+    }
+
+    /// The invariant, over the extreme grid. Synthetic — `total` values are
+    /// asserted against, not allocated.
+    #[test]
+    fn pull_window_invariant_holds_over_extremes() {
+        let totals = [0usize, 1, 2, 4, 4096];
+        let extremes = [
+            0u64,
+            1,
+            2,
+            4095,
+            4096,
+            u32::MAX as u64,
+            u32::MAX as u64 + 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for total in totals {
+            for offset in extremes {
+                for max_bytes in extremes {
+                    match resolve_pull_window(total, offset, max_bytes) {
+                        Some((start, end)) => assert!(
+                            start <= end && end <= total,
+                            "total={total} offset={offset} max_bytes={max_bytes} \
+                             -> ({start}, {end})"
+                        ),
+                        // Only ever rejected for being past the end.
+                        None => assert!(offset > total as u64),
+                    }
+                }
+            }
+        }
+    }
+
+    // ── V2 dispatcher cases: real codec framing + exact response contract ──
+
+    /// Round-trip a V2 request through the ACTUAL V2-capable codec on the
+    /// V2 protocol, so the dispatcher is driven by a request that survived
+    /// real encode/decode and real protocol selection.
+    ///
+    /// This is codec-plus-dispatch coverage. It is NOT a live connection or
+    /// event-loop test: no swarm is started and no socket is opened.
+    async fn v2_through_codec(req: ShardRequestV2) -> ShardRequestV2 {
+        use futures::io::Cursor;
+        use libp2p::request_response::Codec;
+        let mut codec = sum_net::VersionedShardCodec::default();
+        let proto = sum_net::SHARD_XFER_PROTOCOL_V2.to_string();
+        let mut buf = Vec::new();
+        codec
+            .write_request(
+                &proto,
+                &mut Cursor::new(&mut buf),
+                sum_net::ShardRequestVersioned::V2(req),
+            )
+            .await
+            .expect("V2 request must encode on the V2 protocol");
+        match codec
+            .read_request(&proto, &mut Cursor::new(&buf))
+            .await
+            .expect("V2 request must decode on the V2 protocol")
+        {
+            sum_net::ShardRequestVersioned::V2(r) => r,
+            other => panic!("codec returned a non-V2 request: {other:?}"),
+        }
+    }
+
+    /// A store holding `content` under its real CID.
+    async fn stores_with(content: &[u8]) -> (Arc<RwLock<SumStore>>, String) {
+        let stores = make_stores();
+        let cid = sum_store::content_id::cid_from_data(content);
+        stores.write().await.local.put(&cid, content).unwrap();
+        (stores, cid)
+    }
+
+    /// Drive one pull through the real codec and the real dispatcher.
+    async fn v2_pull(
+        d: &V2Dispatcher<ArcRpc, ArcRpc, ArcRpcTrigger>,
+        net: &RecorderNet,
+        cid: &str,
+        offset: u64,
+        max_bytes: u64,
+        channel: u64,
+    ) -> (u64, ShardResponseV2) {
+        let req = v2_through_codec(ShardRequestV2::Pull {
+            cid: cid.to_string(),
+            offset,
+            max_bytes,
+        })
+        .await;
+        d.handle(net, PeerId::random(), req, channel).await;
+        net.last().expect("the dispatcher must answer every pull")
+    }
+
+    /// Assert the FULL response contract: channel, CID, offset, total,
+    /// body and the absence of an error.
+    fn expect_ok(
+        got: (u64, ShardResponseV2),
+        channel: u64,
+        cid: &str,
+        offset: u64,
+        total: u64,
+        data: &[u8],
+    ) {
+        let (ch, resp) = got;
+        assert_eq!(ch, channel, "channel id");
+        match resp {
+            ShardResponseV2::Data {
+                cid: c,
+                offset: o,
+                total_bytes,
+                data: d,
+                error,
+            } => {
+                assert_eq!(c, cid, "cid echoed verbatim");
+                assert_eq!(o, offset, "offset echoed verbatim");
+                assert_eq!(total_bytes, total, "total_bytes");
+                assert_eq!(d, data, "body");
+                assert_eq!(error, None, "successful pull carries no error");
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    /// Assert the FULL error contract, including the EXACT unchanged error
+    /// text this endpoint has always produced.
+    fn expect_offset_error(
+        got: (u64, ShardResponseV2),
+        channel: u64,
+        cid: &str,
+        offset: u64,
+        total: u64,
+    ) {
+        let (ch, resp) = got;
+        assert_eq!(ch, channel, "channel id");
+        match resp {
+            ShardResponseV2::Data {
+                cid: c,
+                offset: o,
+                total_bytes,
+                data,
+                error,
+            } => {
+                assert_eq!(c, cid, "cid echoed verbatim");
+                assert_eq!(o, offset, "offset echoed verbatim");
+                assert_eq!(total_bytes, total, "total_bytes");
+                assert!(data.is_empty(), "error responses carry no body");
+                assert_eq!(
+                    error,
+                    Some(format!("offset {offset} > total_bytes {total}")),
+                    "beyond-EOF error text is unchanged"
+                );
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    fn dispatcher(stores: Arc<RwLock<SumStore>>) -> V2Dispatcher<ArcRpc, ArcRpc, ArcRpcTrigger> {
+        build_dispatcher(AllMockRpc::default(), vec![], [7u8; 20], stores)
+    }
+
+    /// The triggering request through the real codec and the real
+    /// `V2Dispatcher::handle`, on a file the ACL permits
+    /// (`ToggleAcl { allow_default: true }` mirrors Public-file behavior),
+    /// followed by a valid request on the same dispatcher.
+    #[tokio::test]
+    async fn v2_pull_malicious_range_then_valid_request() {
+        let (stores, cid) = stores_with(b"abcd").await;
+        let d = dispatcher(stores);
+        let net = RecorderNet::new();
+
+        // 1. offset = 1, max_bytes = u64::MAX — the overflow trigger.
+        let got = v2_pull(&d, &net, &cid, 1, u64::MAX, 11).await;
+        expect_ok(got, 11, &cid, 1, 4, b"bcd");
+
+        // 2. A valid request afterwards — the dispatcher is still usable.
+        let got = v2_pull(&d, &net, &cid, 0, 2, 12).await;
+        expect_ok(got, 12, &cid, 0, 4, b"ab");
+    }
+
+    /// V2's beyond-EOF policy is unchanged: an offset past the end is an
+    /// error response with the exact original text, not a clamped success.
+    #[tokio::test]
+    async fn v2_pull_beyond_eof_still_errors() {
+        let (stores, cid) = stores_with(b"abcd").await;
+        let d = dispatcher(stores);
+        let net = RecorderNet::new();
+
+        for offset in [5u64, u32::MAX as u64 + 2, u64::MAX] {
+            let got = v2_pull(&d, &net, &cid, offset, u64::MAX, 13).await;
+            expect_offset_error(got, 13, &cid, offset, 4);
+        }
+
+        // Still serving afterwards.
+        let got = v2_pull(&d, &net, &cid, 0, 4, 14).await;
+        expect_ok(got, 14, &cid, 0, 4, b"abcd");
+    }
+
+    /// Offset exactly at EOF is accepted (only `offset > total` rejects) and
+    /// yields an empty successful response.
+    #[tokio::test]
+    async fn v2_pull_offset_at_eof_is_empty_success() {
+        let (stores, cid) = stores_with(b"abcd").await;
+        let d = dispatcher(stores);
+        let net = RecorderNet::new();
+
+        for max_bytes in [0u64, 1, u32::MAX as u64 + 2, u64::MAX] {
+            let got = v2_pull(&d, &net, &cid, 4, max_bytes, 15).await;
+            expect_ok(got, 15, &cid, 4, 4, b"");
+        }
+    }
+
+    /// A zero-length request is a successful empty read at the given offset,
+    /// not an error and not a full read.
+    #[tokio::test]
+    async fn v2_pull_zero_max_bytes_is_empty_success() {
+        let (stores, cid) = stores_with(b"abcd").await;
+        let d = dispatcher(stores);
+        let net = RecorderNet::new();
+
+        for offset in [0u64, 1, 4] {
+            let got = v2_pull(&d, &net, &cid, offset, 0, 16).await;
+            expect_ok(got, 16, &cid, offset, 4, b"");
+        }
+    }
+
+    /// Empty stored content: offset 0 is an empty success for any length;
+    /// any nonzero offset is beyond EOF and carries the exact error text.
+    #[tokio::test]
+    async fn v2_pull_empty_content() {
+        let (stores, cid) = stores_with(b"").await;
+        let d = dispatcher(stores);
+        let net = RecorderNet::new();
+
+        for max_bytes in [0u64, 1, u32::MAX as u64 + 2, u64::MAX] {
+            let got = v2_pull(&d, &net, &cid, 0, max_bytes, 17).await;
+            expect_ok(got, 17, &cid, 0, 0, b"");
+        }
+        for offset in [1u64, u32::MAX as u64 + 2, u64::MAX] {
+            let got = v2_pull(&d, &net, &cid, offset, 1, 18).await;
+            expect_offset_error(got, 18, &cid, offset, 0);
+        }
+    }
+
+    /// Narrowing-specific values. `u32::MAX as u64 + 2` truncates to `1`
+    /// under a 32-bit `as usize` — inside a 4-byte buffer — which is why it
+    /// discriminates. `u64::MAX` truncates to `u32::MAX` (4_294_967_295),
+    /// which is still past the end, so it does not:
+    ///
+    /// * as an OFFSET it must be rejected as beyond EOF. Narrowing first —
+    ///   the pre-fix order — would have turned it into offset 1 and served
+    ///   a read the endpoint is required to refuse.
+    /// * as a LENGTH at offset 1 it must return the whole remainder.
+    ///   Narrowing first would have made it a 1-byte read.
+    ///
+    /// On this 64-bit host both assertions also hold for the pre-fix code;
+    /// the distinguishing behavior is on a 32-bit target, which is NOT
+    /// exercised here. The `resolve_pull_window` tests pin the same
+    /// contract in the `u64` domain, where it is target-independent.
+    #[tokio::test]
+    async fn v2_pull_narrowing_boundary_values() {
+        let (stores, cid) = stores_with(b"abcd").await;
+        let d = dispatcher(stores);
+        let net = RecorderNet::new();
+        let narrowing = u32::MAX as u64 + 2;
+
+        // Oversized offset → reject.
+        let got = v2_pull(&d, &net, &cid, narrowing, 1, 19).await;
+        expect_offset_error(got, 19, &cid, narrowing, 4);
+
+        // Oversized length at offset 1 → whole remainder.
+        let got = v2_pull(&d, &net, &cid, 1, narrowing, 20).await;
+        expect_ok(got, 20, &cid, 1, 4, b"bcd");
+
+        // And at offset 0 → the whole chunk.
+        let got = v2_pull(&d, &net, &cid, 0, narrowing, 21).await;
+        expect_ok(got, 21, &cid, 0, 4, b"abcd");
     }
 }
