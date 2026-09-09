@@ -25,6 +25,7 @@ operator) have different platform stories:
 | Linux | Supported | Supported |
 | macOS (Apple Silicon) | Supported | Experimental |
 | Windows (via WSL2) | Supported with caveats | Not supported |
+| Windows (native) | Not supported — store publication fails closed | Not supported |
 | ChromeOS (via Crostini) | Supported with caveats | Not supported |
 
 Archive operation is Linux-first. macOS Apple Silicon may join
