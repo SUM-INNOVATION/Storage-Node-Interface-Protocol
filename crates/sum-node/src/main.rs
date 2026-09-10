@@ -58,6 +58,15 @@ struct Cli {
     #[arg(long, env = "SUM_KEY_FILE")]
     key_file: Option<PathBuf>,
 
+    /// Directory holding this node's chunks and manifests.
+    ///
+    /// Defaults to `$HOME/.sumnode/store`. The working directory is never
+    /// consulted, so two nodes started by one user in different directories
+    /// share a store root unless this is set. Give every node on a host its
+    /// own root.
+    #[arg(long, env = "SUM_STORE_DIR")]
+    store_dir: Option<PathBuf>,
+
     /// URL of the SUM Chain L1 JSON-RPC endpoint.
     #[arg(long, env = "SUM_RPC_URL", default_value = "http://127.0.0.1:9944")]
     rpc_url: String,
@@ -551,7 +560,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Fetch { cid } => run_fetch(keypair, net_config, cid).await,
+        Command::Fetch { cid } => run_fetch(keypair, cli.store_dir.clone(), net_config, cid).await,
         Command::Download {
             merkle_root,
             output,
@@ -560,6 +569,7 @@ async fn main() -> Result<()> {
         } => {
             run_download(
                 keypair,
+                cli.store_dir.clone(),
                 seed,
                 cli.rpc_url.clone(),
                 net_config,
@@ -599,7 +609,9 @@ async fn run_listen(
     net_config: NetConfig,
 ) -> Result<()> {
     let net = Arc::new(SumNet::new(net_config, keypair.clone()).await?);
-    let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
+    let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::resolve(
+        cli.store_dir.clone(),
+    ))?));
 
     // Shared PeerId -> L1 Address map (populated by PeerIdentified events).
     let peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>> =
@@ -1823,9 +1835,14 @@ async fn run_register_node(
 
 // ── Fetch mode ───────────────────────────────────────────────────────────────
 
-async fn run_fetch(keypair: Keypair, net_config: NetConfig, cid: String) -> Result<()> {
+async fn run_fetch(
+    keypair: Keypair,
+    store_dir: Option<PathBuf>,
+    net_config: NetConfig,
+    cid: String,
+) -> Result<()> {
     let net = SumNet::new(net_config, keypair).await?;
-    let mut store = SumStore::new(StoreConfig::default())?;
+    let mut store = SumStore::new(StoreConfig::resolve(store_dir))?;
 
     if store.has_chunk(&cid) {
         info!(%cid, "chunk already exists locally");
@@ -1943,6 +1960,7 @@ async fn run_fetch(keypair: Keypair, net_config: NetConfig, cid: String) -> Resu
 #[allow(clippy::too_many_arguments)]
 async fn run_download(
     keypair: Keypair,
+    store_dir: Option<PathBuf>,
     seed: Option<[u8; 32]>,
     rpc_url: String,
     net_config: NetConfig,
@@ -2009,7 +2027,7 @@ async fn run_download(
     // V2 rows must use the V2 request protocol. With V2 advertised first,
     // sending V1 payloads on a V2 stream fails at the codec layer. V1 is
     // retained only for legacy rows with no storage_getFileInfoV2 result.
-    let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::default())?));
+    let store = Arc::new(RwLock::new(SumStore::new(StoreConfig::resolve(store_dir))?));
     let peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>> =
         Arc::new(RwLock::new(HashMap::new()));
     // Fetch chain params ONCE at operation entry (#33) so V1 download's

@@ -25,6 +25,7 @@ Applies to every subcommand.
 | Flag | Env var | Default | Purpose |
 |---|---|---|---|
 | `--key-file` | `SUM_KEY_FILE` | (none) | Ed25519 seed hex. Without it: ephemeral keypair, dev mode, PoR + V2 write commands disabled. |
+| `--store-dir` | `SUM_STORE_DIR` | `$HOME/.sumnode/store` | Directory holding this node's chunks and manifests. The working directory is never consulted, so two nodes started by one user in different directories share a root unless this is set. Give every node on a host its own. |
 | `--rpc-url` | `SUM_RPC_URL` | `http://127.0.0.1:9944` | SUM Chain JSON-RPC endpoint. |
 | `--por-poll-secs` | `SUM_POR_INTERVAL` | `10` | PoR challenge polling interval. |
 | `--market-sync-secs` | `SUM_MARKET_SYNC_INTERVAL` | `30` | Market-sync polling interval. |
