@@ -59,6 +59,92 @@ pub struct ManifestIndex {
     private_cid_to_root: HashMap<String, [u8; 32]>,
 }
 
+/// Result of accepting a validated network manifest.
+#[derive(Debug)]
+pub enum AcceptOutcome {
+    /// Newly written to disk and indexed.
+    Indexed(DataManifest),
+    /// Already held under this root; nothing was written.
+    AlreadyPresent(DataManifest),
+}
+
+impl AcceptOutcome {
+    pub fn manifest(&self) -> &DataManifest {
+        match self {
+            AcceptOutcome::Indexed(m) | AcceptOutcome::AlreadyPresent(m) => m,
+        }
+    }
+}
+
+/// A manifest that has been checked against a Merkle root this node asked for.
+///
+/// The field is private and [`validate_network_manifest`] is the only
+/// constructor, so a value of this type cannot exist unless
+/// [`crate::serve::validate_manifest_push`] returned `Ok` for it: CBOR decoded,
+/// `chunk_count` agreeing with the vector, indices ordered `0..n`, every
+/// chunk's CID bound to its own blake3 hash, and the Merkle root recomputed
+/// from the leaves equal to the root that was asked for.
+///
+/// It is the argument type of [`ManifestIndex::commit_validated`], which is the
+/// only way network bytes reach the index. `commit_validated` cannot decode,
+/// hash, or check anything — it has no bytes to work from. So "commit an
+/// unvalidated network manifest" is not a mistake that can be made by writing
+/// the wrong code; it requires constructing a `ValidatedManifest`, and the only
+/// thing that constructs one is the validator.
+///
+/// Splitting the work this way is also what keeps CBOR parsing, Merkle
+/// construction and CID derivation off the store's write lock: validation takes
+/// no lock and needs none, the caller acquires the lock afterwards, and the
+/// commit under the lock is map and file writes only.
+#[derive(Debug, Clone)]
+pub struct ValidatedManifest {
+    manifest: DataManifest,
+}
+
+impl ValidatedManifest {
+    pub fn manifest(&self) -> &DataManifest {
+        &self.manifest
+    }
+
+    /// The root this manifest was validated against — equal to the root the
+    /// local node requested, and equal to the root recomputed from the chunk
+    /// leaves. Those two being the same value is the whole point.
+    pub fn merkle_root(&self) -> [u8; 32] {
+        self.manifest.merkle_root
+    }
+
+    pub fn into_manifest(self) -> DataManifest {
+        self.manifest
+    }
+}
+
+/// Validate network-supplied manifest bytes against the root **this node
+/// asked for**. Step one of two; takes no lock and touches no store state.
+///
+/// `expected_root_hex` must come from the local record of the outbound request
+/// (`sum_net::OutboundOrigin::requested_manifest_root_hex`). It must never be
+/// derived from the response: a peer that supplies both the root and the
+/// manifest can trivially make them agree, and matching them proves only that
+/// the peer was self-consistent.
+///
+/// Note what this does and does not establish. Against a root *this node
+/// requested*, it establishes that the manifest is the one that root names.
+/// Against a root *a peer supplied* — an inbound push — it establishes only
+/// internal consistency, which a self-created manifest has for free. The
+/// strength of the guarantee comes from where the root came from, not from
+/// this function.
+///
+/// The result carries no lock and no borrow, so the caller is free to acquire
+/// the store write guard afterwards and pass it to
+/// [`ManifestIndex::commit_validated`].
+pub fn validate_network_manifest(
+    expected_root_hex: &str,
+    data: &[u8],
+) -> std::result::Result<ValidatedManifest, String> {
+    let manifest = crate::serve::validate_manifest_push(expected_root_hex, data)?;
+    Ok(ValidatedManifest { manifest })
+}
+
 impl ManifestIndex {
     /// Load all manifests from `<store_dir>/manifests/*.cbor` into memory.
     ///
@@ -153,8 +239,52 @@ impl ManifestIndex {
         Ok(index)
     }
 
+    /// Commit an already-validated manifest. Step two of two; the caller holds
+    /// the store write lock across this call and nothing else.
+    ///
+    /// There is no `data: &[u8]` parameter and no validation here, by design:
+    /// this function is incapable of accepting unchecked network bytes. The
+    /// proof of validation is the argument type — see [`ValidatedManifest`].
+    ///
+    /// Idempotent: a manifest already held under this root is reported as
+    /// [`AcceptOutcome::AlreadyPresent`] with nothing written.
+    pub fn commit_validated(
+        &mut self,
+        validated: &ValidatedManifest,
+    ) -> std::result::Result<AcceptOutcome, String> {
+        let manifest = validated.manifest();
+        if self.get_by_merkle_root(&validated.merkle_root()).is_some() {
+            return Ok(AcceptOutcome::AlreadyPresent(manifest.clone()));
+        }
+        self.insert(manifest)
+            .map_err(|e| format!("manifest index insert failed: {e}"))?;
+        Ok(AcceptOutcome::Indexed(manifest.clone()))
+    }
+
     /// Insert a Public manifest: write to disk as CBOR and update
     /// in-memory indexes (both root→manifest and chunk-CID→root).
+    ///
+    /// Trusts what it is handed. Callers holding a manifest that came back
+    /// from a **pull this node issued** must go through
+    /// [`validate_network_manifest`] and [`ManifestIndex::commit_validated`],
+    /// which bind it to the root that was requested.
+    ///
+    /// The remaining callers are not all equally safe, and it is worth being
+    /// exact about which is which:
+    ///
+    /// * `SumStore::ingest_file` — local, trusted; the manifest was built here.
+    /// * `download.rs` (V1 and V2) — validated against a root this node chose:
+    ///   the one it is downloading, or the one the chain states.
+    /// * `serve::handle_manifest_push` — an **inbound V1 push**. The root comes
+    ///   from the pushing peer's own request CID, and the peer is neither
+    ///   authenticated nor authorized for it. Validation proves the chunk list
+    ///   produces the root the pusher named; it proves nothing about whether
+    ///   that peer was entitled to name it. A self-created manifest is
+    ///   internally consistent by construction.
+    /// * `inbound_v2::handle_manifest_push` — an inbound V2 push, same shape
+    ///   plus a chain probe that the root is registered. A cost, not a barrier.
+    ///
+    /// Closing the V1 push path is WP-B's job, not this module's.
     pub fn insert(&mut self, manifest: &DataManifest) -> Result<()> {
         self.write_manifest(manifest)?;
         self.add_to_maps(manifest.clone());
@@ -638,5 +768,198 @@ mod tests {
         // Last write wins; no error.
         assert_eq!(idx.get_private_bytes(&root), Some(b"second".as_slice()));
         assert_eq!(idx.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod network_manifest_ingress_tests {
+    use super::*;
+    use sum_types::storage::{ChunkDescriptor, DataManifest};
+
+    /// A genuinely well-formed manifest: CIDs derived from real chunk hashes,
+    /// root recomputed from the leaves.
+    fn valid_manifest(bodies: &[&[u8]]) -> DataManifest {
+        let mut chunks = Vec::new();
+        let mut leaves = Vec::new();
+        let mut offset = 0u64;
+        for (i, body) in bodies.iter().enumerate() {
+            let hash = blake3::hash(body);
+            leaves.push(hash);
+            chunks.push(ChunkDescriptor {
+                chunk_index: i as u32,
+                offset,
+                size: body.len() as u64,
+                blake3_hash: *hash.as_bytes(),
+                cid: crate::content_id::cid_from_blake3_hash(&hash),
+                plaintext_blake3_hash: None,
+            });
+            offset += body.len() as u64;
+        }
+        DataManifest {
+            file_name: "fixture.bin".into(),
+            file_hash: [0xAB; 32],
+            total_size_bytes: offset,
+            chunk_count: chunks.len() as u32,
+            merkle_root: *crate::merkle::MerkleTree::build(&leaves).root().as_bytes(),
+            chunks,
+        }
+    }
+
+    fn cbor(m: &DataManifest) -> Vec<u8> {
+        let mut b = Vec::new();
+        ciborium::ser::into_writer(m, &mut b).unwrap();
+        b
+    }
+
+    fn idx(dir: &std::path::Path) -> ManifestIndex {
+        ManifestIndex::load(dir).unwrap()
+    }
+
+    /// The production sequence, exactly: validate with no store in hand, then
+    /// commit what validation produced. Written as a helper so every test below
+    /// exercises both steps and neither can be skipped by accident.
+    fn accept(
+        i: &mut ManifestIndex,
+        root_hex: &str,
+        data: &[u8],
+    ) -> std::result::Result<AcceptOutcome, String> {
+        let validated = validate_network_manifest(root_hex, data)?;
+        i.commit_validated(&validated)
+    }
+
+    /// Everything the store owns, so a rejection can be proved to change none
+    /// of it — names AND bytes, not just a count.
+    fn snapshot(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir.join("manifests"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                    .map(|e| {
+                        (
+                            e.file_name().to_string_lossy().into_owned(),
+                            std::fs::read(e.path()).unwrap_or_default(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_valid_manifest_is_indexed() {
+        let d = tempfile::tempdir().unwrap();
+        let mut i = idx(d.path());
+        let m = valid_manifest(&[b"alpha", b"beta"]);
+        let root_hex = hex::encode(m.merkle_root);
+
+        let out = accept(&mut i, &root_hex, &cbor(&m)).unwrap();
+        assert!(matches!(out, AcceptOutcome::Indexed(_)));
+        assert!(i.get_by_merkle_root(&m.merkle_root).is_some());
+        for c in &m.chunks {
+            assert_eq!(i.merkle_root_for_cid(&c.cid), Some(&m.merkle_root));
+        }
+    }
+
+    #[test]
+    fn a_repeat_of_the_same_manifest_is_already_present() {
+        let d = tempfile::tempdir().unwrap();
+        let mut i = idx(d.path());
+        let m = valid_manifest(&[b"alpha"]);
+        let root_hex = hex::encode(m.merkle_root);
+        accept(&mut i, &root_hex, &cbor(&m)).unwrap();
+        let out = accept(&mut i, &root_hex, &cbor(&m)).unwrap();
+        assert!(matches!(out, AcceptOutcome::AlreadyPresent(_)));
+    }
+
+    /// The attack this exists to stop: the manifest declares the root we asked
+    /// for, but its chunk list is the attacker's.
+    #[test]
+    fn a_forged_chunk_list_under_the_requested_root_is_rejected_and_changes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let mut i = idx(d.path());
+        let asked = valid_manifest(&[b"the-real-chunk"]);
+        let asked_hex = hex::encode(asked.merkle_root);
+
+        let mut forged = valid_manifest(&[b"attacker-chosen", b"and-another"]);
+        let victim_cids: Vec<String> = forged.chunks.iter().map(|c| c.cid.clone()).collect();
+        forged.merkle_root = asked.merkle_root; // declare the root we asked for
+
+        let before = snapshot(d.path());
+        let err = accept(&mut i, &asked_hex, &cbor(&forged)).unwrap_err();
+        assert!(err.contains("merkle root recomputation failed"), "{err}");
+
+        assert_eq!(
+            snapshot(d.path()),
+            before,
+            "disk must be byte-for-byte unchanged"
+        );
+        assert!(i.get_by_merkle_root(&asked.merkle_root).is_none());
+        for cid in victim_cids {
+            assert_eq!(i.merkle_root_for_cid(&cid), None, "no cid may be bound");
+        }
+    }
+
+    #[test]
+    fn a_manifest_for_a_different_root_is_rejected_and_changes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let mut i = idx(d.path());
+        let other = valid_manifest(&[b"some-other-file"]);
+        let asked_hex = hex::encode([0x11u8; 32]);
+
+        let before = snapshot(d.path());
+        let err = accept(&mut i, &asked_hex, &cbor(&other)).unwrap_err();
+        assert!(!err.is_empty());
+        assert_eq!(snapshot(d.path()), before);
+        assert!(i.get_by_merkle_root(&other.merkle_root).is_none());
+    }
+
+    #[test]
+    fn malformed_cbor_is_rejected_and_changes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let mut i = idx(d.path());
+        let before = snapshot(d.path());
+        let err = accept(&mut i, &hex::encode([0x22u8; 32]), b"\xff\xff not cbor").unwrap_err();
+        assert!(err.contains("deserialization failed"), "{err}");
+        assert_eq!(snapshot(d.path()), before);
+    }
+
+    #[test]
+    fn a_bad_cid_hash_binding_is_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        let mut i = idx(d.path());
+        let mut m = valid_manifest(&[b"alpha"]);
+        m.chunks[0].cid = "bafkr4iaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        let root_hex = hex::encode(m.merkle_root);
+        let err = accept(&mut i, &root_hex, &cbor(&m)).unwrap_err();
+        assert!(err.contains("does not match its blake3_hash"), "{err}");
+    }
+
+    #[test]
+    fn out_of_order_chunks_are_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        let mut i = idx(d.path());
+        let mut m = valid_manifest(&[b"alpha", b"beta"]);
+        m.chunks.swap(0, 1);
+        let root_hex = hex::encode(m.merkle_root);
+        let err = accept(&mut i, &root_hex, &cbor(&m)).unwrap_err();
+        assert!(err.contains("out of order"), "{err}");
+    }
+
+    #[test]
+    fn a_rejected_manifest_does_not_survive_a_reload() {
+        let d = tempfile::tempdir().unwrap();
+        let asked = valid_manifest(&[b"real"]);
+        let asked_hex = hex::encode(asked.merkle_root);
+        let mut forged = valid_manifest(&[b"forged"]);
+        forged.merkle_root = asked.merkle_root;
+        {
+            let mut i = idx(d.path());
+            assert!(accept(&mut i, &asked_hex, &cbor(&forged)).is_err());
+        }
+        let reloaded = idx(d.path());
+        assert!(reloaded.get_by_merkle_root(&asked.merkle_root).is_none());
+        assert_eq!(reloaded.len(), 0);
     }
 }

@@ -15,7 +15,6 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use sum_net::{PeerId, ShardResponseV2, SumNet, SumNetEvent};
-use sum_store::manifest::deserialize_manifest_cbor;
 use sum_store::{
     FetchManager, FetchOutcome, MerkleTree, compute_chunk_assignment, nodes_for_chunk,
 };
@@ -218,8 +217,22 @@ impl DownloadOrchestrator {
                             // manifest is skipped rather than fatal: another
                             // peer may still serve the real one, and the
                             // surrounding loop already handles that.
-                            let m = deserialize_manifest_cbor(&response.data)
-                                .map_err(|e| anyhow::anyhow!("failed to deserialize manifest: {e}"))?;
+                            let m = match sum_store::serve::validate_manifest_push(
+                                origin
+                                    .requested_manifest_root_hex()
+                                    .expect("guard above matched a manifest pull"),
+                                &response.data,
+                            ) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    warn!(
+                                        %peer_id,
+                                        error = %e,
+                                        "manifest failed validation against the requested root — trying other peers"
+                                    );
+                                    continue;
+                                }
+                            };
                             info!(
                                 %peer_id,
                                 file_name = %m.file_name,
@@ -1104,6 +1117,21 @@ async fn fetch_v2_public_manifest(
                                 "archive {} root mismatch (got {got})",
                                 hex::encode(archive)
                             );
+                            status.insert(archive, Status::Failed);
+                        }
+                        Err(ManifestDecodeError::Invalid(e)) => {
+                            // Declared the right root but the contents do not
+                            // produce it. Treat exactly like a mismatch: this
+                            // archive is not serving the real manifest, so try
+                            // the others rather than failing the download.
+                            warn!(
+                                %peer_id,
+                                archive = %hex::encode(archive),
+                                err = %e,
+                                "V2Public manifest fan-out: manifest failed validation; trying others"
+                            );
+                            last_reason =
+                                format!("archive {} invalid manifest: {e}", hex::encode(archive));
                             status.insert(archive, Status::Failed);
                         }
                         Err(ManifestDecodeError::Cbor(e)) => {

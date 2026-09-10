@@ -9,6 +9,7 @@ pub mod download_route;
 pub mod download_v2_routing;
 pub mod inbound_v2;
 pub mod ingest_v2;
+pub mod manifest_ingress;
 pub mod market_sync;
 pub mod metrics;
 pub mod peer_state;

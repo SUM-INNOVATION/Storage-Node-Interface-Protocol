@@ -27,7 +27,7 @@ use tracing_subscriber::EnvFilter;
 
 use sum_net::identity;
 use sum_net::{Keypair, ShardResponse, SumNet, SumNetEvent, TOPIC_STORAGE, TOPIC_TEST};
-use sum_store::manifest::deserialize_manifest_cbor;
+use sum_node::manifest_ingress::{ManifestIngress, commit_manifest_ingress, plan_manifest_ingress};
 use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_store::{FetchOutcome, SumStore, decode_announcement};
 use sum_types::config::{NetConfig, StoreConfig};
@@ -896,53 +896,45 @@ async fn run_listen(
                     SumNetEvent::ShardReceived {
                         response, origin, ..
                     } => {
-                        // Whether this is a manifest response is decided by what
-                        // this node asked for, read out of the outbound record
-                        // the networking layer kept — not by inspecting
-                        // `response.cid`, which the peer writes. `origin` is
-                        // `Some` here only for a V1 manifest pull, and the
-                        // response has already been rejected by
-                        // `sum_net::correlation` unless its CID equals the one
-                        // we sent. Chunk responses fall through to FetchManager
-                        // so the background MarketSync state machine closes its
-                        // loop.
                         // Whether this is a manifest response is decided by
                         // what this node asked for, read out of the outbound
                         // record the networking layer kept — not by inspecting
-                        // `response.cid`, which the peer writes. `origin` is
-                        // `Some` here only for a V1 manifest pull. Chunk
+                        // `response.cid`, which the peer writes. Chunk
                         // responses fall through to the FetchManager below so
                         // the background MarketSync state machine closes its
                         // loop.
                         //
-                        // What is persisted, and how, is unchanged in this
-                        // commit — the manifest is still deserialized and
-                        // inserted without being bound to the requested root.
-                        // Binding it is the next commit's work.
-                        if let Some(root_hex) = origin.requested_manifest_root_hex() {
-                            match deserialize_manifest_cbor(&response.data) {
-                                Ok(manifest) => {
+                        // Phase 1 — decide and validate with no lock held.
+                        // `plan_manifest_ingress` returns `None` for anything
+                        // that is not a manifest pull.
+                        if let Some(plan) = plan_manifest_ingress(origin, response) {
+                            match plan {
+                                ManifestIngress::Rejected { root_hex, error } => warn!(
+                                    root = %root_hex,
+                                    %error,
+                                    "manifest rejected — not indexed"
+                                ),
+                                // Phase 2 — take the write lock only to commit.
+                                // The guard covers map and file writes and
+                                // nothing else.
+                                ManifestIngress::Commit { root_hex, validated } => {
                                     let mut store_w = store.write().await;
-                                    if store_w.manifest_idx.get_by_merkle_root(&manifest.merkle_root).is_none() {
-                                        match store_w.manifest_idx.insert(&manifest) {
-                                            Ok(()) => info!(
-                                                root = %root_hex,
-                                                file_name = %manifest.file_name,
-                                                chunks = manifest.chunk_count,
-                                                "manifest persisted by listen loop"
-                                            ),
-                                            Err(e) => warn!(
-                                                root = %root_hex,
-                                                %e,
-                                                "manifest_idx.insert failed"
-                                            ),
-                                        }
-                                    } else {
-                                        debug!(root = %root_hex, "manifest already indexed — skipping");
+                                    match commit_manifest_ingress(
+                                        &mut store_w.manifest_idx,
+                                        &validated,
+                                    ) {
+                                        Ok(outcome) => info!(
+                                            root = %root_hex,
+                                            file_name = %outcome.manifest().file_name,
+                                            chunks = outcome.manifest().chunk_count,
+                                            "manifest accepted by listen loop"
+                                        ),
+                                        Err(e) => warn!(
+                                            root = %root_hex,
+                                            error = %e,
+                                            "manifest commit failed — not indexed"
+                                        ),
                                     }
-                                }
-                                Err(e) => {
-                                    warn!(root = %root_hex, %e, "manifest deserialization failed");
                                 }
                             }
                         } else {
