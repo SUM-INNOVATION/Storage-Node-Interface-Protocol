@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use sum_net::identity;
-use sum_net::{Keypair, ShardResponse, SumNet, SumNetEvent, TOPIC_STORAGE, TOPIC_TEST};
+use sum_net::{Keypair, SumNet, SumNetEvent, TOPIC_STORAGE, TOPIC_TEST};
 use sum_node::manifest_ingress::{ManifestIngress, commit_manifest_ingress, plan_manifest_ingress};
 use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_store::{FetchOutcome, SumStore, decode_announcement};
@@ -755,100 +755,29 @@ async fn run_listen(
         warn!("V2 dispatcher not initialized — V2 ingest disabled (no signing key)");
     }
 
+    // One dispatcher, shared with `simple_serve_loop`. `v2` is `None` on a
+    // node with no signing key; the dispatcher then answers V2 requests with a
+    // structured refusal rather than dropping them.
+    let shard_dispatch = {
+        let v2: Option<Arc<dyn sum_node::shard_dispatch::V2Handler>> = v2_dispatcher
+            .clone()
+            .map(|d| d as Arc<dyn sum_node::shard_dispatch::V2Handler>);
+        let acl_dyn: Arc<dyn sum_node::inbound_v2::AccessChecker> = acl.clone();
+        sum_node::shard_dispatch::ShardDispatch::new(store.clone(), acl_dyn, v2)
+    };
+
     info!("SUM Node listening — serving chunks, enforcing ACLs, press Ctrl-C to stop");
 
     loop {
         tokio::select! {
             Some(event) = net.next_event() => {
                 match &event {
-                    SumNetEvent::ShardRequested { peer_id, request, channel_id } => {
-                        // Four-way dispatch:
-                        //   - Manifest push (mutates manifest_idx) → write lock + handle_manifest_push.
-                        //     Without this branch, archives that received chunk pushes never learn the
-                        //     `cid → root` mapping, so production ACL would deny pulls to those CIDs.
-                        //   - Chunk push: read lock; `serve::handle_request` already validates CID.
-                        //   - Pulls: ACL gate + read lock + `handle_request`.
-                        let is_manifest = request.cid.starts_with(MANIFEST_REQUEST_PREFIX);
-                        let is_push = request.push_data.is_some();
-                        match (is_manifest, is_push) {
-                            (true, true) => {
-                                let mut store_w = store.write().await;
-                                sum_store::serve::handle_manifest_push(
-                                    &net, &mut store_w.manifest_idx, request, *channel_id,
-                                )
-                                .await;
-                            }
-                            (false, true) => {
-                                let store_read = store.read().await;
-                                sum_store::serve::handle_request(
-                                    &net, &store_read.local, &store_read.manifest_idx,
-                                    request, *channel_id,
-                                ).await;
-                            }
-                            // Pull paths (manifest or chunk) — apply ACL.
-                            (_, false) => {
-                                let store_read = store.read().await;
-                                let allowed = acl
-                                    .check_access_or_default(
-                                        peer_id, &request.cid, &store_read.manifest_idx,
-                                    )
-                                    .await;
-                                if allowed {
-                                    sum_store::serve::handle_request(
-                                        &net, &store_read.local, &store_read.manifest_idx,
-                                        request, *channel_id,
-                                    ).await;
-                                } else {
-                                    info!(
-                                        peer = %peer_id,
-                                        cid = %request.cid,
-                                        "ACCESS DENIED — peer not in file ACL"
-                                    );
-                                    let resp = ShardResponse {
-                                        cid: request.cid.clone(),
-                                        offset: 0,
-                                        total_bytes: 0,
-                                        data: Vec::new(),
-                                        error: Some("ACCESS_DENIED: not in file access list".into()),
-                                    };
-                                    let _ = net.respond_shard(*channel_id, resp).await;
-                                }
-                            }
-                        }
-                    }
-                    SumNetEvent::ShardRequestedV2 { peer_id, request, channel_id } => {
-                        if let Some(ref dispatcher) = v2_dispatcher {
-                            dispatcher.handle(&net, *peer_id, request.clone(), *channel_id).await;
-                        } else {
-                            // V2 disabled (no signing key on this node) — reply
-                            // with a structurally-valid V2 error so the peer
-                            // sees a clean reject rather than a timeout.
-                            warn!(%peer_id, channel_id, "V2 request received but V2 dispatcher disabled — node has no signing key");
-                            let resp = match request {
-                                sum_net::ShardRequestV2::Pull { cid, offset, .. } => sum_net::ShardResponseV2::Data {
-                                    cid: cid.clone(),
-                                    offset: *offset,
-                                    total_bytes: 0,
-                                    data: Vec::new(),
-                                    error: Some("V2 disabled on this node".into()),
-                                },
-                                sum_net::ShardRequestV2::Push { merkle_root, chunk_index, .. } => sum_net::ShardResponseV2::PushAck {
-                                    merkle_root: *merkle_root,
-                                    chunk_index: *chunk_index,
-                                    error: Some("V2 disabled on this node".into()),
-                                },
-                                sum_net::ShardRequestV2::ManifestPush { merkle_root, .. } => sum_net::ShardResponseV2::ManifestPushAck {
-                                    merkle_root: *merkle_root,
-                                    error: Some("V2 disabled on this node".into()),
-                                },
-                                sum_net::ShardRequestV2::ManifestPull { merkle_root } => sum_net::ShardResponseV2::ManifestData {
-                                    merkle_root: *merkle_root,
-                                    manifest_bytes: Vec::new(),
-                                    error: Some("V2 disabled on this node".into()),
-                                },
-                            };
-                            let _ = net.respond_shard_v2(*channel_id, resp).await;
-                        }
+                    // Inbound shard traffic — V1 and V2 — goes through the
+                    // one shared dispatcher. `simple_serve_loop` calls the
+                    // same `on_event`, so a gate added there applies to both
+                    // loops or to neither.
+                    SumNetEvent::ShardRequested { .. } | SumNetEvent::ShardRequestedV2 { .. } => {
+                        shard_dispatch.on_event(net.as_ref(), &event).await;
                     }
                     SumNetEvent::ShardReceivedV2 { .. } => {
                         // Phase 0b listen-mode doesn't initiate V2 outbound
@@ -1302,57 +1231,24 @@ async fn simple_serve_loop(
     acl: Arc<AclChecker>,
     peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>>,
 ) -> Result<()> {
+    // Node-mode ingest has no signing key wired here, so `v2` is `None` — but
+    // the dispatcher still answers V2 requests with the same structured
+    // refusal `run_listen` sends, instead of dropping them.
+    let shard_dispatch = {
+        let acl_dyn: Arc<dyn sum_node::inbound_v2::AccessChecker> = acl.clone();
+        sum_node::shard_dispatch::ShardDispatch::new(store.clone(), acl_dyn, None)
+    };
+
     loop {
         tokio::select! {
             Some(event) = net.next_event() => {
                 match &event {
-                    SumNetEvent::ShardRequested { peer_id, request, channel_id } => {
-                        let is_manifest = request.cid.starts_with(MANIFEST_REQUEST_PREFIX);
-                        let is_push = request.push_data.is_some();
-                        match (is_manifest, is_push) {
-                            (true, true) => {
-                                let mut store_w = store.write().await;
-                                sum_store::serve::handle_manifest_push(
-                                    net, &mut store_w.manifest_idx, request, *channel_id,
-                                )
-                                .await;
-                            }
-                            (false, true) => {
-                                let store_read = store.read().await;
-                                sum_store::serve::handle_request(
-                                    net, &store_read.local, &store_read.manifest_idx,
-                                    request, *channel_id,
-                                ).await;
-                            }
-                            (_, false) => {
-                                let store_read = store.read().await;
-                                let allowed = acl
-                                    .check_access_or_default(
-                                        peer_id, &request.cid, &store_read.manifest_idx,
-                                    )
-                                    .await;
-                                if allowed {
-                                    sum_store::serve::handle_request(
-                                        net, &store_read.local, &store_read.manifest_idx,
-                                        request, *channel_id,
-                                    ).await;
-                                } else {
-                                    info!(
-                                        peer = %peer_id,
-                                        cid = %request.cid,
-                                        "ACCESS DENIED — peer not in file ACL"
-                                    );
-                                    let resp = ShardResponse {
-                                        cid: request.cid.clone(),
-                                        offset: 0,
-                                        total_bytes: 0,
-                                        data: Vec::new(),
-                                        error: Some("ACCESS_DENIED: not in file access list".into()),
-                                    };
-                                    let _ = net.respond_shard(*channel_id, resp).await;
-                                }
-                            }
-                        }
+                    // Same shared dispatcher `run_listen` uses. Before this,
+                    // the two loops carried separate copies and this one had
+                    // no V2 arm at all, so every inbound V2 request went
+                    // unanswered until the swarm's channel reaper.
+                    SumNetEvent::ShardRequested { .. } | SumNetEvent::ShardRequestedV2 { .. } => {
+                        shard_dispatch.on_event(net, &event).await;
                     }
                     SumNetEvent::PeerIdentified { .. } | SumNetEvent::PeerDisconnected { .. } => {
                         let mut map = peer_addresses.write().await;
