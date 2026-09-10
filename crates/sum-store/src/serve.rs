@@ -315,20 +315,18 @@ async fn handle_push_request<N: RespondShard + ?Sized>(
         return;
     }
 
-    // Write to disk (idempotent — skip if already exists)
-    if !store.has(cid) {
-        if let Err(e) = store.put(cid, data) {
-            warn!(%cid, %e, "push rejected: store write failed");
-            let resp = ShardResponse {
-                cid: cid.clone(),
-                offset: 0,
-                total_bytes: 0,
-                data: Vec::new(),
-                error: Some(format!("store write failed: {e}")),
-            };
-            let _ = net.respond_shard(channel_id, resp).await;
-            return;
-        }
+    // The publisher verifies and synchronizes duplicates as well as new files.
+    if let Err(e) = store.put(cid, data) {
+        warn!(%cid, %e, "push rejected: store write failed");
+        let resp = ShardResponse {
+            cid: cid.clone(),
+            offset: 0,
+            total_bytes: 0,
+            data: Vec::new(),
+            error: Some(format!("store write failed: {e}")),
+        };
+        let _ = net.respond_shard(channel_id, resp).await;
+        return;
     }
 
     info!(%cid, bytes = data.len(), "push accepted — chunk stored");

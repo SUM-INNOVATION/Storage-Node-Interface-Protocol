@@ -29,7 +29,7 @@ binary with different flags:
 | Linux aarch64 | ✅ Supported | ⚠️ Supported with caveats |
 | macOS (Apple Silicon) | ✅ Supported | ⚠️ Experimental |
 | macOS (Intel) | Skip unless requested | Skip unless requested |
-| Windows native | ⚠️ Experimental / not recommended | ❌ Not supported |
+| Windows native | ❌ Not supported (store publication fails closed) | ❌ Not supported |
 | Windows + WSL2 | ⚠️ Supported with caveats | ❌ Not supported |
 | ChromeOS Crostini | ⚠️ Supported with caveats | ❌ Not supported |
 | ChromeOS native | ❌ Not supported | ❌ Not supported |
@@ -119,12 +119,25 @@ matrix; add a CI lane on request.
 ### Windows — recommended path is WSL2
 
 For `v0.4.x` the supported Windows path is **WSL2 with Ubuntu**.
-Native Windows (PowerShell, no WSL) is marked **experimental /
-not recommended**: the binary may build with the MSVC toolchain
-but the operator surface (POSIX-style commands, firewall, service
-management, mDNS / multi-interface routing) is not covered in any
-SNIP docs and would only make sense for an operator willing to do
-their own integration work.
+
+**Native Windows store publication fails closed.** Constructing the
+chunk store on a non-Unix target returns
+`StoreError::UnsupportedPlatform` before touching the filesystem, so
+native Windows cannot write into a store at all — not in client mode
+either. This is deliberate. Immutable publication depends on
+descriptor-relative confined opens, a no-clobber link of a fully
+staged file, and file *and* directory durability; no equivalent native
+Windows implementation has been written or validated, and there is no
+Windows CI lane in this repository to validate one. Rather than ship a
+weaker path that silently claims the same guarantees, the platform is
+refused with a message naming WSL2.
+
+Equivalent native Windows support is tracked in
+[#49](https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/issues/49)
+(and [OmniNode#119](https://github.com/SUM-INNOVATION/OmniNode-Protocol/issues/119)
+for the shard store). Until then, the rest of the operator surface
+(POSIX-style commands, firewall, service management, mDNS /
+multi-interface routing) is likewise uncovered by SNIP docs.
 
 WSL2 + client mode is the practical answer:
 

@@ -1,126 +1,130 @@
-//! On-disk chunk storage.
+//! Immutable filesystem storage under an exclusively managed root.
 //!
-//! Layout: `<chunk_dir>/<cid>.chunk`
-//!
-//! Files are write-once and content-addressed, so there are no race
-//! conditions — if two writers produce the same CID they write identical bytes.
-
-use std::fs;
-use std::path::{Path, PathBuf};
-
-use memmap2::Mmap;
+//! Published files are never truncated or overwritten by this store. External
+//! writers and writable aliases remain outside the mapping lifetime guarantee.
 
 use crate::error::{Result, StoreError};
-use crate::mmap;
+use crate::publication::PublicationStore;
+use memmap2::Mmap;
+use std::path::{Path, PathBuf};
 
-/// Filesystem-backed chunk store keyed by CID.
+/// Filesystem-backed chunk store. New writes require canonical content CIDs;
+/// confined legacy aliases remain readable and deletable.
 pub struct ChunkStore {
-    chunk_dir: PathBuf,
+    files: PublicationStore,
 }
 
 impl ChunkStore {
-    /// Open (or create) a chunk store rooted at `chunk_dir`.
-    pub fn new(chunk_dir: PathBuf) -> Result<Self> {
-        fs::create_dir_all(&chunk_dir)?;
-        Ok(Self { chunk_dir })
+    pub fn new(root: PathBuf) -> Result<Self> {
+        Ok(Self {
+            files: PublicationStore::new(root, ".chunk")?,
+        })
     }
 
-    /// Path on disk for a given CID.
-    pub fn chunk_path(&self, cid: &str) -> PathBuf {
-        self.chunk_dir.join(format!("{cid}.chunk"))
+    /// A validated path for interoperability with trusted local tools.
+    /// Returning this path does not authorize mutation of a published inode.
+    pub fn chunk_path(&self, cid: &str) -> Result<PathBuf> {
+        self.files.path(cid)
     }
 
-    /// Check whether a chunk exists locally.
+    /// Convenience presence check. Publication never uses this to skip errors
+    /// or to infer content identity/durability.
     pub fn has(&self, cid: &str) -> bool {
-        self.chunk_path(cid).exists()
+        self.files.has(cid)
     }
 
-    /// Write chunk data to disk.
     pub fn put(&self, cid: &str, data: &[u8]) -> Result<()> {
-        let path = self.chunk_path(cid);
-        fs::write(&path, data)?;
-        Ok(())
+        self.files.put(cid, data)
     }
 
-    /// Read entire chunk into memory.
-    /// Prefer [`Self::mmap`] for large chunks.
     pub fn get(&self, cid: &str) -> Result<Vec<u8>> {
-        let path = self.chunk_path(cid);
-        if !path.exists() {
-            return Err(StoreError::NotFound(cid.to_string()));
-        }
-        Ok(fs::read(&path)?)
+        self.files.get(cid)
     }
 
-    /// Memory-map a chunk for zero-copy read access.
+    /// Map a regular store-managed file without following a destination symlink.
+    /// The root must not have other writers or writable aliases while mapped.
     pub fn mmap(&self, cid: &str) -> Result<Mmap> {
-        let path = self.chunk_path(cid);
-        if !path.exists() {
-            return Err(StoreError::NotFound(cid.to_string()));
-        }
-        mmap::mmap_file(&path)
+        let file = self
+            .files
+            .open(cid)?
+            .ok_or_else(|| StoreError::NotFound(cid.to_owned()))?;
+        // SAFETY: cooperating store APIs never mutate a published inode. This
+        // relies on the documented exclusive management of the store root.
+        Ok(unsafe { Mmap::map(&file)? })
     }
 
-    /// Write chunk data from an existing memory map to disk.
     pub fn put_from_mmap(&self, cid: &str, data: &Mmap) -> Result<()> {
         self.put(cid, data)
     }
 
-    /// Root directory of this store.
     pub fn root(&self) -> &Path {
-        &self.chunk_dir
+        self.files.root()
     }
 
-    /// List all CIDs stored on disk.
-    ///
-    /// Reads the chunk directory, filters for `.chunk` files, and returns
-    /// the CID (filename without extension) for each.
     pub fn list_all_cids(&self) -> Result<Vec<String>> {
         let mut cids = Vec::new();
-        for entry in fs::read_dir(&self.chunk_dir)? {
+        for entry in std::fs::read_dir(self.root())? {
             let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("chunk") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    cids.push(stem.to_string());
-                }
+            let name = entry.file_name();
+            let Some(key) = name.to_str().and_then(|name| name.strip_suffix(".chunk")) else {
+                continue;
+            };
+            if !entry.file_type()?.is_file() || self.files.path(key).is_err() {
+                continue;
+            }
+            if self.files.open(key)?.is_some() {
+                cids.push(key.to_owned());
             }
         }
         Ok(cids)
     }
 
-    /// Delete a chunk from disk.
-    ///
-    /// Returns `Ok(true)` if the file existed and was deleted,
-    /// `Ok(false)` if it did not exist.
     pub fn delete(&self, cid: &str) -> Result<bool> {
-        let path = self.chunk_path(cid);
-        if path.exists() {
-            fs::remove_file(&path)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.files.delete(cid)
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn all_public_path_apis_reject_unconfined_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::new(dir.path().to_owned()).unwrap();
+        let mapped = memmap2::MmapMut::map_anon(1)
+            .unwrap()
+            .make_read_only()
+            .unwrap();
+        for key in ["../escape", "a/b", "a\\b", "", ".", "..", "bad\0key"] {
+            assert!(store.chunk_path(key).is_err());
+            assert!(!store.has(key));
+            assert!(store.get(key).is_err());
+            assert!(store.mmap(key).is_err());
+            assert!(store.put(key, b"x").is_err());
+            assert!(store.put_from_mmap(key, &mapped).is_err());
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn put_get_has_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let store = ChunkStore::new(dir.path().join("chunks")).unwrap();
 
-        assert!(!store.has("baftest"));
+        assert!(!store.has(crate::content_id::cid_from_data(b"chunk payload").as_str()));
 
-        store.put("baftest", b"chunk payload").unwrap();
-        assert!(store.has("baftest"));
+        store
+            .put(
+                crate::content_id::cid_from_data(b"chunk payload").as_str(),
+                b"chunk payload",
+            )
+            .unwrap();
+        assert!(store.has(crate::content_id::cid_from_data(b"chunk payload").as_str()));
 
-        let data = store.get("baftest").unwrap();
+        let data = store
+            .get(crate::content_id::cid_from_data(b"chunk payload").as_str())
+            .unwrap();
         assert_eq!(data, b"chunk payload");
     }
 
@@ -146,13 +150,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ChunkStore::new(dir.path().join("chunks")).unwrap();
 
-        store.put("bafaaa", b"chunk a").unwrap();
-        store.put("bafbbb", b"chunk b").unwrap();
-        store.put("bafccc", b"chunk c").unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(b"chunk a").as_str(),
+                b"chunk a",
+            )
+            .unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(b"chunk b").as_str(),
+                b"chunk b",
+            )
+            .unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(b"chunk c").as_str(),
+                b"chunk c",
+            )
+            .unwrap();
 
         let mut cids = store.list_all_cids().unwrap();
         cids.sort();
-        assert_eq!(cids, vec!["bafaaa", "bafbbb", "bafccc"]);
+        let mut expected = vec![
+            crate::content_id::cid_from_data(b"chunk a"),
+            crate::content_id::cid_from_data(b"chunk b"),
+            crate::content_id::cid_from_data(b"chunk c"),
+        ];
+        expected.sort();
+        assert_eq!(cids, expected);
     }
 
     #[test]
@@ -160,12 +185,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ChunkStore::new(dir.path().join("chunks")).unwrap();
 
-        store.put("bafdelete", b"to be deleted").unwrap();
-        assert!(store.has("bafdelete"));
+        store
+            .put(
+                crate::content_id::cid_from_data(b"to be deleted").as_str(),
+                b"to be deleted",
+            )
+            .unwrap();
+        assert!(store.has(crate::content_id::cid_from_data(b"to be deleted").as_str()));
 
-        let deleted = store.delete("bafdelete").unwrap();
+        let deleted = store
+            .delete(crate::content_id::cid_from_data(b"to be deleted").as_str())
+            .unwrap();
         assert!(deleted);
-        assert!(!store.has("bafdelete"));
+        assert!(!store.has(crate::content_id::cid_from_data(b"to be deleted").as_str()));
     }
 
     #[test]
@@ -183,9 +215,16 @@ mod tests {
         let store = ChunkStore::new(dir.path().join("chunks")).unwrap();
 
         let payload = vec![0xABu8; 8192];
-        store.put("bafmmap", &payload).unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(&payload).as_str(),
+                &payload,
+            )
+            .unwrap();
 
-        let mapped = store.mmap("bafmmap").unwrap();
+        let mapped = store
+            .mmap(crate::content_id::cid_from_data(&payload).as_str())
+            .unwrap();
         assert_eq!(&*mapped, &payload[..]);
     }
 }

@@ -3925,6 +3925,7 @@ dependencies = [
  "libp2p",
  "memmap2",
  "multihash",
+ "rustix",
  "serde",
  "serde_json",
  "sum-net",

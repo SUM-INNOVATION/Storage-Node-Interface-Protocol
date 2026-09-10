@@ -170,10 +170,19 @@ mod tests {
     #[test]
     fn gc_assigned_chunk_not_deleted() {
         let (_dir, store) = make_store();
-        store.put("cid_a", b"chunk a data").unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(b"chunk a data").as_str(),
+                b"chunk a data",
+            )
+            .unwrap();
 
         let mut assigned = HashSet::new();
-        assigned.insert("cid_a".to_string());
+        assigned.insert(
+            crate::content_id::cid_from_data(b"chunk a data")
+                .as_str()
+                .to_string(),
+        );
 
         let mut gc = GarbageCollector::new(Duration::from_secs(0)); // 0 grace
         let result = gc
@@ -181,13 +190,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.chunks_deleted, 0);
-        assert!(store.has("cid_a"));
+        assert!(store.has(crate::content_id::cid_from_data(b"chunk a data").as_str()));
     }
 
     #[test]
     fn gc_unassigned_within_grace() {
         let (_dir, store) = make_store();
-        store.put("cid_b", b"chunk b data").unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(b"chunk b data").as_str(),
+                b"chunk b data",
+            )
+            .unwrap();
 
         let assigned: HashSet<String> = HashSet::new(); // cid_b not assigned
 
@@ -198,13 +212,18 @@ mod tests {
 
         assert_eq!(result.chunks_deleted, 0);
         assert_eq!(result.chunks_retained, 1);
-        assert!(store.has("cid_b")); // still on disk
+        assert!(store.has(crate::content_id::cid_from_data(b"chunk b data").as_str())); // still on disk
     }
 
     #[test]
     fn gc_unassigned_past_grace() {
         let (_dir, store) = make_store();
-        store.put("cid_c", b"chunk c data").unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(b"chunk c data").as_str(),
+                b"chunk c data",
+            )
+            .unwrap();
 
         let assigned: HashSet<String> = HashSet::new();
 
@@ -215,13 +234,18 @@ mod tests {
 
         assert_eq!(result.chunks_deleted, 1);
         assert!(result.bytes_freed > 0);
-        assert!(!store.has("cid_c")); // deleted
+        assert!(!store.has(crate::content_id::cid_from_data(b"chunk c data").as_str())); // deleted
     }
 
     #[test]
     fn gc_reassigned_during_grace() {
         let (_dir, store) = make_store();
-        store.put("cid_d", b"chunk d data").unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(b"chunk d data").as_str(),
+                b"chunk d data",
+            )
+            .unwrap();
 
         let mut gc = GarbageCollector::new(Duration::from_secs(3600));
         let empty: HashSet<String> = HashSet::new();
@@ -233,20 +257,29 @@ mod tests {
 
         // Now cid_d is re-assigned
         let mut assigned = HashSet::new();
-        assigned.insert("cid_d".to_string());
+        assigned.insert(
+            crate::content_id::cid_from_data(b"chunk d data")
+                .as_str()
+                .to_string(),
+        );
 
         let r2 = gc
             .mark_and_sweep(&store, &assigned, Instant::now())
             .unwrap();
         assert_eq!(r2.chunks_deleted, 0);
         assert_eq!(gc.tracked_count(), 0); // no longer tracked
-        assert!(store.has("cid_d")); // still on disk
+        assert!(store.has(crate::content_id::cid_from_data(b"chunk d data").as_str())); // still on disk
     }
 
     #[test]
     fn gc_l1_unreachable_paused() {
         let (_dir, store) = make_store();
-        store.put("cid_e", b"chunk e data").unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(b"chunk e data").as_str(),
+                b"chunk e data",
+            )
+            .unwrap();
 
         let assigned: HashSet<String> = HashSet::new();
         let mut gc = GarbageCollector::new(Duration::from_secs(0));
@@ -257,20 +290,43 @@ mod tests {
 
         assert!(result.skipped);
         assert_eq!(result.chunks_deleted, 0);
-        assert!(store.has("cid_e")); // NOT deleted
+        assert!(store.has(crate::content_id::cid_from_data(b"chunk e data").as_str())); // NOT deleted
     }
 
     #[test]
     fn gc_multiple_files() {
         let (_dir, store) = make_store();
-        store.put("file_a_chunk", b"file a data").unwrap();
-        store.put("file_b_chunk", b"file b data").unwrap();
-        store.put("file_c_chunk", b"file c data").unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(b"file a data").as_str(),
+                b"file a data",
+            )
+            .unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(b"file b data").as_str(),
+                b"file b data",
+            )
+            .unwrap();
+        store
+            .put(
+                crate::content_id::cid_from_data(b"file c data").as_str(),
+                b"file c data",
+            )
+            .unwrap();
 
         // Assigned to files A and C, but not B
         let mut assigned = HashSet::new();
-        assigned.insert("file_a_chunk".to_string());
-        assigned.insert("file_c_chunk".to_string());
+        assigned.insert(
+            crate::content_id::cid_from_data(b"file a data")
+                .as_str()
+                .to_string(),
+        );
+        assigned.insert(
+            crate::content_id::cid_from_data(b"file c data")
+                .as_str()
+                .to_string(),
+        );
 
         let mut gc = GarbageCollector::new(Duration::from_secs(0));
         let result = gc
@@ -278,16 +334,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.chunks_deleted, 1); // only file B's chunk
-        assert!(store.has("file_a_chunk"));
-        assert!(!store.has("file_b_chunk")); // deleted
-        assert!(store.has("file_c_chunk"));
+        assert!(store.has(crate::content_id::cid_from_data(b"file a data").as_str()));
+        assert!(!store.has(crate::content_id::cid_from_data(b"file b data").as_str())); // deleted
+        assert!(store.has(crate::content_id::cid_from_data(b"file c data").as_str()));
     }
 
     #[test]
     fn gc_disk_space_reported() {
         let (_dir, store) = make_store();
         let data = vec![0xAA; 4096];
-        store.put("cid_f", &data).unwrap();
+        store
+            .put(crate::content_id::cid_from_data(&data).as_str(), &data)
+            .unwrap();
 
         let assigned: HashSet<String> = HashSet::new();
         let mut gc = GarbageCollector::new(Duration::from_secs(0));

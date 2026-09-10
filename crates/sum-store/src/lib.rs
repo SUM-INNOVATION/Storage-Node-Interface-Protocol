@@ -10,6 +10,7 @@ pub mod manifest;
 pub mod manifest_index;
 pub mod merkle;
 pub mod mmap;
+mod publication;
 pub mod serve;
 pub mod store;
 pub mod verify;
@@ -67,10 +68,6 @@ impl SumStore {
 
         // Write each chunk to disk.
         for chunk in &manifest.chunks {
-            if self.local.has(&chunk.cid) {
-                info!(cid = %chunk.cid, "chunk already exists — skipping");
-                continue;
-            }
             let chunk_data = &mapped[chunk.offset as usize..(chunk.offset + chunk.size) as usize];
             self.local.put(&chunk.cid, chunk_data)?;
             info!(
@@ -203,9 +200,27 @@ mod tests {
         let store = SumStore::new(config).unwrap();
 
         // Put some chunks
-        store.local.put("cid_a", b"chunk a").unwrap();
-        store.local.put("cid_b", b"chunk b").unwrap();
-        store.local.put("cid_c", b"chunk c").unwrap();
+        store
+            .local
+            .put(
+                crate::content_id::cid_from_data(b"chunk a").as_str(),
+                b"chunk a",
+            )
+            .unwrap();
+        store
+            .local
+            .put(
+                crate::content_id::cid_from_data(b"chunk b").as_str(),
+                b"chunk b",
+            )
+            .unwrap();
+        store
+            .local
+            .put(
+                crate::content_id::cid_from_data(b"chunk c").as_str(),
+                b"chunk c",
+            )
+            .unwrap();
         assert_eq!(store.local.list_all_cids().unwrap().len(), 3);
 
         // Cleanup
@@ -213,9 +228,21 @@ mod tests {
 
         // Verify empty
         assert_eq!(store.local.list_all_cids().unwrap().len(), 0);
-        assert!(!store.local.has("cid_a"));
-        assert!(!store.local.has("cid_b"));
-        assert!(!store.local.has("cid_c"));
+        assert!(
+            !store
+                .local
+                .has(crate::content_id::cid_from_data(b"chunk a").as_str())
+        );
+        assert!(
+            !store
+                .local
+                .has(crate::content_id::cid_from_data(b"chunk b").as_str())
+        );
+        assert!(
+            !store
+                .local
+                .has(crate::content_id::cid_from_data(b"chunk c").as_str())
+        );
     }
 
     #[test]
@@ -256,8 +283,20 @@ mod tests {
         };
         let store = SumStore::new(config).unwrap();
 
-        store.local.put("cid_x", b"hello world").unwrap();
-        store.local.put("cid_y", &vec![0u8; 4096]).unwrap();
+        store
+            .local
+            .put(
+                crate::content_id::cid_from_data(b"hello world").as_str(),
+                b"hello world",
+            )
+            .unwrap();
+        store
+            .local
+            .put(
+                crate::content_id::cid_from_data(&[0u8; 4096]).as_str(),
+                &vec![0u8; 4096],
+            )
+            .unwrap();
 
         let report = store.health_check();
         assert_eq!(report.chunk_count, 2);
