@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use tracing::{info, warn};
 
 use sum_net::identity;
-use sum_net::{PeerId, SumNet, SumNetEvent};
+use sum_net::{PeerId, SumNetEvent};
 use sum_store::{SumStore, compute_chunk_assignment, nodes_for_chunk};
 use sum_types::rpc_types::NodeRecordInfo;
 use sum_types::storage::DataManifest;
@@ -49,22 +49,47 @@ pub trait UploadNet: Send + Sync {
     async fn next_event(&self) -> Option<SumNetEvent>;
 }
 
-#[async_trait]
-impl UploadNet for SumNet {
-    async fn push_chunk_shared(&self, peer_id: PeerId, cid: String, data: Arc<[u8]>) -> Result<()> {
-        SumNet::push_chunk_shared(self, peer_id, cid, data).await
-    }
+// There is deliberately **no `impl UploadNet for SumNet`**.
+//
+// That impl was the production sender for V1 push, and removing it is what
+// makes "no V1 push goes out of this binary" a fact the compiler enforces
+// rather than a claim: `SumNet` no longer has `push_chunk_shared` to forward
+// to, and `UploadOrchestrator::run` cannot be handed a real network. The
+// orchestrator's planning and accounting logic is retained and exercised by
+// tests through mock `UploadNet`s; nothing in production can drive it onto a
+// wire.
+//
+// The V2 replacement lives in `crate::ingest_v2`, whose pushes carry a Merkle
+// proof the receiver validates.
 
-    async fn next_event(&self) -> Option<SumNetEvent> {
-        SumNet::next_event(self).await
-    }
+// ── Legacy ingest retirement ─────────────────────────────────────────────────
+
+/// What `sum-node ingest` now says, instead of running.
+///
+/// It has to *say* something rather than hang. The V1 ingest flow pushed
+/// chunks and then blocked draining `ShardReceived` ACKs until every recipient
+/// answered or a timeout expired. With inbound V1 push refused mesh-wide, those
+/// ACKs cannot arrive: the drain would run to its full timeout — minutes,
+/// twice, once for chunks and once for the manifest — and then report a
+/// replication failure that names the wrong cause. Failing at entry costs the
+/// operator nothing and tells them exactly what to run.
+pub const LEGACY_INGEST_RETIRED: &str = "\
+`ingest` is retired: it used the unauthenticated /sum/storage/v1 push, which \
+peers now refuse. Use `sum-node ingest-v2 --key-file <key> <path>`, which \
+pushes over /sum/storage/v2 with per-chunk Merkle proofs and registers the \
+file on chain. No chunks were pushed and nothing was written.";
+
+/// The error `sum-node ingest` returns, immediately and without touching the
+/// network.
+pub fn legacy_ingest_retired() -> anyhow::Error {
+    anyhow::anyhow!(LEGACY_INGEST_RETIRED)
 }
 
 // ── Public Types ─────────────────────────────────────────────────────────────
 
 /// Default cap on the number of chunks that may have outstanding push
 /// requests at any given moment. With `R=3` replicas, the peak number of
-/// queued `SwarmCommand::PushShard` entries is bounded by
+/// queued push commands is bounded by
 /// `DEFAULT_MAX_IN_FLIGHT_CHUNKS * effective_r`.
 pub const DEFAULT_MAX_IN_FLIGHT_CHUNKS: usize = 4;
 

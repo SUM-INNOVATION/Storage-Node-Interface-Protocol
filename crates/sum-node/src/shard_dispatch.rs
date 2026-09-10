@@ -1,19 +1,24 @@
 //! The one inbound shard dispatcher.
 //!
-//! `run_listen` and `simple_serve_loop` both serve inbound shard traffic, and
-//! until now each carried its own hand-maintained copy of the dispatch. They
-//! had already drifted: `simple_serve_loop` has no `ShardRequestedV2` arm at
-//! all, so every inbound V2 request fell into its catch-all, was logged, and
-//! was never answered — the response channel sat in the swarm's pending map
-//! until the 120s reaper, by which time the peer had already timed out.
+//! `run_listen` is the one serve loop, and every inbound shard request it
+//! receives — V1 and V2 — is decided here.
 //!
-//! That is the argument for this module, and it is not tidiness. Every gate
-//! this protocol is about to grow — WP-B's V1-push retirement, conflict-aware
+//! There used to be a second. `simple_serve_loop` served V1 ingest's node mode
+//! and carried its own hand-maintained copy of this dispatch, which had already
+//! drifted: it never grew a `ShardRequestedV2` arm, so every inbound V2 request
+//! fell into its catch-all, was logged, and was never answered — the response
+//! channel sat in the swarm's pending map until the 120s reaper, by which time
+//! the peer had already timed out. This module was introduced to end that
+//! duplication; WP-B then retired V1 ingest, which left that loop with no
+//! caller, and it was removed.
+//!
+//! The argument for keeping the dispatch here outlives the second loop, and it
+//! is not tidiness. Every gate this protocol is about to grow — conflict-aware
 //! ambiguity denial, V2.1's activation check — is another arm or another guard
-//! on exactly this code. With two copies, each of those can land correctly in
-//! one loop and silently not in the other, and the second loop is the one
-//! nobody looks at. One dispatcher makes "did this gate apply everywhere?" a
-//! question the compiler answers.
+//! on exactly this code. A copy of it is a place a gate can be forgotten, and
+//! the forgotten copy is the one nobody reads. One dispatcher makes "did this
+//! gate apply everywhere?" a question the compiler answers, and
+//! `tests/shared_dispatch_wiring.rs` fails the build if a second copy returns.
 //!
 //! ## What is centralised
 //!
@@ -24,14 +29,28 @@
 //! **every path answers exactly once**. An unanswered request is a leaked
 //! response channel and a peer that waits out the protocol timeout.
 //!
-//! ## What is deliberately unchanged
+//! ## V1 push is retired here
 //!
-//! `run_listen`'s behaviour, byte for byte on the wire. No wire format
-//! changes. V1 push is **not** retired here — it remains unauthenticated and
-//! unauthorized, exactly as before, and retiring it is WP-B's work. This
-//! commit moves code; it does not decide policy.
+//! Both V1 push forms — a chunk push (`push_data: Some(..)` under a plain CID)
+//! and a manifest push (the same under a `manifest:` CID) — are refused, and
+//! refused **first**: before the store lock is taken, before the ACL is
+//! consulted, and before `sum_store::serve` is reached. The ordering is the
+//! security property, not a performance one. A V1 push carries no Merkle
+//! proof, no assignment, and no signature; the receiving side could only ever
+//! check that the sender hashed what it sent. Letting such a request as far as
+//! a lock means an unauthenticated peer can make this node contend for one,
+//! and letting it as far as `serve` means it can write.
+//!
+//! The refusal is a stable typed value — [`v1_push_retired_response`], carrying
+//! [`V1_PUSH_RETIRED_ERROR`] — so a peer gets an immediate, greppable answer
+//! naming the replacement, rather than a timeout.
+//!
+//! V1 **pull** is untouched: `/sum/storage/v1` reads keep working, ACL gate and
+//! all, and the node now routes V1 pulls on a V1-only behaviour so V1-only
+//! peers stay reachable.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sum_net::{PeerId, ShardRequest, ShardRequestV2, ShardResponse, ShardResponseV2, SumNetEvent};
 use sum_store::SumStore;
@@ -42,11 +61,69 @@ use tracing::{info, warn};
 use crate::inbound_v2::{AccessChecker, RespondNet};
 
 /// The error a node without a V2 dispatcher returns. One string, one place —
-/// both loops now emit the identical text, which they did not before.
+/// One definition, so the text cannot drift between call sites. When there
+/// were two serve loops only one of them emitted this at all.
 pub const V2_DISABLED_ERROR: &str = "V2 disabled on this node";
 
 /// The error a peer outside a file's ACL receives.
 pub const ACCESS_DENIED_ERROR: &str = "ACCESS_DENIED: not in file access list";
+
+/// The stable refusal a V1 push receives. One string, matched exactly by the
+/// regression tests, and naming the replacement so an operator reading a peer
+/// log knows what to do rather than only what failed.
+///
+/// The prefix is a machine-readable code; peers should match on it and not on
+/// the prose.
+pub const V1_PUSH_RETIRED_ERROR: &str = "V1_PUSH_RETIRED: /sum/storage/v1 push is retired — it carries no Merkle \
+     proof and no assignment. Use /sum/storage/v2 Push (chunk) or ManifestPush \
+     (manifest).";
+
+/// Fixed-cardinality refusal counters for the inbound dispatcher.
+///
+/// Fields, not a map. A keyed counter here would be keyed by something a
+/// remote peer chooses — its peer id, or the CID it asked for — and an
+/// unauthenticated peer that can name a metric key can grow the metric set
+/// without bound. There are exactly two things to count and they are exactly
+/// two fields.
+#[derive(Debug, Default)]
+pub struct RefusalCounters {
+    v1_chunk_push: AtomicU64,
+    v1_manifest_push: AtomicU64,
+}
+
+/// A snapshot of [`RefusalCounters`], for tests and for whatever exports
+/// metrics.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RefusalCounts {
+    /// Inbound V1 chunk pushes refused.
+    pub v1_chunk_push: u64,
+    /// Inbound V1 manifest pushes refused.
+    pub v1_manifest_push: u64,
+}
+
+impl RefusalCounters {
+    fn snapshot(&self) -> RefusalCounts {
+        RefusalCounts {
+            v1_chunk_push: self.v1_chunk_push.load(Ordering::Relaxed),
+            v1_manifest_push: self.v1_manifest_push.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The refusal sent for either V1 push form.
+///
+/// Shaped as an ordinary `ShardResponse` with a non-empty `error`, which is the
+/// only failure shape the V1 wire has. `total_bytes` and `data` are empty: this
+/// is a refusal, not a partial result.
+pub fn v1_push_retired_response(request: &ShardRequest) -> ShardResponse {
+    ShardResponse {
+        cid: request.cid.clone(),
+        offset: 0,
+        total_bytes: 0,
+        data: Vec::new(),
+        error: Some(V1_PUSH_RETIRED_ERROR.into()),
+    }
+}
 
 /// Anything that can answer both protocol versions.
 ///
@@ -92,6 +169,8 @@ pub struct ShardDispatch {
     acl: Arc<dyn AccessChecker>,
     /// `None` on a node with no signing key, which cannot serve V2.
     v2: Option<Arc<dyn V2Handler>>,
+    /// Fixed-field refusal counters. See [`RefusalCounters`].
+    refusals: RefusalCounters,
 }
 
 impl ShardDispatch {
@@ -100,13 +179,24 @@ impl ShardDispatch {
         acl: Arc<dyn AccessChecker>,
         v2: Option<Arc<dyn V2Handler>>,
     ) -> Self {
-        Self { store, acl, v2 }
+        Self {
+            store,
+            acl,
+            v2,
+            refusals: RefusalCounters::default(),
+        }
+    }
+
+    /// Snapshot of the refusal counters.
+    pub fn refusals(&self) -> RefusalCounts {
+        self.refusals.snapshot()
     }
 
     /// Handle one event if it is an inbound shard request.
     ///
-    /// This is the entry point both loops call, and calling it is what makes
-    /// them share a dispatch rather than merely resemble one.
+    /// The entry point `run_listen` calls. Any future serve loop calls this
+    /// too rather than growing its own copy — sharing a dispatch, not merely
+    /// resembling one.
     pub async fn on_event<N>(&self, net: &N, event: &SumNetEvent) -> Handled
     where
         N: RespondShard + RespondNet,
@@ -133,16 +223,13 @@ impl ShardDispatch {
         }
     }
 
-    /// The V1 four-way dispatch.
+    /// The V1 dispatch: two refusals and two pulls.
     ///
-    /// Unchanged in behaviour from `run_listen`'s copy:
-    ///
-    /// * **manifest push** — mutates the index, so it takes the write lock.
-    ///   Without this branch an archive that received chunk pushes never learns
-    ///   the `cid → root` mapping and production ACL denies pulls for those
-    ///   CIDs. Still unauthenticated; see the module docs.
-    /// * **chunk push** — read lock; `serve::handle_request` verifies the CID.
-    /// * **pulls, manifest or chunk** — ACL gate, then read lock.
+    /// * **any push, chunk or manifest** — refused with
+    ///   [`V1_PUSH_RETIRED_ERROR`]. This arm comes first and returns before
+    ///   `self.store` is touched, so no unauthenticated peer can make this node
+    ///   take a lock, and `sum_store::serve` is never reached for a push.
+    /// * **pulls, manifest or chunk** — unchanged: ACL gate, then read lock.
     pub async fn on_v1_request<N>(
         &self,
         net: &N,
@@ -155,28 +242,32 @@ impl ShardDispatch {
         let is_manifest = request.cid.starts_with(MANIFEST_REQUEST_PREFIX);
         let is_push = request.push_data.is_some();
 
+        // FIRST. Before `self.store` is read or written, and before any
+        // `sum_store::serve` entry point. Moving this below either of those is
+        // the mutation `an_inbound_v1_*_push_never_reaches_the_store` catches.
+        if is_push {
+            if is_manifest {
+                self.refusals
+                    .v1_manifest_push
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.refusals.v1_chunk_push.fetch_add(1, Ordering::Relaxed);
+            }
+            warn!(
+                peer = %peer_id,
+                cid = %request.cid,
+                bytes = request.push_data.as_ref().map_or(0, Vec::len),
+                manifest = is_manifest,
+                "refused retired V1 push"
+            );
+            let _ = net
+                .respond_shard(channel_id, v1_push_retired_response(request))
+                .await;
+            return;
+        }
+
         match (is_manifest, is_push) {
-            (true, true) => {
-                let mut store_w = self.store.write().await;
-                sum_store::serve::handle_manifest_push(
-                    net,
-                    &mut store_w.manifest_idx,
-                    request,
-                    channel_id,
-                )
-                .await;
-            }
-            (false, true) => {
-                let store_read = self.store.read().await;
-                sum_store::serve::handle_request(
-                    net,
-                    &store_read.local,
-                    &store_read.manifest_idx,
-                    request,
-                    channel_id,
-                )
-                .await;
-            }
+            (_, true) => unreachable!("every push returned above"),
             (_, false) => {
                 let store_read = self.store.read().await;
                 let allowed = self
@@ -214,9 +305,9 @@ impl ShardDispatch {
     /// The V2 hand-off, or the structured refusal when V2 is disabled.
     ///
     /// The refusal matters: a node with no signing key must still *answer*.
-    /// Dropping the event — which is what `simple_serve_loop` did — leaves the
-    /// response channel pending until the swarm's 120s reaper and gives the
-    /// peer a timeout instead of a reject.
+    /// Dropping the event — which is what the retired `simple_serve_loop` did —
+    /// left the response channel pending until the swarm's 120s reaper and gave
+    /// the peer a timeout instead of a reject.
     pub async fn on_v2_request<N>(
         &self,
         net: &N,
@@ -289,7 +380,8 @@ mod tests {
     ///
     /// Counting responses is what makes "every path answers exactly once"
     /// testable — an unanswered request is a leaked response channel and a peer
-    /// left to time out, which is precisely the defect `simple_serve_loop` had.
+    /// left to time out, which is precisely the defect the retired
+    /// `simple_serve_loop` had.
     #[derive(Default)]
     struct Recorder {
         v1: Mutex<Vec<(u64, ShardResponse)>>,
@@ -520,51 +612,154 @@ mod tests {
         assert_eq!(resp.total_bytes, 0);
     }
 
+    // ── V1 push retirement ───────────────────────────────────────────────
+
+    /// An inbound V1 chunk push is refused, answered once, and — the part that
+    /// matters — never written.
+    ///
+    /// `allow = false` is not doing the work here: V1 push was never ACL-gated,
+    /// so a store that stays empty proves the refusal and not the ACL.
     #[tokio::test]
-    async fn a_chunk_push_is_stored_without_consulting_the_acl() {
+    async fn an_inbound_v1_chunk_push_is_refused_and_never_reaches_the_store() {
         let body = b"pushed bytes";
         let cid = sum_store::content_id::cid_from_data(body);
         let (_d, store) = store_with(&[]);
         let net = Recorder::default();
+        let d = dispatch(store.clone(), true, None);
 
-        // `allow = false`: a push must not be gated by the pull ACL. This
-        // pins current behaviour, which WP-B changes by retiring the path —
-        // not by adding a gate here.
-        dispatch(store.clone(), false, None)
-            .on_v1_request(&net, &PeerId::random(), &push(&cid, body.to_vec()), 3)
+        d.on_v1_request(&net, &PeerId::random(), &push(&cid, body.to_vec()), 3)
             .await;
 
-        assert_eq!(net.v1_count(), 1);
-        assert_eq!(net.last_v1().1.error, None);
-        assert_eq!(store.read().await.local.get(&cid).unwrap(), body);
+        assert_eq!(net.v1_count(), 1, "a refusal is still exactly one reply");
+        let (ch, resp) = net.last_v1();
+        assert_eq!(ch, 3);
+        assert_eq!(
+            resp.error.as_deref(),
+            Some(V1_PUSH_RETIRED_ERROR),
+            "the refusal must be the stable typed one"
+        );
+        assert_eq!(resp.cid, cid, "the refusal names what was refused");
+        assert!(resp.data.is_empty());
+        assert_eq!(resp.total_bytes, 0);
+
+        assert!(
+            store.read().await.local.get(&cid).is_err(),
+            "the pushed bytes must not have been written"
+        );
+        assert_eq!(
+            d.refusals(),
+            RefusalCounts {
+                v1_chunk_push: 1,
+                v1_manifest_push: 0
+            }
+        );
     }
 
+    /// The manifest form of the same push, refused the same way. Both forms,
+    /// because they took different branches — and different locks — before.
     #[tokio::test]
-    async fn a_manifest_push_is_indexed() {
+    async fn an_inbound_v1_manifest_push_is_refused_and_never_reaches_the_index() {
         let m = well_formed(&[b"alpha", b"beta"]);
         let root_hex = hex::encode(m.merkle_root);
         let (_d, store) = store_with(&[]);
         let net = Recorder::default();
+        let d = dispatch(store.clone(), true, None);
 
-        dispatch(store.clone(), false, None)
-            .on_v1_request(
-                &net,
-                &PeerId::random(),
-                &push(&format!("{MANIFEST_REQUEST_PREFIX}{root_hex}"), cbor(&m)),
-                4,
-            )
-            .await;
+        d.on_v1_request(
+            &net,
+            &PeerId::random(),
+            &push(&format!("{MANIFEST_REQUEST_PREFIX}{root_hex}"), cbor(&m)),
+            4,
+        )
+        .await;
 
         assert_eq!(net.v1_count(), 1);
-        assert_eq!(net.last_v1().1.error, None);
+        assert_eq!(
+            net.last_v1().1.error.as_deref(),
+            Some(V1_PUSH_RETIRED_ERROR)
+        );
         assert!(
             store
                 .read()
                 .await
                 .manifest_idx
                 .get_by_merkle_root(&m.merkle_root)
-                .is_some()
+                .is_none(),
+            "a well-formed manifest must still not be indexed from a V1 push"
         );
+        assert_eq!(
+            d.refusals(),
+            RefusalCounts {
+                v1_chunk_push: 0,
+                v1_manifest_push: 1
+            }
+        );
+    }
+
+    /// The refusal happens **before the store lock is taken**. Holding the
+    /// write lock for the whole call would deadlock any handler that reaches
+    /// for the store; the refusal completes regardless, which is only possible
+    /// if it never asks for the lock.
+    ///
+    /// This is the ordering assertion. Moving the push check below
+    /// `self.store.read()`/`.write()` hangs this test rather than failing it,
+    /// so it is bounded by an explicit timeout and the timeout is the failure.
+    #[tokio::test]
+    async fn a_v1_push_is_refused_before_the_store_lock_is_taken() {
+        let body = b"pushed bytes";
+        let cid = sum_store::content_id::cid_from_data(body);
+        let (_d, store) = store_with(&[]);
+        let net = Recorder::default();
+        let d = dispatch(store.clone(), true, None);
+
+        // Hold the write lock for the duration of the call.
+        let guard = store.write().await;
+
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            d.on_v1_request(&net, &PeerId::random(), &push(&cid, body.to_vec()), 9),
+        )
+        .await;
+
+        assert!(
+            refused.is_ok(),
+            "the refusal waited on the store lock — it must be decided before any lock"
+        );
+        drop(guard);
+        assert_eq!(
+            net.last_v1().1.error.as_deref(),
+            Some(V1_PUSH_RETIRED_ERROR)
+        );
+    }
+
+    /// The refusal text is the contract a peer reads. It names a machine
+    /// prefix and the replacement, so an operator seeing it in a log knows
+    /// what to run.
+    #[test]
+    fn the_v1_push_refusal_names_its_replacement() {
+        assert!(V1_PUSH_RETIRED_ERROR.starts_with("V1_PUSH_RETIRED:"));
+        assert!(V1_PUSH_RETIRED_ERROR.contains("/sum/storage/v2"));
+        assert!(V1_PUSH_RETIRED_ERROR.contains("Push"));
+        assert!(V1_PUSH_RETIRED_ERROR.contains("ManifestPush"));
+    }
+
+    /// Pull and push are told apart by `push_data`, not by the CID. An empty
+    /// `push_data` is still a push — `Some(vec![])` — and must be refused, or
+    /// the retirement has a zero-length hole in it.
+    #[tokio::test]
+    async fn an_empty_v1_push_is_still_a_push() {
+        let (_d, store) = store_with(&[]);
+        let net = Recorder::default();
+        let d = dispatch(store, true, None);
+
+        d.on_v1_request(&net, &PeerId::random(), &push("any-cid", Vec::new()), 11)
+            .await;
+
+        assert_eq!(
+            net.last_v1().1.error.as_deref(),
+            Some(V1_PUSH_RETIRED_ERROR)
+        );
+        assert_eq!(d.refusals().v1_chunk_push, 1);
     }
 
     #[tokio::test]
@@ -658,9 +853,9 @@ mod tests {
 
     // ── Routing and channel accounting ───────────────────────────────────
 
-    /// `on_event` is the entry point both loops call. Everything else falls
-    /// through untouched, so neither loop has to re-derive which variants are
-    /// shard traffic.
+    /// `on_event` is the serve loop's entry point. Everything else falls
+    /// through untouched, so no caller has to re-derive which event variants
+    /// are shard traffic.
     #[tokio::test]
     async fn on_event_claims_shard_traffic_and_nothing_else() {
         let (_d, store) = store_with(&[]);

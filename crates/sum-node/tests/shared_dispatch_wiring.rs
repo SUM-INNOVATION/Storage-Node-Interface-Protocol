@@ -1,24 +1,31 @@
-//! Proves both serve loops route inbound shard traffic through the one shared
-//! dispatcher, and that neither has grown a private copy back.
+//! Proves every serve loop routes inbound shard traffic through the one shared
+//! dispatcher, and that none has grown a private copy back.
+//!
+//! There is one serve loop now. `simple_serve_loop` is gone: its only caller
+//! was V1 `ingest`'s node mode, and `ingest` is retired. So the test no longer
+//! checks that two loops agree — it checks the stronger thing, that no *second*
+//! loop exists at all. `every_inbound_shard_match_is_inside_a_known_serve_loop`
+//! is what makes a reintroduced private loop a build failure rather than a
+//! thing someone notices later.
 //!
 //! This is a source-level assertion, and that needs justifying. The property is
-//! structural — "these two functions delegate rather than duplicate" — and it
-//! has no runtime observable: `run_listen` and `simple_serve_loop` both need a
-//! live swarm, a chain RPC endpoint and a signing key to reach, none of which a
-//! unit test can stand up. The behaviour they delegate to is covered
-//! exhaustively by `sum_node::shard_dispatch::tests`; what is left is the
-//! delegation itself, and reading the source is the only way to see it.
+//! structural — "this function delegates rather than duplicates" — and it has
+//! no runtime observable: `run_listen` needs a live swarm, a chain RPC endpoint
+//! and a signing key to reach, none of which a unit test can stand up. The
+//! behaviour it delegates to is covered exhaustively by
+//! `sum_node::shard_dispatch::tests`; what is left is the delegation itself,
+//! and reading the source is the only way to see it.
 //!
-//! It exists because of what happened without it. The two loops carried
-//! hand-maintained copies of the same dispatch and drifted:
-//! `simple_serve_loop` never grew a `ShardRequestedV2` arm, so every inbound V2
-//! request fell into its catch-all and went unanswered until the swarm's 120s
-//! channel reaper. Nothing failed. Nothing warned. The gap was invisible until
-//! someone read both loops side by side.
+//! It exists because of what happened without it. Two loops once carried
+//! hand-maintained copies of the same dispatch and drifted: `simple_serve_loop`
+//! never grew a `ShardRequestedV2` arm, so every inbound V2 request fell into
+//! its catch-all and went unanswered until the swarm's 120s channel reaper.
+//! Nothing failed. Nothing warned. The gap stayed invisible until someone read
+//! the two loops side by side.
 //!
-//! Every gate this protocol is about to grow — WP-B's V1-push retirement,
+//! Every gate this protocol grows — the V1-push retirement that landed here,
 //! ambiguity denial, V2.1's activation check — lands in exactly this code. This
-//! test is what makes a gate that reaches only one loop a build failure.
+//! test is what makes a gate that reaches only part of it a build failure.
 
 const MAIN_RS: &str = include_str!("../src/main.rs");
 
@@ -49,17 +56,11 @@ fn body_of(source: &str, signature: &str) -> String {
 }
 
 fn serve_loops() -> Vec<(&'static str, String)> {
-    vec![
-        ("run_listen", body_of(MAIN_RS, "async fn run_listen(")),
-        (
-            "simple_serve_loop",
-            body_of(MAIN_RS, "async fn simple_serve_loop("),
-        ),
-    ]
+    vec![("run_listen", body_of(MAIN_RS, "async fn run_listen("))]
 }
 
 #[test]
-fn both_serve_loops_call_the_shared_dispatcher() {
+fn every_serve_loop_calls_the_shared_dispatcher() {
     for (name, body) in serve_loops() {
         assert!(
             body.contains("shard_dispatch.on_event("),
@@ -69,7 +70,7 @@ fn both_serve_loops_call_the_shared_dispatcher() {
 }
 
 #[test]
-fn both_serve_loops_route_v1_and_v2_to_the_dispatcher() {
+fn every_serve_loop_routes_v1_and_v2_to_the_dispatcher() {
     for (name, body) in serve_loops() {
         assert!(
             body.contains("SumNetEvent::ShardRequested { .. }"),
@@ -78,10 +79,52 @@ fn both_serve_loops_route_v1_and_v2_to_the_dispatcher() {
         assert!(
             body.contains("SumNetEvent::ShardRequestedV2 { .. }"),
             "{name} does not hand V2 shard requests to the dispatcher — this is \
-             the exact drift that left simple_serve_loop silently dropping every \
-             inbound V2 request"
+             the exact drift that left the old second loop silently dropping \
+             every inbound V2 request"
         );
     }
+}
+
+/// A second serve loop is how the drift started last time: one loop grew a
+/// gate, the other did not, and nothing said so. There is one loop now, and
+/// every place in `main.rs` that matches on an inbound shard event must be
+/// inside it.
+///
+/// A new loop therefore cannot be added quietly — it either delegates from
+/// inside `run_listen`, or it appears here.
+#[test]
+fn every_inbound_shard_match_is_inside_a_known_serve_loop() {
+    // The elided form, `SumNetEvent::ShardRequested { .. }`, is what a routing
+    // arm looks like: it does not bind the request, because it hands the whole
+    // event to the dispatcher. `print_event` binds the fields to log them and
+    // makes no dispatch decision, so it is not counted here.
+    const ROUTING_ARMS: &[&str] = &[
+        "SumNetEvent::ShardRequested { .. }",
+        "SumNetEvent::ShardRequestedV2 { .. }",
+    ];
+    let bodies: Vec<String> = serve_loops().into_iter().map(|(_, b)| b).collect();
+
+    for arm in ROUTING_ARMS {
+        let total = MAIN_RS.matches(arm).count();
+        let inside: usize = bodies.iter().map(|b| b.matches(arm).count()).sum();
+        assert!(total > 0, "no serve loop routes `{arm}`");
+        assert_eq!(
+            total, inside,
+            "main.rs routes `{arm}` outside every known serve loop — a second \
+             dispatch has appeared. Route it through ShardDispatch::on_event, \
+             or add its loop to serve_loops()."
+        );
+    }
+}
+
+/// The retired second loop must stay retired.
+#[test]
+fn the_retired_ingest_serve_loop_has_not_come_back() {
+    assert!(
+        !MAIN_RS.contains("async fn simple_serve_loop("),
+        "simple_serve_loop was removed with V1 ingest; a second serve loop is \
+         what this whole test file exists to prevent"
+    );
 }
 
 /// No serve loop may make a dispatch decision of its own. Each of these was a
