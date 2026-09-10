@@ -1,6 +1,7 @@
 use libp2p::{Multiaddr, PeerId};
 
 use crate::codec::{ShardRequest, ShardRequestV2, ShardResponse, ShardResponseV2};
+use crate::correlation::OutboundOrigin;
 
 /// Domain-level events emitted by the SUM Storage Node networking layer.
 /// Never exposes raw libp2p internals to callers.
@@ -41,9 +42,16 @@ pub enum SumNetEvent {
     },
 
     /// We received V1 chunk data from a remote peer (response to our V1 request).
+    ///
+    /// Only emitted after the networking layer has matched the response to an
+    /// outbound request this node actually issued: known request id, same peer,
+    /// same response shape, same CID. `origin` is that retained request
+    /// identity — consumers needing to know what was asked for must read it
+    /// from here, because every field of `response` is written by the peer.
     ShardReceived {
         peer_id: PeerId,
         response: ShardResponse,
+        origin: OutboundOrigin,
     },
 
     /// A remote peer issued a V2 request to us (`/sum/storage/v2`). V2
@@ -59,14 +67,34 @@ pub enum SumNetEvent {
     },
 
     /// We received a V2 response from a remote peer (response to our V2 request).
+    ///
+    /// Correlated the same way as [`SumNetEvent::ShardReceived`]; `origin`
+    /// carries the locally-retained request identity.
     ShardReceivedV2 {
         peer_id: PeerId,
         response: ShardResponseV2,
+        origin: OutboundOrigin,
     },
 
     /// An outbound chunk request failed (V1 OR V2 — covers both since
     /// the libp2p outbound failure is protocol-agnostic).
-    ShardRequestFailed { peer_id: PeerId, error: String },
+    ///
+    /// `origin` names **the one request that failed**, from the outbound
+    /// record the networking layer kept. Without it a consumer can only see
+    /// "something to this peer failed" and has to retry or abandon everything
+    /// outstanding to that peer — which, with several requests in flight to one
+    /// peer, is either a lost fetch or a stampede. With it, exactly one
+    /// in-flight entry is settled.
+    ///
+    /// A failure whose request id is not in the outbound record is **not**
+    /// surfaced as an event at all. There is nothing a consumer could correctly
+    /// do with a peer-only failure, and inviting a peer-wide retry is the
+    /// behaviour this field exists to remove.
+    ShardRequestFailed {
+        peer_id: PeerId,
+        error: String,
+        origin: OutboundOrigin,
+    },
 
     /// A peer's L1 address was identified via the libp2p identify protocol.
     /// Used by the ACL checker to map PeerId -> L1 Address.
