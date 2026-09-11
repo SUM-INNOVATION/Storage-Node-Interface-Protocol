@@ -1221,7 +1221,7 @@ mod tests {
         std::fs::create_dir_all(&store_dir).unwrap();
         let cfg = sum_types::config::StoreConfig {
             store_dir,
-            ..sum_types::config::StoreConfig::default()
+            max_chunk_msg_bytes: sum_types::config::DEFAULT_MAX_CHUNK_MSG_BYTES,
         };
         let store = SumStore::new(cfg).expect("SumStore::new failed");
         // Leak the temp_dir so the test can still find files. tests are

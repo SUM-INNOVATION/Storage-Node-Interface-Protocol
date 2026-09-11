@@ -305,6 +305,7 @@ impl AccessListSource for StaticAccessRpc {
 use std::path::Path as StdPath;
 
 use sum_node::rpc_client::L1RpcClient;
+use sum_types::config::STORE_DIR_ENV;
 use sum_types::rpc_types::TxStatusV2;
 
 /// Default chain mirror RPC URL. Overrideable per-test via the
@@ -468,6 +469,37 @@ pub async fn await_tx_finality(rpc: &L1RpcClient, tx_hash: &str) -> u64 {
     );
 }
 
+/// Environment for one spawned process: the cleaned-through base, an
+/// explicit store root, then the caller's overrides.
+///
+/// Split out from [`spawn_bin`] so the property that matters is testable
+/// without spawning anything: every spawn is told where its store is, and
+/// each spawn is told a different place.
+///
+/// `env_clear()` removes `HOME`, so a child inherits no store root at all.
+/// Every spawned process therefore used to resolve to one and the same path
+/// — one chunk namespace shared by an ingesting client and three archives,
+/// which is precisely the collision this lane exists to remove. (Since the
+/// fail-closed change it would not resolve at all: the child exits naming
+/// `--store-dir`.) The root is pushed before `extra_env` so a caller that
+/// wants a specific root can still name one.
+fn spawn_env(store_dir: &StdPath, extra_env: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        env.push(("RUST_LOG".to_string(), rust_log));
+    }
+    // `PATH` minimally needed so subprocess can locate dynamic
+    // loader / libc / etc on the host.
+    if let Ok(path) = std::env::var("PATH") {
+        env.push(("PATH".to_string(), path));
+    }
+    env.push((STORE_DIR_ENV.to_string(), store_dir.display().to_string()));
+    for (k, v) in extra_env {
+        env.push(((*k).to_string(), (*v).to_string()));
+    }
+    env
+}
+
 /// Spawn `sum-node` (or `e2e-helper`) as a subprocess, capturing
 /// output. Path comes from cargo's `CARGO_BIN_EXE_<name>` env var,
 /// guaranteeing the test runs against the same build artifact
@@ -475,8 +507,12 @@ pub async fn await_tx_finality(rpc: &L1RpcClient, tx_hash: &str) -> u64 {
 /// on `status` + parse `stdout` / `stderr`.
 ///
 /// Each spawn carries a clean env to insulate from operator shell
-/// state — only `RUST_LOG` and the explicitly-supplied env vars
-/// pass through.
+/// state — only `RUST_LOG`, an isolated store root, and the
+/// explicitly-supplied env vars pass through.
+///
+/// The store root is a fresh tempdir per call, dropped once the child has
+/// exited. `Command::output` runs the child to completion, so the directory
+/// outlives every use the child makes of it.
 pub fn spawn_bin(
     bin_name: &str,
     args: &[&str],
@@ -487,22 +523,18 @@ pub fn spawn_bin(
         "e2e-helper" => env!("CARGO_BIN_EXE_e2e-helper"),
         other => panic!("e2e: spawn_bin unknown binary {other}"),
     };
+    let store_dir = tempfile::tempdir().expect("e2e: spawn_bin store root");
     let mut cmd = std::process::Command::new(bin_path);
     cmd.env_clear();
-    if let Ok(rust_log) = std::env::var("RUST_LOG") {
-        cmd.env("RUST_LOG", rust_log);
-    }
-    // `PATH` minimally needed so subprocess can locate dynamic
-    // loader / libc / etc on the host.
-    if let Ok(path) = std::env::var("PATH") {
-        cmd.env("PATH", path);
-    }
-    for (k, v) in extra_env {
+    for (k, v) in spawn_env(store_dir.path(), extra_env) {
         cmd.env(k, v);
     }
     cmd.args(args);
-    cmd.output()
-        .unwrap_or_else(|e| panic!("e2e: spawn_bin({bin_name}) failed: {e}"))
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("e2e: spawn_bin({bin_name}) failed: {e}"));
+    drop(store_dir);
+    output
 }
 
 /// Convenience: write a hex seed to a tempfile and return its path.
@@ -564,6 +596,60 @@ mod helpers_self_test {
         let a = build_private_test_artifacts(&pt, &k);
         let b = build_private_test_artifacts(&pt, &k);
         assert_eq!(a.merkle_root, b.merkle_root);
+    }
+
+    /// Every spawned process is told where its store is, and told a
+    /// different place from the last one.
+    ///
+    /// `env_clear()` strips `HOME`, so a child inherits nothing to resolve a
+    /// root from. Before this, every spawn in the suite — the ingesting
+    /// client and each archive alike — landed on one path and shared one
+    /// chunk namespace, which made "the chunks are on disk" true for reasons
+    /// that had nothing to do with replication.
+    #[test]
+    fn every_spawned_process_gets_its_own_explicit_store_root() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+
+        let root_of = |env: &[(String, String)]| -> Option<String> {
+            env.iter()
+                .rev()
+                .find(|(k, _)| k == STORE_DIR_ENV)
+                .map(|(_, v)| v.clone())
+        };
+
+        let env_a = spawn_env(a.path(), &[]);
+        let env_b = spawn_env(b.path(), &[]);
+
+        assert_eq!(
+            root_of(&env_a).as_deref(),
+            Some(a.path().display().to_string().as_str()),
+            "the spawn must carry the root it was given"
+        );
+        assert_ne!(
+            root_of(&env_a),
+            root_of(&env_b),
+            "two spawns must not share a store root"
+        );
+        assert!(
+            !env_a.iter().any(|(k, _)| k == "HOME"),
+            "HOME is cleared, so the root cannot be left implicit"
+        );
+    }
+
+    /// A caller that names its own root still wins. `Command::env` applies in
+    /// order, so the last value for a key is the one the child sees.
+    #[test]
+    fn a_caller_supplied_store_root_overrides_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = spawn_env(dir.path(), &[(STORE_DIR_ENV, "/from/caller")]);
+
+        let effective = env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == STORE_DIR_ENV)
+            .map(|(_, v)| v.as_str());
+        assert_eq!(effective, Some("/from/caller"));
     }
 
     #[test]

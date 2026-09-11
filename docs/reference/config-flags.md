@@ -14,6 +14,7 @@ gates that the binary reads at runtime are listed in
 | Flag | Env var | Default | Notes |
 |---|---|---|---|
 | `--key-file` | `SUM_KEY_FILE` | (none) | Ed25519 seed hex file. Without it the binary generates an ephemeral keypair and runs in dev mode with PoR and V2 write commands disabled. |
+| `--store-dir` | `SUM_STORE_DIR` | `$HOME/.sumnode/store` | Root for chunks and manifests. Resolution is flag, then env, then `$HOME`; CWD is never consulted. With none of the three set the binary exits with an error naming this flag — there is no shared-path fallback. Two nodes sharing a root share one chunk namespace and one `manifests/` directory, silently — set this per node when running more than one on a host. |
 | `--rpc-url` | `SUM_RPC_URL` | `http://127.0.0.1:9944` | JSON-RPC endpoint on the SUM Chain node. |
 | `--chain-id` | `SUM_CHAIN_ID` | `1337` | **See "Chain ID safety" below.** |
 | `--attest-fee` | `SUM_ATTEST_FEE` | `1000000` (base units) | Per-tx fee used by V2 attestation paths. Must be ≥ chain `min_fee`. |

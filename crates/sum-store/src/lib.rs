@@ -6,6 +6,7 @@ pub mod content_id;
 pub mod error;
 pub mod fetch;
 pub mod gc;
+pub mod lease;
 pub mod manifest;
 pub mod manifest_index;
 pub mod merkle;
@@ -21,6 +22,7 @@ pub use chunker::BinaryChunker;
 pub use content_id::cid_from_data;
 pub use error::StoreError;
 pub use fetch::{FetchManager, FetchNet, FetchOutcome};
+pub use lease::{LEASE_FILE_NAME, StoreLease};
 pub use manifest_index::ManifestIndex;
 pub use merkle::MerkleTree;
 pub use store::ChunkStore;
@@ -40,11 +42,30 @@ pub struct SumStore {
     pub local: ChunkStore,
     pub fetcher: FetchManager,
     pub manifest_idx: ManifestIndex,
+    /// Exclusive lease on `config.store_dir`, held for as long as this store
+    /// exists. Private: the point of it is that it cannot be released
+    /// independently of the store it protects.
+    lease: StoreLease,
 }
 
 impl SumStore {
     /// Open (or create) the chunk store from the given config.
+    ///
+    /// The exclusive lease is taken before the chunk store and manifest index
+    /// are constructed, and fails if another process already holds the root.
+    /// `ChunkStore::mmap`'s safety argument assumes the root has exactly one
+    /// manager; this is where that stops being an assumption.
+    ///
+    /// Precisely: [`StoreLease::acquire`] does `create_dir_all` on the root and
+    /// opens `.store.lease` before it calls `flock`, so the root directory and
+    /// that one file may exist before the lock is held. Nothing else is written,
+    /// and the lease file is opened with `truncate(false)` so its contents are
+    /// never modified by a process that has not been granted the root. The
+    /// guarantee is therefore "no chunk or manifest state is constructed before
+    /// the lock", not "nothing is created before the lock" — an earlier draft of
+    /// this comment claimed the latter, which the code does not do.
     pub fn new(config: StoreConfig) -> Result<Self> {
+        let lease = StoreLease::acquire(&config.store_dir)?;
         let local = ChunkStore::new(config.store_dir.clone())?;
         let fetcher = FetchManager::new(config.max_chunk_msg_bytes);
         let manifest_idx = ManifestIndex::load(&config.store_dir)?;
@@ -53,7 +74,13 @@ impl SumStore {
             local,
             fetcher,
             manifest_idx,
+            lease,
         })
+    }
+
+    /// Path of the exclusive lease file this store holds on its root.
+    pub fn lease_path(&self) -> &Path {
+        self.lease.path()
     }
 
     /// Ingest any file: chunk, compute Merkle tree, store chunks, build manifest.
@@ -121,28 +148,6 @@ impl SumStore {
         self.local.mmap(cid)
     }
 
-    /// Delete all locally stored chunks and manifests.
-    ///
-    /// Used in client mode after a successful upload — Alice doesn't need
-    /// to keep chunks on her disk after they've been pushed to R=3 nodes.
-    pub fn cleanup(&self) -> Result<()> {
-        let cids = self.local.list_all_cids()?;
-        for cid in &cids {
-            self.local.delete(cid)?;
-        }
-        // Also clean up manifests directory.
-        let manifests_dir = self.config.store_dir.join("manifests");
-        if manifests_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&manifests_dir) {
-                for entry in entries.flatten() {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-        info!("store cleanup complete — {} chunks removed", cids.len());
-        Ok(())
-    }
-
     /// Health check: returns a snapshot of store health for monitoring.
     pub fn health_check(&self) -> HealthReport {
         let chunk_count = self.local.list_all_cids().map(|v| v.len()).unwrap_or(0);
@@ -189,61 +194,6 @@ pub struct HealthReport {
 mod tests {
     use super::*;
     use sum_types::config::StoreConfig;
-
-    #[test]
-    fn cleanup_removes_all_chunks() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = StoreConfig {
-            store_dir: dir.path().join("store"),
-            max_chunk_msg_bytes: 64 * 1024 * 1024,
-        };
-        let store = SumStore::new(config).unwrap();
-
-        // Put some chunks
-        store
-            .local
-            .put(
-                crate::content_id::cid_from_data(b"chunk a").as_str(),
-                b"chunk a",
-            )
-            .unwrap();
-        store
-            .local
-            .put(
-                crate::content_id::cid_from_data(b"chunk b").as_str(),
-                b"chunk b",
-            )
-            .unwrap();
-        store
-            .local
-            .put(
-                crate::content_id::cid_from_data(b"chunk c").as_str(),
-                b"chunk c",
-            )
-            .unwrap();
-        assert_eq!(store.local.list_all_cids().unwrap().len(), 3);
-
-        // Cleanup
-        store.cleanup().unwrap();
-
-        // Verify empty
-        assert_eq!(store.local.list_all_cids().unwrap().len(), 0);
-        assert!(
-            !store
-                .local
-                .has(crate::content_id::cid_from_data(b"chunk a").as_str())
-        );
-        assert!(
-            !store
-                .local
-                .has(crate::content_id::cid_from_data(b"chunk b").as_str())
-        );
-        assert!(
-            !store
-                .local
-                .has(crate::content_id::cid_from_data(b"chunk c").as_str())
-        );
-    }
 
     #[test]
     fn health_check_empty_store() {
@@ -302,5 +252,96 @@ mod tests {
         assert_eq!(report.chunk_count, 2);
         assert!(report.disk_usage_bytes > 0);
         assert!(report.store_dir_writable);
+    }
+
+    // ── Store-root lease ────────────────────────────────────────────────
+
+    /// Two `SumStore`s cannot share a root.
+    ///
+    /// Naming a root per node kept honest operators apart; it never stopped
+    /// two nodes from being handed the same one. Nothing downstream noticed —
+    /// content addressing means concurrent writers produce no write-time
+    /// conflict — and the two then garbage-collected against each other's
+    /// assignment sets, each deleting chunks the other was obliged to serve.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_store_on_one_root_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        let config = StoreConfig {
+            store_dir: store_dir.clone(),
+            max_chunk_msg_bytes: 64 * 1024,
+        };
+
+        let _held = SumStore::new(config.clone()).expect("first store");
+        // `SumStore` is not `Debug`, so `expect_err` is unavailable.
+        let err = match SumStore::new(config) {
+            Ok(_) => panic!("a second store on one root must be refused"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, StoreError::StoreRootBusy { .. }),
+            "expected StoreRootBusy, got {err:?}"
+        );
+    }
+
+    /// The lease is taken before the root is populated, and released with the
+    /// store — so a restart re-opens its own root without an unlock step.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_can_reopen_the_root_its_predecessor_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig {
+            store_dir: dir.path().join("store"),
+            max_chunk_msg_bytes: 64 * 1024,
+        };
+
+        let first = SumStore::new(config.clone()).expect("first store");
+        drop(first);
+
+        SumStore::new(config).expect("restart must not need an unlock step");
+    }
+
+    /// The lease file is invisible to every chunk lister, and therefore to GC.
+    ///
+    /// `list_all_cids` is the sole input to the collector's delete loop and
+    /// yields only entries ending in `.chunk`. This runs the collector in its
+    /// most destructive configuration — nothing assigned, zero grace — and
+    /// asserts it takes the chunk and leaves the lease.
+    #[cfg(unix)]
+    #[test]
+    fn garbage_collection_cannot_sweep_the_lease() {
+        use std::collections::HashSet;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SumStore::new(StoreConfig {
+            store_dir: dir.path().join("store"),
+            max_chunk_msg_bytes: 64 * 1024,
+        })
+        .unwrap();
+
+        let cid = crate::content_id::cid_from_data(b"a sweepable chunk");
+        store.local.put(cid.as_str(), b"a sweepable chunk").unwrap();
+
+        assert_eq!(
+            store.local.list_all_cids().unwrap(),
+            vec![cid.clone()],
+            "the lease must not appear as a CID"
+        );
+
+        let mut gc = crate::gc::GarbageCollector::new(Duration::from_secs(0));
+        let result = gc
+            .mark_and_sweep(&store.local, &HashSet::new(), Instant::now())
+            .unwrap();
+
+        assert_eq!(result.chunks_deleted, 1, "the chunk was sweepable");
+        assert!(!store.local.has(&cid));
+        assert!(
+            store.lease_path().exists(),
+            "GC removed the lease file at {}",
+            store.lease_path().display()
+        );
     }
 }

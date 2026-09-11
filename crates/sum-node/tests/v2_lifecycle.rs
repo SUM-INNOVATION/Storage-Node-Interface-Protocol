@@ -353,7 +353,7 @@ fn make_store() -> Arc<RwLock<SumStore>> {
     std::fs::create_dir_all(&store_dir).unwrap();
     let cfg = StoreConfig {
         store_dir,
-        ..StoreConfig::default()
+        max_chunk_msg_bytes: sum_types::config::DEFAULT_MAX_CHUNK_MSG_BYTES,
     };
     let store = SumStore::new(cfg).expect("SumStore::new");
     std::mem::forget(temp_dir);

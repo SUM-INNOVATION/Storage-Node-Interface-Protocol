@@ -135,6 +135,35 @@ fn extract_hex32(s: &str) -> Option<String> {
     None
 }
 
+/// Argument vector for one archive's `sum-node listen`.
+///
+/// Split out from [`spawn_archive_listen`] so the isolation property is
+/// testable without a chain: the root each archive is given appears in its
+/// own argv, and two archives are given two different roots.
+fn archive_listen_args(role: &str, store_dir: &std::path::Path) -> Vec<String> {
+    vec![
+        "--key-file".to_string(),
+        role_seed_path(role).to_str().unwrap().to_string(),
+        // Each archive needs its own store root so they do not share one
+        // chunk namespace. This must be said explicitly: store-root
+        // resolution consults the `--store-dir` flag, then `$SUM_STORE_DIR`,
+        // then `$HOME` — never the working directory. This call site
+        // previously handed the root to `Command::current_dir`, which
+        // resolution does not read, so all three archives resolved to the
+        // same root and "the chunks are on disk" held for reasons unrelated
+        // to replication. (`env_clear` also strips `HOME`, so since the
+        // fail-closed change an archive started this way would not resolve a
+        // root at all — it would exit asking for `--store-dir`.)
+        "--store-dir".to_string(),
+        store_dir.display().to_string(),
+        "--rpc-url".to_string(),
+        e2e_rpc_url(),
+        "--chain-id".to_string(),
+        "1337".to_string(),
+        "listen".to_string(),
+    ]
+}
+
 /// Spawn a long-running `sum-node listen` archive node. Returns
 /// the `Child` handle so the test can kill it during teardown.
 /// Callers are responsible for waiting a few seconds before the
@@ -150,19 +179,7 @@ fn spawn_archive_listen(role: &str, store_dir: &std::path::Path) -> std::process
     if let Ok(path) = std::env::var("PATH") {
         cmd.env("PATH", path);
     }
-    // Each archive needs its own store-root so they don't clobber
-    // each other's chunks. Pass via env (SumStore reads from CWD
-    // by default; we change CWD to give it an isolated dir).
-    cmd.current_dir(store_dir);
-    cmd.args([
-        "--key-file",
-        role_seed_path(role).to_str().unwrap(),
-        "--rpc-url",
-        &e2e_rpc_url(),
-        "--chain-id",
-        "1337",
-        "listen",
-    ]);
+    cmd.args(archive_listen_args(role, store_dir));
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.spawn()
@@ -1171,4 +1188,65 @@ async fn resume_pending_completes_to_active() {
         "file lifecycle after resume must be Active, got {:?}",
         info.lifecycle
     );
+}
+
+/// Store-root isolation for the archive fleet, provable without a chain.
+///
+/// Every scenario in this file is `#[ignore]`d behind a live mirror, so the
+/// property that the fleet's three archives do not share a store root had no
+/// unignored coverage. These two run in an ordinary `cargo test`.
+mod archive_store_isolation {
+    use super::{ARCHIVE_ROLES, archive_listen_args};
+
+    /// Read back the value the argv gives to `--store-dir`.
+    fn store_dir_arg(args: &[String]) -> Option<&str> {
+        let at = args.iter().position(|a| a == "--store-dir")?;
+        args.get(at + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn each_archive_is_told_its_own_store_root() {
+        let dirs: Vec<_> = ARCHIVE_ROLES
+            .iter()
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+
+        let roots: Vec<String> = ARCHIVE_ROLES
+            .iter()
+            .zip(&dirs)
+            .map(|(role, dir)| {
+                let args = archive_listen_args(role, dir.path());
+                store_dir_arg(&args)
+                    .expect("every archive must be told a store root explicitly")
+                    .to_string()
+            })
+            .collect();
+
+        for (root, dir) in roots.iter().zip(&dirs) {
+            assert_eq!(root.as_str(), dir.path().display().to_string());
+        }
+
+        let mut unique = roots.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ARCHIVE_ROLES.len(),
+            "the {} archives share a store root: {roots:?} — replication assertions \
+             would pass on one node's chunks",
+            ARCHIVE_ROLES.len()
+        );
+    }
+
+    /// The working directory is not a store-root source, so it must not be
+    /// the thing carrying isolation.
+    #[test]
+    fn the_root_travels_in_argv_not_the_working_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = archive_listen_args("archive_1", dir.path());
+        assert_eq!(
+            store_dir_arg(&args),
+            Some(dir.path().display().to_string()).as_deref()
+        );
+    }
 }
