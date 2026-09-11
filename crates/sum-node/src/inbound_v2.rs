@@ -303,6 +303,29 @@ fn resolve_pull_window(total: usize, offset: u64, max_bytes: u64) -> Option<(usi
     Some((offset as usize, end as usize))
 }
 
+/// The dyn-safe seam the shared dispatcher routes V2 traffic through.
+///
+/// `V2Dispatcher` is generic over three RPC clients, so it cannot be held as a
+/// trait object directly. This forwards to the inherent `handle`, which stays
+/// the implementation.
+#[async_trait::async_trait]
+impl<V, A, T> crate::shard_dispatch::V2Handler for V2Dispatcher<V, A, T>
+where
+    V: V2RpcClient + 'static,
+    A: AttestorRpc + 'static,
+    T: AttestTriggerRpc + 'static,
+{
+    async fn handle(
+        &self,
+        net: &dyn RespondNet,
+        peer_id: PeerId,
+        request: ShardRequestV2,
+        channel_id: u64,
+    ) {
+        V2Dispatcher::handle(self, net, peer_id, request, channel_id).await
+    }
+}
+
 impl<V, A, T> V2Dispatcher<V, A, T>
 where
     V: V2RpcClient + 'static,

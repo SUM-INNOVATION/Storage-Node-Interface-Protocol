@@ -17,10 +17,17 @@
 //     `ShardRequestV2` / `ShardResponseV2` with explicit Pull / Push /
 //     ManifestPush / ManifestPull variants and per-push Merkle proofs.
 //
-// `VersionedShardCodec` is the per-stream codec that dispatches on the
-// libp2p-negotiated protocol name (passed in on every read/write call).
+// The two protocols are carried by two separate `request_response`
+// behaviours, one protocol each — `libp2p-request-response` attaches a
+// behaviour's whole protocol list to every request it sends, so a single
+// behaviour holding both could not be asked to speak one of them. See
+// `crate::behaviour`.
+//
+// `VersionedShardCodec` is the codec both behaviours register. It dispatches
+// on the libp2p-negotiated protocol name (passed in on every read/write call).
 // V1 wire stays bit-compatible: a V1 peer sees the same bytes from
-// `VersionedShardCodec` as it always saw from `ShardCodec`.
+// `VersionedShardCodec` as it always saw from the legacy `ShardCodec`, which
+// is no longer registered anywhere.
 
 use std::io;
 
@@ -88,7 +95,9 @@ pub struct ShardResponse {
 
 // ── Codec ─────────────────────────────────────────────────────────────────────
 
-/// Codec for the `/sum/shard-xfer/1` request-response protocol.
+/// Reference V1 codec. **Not registered by the swarm** — `VersionedShardCodec`
+/// is. Kept because `v1_wire_is_bit_compatible_with_the_legacy_codec` compares
+/// against it, and because `sum-store`'s serve tests decode with it.
 #[derive(Debug, Clone)]
 pub struct ShardCodec {
     max_msg_bytes: usize,
@@ -258,19 +267,24 @@ pub enum ShardResponseVersioned {
 
 // ── VersionedShardCodec ──────────────────────────────────────────────────────
 
-/// Codec that dispatches on the libp2p-negotiated protocol name. V1 and
-/// V2 streams share one codec instance; the protocol passed on every
-/// read/write call selects which inner type to (de)serialize.
+/// Codec that dispatches on the libp2p-negotiated protocol name.
+///
+/// **This is the codec the swarm registers** — on both shard behaviours. The
+/// legacy [`ShardCodec`] below is registered nowhere; it survives only as the
+/// reference implementation the V1 bit-compatibility test compares against, and
+/// as the decoder `sum-store`'s serve-path tests use.
+///
+/// The two behaviours each hold their own `VersionedShardCodec` instance and
+/// each negotiate exactly one protocol, so in production the protocol passed to
+/// every `read_*`/`write_*` call is fixed per behaviour. The dispatch is still
+/// what makes the type correct rather than merely lucky: it is what turns a
+/// version/stream mismatch into an error instead of junk on the wire.
 ///
 /// Tests in this module verify (a) V1 wire bytes are bit-compatible
 /// with the legacy `ShardCodec`, (b) every V2 variant round-trips, and
 /// (c) constructing a V2-shaped request and writing it to a V1 stream
 /// (or vice versa) is rejected as a programmer error rather than
 /// silently producing junk on the wire.
-///
-/// **Not yet wired into `SumNet`** — that swap is W5 / receive-side
-/// dispatch. Until then this type exists only as a tested building
-/// block. The legacy `ShardCodec` is still what the swarm registers.
 #[derive(Debug, Clone)]
 pub struct VersionedShardCodec {
     max_msg_bytes: usize,
