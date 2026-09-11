@@ -27,7 +27,7 @@ use tracing_subscriber::EnvFilter;
 
 use sum_net::identity;
 use sum_net::{Keypair, ShardResponse, SumNet, SumNetEvent, TOPIC_STORAGE, TOPIC_TEST};
-use sum_store::manifest::deserialize_manifest_cbor;
+use sum_node::manifest_ingress::{ManifestIngress, commit_manifest_ingress, plan_manifest_ingress};
 use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_store::{FetchOutcome, SumStore, decode_announcement};
 use sum_types::config::{NetConfig, StoreConfig};
@@ -775,7 +775,8 @@ async fn run_listen(
                                 let mut store_w = store.write().await;
                                 sum_store::serve::handle_manifest_push(
                                     &net, &mut store_w.manifest_idx, request, *channel_id,
-                                ).await;
+                                )
+                                .await;
                             }
                             (false, true) => {
                                 let store_read = store.read().await;
@@ -892,35 +893,48 @@ async fn run_listen(
                         }
                         print_event(&event);
                     }
-                    SumNetEvent::ShardReceived { response, .. } => {
-                        // Manifest responses use the "manifest:<hex>" CID convention
-                        // and bypass FetchManager entirely (manifests aren't tracked
-                        // there). Chunk responses go through FetchManager so the
-                        // background MarketSync state machine closes its loop.
-                        if let Some(root_hex) = response.cid.strip_prefix("manifest:") {
-                            match deserialize_manifest_cbor(&response.data) {
-                                Ok(manifest) => {
+                    SumNetEvent::ShardReceived {
+                        response, origin, ..
+                    } => {
+                        // Whether this is a manifest response is decided by
+                        // what this node asked for, read out of the outbound
+                        // record the networking layer kept — not by inspecting
+                        // `response.cid`, which the peer writes. Chunk
+                        // responses fall through to the FetchManager below so
+                        // the background MarketSync state machine closes its
+                        // loop.
+                        //
+                        // Phase 1 — decide and validate with no lock held.
+                        // `plan_manifest_ingress` returns `None` for anything
+                        // that is not a manifest pull.
+                        if let Some(plan) = plan_manifest_ingress(origin, response) {
+                            match plan {
+                                ManifestIngress::Rejected { root_hex, error } => warn!(
+                                    root = %root_hex,
+                                    %error,
+                                    "manifest rejected — not indexed"
+                                ),
+                                // Phase 2 — take the write lock only to commit.
+                                // The guard covers map and file writes and
+                                // nothing else.
+                                ManifestIngress::Commit { root_hex, validated } => {
                                     let mut store_w = store.write().await;
-                                    if store_w.manifest_idx.get_by_merkle_root(&manifest.merkle_root).is_none() {
-                                        match store_w.manifest_idx.insert(&manifest) {
-                                            Ok(()) => info!(
-                                                root = %root_hex,
-                                                file_name = %manifest.file_name,
-                                                chunks = manifest.chunk_count,
-                                                "manifest persisted by listen loop"
-                                            ),
-                                            Err(e) => warn!(
-                                                root = %root_hex,
-                                                %e,
-                                                "manifest_idx.insert failed"
-                                            ),
-                                        }
-                                    } else {
-                                        debug!(root = %root_hex, "manifest already indexed — skipping");
+                                    match commit_manifest_ingress(
+                                        &mut store_w.manifest_idx,
+                                        &validated,
+                                    ) {
+                                        Ok(outcome) => info!(
+                                            root = %root_hex,
+                                            file_name = %outcome.manifest().file_name,
+                                            chunks = outcome.manifest().chunk_count,
+                                            "manifest accepted by listen loop"
+                                        ),
+                                        Err(e) => warn!(
+                                            root = %root_hex,
+                                            error = %e,
+                                            "manifest commit failed — not indexed"
+                                        ),
                                     }
-                                }
-                                Err(e) => {
-                                    warn!(root = %root_hex, %e, "manifest deserialization failed");
                                 }
                             }
                         } else {
@@ -1211,7 +1225,10 @@ async fn push_manifest_to_recipients(
         tokio::select! {
             event = net.next_event() => {
                 match event {
-                    Some(SumNetEvent::ShardReceived { peer_id, response }) => {
+                    // `origin` unused: sum-net has already matched this ACK to
+                    // the push we sent, so the `response.cid` comparison below
+                    // is a demultiplexing step, not an authorization one.
+                    Some(SumNetEvent::ShardReceived { peer_id, response, origin: _ }) => {
                         if response.cid != cid {
                             // Some other concurrent push or an out-of-order
                             // event — ignore.
@@ -1297,7 +1314,8 @@ async fn simple_serve_loop(
                                 let mut store_w = store.write().await;
                                 sum_store::serve::handle_manifest_push(
                                     net, &mut store_w.manifest_idx, request, *channel_id,
-                                ).await;
+                                )
+                                .await;
                             }
                             (false, true) => {
                                 let store_read = store.read().await;
@@ -2333,7 +2351,15 @@ async fn run_fetch(keypair: Keypair, net_config: NetConfig, cid: String) -> Resu
                             }
                         }
                     }
-                    SumNetEvent::ShardRequestFailed { peer_id, error } => {
+                    // Single-CID fetch: only a failure of the request for
+                    // *this* CID counts against the retry budget. Any other
+                    // outbound request failing — to this peer or another — must
+                    // not consume a retry or trigger a re-fetch.
+                    SumNetEvent::ShardRequestFailed {
+                        peer_id,
+                        error,
+                        origin,
+                    } if origin.requested_cid() == Some(cid.as_str()) => {
                         retries += 1;
                         warn!(%error, retries, "chunk request failed — will retry");
                         if retries > 5 {
@@ -2557,8 +2583,13 @@ fn print_event(event: &SumNetEvent) {
             "CHUNK_REQ    peer={peer_id}  cid={}  ch={channel_id}",
             request.cid
         ),
-        SumNetEvent::ShardReceived { peer_id, response } => info!(
-            "CHUNK_RECV   peer={peer_id}  cid={}  offset={}  bytes={}",
+        SumNetEvent::ShardReceived {
+            peer_id,
+            response,
+            origin,
+        } => info!(
+            "CHUNK_RECV   peer={peer_id}  asked={}  cid={}  offset={}  bytes={}",
+            origin.kind().label(),
             response.cid,
             response.offset,
             response.data.len()
@@ -2576,17 +2607,31 @@ fn print_event(event: &SumNetEvent) {
             };
             info!("V2_REQ       peer={peer_id}  kind={kind}  ch={channel_id}");
         }
-        SumNetEvent::ShardReceivedV2 { peer_id, response } => {
+        SumNetEvent::ShardReceivedV2 {
+            peer_id,
+            response,
+            origin,
+        } => {
             let kind = match response {
                 sum_net::ShardResponseV2::Data { .. } => "Data",
                 sum_net::ShardResponseV2::PushAck { .. } => "PushAck",
                 sum_net::ShardResponseV2::ManifestPushAck { .. } => "ManifestPushAck",
                 sum_net::ShardResponseV2::ManifestData { .. } => "ManifestData",
             };
-            info!("V2_RECV      peer={peer_id}  kind={kind}");
+            info!(
+                "V2_RECV      peer={peer_id}  asked={}  kind={kind}",
+                origin.kind().label()
+            );
         }
-        SumNetEvent::ShardRequestFailed { peer_id, error } => {
-            info!("CHUNK_FAIL   peer={peer_id}  error={error}")
+        SumNetEvent::ShardRequestFailed {
+            peer_id,
+            error,
+            origin,
+        } => {
+            info!(
+                "CHUNK_FAIL   peer={peer_id}  asked={}  error={error}",
+                origin.kind().label()
+            )
         }
         SumNetEvent::PeerIdentified {
             peer_id,

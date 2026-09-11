@@ -15,8 +15,6 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use sum_net::{PeerId, ShardResponseV2, SumNet, SumNetEvent};
-use sum_store::manifest::deserialize_manifest_cbor;
-use sum_store::serve::MANIFEST_REQUEST_PREFIX;
 use sum_store::{
     FetchManager, FetchOutcome, MerkleTree, compute_chunk_assignment, nodes_for_chunk,
 };
@@ -160,7 +158,6 @@ impl DownloadOrchestrator {
         // double-ask. The first peer to respond with a valid manifest
         // wins; everyone else's responses are ignored after `break`.
         info!("waiting for manifest response...");
-        let manifest_cid = format!("{MANIFEST_REQUEST_PREFIX}{}", self.merkle_root_hex);
         let mut tried_for_manifest: HashSet<PeerId> = HashSet::new();
 
         // Helper: send a manifest request to `peer_id` if we haven't
@@ -198,8 +195,14 @@ impl DownloadOrchestrator {
             tokio::select! {
                 event = net.next_event() => {
                     match event {
-                        Some(SumNetEvent::ShardReceived { peer_id, response })
-                            if response.cid == manifest_cid =>
+                        // Accept only a response to a manifest pull this
+                        // download issued for *this* root. The test is against
+                        // `origin`, the request identity sum-net retained at
+                        // send time, so a peer cannot steer this arm by choosing
+                        // what CID to name in its reply.
+                        Some(SumNetEvent::ShardReceived { peer_id, response, origin })
+                            if origin.requested_manifest_root_hex()
+                                == Some(self.merkle_root_hex.as_str()) =>
                         {
                             if let Some(ref err) = response.error {
                                 // The peer we asked answered "not found".
@@ -209,8 +212,27 @@ impl DownloadOrchestrator {
                                 warn!(%peer_id, %err, "manifest request rejected by a peer — waiting for others");
                                 continue;
                             }
-                            let m = deserialize_manifest_cbor(&response.data)
-                                .map_err(|e| anyhow::anyhow!("failed to deserialize manifest: {e}"))?;
+                            // Validate against the root this download is for.
+                            // A peer that answers with a different or forged
+                            // manifest is skipped rather than fatal: another
+                            // peer may still serve the real one, and the
+                            // surrounding loop already handles that.
+                            let m = match sum_store::serve::validate_manifest_push(
+                                origin
+                                    .requested_manifest_root_hex()
+                                    .expect("guard above matched a manifest pull"),
+                                &response.data,
+                            ) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    warn!(
+                                        %peer_id,
+                                        error = %e,
+                                        "manifest failed validation against the requested root — trying other peers"
+                                    );
+                                    continue;
+                                }
+                            };
                             info!(
                                 %peer_id,
                                 file_name = %m.file_name,
@@ -237,15 +259,17 @@ impl DownloadOrchestrator {
                             }
                             break m;
                         }
-                        Some(SumNetEvent::ShardRequestFailed { peer_id, error })
-                            // An outbound request to `peer_id` failed before
-                            // it could be sent (no connection, peer down,
-                            // protocol mismatch). During Phase 2 the only
-                            // outbound traffic is manifest requests, so
-                            // treat this as a manifest failure for that
-                            // peer. We don't retry against the same peer —
-                            // we wait for another peer to be discovered.
-                            if tried_for_manifest.contains(&peer_id) =>
+                        // A manifest pull for *this* root failed (no
+                        // connection, peer down, protocol mismatch). The guard
+                        // is on the retained request identity, not on
+                        // `tried_for_manifest.contains(peer_id)`: the old test
+                        // matched any outbound failure to a peer we had ever
+                        // asked, so an unrelated request failing to that peer
+                        // was logged as a manifest failure. We don't retry the
+                        // same peer — we wait for another to be discovered.
+                        Some(SumNetEvent::ShardRequestFailed { peer_id, error, origin })
+                            if origin.requested_manifest_root_hex()
+                                == Some(self.merkle_root_hex.as_str()) =>
                         {
                             warn!(%peer_id, %error, "manifest request to peer dropped — will rely on other peers");
                         }
@@ -303,6 +327,9 @@ impl DownloadOrchestrator {
         // Store the manifest so we can read chunks back for assembly
         {
             let mut store_write = store.write().await;
+            // `manifest` reached here only through `validate_manifest_push`
+            // against `self.merkle_root_hex` at the accept site above, so it
+            // is already bound to the root this download asked for.
             if store_write
                 .manifest_idx
                 .get_by_merkle_root(&manifest.merkle_root)
@@ -395,9 +422,15 @@ impl DownloadOrchestrator {
             tokio::select! {
                 event = net.next_event() => {
                     match event {
-                        Some(SumNetEvent::ShardReceived { peer_id, response }) => {
-                            // Skip manifest responses
-                            if response.cid.starts_with(MANIFEST_REQUEST_PREFIX) {
+                        Some(SumNetEvent::ShardReceived { peer_id, response, origin }) => {
+                            // Skip manifest responses. Decided from the request
+                            // this node issued, not from `response.cid`: a late
+                            // manifest reply must not be handed to the chunk
+                            // fetcher because the peer chose to label it as a
+                            // chunk. Beyond this point the loop keys off
+                            // `response.cid`, which sum-net has already checked
+                            // against the CID we asked for.
+                            if origin.requested_manifest_root_hex().is_some() {
                                 continue;
                             }
 
@@ -441,36 +474,44 @@ impl DownloadOrchestrator {
                                 }
                             }
                         }
-                        Some(SumNetEvent::ShardRequestFailed { peer_id, error }) => {
-                            // Re-queue every chunk whose outbound request was
-                            // attributed to this peer. Without this, a relay
-                            // circuit reset (or any transport-layer failure)
-                            // permanently wedges the pipeline: in_flight stays
-                            // full, fill_fetches refuses to issue more, and the
+                        Some(SumNetEvent::ShardRequestFailed { peer_id, error, origin }) => {
+                            // Re-queue exactly the chunk that failed. Without
+                            // a re-queue, a relay circuit reset permanently
+                            // wedges the pipeline: in_flight stays full,
+                            // fill_fetches refuses to issue more, and the
                             // download times out with 0 progress.
-                            let wedged: Vec<String> = in_flight
-                                .iter()
-                                .filter(|(_, p)| **p == peer_id)
-                                .map(|(cid, _)| cid.clone())
-                                .collect();
+                            //
+                            // This used to re-queue *every* in-flight chunk
+                            // attributed to the peer, because a peer id was the
+                            // only identity the event carried. With several
+                            // requests outstanding to one peer that abandons
+                            // healthy transfers and re-issues them, which is
+                            // both slower and a stampede. `origin` names the
+                            // one request that failed, so exactly one entry is
+                            // settled.
+                            let Some(cid) = origin.requested_cid() else {
+                                warn!(%peer_id, %error, asked = origin.kind().label(),
+                                      "outbound failure for a request with no CID — nothing to re-queue");
+                                continue;
+                            };
+                            if in_flight.remove(cid).is_none() {
+                                // Already settled by a response or an earlier
+                                // failure; nothing outstanding to re-queue.
+                                continue;
+                            }
                             warn!(
                                 %peer_id,
                                 %error,
-                                requeued = wedged.len(),
-                                "shard request failed — re-queuing in-flight chunks from peer"
+                                %cid,
+                                "shard request failed — re-queuing that chunk"
                             );
-                            for cid in &wedged {
-                                in_flight.remove(cid);
-                                if let Some(chunk) = manifest.chunks.iter().find(|c| &c.cid == cid) {
-                                    remaining.push_back(chunk.chunk_index);
-                                }
+                            if let Some(chunk) = manifest.chunks.iter().find(|c| c.cid == *cid) {
+                                remaining.push_back(chunk.chunk_index);
                             }
-                            if !wedged.is_empty() {
-                                self.fill_fetches(
-                                    &net, &mut fetcher, &mut remaining, &mut in_flight,
-                                    &manifest, &holder_map, &discovered_peers,
-                                ).await;
-                            }
+                            self.fill_fetches(
+                                &net, &mut fetcher, &mut remaining, &mut in_flight,
+                                &manifest, &holder_map, &discovered_peers,
+                            ).await;
                         }
                         Some(SumNetEvent::PeerDiscovered { peer_id, .. })
                             if !discovered_peers.contains(&peer_id) =>
@@ -1041,6 +1082,7 @@ async fn fetch_v2_public_manifest(
                         manifest_bytes,
                         error,
                     },
+                origin: _,
             }) => {
                 if merkle_root != chain_root {
                     continue;
@@ -1077,6 +1119,21 @@ async fn fetch_v2_public_manifest(
                             );
                             status.insert(archive, Status::Failed);
                         }
+                        Err(ManifestDecodeError::Invalid(e)) => {
+                            // Declared the right root but the contents do not
+                            // produce it. Treat exactly like a mismatch: this
+                            // archive is not serving the real manifest, so try
+                            // the others rather than failing the download.
+                            warn!(
+                                %peer_id,
+                                archive = %hex::encode(archive),
+                                err = %e,
+                                "V2Public manifest fan-out: manifest failed validation; trying others"
+                            );
+                            last_reason =
+                                format!("archive {} invalid manifest: {e}", hex::encode(archive));
+                            status.insert(archive, Status::Failed);
+                        }
                         Err(ManifestDecodeError::Cbor(e)) => {
                             warn!(
                                 %peer_id,
@@ -1100,7 +1157,17 @@ async fn fetch_v2_public_manifest(
                 )
                 .await;
             }
-            Some(SumNetEvent::ShardRequestFailed { peer_id, error }) => {
+            Some(SumNetEvent::ShardRequestFailed {
+                peer_id,
+                error,
+                origin,
+            }) => {
+                // Only a manifest pull for the root this fan-out is for may
+                // mark an archive failed. A chunk request to the same peer
+                // failing says nothing about its manifest dispatch.
+                if origin.requested_manifest_root() != Some(chain_root) {
+                    continue;
+                }
                 if let Some(&archive) = dispatched_peers.get(&peer_id) {
                     if status.get(&archive) == Some(&Status::Dispatched) {
                         warn!(
@@ -1306,6 +1373,7 @@ async fn fetch_v2_public_chunks(
                         data,
                         error,
                     },
+                origin: _,
             }) => {
                 let Some(&idx) = cid_to_idx.get(&cid) else {
                     continue;
@@ -1386,15 +1454,26 @@ async fn fetch_v2_public_chunks(
                 }
                 try_dispatch(net, peer_addresses, manifest, &mut state, max_concurrent).await?;
             }
-            Some(SumNetEvent::ShardRequestFailed { peer_id, error }) => {
-                // Re-queue the chunk whose dispatch was attributed to
-                // this peer. Same semantics as the V1 orchestrator's
-                // wedging guard — without this, a transport reset
-                // permanently parks the chunk.
-                let wedged_idx: Option<u32> =
-                    state.iter().find_map(|(idx, s)| match s.in_flight_to {
-                        Some((p, _)) if p == peer_id => Some(*idx),
-                        _ => None,
+            Some(SumNetEvent::ShardRequestFailed {
+                peer_id,
+                error,
+                origin,
+            }) => {
+                // Re-queue the chunk that actually failed. The previous
+                // version took the *first* in-flight chunk dispatched to this
+                // peer, which with several outstanding is an arbitrary choice
+                // — it could settle a healthy transfer and leave the failed
+                // one parked forever. `origin` names the request, so the
+                // lookup is exact.
+                let wedged_idx: Option<u32> = origin
+                    .requested_cid()
+                    .and_then(|cid| cid_to_idx.get(cid).copied())
+                    .filter(|idx| {
+                        state
+                            .get(idx)
+                            .and_then(|s| s.in_flight_to)
+                            .map(|(p, _)| p == peer_id)
+                            .unwrap_or(false)
                     });
                 if let Some(idx) = wedged_idx {
                     let s = state.get_mut(&idx).expect("idx from state");

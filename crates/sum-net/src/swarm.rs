@@ -13,7 +13,7 @@ use libp2p::{
     swarm::SwarmEvent,
 };
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use sum_types::config::NetConfig;
 
@@ -23,6 +23,10 @@ use crate::{
         SHARD_XFER_PROTOCOL_V1, SHARD_XFER_PROTOCOL_V2, ShardRequest, ShardRequestV2,
         ShardRequestVersioned, ShardResponse, ShardResponseV2, ShardResponseVersioned,
         VersionedShardCodec,
+    },
+    correlation::{
+        FailureOutcome, OUTBOUND_RECORD_TTL, OutboundKey, OutboundOrigin, OutboundRequestKind,
+        OutboundTracker, RequestDomain,
     },
     discovery,
     events::SumNetEvent,
@@ -111,6 +115,12 @@ pub struct SumSwarm {
 
     /// Monotonic counter for channel IDs.
     next_channel_id: u64,
+
+    /// Identity of every outbound chunk request still awaiting a terminal
+    /// event, recorded from the request this node built. A response is only
+    /// surfaced to the upper layer if it matches the record filed under its
+    /// request id — see [`crate::correlation`].
+    outbound: OutboundTracker,
 
     /// Candidate relay peers indexed by peer id. Seeded from
     /// `--bootstrap-peer` (with `confirmed: false`) and promoted to
@@ -263,6 +273,7 @@ impl SumSwarm {
             gossip: GossipManager::new(),
             pending_shard_channels: HashMap::new(),
             next_channel_id: 0,
+            outbound: OutboundTracker::default(),
             relay_peers: HashMap::new(),
             nat_status: nat::NatStatus::Unknown,
             active_relay_reservation: nat::RelayReservationState::None,
@@ -367,12 +378,31 @@ impl SumSwarm {
                             }
                         }
                         Some(SwarmCommand::RequestShard { peer_id, request }) => {
-                            self.inner.behaviour_mut().shard_xfer
+                            // Classify before the request is moved into libp2p:
+                            // this is the last point at which the locally-built
+                            // request is in hand.
+                            let kind = OutboundRequestKind::from_v1(&request);
+                            let id = self.inner.behaviour_mut().shard_xfer
                                 .send_request(&peer_id, ShardRequestVersioned::V1(request));
+                            if let Err(e) = self.outbound.record(
+                                OutboundKey::new(RequestDomain::ShardXfer, id),
+                                peer_id,
+                                kind,
+                            ) {
+                                error!(%peer_id, %e, "outbound request identity collision — key poisoned, both requests abandoned");
+                            }
                         }
                         Some(SwarmCommand::RequestShardV2 { peer_id, request }) => {
-                            self.inner.behaviour_mut().shard_xfer
+                            let kind = OutboundRequestKind::from_v2(&request);
+                            let id = self.inner.behaviour_mut().shard_xfer
                                 .send_request(&peer_id, ShardRequestVersioned::V2(request));
+                            if let Err(e) = self.outbound.record(
+                                OutboundKey::new(RequestDomain::ShardXfer, id),
+                                peer_id,
+                                kind,
+                            ) {
+                                error!(%peer_id, %e, "outbound request identity collision — key poisoned, both requests abandoned");
+                            }
                         }
                         Some(SwarmCommand::PushShard { peer_id, cid, data }) => {
                             // Materialize the Vec<u8> exactly once, here at
@@ -389,8 +419,16 @@ impl SumSwarm {
                                 max_bytes: None,
                                 push_data: Some(data.to_vec()),
                             };
-                            self.inner.behaviour_mut().shard_xfer
+                            let kind = OutboundRequestKind::from_v1(&request);
+                            let id = self.inner.behaviour_mut().shard_xfer
                                 .send_request(&peer_id, ShardRequestVersioned::V1(request));
+                            if let Err(e) = self.outbound.record(
+                                OutboundKey::new(RequestDomain::ShardXfer, id),
+                                peer_id,
+                                kind,
+                            ) {
+                                error!(%peer_id, %e, "outbound request identity collision — key poisoned, both requests abandoned");
+                            }
                         }
                         Some(SwarmCommand::SendShardResponse { channel_id, response }) => {
                             if let Some((channel, _inserted)) = self.pending_shard_channels.remove(&channel_id) {
@@ -443,6 +481,19 @@ impl SumSwarm {
                 reaped,
                 remaining = self.pending_shard_channels.len(),
                 "orphaned channel cleanup"
+            );
+        }
+
+        // Outbound correlation records are removed by the response and failure
+        // paths, both of which libp2p guarantees to deliver. This is the
+        // backstop: if either guarantee is ever broken, the pending set is
+        // capped by TTL rather than growing for the life of the process.
+        let stale = self.outbound.reap(Instant::now(), OUTBOUND_RECORD_TTL);
+        if stale > 0 {
+            warn!(
+                reaped = stale,
+                remaining = self.outbound.len(),
+                "outbound request records expired without a terminal event"
             );
         }
     }
@@ -671,45 +722,123 @@ impl SumSwarm {
                         }
                     }
                 }
-                request_response::Message::Response { response, .. } => match response {
-                    ShardResponseVersioned::V1(resp) => {
-                        info!(
-                            %peer,
-                            cid = %resp.cid,
-                            offset = resp.offset,
-                            bytes = resp.data.len(),
-                            "V1 chunk data received"
-                        );
-                        if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceived {
-                            peer_id: peer,
-                            response: resp,
-                        }) {
-                            warn!(%e, "event channel full — dropping V1 ShardReceived");
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    // Correlate before anything else looks at the payload. The
+                    // response is matched against the request record filed under
+                    // this id at send time; a mismatch is dropped here and never
+                    // becomes a domain event.
+                    let key = OutboundKey::new(RequestDomain::ShardXfer, request_id);
+                    let origin = match self.outbound.correlate_response(key, peer, &response) {
+                        Ok(origin) => origin,
+                        Err(e) => {
+                            warn!(
+                                %peer,
+                                %request_id,
+                                error = %e,
+                                "uncorrelated chunk response rejected — dropped before dispatch"
+                            );
+                            return;
+                        }
+                    };
+
+                    match response {
+                        ShardResponseVersioned::V1(resp) => {
+                            info!(
+                                %peer,
+                                cid = %resp.cid,
+                                offset = resp.offset,
+                                bytes = resp.data.len(),
+                                asked = origin.kind().label(),
+                                "V1 chunk data received"
+                            );
+                            if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceived {
+                                peer_id: peer,
+                                response: resp,
+                                origin,
+                            }) {
+                                warn!(%e, "event channel full — dropping V1 ShardReceived");
+                            }
+                        }
+                        ShardResponseVersioned::V2(resp) => {
+                            info!(
+                                %peer,
+                                kind = v2_response_kind(&resp),
+                                asked = origin.kind().label(),
+                                "V2 response received"
+                            );
+                            if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceivedV2 {
+                                peer_id: peer,
+                                response: resp,
+                                origin,
+                            }) {
+                                warn!(%e, "event channel full — dropping V2 ShardReceived");
+                            }
                         }
                     }
-                    ShardResponseVersioned::V2(resp) => {
-                        info!(
-                            %peer,
-                            kind = v2_response_kind(&resp),
-                            "V2 response received"
-                        );
-                        if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceivedV2 {
-                            peer_id: peer,
-                            response: resp,
-                        }) {
-                            warn!(%e, "event channel full — dropping V2 ShardReceived");
-                        }
-                    }
-                },
+                }
             },
 
             SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
-                request_response::Event::OutboundFailure { peer, error, .. },
+                request_response::Event::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                },
             )) => {
-                warn!(%peer, %error, "chunk request outbound failure");
+                // Terminal for this request id: drop the retained record so the
+                // pending set stays bounded and the id cannot later be matched.
+                let key = OutboundKey::new(RequestDomain::ShardXfer, request_id);
+                let (asked_peer, kind) = match self.outbound.on_failure(key) {
+                    FailureOutcome::Retained { peer, kind } => (peer, kind),
+                    FailureOutcome::Unknown => {
+                        // No record: we cannot say which request this failure
+                        // is about. Emitting a peer-only failure would invite a
+                        // consumer to settle every request outstanding to this
+                        // peer, so it is logged and dropped instead.
+                        warn!(
+                            %peer,
+                            %request_id,
+                            %error,
+                            "outbound failure for an untracked request id — not surfaced"
+                        );
+                        return;
+                    }
+                    FailureOutcome::Poisoned => {
+                        error!(
+                            %peer,
+                            %request_id,
+                            %error,
+                            "outbound failure for a poisoned request id — not surfaced"
+                        );
+                        return;
+                    }
+                };
+
+                // The failure event carries a peer too. It must agree with the
+                // one recorded at send time; a disagreement means the event
+                // cannot be attributed and is dropped rather than guessed at.
+                if asked_peer != peer {
+                    warn!(
+                        %request_id,
+                        expected = %asked_peer,
+                        got = %peer,
+                        %error,
+                        "outbound failure peer mismatch — not surfaced"
+                    );
+                    return;
+                }
+
+                warn!(%peer, %error, asked = kind.label(), "chunk request outbound failure");
+                // Every field of the event comes from the outbound record.
+                let origin = OutboundOrigin::new(asked_peer, kind);
                 if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequestFailed {
-                    peer_id: peer,
+                    peer_id: origin.peer(),
                     error: error.to_string(),
+                    origin,
                 }) {
                     warn!(%e, "event channel full — dropping ShardRequestFailed");
                 }

@@ -18,7 +18,11 @@ use crate::store::ChunkStore;
 use crate::verify;
 
 /// The prefix that distinguishes manifest requests from chunk requests.
-pub const MANIFEST_REQUEST_PREFIX: &str = "manifest:";
+///
+/// Re-exported rather than redeclared: `sum-net` needs the same literal to
+/// classify an outbound request at send time (see `sum_net::correlation`), and
+/// two copies of a protocol constant is one copy too many.
+pub use sum_net::MANIFEST_CID_PREFIX as MANIFEST_REQUEST_PREFIX;
 
 /// Outbound-response abstraction over [`SumNet::respond_shard`].
 ///

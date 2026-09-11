@@ -26,7 +26,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use sum_net::{Keypair, PeerId, ShardResponse, SumNetEvent};
+use sum_net::{Keypair, OutboundOrigin, OutboundRequestKind, PeerId, ShardResponse, SumNetEvent};
 use sum_net::{l1_address_from_keypair, peer_id_from_keypair};
 use sum_node::rpc_client::L1RpcClient;
 use sum_node::upload::{UploadNet, UploadOrchestrator};
@@ -110,8 +110,12 @@ impl UploadNet for MockUploadNet {
         });
 
         // Synthesize a successful ACK and queue it for next_event() to drain.
+        // The mock stands in for sum-net, so it must also stand in for the
+        // correlation record sum-net would have kept: the ACK is attributed to
+        // the push this call just made, by CID, from local state.
         let ack = SumNetEvent::ShardReceived {
             peer_id,
+            origin: OutboundOrigin::new(peer_id, OutboundRequestKind::V1Push { cid: cid.clone() }),
             response: ShardResponse {
                 cid,
                 offset: 0,

@@ -784,6 +784,7 @@ async fn fetch_manifest_v2(
                         manifest_bytes,
                         error,
                     },
+                origin: _,
             }) => {
                 if merkle_root != chain_root {
                     // Response for a different file — ignore. The
@@ -1103,6 +1104,7 @@ async fn fetch_all_ciphertext_chunks_v2(
                         data,
                         error,
                     },
+                origin: _,
             }) => {
                 let Some(&idx) = cid_to_idx.get(&cid) else {
                     // Not a chunk we're waiting on (or already fulfilled).
