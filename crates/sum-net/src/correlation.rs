@@ -18,14 +18,27 @@
 //! `OutboundRequestId` is **not** a key on its own. libp2p is explicit about
 //! this: "`OutboundRequestId`'s uniqueness is only guaranteed between outbound
 //! requests of the same originating `Behaviour`" (libp2p-request-response
-//! 0.28.0, `lib.rs`). One behaviour is registered today, so ids happen to be
-//! globally unique — but WP-B splits shard transfer into a `/sum/storage/v1`
-//! behaviour and a `/sum/storage/v2` behaviour, and on that day both counters
-//! start at zero and collide immediately.
+//! 0.28.0, `lib.rs`). Shard transfer is registered as two behaviours — one for
+//! `/sum/storage/v1`, one for `/sum/storage/v2` — so both counters start at
+//! zero and collide from the first request each sends.
 //!
 //! [`OutboundKey`] therefore pairs the id with a [`RequestDomain`] naming the
-//! behaviour that issued it. Adding WP-B's second behaviour is one new variant,
-//! and a record filed under one domain can never be taken by the other.
+//! behaviour that issued it, and a record filed under one domain can never be
+//! taken by the other. `ids_are_namespaced_by_domain` mints the same raw id
+//! from both real behaviours and shows exactly that.
+//!
+//! ## Domain / protocol agreement
+//!
+//! The domain says which behaviour minted the id; the recorded
+//! [`OutboundRequestKind`] says which protocol the request was written for.
+//! Those two statements are made at the same call site and must agree — a V2
+//! request filed under the V1 domain means the request went out on the wrong
+//! behaviour, which now only ever means a routing bug. [`OutboundTracker::record`]
+//! refuses such a filing outright ([`RecordError::DomainProtocolMismatch`]).
+//! Refusing is fail-closed: the request is on the wire but unfiled, so its
+//! response resolves to [`CorrelationError::UnknownRequestId`] and is dropped
+//! rather than accepted against an identity recorded under a domain that did
+//! not send it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -66,23 +79,34 @@ pub(crate) const POISON_TTL: Duration = Duration::from_secs(600);
 /// is a required part of the key rather than a label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RequestDomain {
-    /// The single behaviour registered today, carrying `/sum/storage/v1` and
-    /// `/sum/storage/v2` on one `VersionedShardCodec`.
-    ///
-    /// WP-B replaces this with one variant per protocol. That is a change to
-    /// this enum and to the `record` call sites — deliberately, so the compiler
-    /// names every place a domain must be chosen.
-    ShardXfer,
+    /// `LocalMeshBehaviour::shard_xfer_v1` — advertises `/sum/storage/v1` and
+    /// nothing else.
+    ShardXferV1,
 
-    /// Stand-in for the second behaviour WP-B will register.
+    /// `LocalMeshBehaviour::shard_xfer_v2` — advertises `/sum/storage/v2` and
+    /// nothing else.
+    ShardXferV2,
+}
+
+impl RequestDomain {
+    /// The one protocol the behaviour this domain names advertises.
     ///
-    /// It exists only under `cfg(test)`, and only so that
-    /// `ids_are_namespaced_by_domain` can demonstrate the property this key is
-    /// built for *before* there is a second real behaviour to demonstrate it
-    /// with. When WP-B lands, that test retargets to the real variant and this
-    /// one goes away.
-    #[cfg(test)]
-    SecondBehaviourProbe,
+    /// Single-valued precisely because each behaviour carries a
+    /// single-element protocol list; see [`crate::behaviour`].
+    pub fn protocol(&self) -> &'static str {
+        match self {
+            Self::ShardXferV1 => SHARD_XFER_PROTOCOL_V1,
+            Self::ShardXferV2 => SHARD_XFER_PROTOCOL_V2,
+        }
+    }
+
+    /// Short label for logs and mismatch messages.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ShardXferV1 => "shard-xfer-v1",
+            Self::ShardXferV2 => "shard-xfer-v2",
+        }
+    }
 }
 
 /// Fully-qualified identifier for one outbound request.
@@ -481,6 +505,68 @@ impl std::fmt::Display for RecordCollision {
 
 impl std::error::Error for RecordCollision {}
 
+/// Why an outbound request could not be filed.
+///
+/// Both variants mean the same thing operationally: **no record exists** for
+/// the key, so any response that later arrives under it is refused as
+/// [`CorrelationError::UnknownRequestId`]. They are distinguished so the caller
+/// can count them separately — they have different causes and different fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordError {
+    /// Two requests claimed one key. See [`RecordCollision`].
+    Collision(RecordCollision),
+
+    /// The request was filed under a domain whose behaviour does not speak the
+    /// protocol the request was written for.
+    ///
+    /// The domain and the kind are supplied by the same call site, one line
+    /// apart, from the behaviour it just called and the request it just built.
+    /// A disagreement is therefore a routing bug — a V2 request handed to the
+    /// V1 behaviour, or the reverse — and the request on the wire is already
+    /// wrong. Nothing is filed for it.
+    DomainProtocolMismatch {
+        domain: &'static str,
+        domain_protocol: &'static str,
+        kind: &'static str,
+        kind_protocol: &'static str,
+    },
+}
+
+impl RecordError {
+    /// Whether this is a domain/protocol disagreement, for the fixed-field
+    /// refusal counters kept by the swarm.
+    pub fn is_domain_protocol_mismatch(&self) -> bool {
+        matches!(self, Self::DomainProtocolMismatch { .. })
+    }
+}
+
+impl std::fmt::Display for RecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Collision(c) => c.fmt(f),
+            Self::DomainProtocolMismatch {
+                domain,
+                domain_protocol,
+                kind,
+                kind_protocol,
+            } => write!(
+                f,
+                "outbound routing bug: a {kind} request (written for \
+                 {kind_protocol}) was filed under {domain}, which speaks \
+                 {domain_protocol} — not recorded"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecordError {}
+
+impl From<RecordCollision> for RecordError {
+    fn from(c: RecordCollision) -> Self {
+        Self::Collision(c)
+    }
+}
+
 // ── Tracker ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -568,12 +654,32 @@ impl OutboundTracker {
     /// therefore exists to bound memory, not to make the key reusable — and if
     /// the counter invariant is ever broken badly enough to reissue an id, the
     /// second collision simply re-poisons.
+    ///
+    /// # Domain / protocol agreement
+    ///
+    /// Before anything is filed, the recorded kind's
+    /// [`OutboundRequestKind::protocol`] is checked against
+    /// [`RequestDomain::protocol`] for the domain in the key. They come from
+    /// the same call site — the behaviour that was just called, and the request
+    /// that was just built — so a disagreement is a routing bug, not a wire
+    /// event. The filing is refused rather than corrected: correcting it would
+    /// paper over a request that has already gone out on the wrong protocol,
+    /// while refusing leaves the id unrecorded and its response therefore
+    /// unaccepted.
     pub(crate) fn record(
         &mut self,
         key: OutboundKey,
         peer: PeerId,
         kind: OutboundRequestKind,
-    ) -> Result<(), RecordCollision> {
+    ) -> Result<(), RecordError> {
+        if kind.protocol() != key.domain.protocol() {
+            return Err(RecordError::DomainProtocolMismatch {
+                domain: key.domain.label(),
+                domain_protocol: key.domain.protocol(),
+                kind: kind.label(),
+                kind_protocol: kind.protocol(),
+            });
+        }
         use std::collections::hash_map::Entry;
         match self.slots.entry(key) {
             Entry::Vacant(v) => {
@@ -596,7 +702,11 @@ impl OutboundTracker {
                     first,
                     second,
                 }));
-                Err(RecordCollision { key, first, second })
+                Err(RecordError::Collision(RecordCollision {
+                    key,
+                    first,
+                    second,
+                }))
             }
         }
     }
@@ -693,7 +803,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use libp2p::request_response::{self, ProtocolSupport};
+    use libp2p::request_response;
 
     use crate::codec::{
         ShardRequest, ShardResponse, ShardResponseV2, ShardResponseVersioned, VersionedShardCodec,
@@ -704,22 +814,43 @@ mod tests {
     /// configured exactly as the swarm configures it. `send_request` to an
     /// unconnected peer queues a dial and returns the id, which is all we need.
     fn behaviour() -> request_response::Behaviour<VersionedShardCodec> {
-        request_response::Behaviour::with_codec(
-            VersionedShardCodec::default(),
-            [
-                (SHARD_XFER_PROTOCOL_V2.to_string(), ProtocolSupport::Full),
-                (SHARD_XFER_PROTOCOL_V1.to_string(), ProtocolSupport::Full),
-            ],
-            request_response::Config::default().with_request_timeout(Duration::from_secs(120)),
-        )
+        crate::behaviour::build_shard_xfer_v1()
     }
 
-    fn mint(b: &mut request_response::Behaviour<VersionedShardCodec>, peer: PeerId) -> OutboundKey {
+    fn behaviour_v2() -> request_response::Behaviour<VersionedShardCodec> {
+        crate::behaviour::build_shard_xfer_v2()
+    }
+
+    fn mint_in(
+        domain: RequestDomain,
+        b: &mut request_response::Behaviour<VersionedShardCodec>,
+        peer: PeerId,
+    ) -> OutboundKey {
         let id = b.send_request(
             &peer,
             crate::codec::ShardRequestVersioned::V1(chunk_request("placeholder")),
         );
-        OutboundKey::new(RequestDomain::ShardXfer, id)
+        OutboundKey::new(domain, id)
+    }
+
+    fn mint(b: &mut request_response::Behaviour<VersionedShardCodec>, peer: PeerId) -> OutboundKey {
+        mint_in(RequestDomain::ShardXferV1, b, peer)
+    }
+
+    fn mint_v2(
+        b: &mut request_response::Behaviour<VersionedShardCodec>,
+        peer: PeerId,
+    ) -> OutboundKey {
+        mint_in(RequestDomain::ShardXferV2, b, peer)
+    }
+
+    /// The domain the behaviour that would have sent this request belongs to.
+    fn domain_of(kind: &OutboundRequestKind) -> RequestDomain {
+        match kind.protocol() {
+            SHARD_XFER_PROTOCOL_V1 => RequestDomain::ShardXferV1,
+            SHARD_XFER_PROTOCOL_V2 => RequestDomain::ShardXferV2,
+            other => panic!("unknown protocol {other}"),
+        }
     }
 
     fn chunk_request(cid: &str) -> ShardRequest {
@@ -940,28 +1071,168 @@ mod tests {
         assert_eq!(t.len(), 0);
     }
 
-    /// `OutboundRequestId` is unique per behaviour, not per process. The key
-    /// carries the domain so that two behaviours minting the same raw id — which
-    /// is what WP-B's split makes routine — cannot take each other's records.
+    /// `OutboundRequestId` is unique per behaviour, not per process — and the
+    /// two shard behaviours are *both real* now, so this is not a hypothetical.
+    /// Two freshly-built behaviours mint the same raw id from their own
+    /// counters; the domain is what keeps their records apart.
     #[test]
     fn ids_are_namespaced_by_domain() {
         let peer = PeerId::random();
-        let mut b = behaviour();
+        let mut v1 = behaviour();
+        let mut v2 = behaviour_v2();
         let mut t = OutboundTracker::default();
 
-        let shard = mint(&mut b, peer);
-        let probe = OutboundKey::new(RequestDomain::SecondBehaviourProbe, shard.id);
-        assert_eq!(shard.id, probe.id, "same raw id, different behaviour");
-        assert_ne!(shard, probe);
-
-        t.record(shard, peer, manifest_pull_kind(&hex_a())).unwrap();
+        let a = mint(&mut v1, peer);
+        let b = mint_v2(&mut v2, peer);
         assert_eq!(
-            t.correlate_response(probe, peer, &v1_response(&manifest_cid(&hex_a())))
+            a.id, b.id,
+            "two behaviours mint the same raw id — both counters start at zero"
+        );
+        assert_ne!(a, b, "the domain is what distinguishes them");
+
+        t.record(a, peer, manifest_pull_kind(&hex_a())).unwrap();
+        assert_eq!(
+            t.correlate_response(b, peer, &v1_response(&manifest_cid(&hex_a())))
                 .unwrap_err(),
             CorrelationError::UnknownRequestId,
-            "one domain must not answer another domain's request id"
+            "one behaviour must not answer the other behaviour's request id"
         );
         assert_eq!(t.len(), 1, "the real record is untouched");
+
+        // Both may be outstanding at once under the same raw id.
+        t.record(
+            b,
+            peer,
+            OutboundRequestKind::V2ManifestPull {
+                merkle_root: ROOT_A,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            t.len(),
+            2,
+            "one raw id, two live records, one per behaviour"
+        );
+    }
+
+    /// The domain in the key and the protocol the request was written for are
+    /// stated one line apart at the same call site. If they disagree the
+    /// request went out on the wrong behaviour, and nothing is filed for it.
+    #[test]
+    fn a_request_filed_under_the_wrong_domain_is_refused() {
+        let peer = PeerId::random();
+        let mut v1 = behaviour();
+        let mut t = OutboundTracker::default();
+
+        // A V2 pull handed to the V1 behaviour's domain.
+        let key = mint(&mut v1, peer);
+        let err = t
+            .record(
+                key,
+                peer,
+                OutboundRequestKind::V2Pull {
+                    cid: "asked".into(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RecordError::DomainProtocolMismatch {
+                domain: "shard-xfer-v1",
+                domain_protocol: SHARD_XFER_PROTOCOL_V1,
+                kind: "v2-chunk-pull",
+                kind_protocol: SHARD_XFER_PROTOCOL_V2,
+            }
+        );
+        assert!(err.is_domain_protocol_mismatch());
+        assert_eq!(t.len(), 0, "nothing was filed");
+
+        // Fail-closed: the response to that request is unacceptable.
+        let resp = ShardResponseVersioned::V2(ShardResponseV2::Data {
+            cid: "asked".into(),
+            offset: 0,
+            total_bytes: 0,
+            data: Vec::new(),
+            error: None,
+        });
+        assert_eq!(
+            t.correlate_response(key, peer, &resp).unwrap_err(),
+            CorrelationError::UnknownRequestId
+        );
+    }
+
+    /// The mirror image: a V1 request filed under the V2 domain.
+    #[test]
+    fn a_v1_request_filed_under_the_v2_domain_is_refused() {
+        let peer = PeerId::random();
+        let mut v2 = behaviour_v2();
+        let mut t = OutboundTracker::default();
+
+        let key = mint_v2(&mut v2, peer);
+        let err = t
+            .record(key, peer, manifest_pull_kind(&hex_a()))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RecordError::DomainProtocolMismatch {
+                domain: "shard-xfer-v2",
+                domain_protocol: SHARD_XFER_PROTOCOL_V2,
+                kind: "v1-manifest-pull",
+                kind_protocol: SHARD_XFER_PROTOCOL_V1,
+            }
+        );
+        assert_eq!(t.len(), 0, "nothing was filed");
+    }
+
+    /// Every domain agrees with the protocol of every kind that belongs to it,
+    /// so the guard above never fires on correctly-routed traffic.
+    #[test]
+    fn each_domain_accepts_exactly_its_own_protocols_kinds() {
+        let peer = PeerId::random();
+        let mut v1 = behaviour();
+        let mut v2 = behaviour_v2();
+        let mut t = OutboundTracker::default();
+
+        for kind in all_kinds() {
+            let domain = domain_of(&kind);
+            let key = match domain {
+                RequestDomain::ShardXferV1 => mint(&mut v1, peer),
+                RequestDomain::ShardXferV2 => mint_v2(&mut v2, peer),
+            };
+            t.record(key, peer, kind.clone())
+                .unwrap_or_else(|e| panic!("{kind:?} must file under {domain:?}: {e}"));
+
+            let wrong = OutboundKey::new(
+                match domain {
+                    RequestDomain::ShardXferV1 => RequestDomain::ShardXferV2,
+                    RequestDomain::ShardXferV2 => RequestDomain::ShardXferV1,
+                },
+                key.id,
+            );
+            assert!(
+                t.record(wrong, peer, kind.clone()).is_err(),
+                "{kind:?} must not file under the other domain"
+            );
+        }
+    }
+
+    fn all_kinds() -> Vec<OutboundRequestKind> {
+        vec![
+            OutboundRequestKind::V1Chunk { cid: "c".into() },
+            OutboundRequestKind::V1Push { cid: "c".into() },
+            manifest_pull_kind(&hex_a()),
+            OutboundRequestKind::V2Pull { cid: "c".into() },
+            OutboundRequestKind::V2Push {
+                merkle_root: ROOT_A,
+                chunk_index: 3,
+            },
+            OutboundRequestKind::V2ManifestPush {
+                merkle_root: ROOT_A,
+            },
+            OutboundRequestKind::V2ManifestPull {
+                merkle_root: ROOT_A,
+            },
+        ]
     }
 
     // ── Shape and subject matching ───────────────────────────────────────
@@ -991,9 +1262,9 @@ mod tests {
     #[test]
     fn a_v2_manifest_pull_answered_with_a_push_ack_is_refused() {
         let peer = PeerId::random();
-        let mut b = behaviour();
+        let mut b = behaviour_v2();
         let mut t = OutboundTracker::default();
-        let key = mint(&mut b, peer);
+        let key = mint_v2(&mut b, peer);
 
         t.record(
             key,
@@ -1019,9 +1290,9 @@ mod tests {
     #[test]
     fn a_v2_manifest_pull_answered_for_another_root_is_refused() {
         let peer = PeerId::random();
-        let mut b = behaviour();
+        let mut b = behaviour_v2();
         let mut t = OutboundTracker::default();
-        let key = mint(&mut b, peer);
+        let key = mint_v2(&mut b, peer);
 
         t.record(
             key,
@@ -1048,9 +1319,9 @@ mod tests {
     #[test]
     fn a_push_ack_for_another_chunk_index_is_refused() {
         let peer = PeerId::random();
-        let mut b = behaviour();
+        let mut b = behaviour_v2();
         let mut t = OutboundTracker::default();
-        let key = mint(&mut b, peer);
+        let key = mint_v2(&mut b, peer);
 
         t.record(
             key,
@@ -1078,9 +1349,9 @@ mod tests {
     #[test]
     fn a_v2_pull_answered_for_another_cid_is_refused() {
         let peer = PeerId::random();
-        let mut b = behaviour();
+        let mut b = behaviour_v2();
         let mut t = OutboundTracker::default();
-        let key = mint(&mut b, peer);
+        let key = mint_v2(&mut b, peer);
 
         t.record(
             key,
@@ -1111,7 +1382,8 @@ mod tests {
     #[test]
     fn every_request_kind_accepts_its_own_response() {
         let peer = PeerId::random();
-        let mut b = behaviour();
+        let mut v1 = behaviour();
+        let mut v2 = behaviour_v2();
         let mut t = OutboundTracker::default();
 
         let pairs: Vec<(OutboundRequestKind, ShardResponseVersioned)> = vec![
@@ -1170,7 +1442,12 @@ mod tests {
         ];
 
         for (kind, resp) in pairs {
-            let key = mint(&mut b, peer);
+            // Mint from the behaviour that would really have sent it, so the
+            // domain the record is filed under is the one production would use.
+            let key = match domain_of(&kind) {
+                RequestDomain::ShardXferV1 => mint(&mut v1, peer),
+                RequestDomain::ShardXferV2 => mint_v2(&mut v2, peer),
+            };
             t.record(key, peer, kind.clone()).unwrap();
             assert!(
                 t.correlate_response(key, peer, &resp).is_ok(),
@@ -1366,6 +1643,9 @@ mod tests {
                 },
             )
             .unwrap_err();
+        let RecordError::Collision(err) = err else {
+            panic!("a reused id is a collision, not a routing error: {err}");
+        };
         assert_eq!(err.first, "v1-manifest-pull");
         assert_eq!(err.second, "v1-chunk-pull");
         assert_eq!(t.poisoned_len(), 1, "the key must be poisoned");

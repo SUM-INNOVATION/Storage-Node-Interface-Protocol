@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -9,7 +9,7 @@ use libp2p::{
     identity::Keypair,
     kad, mdns,
     multiaddr::Protocol,
-    request_response::{self, ProtocolSupport, ResponseChannel},
+    request_response::{self, ResponseChannel},
     swarm::SwarmEvent,
 };
 use tokio::sync::mpsc;
@@ -18,11 +18,12 @@ use tracing::{debug, error, info, warn};
 use sum_types::config::NetConfig;
 
 use crate::{
-    behaviour::{LocalMeshBehaviour, LocalMeshBehaviourEvent},
+    behaviour::{
+        LocalMeshBehaviour, LocalMeshBehaviourEvent, build_shard_xfer_v1, build_shard_xfer_v2,
+    },
     codec::{
-        SHARD_XFER_PROTOCOL_V1, SHARD_XFER_PROTOCOL_V2, ShardRequest, ShardRequestV2,
-        ShardRequestVersioned, ShardResponse, ShardResponseV2, ShardResponseVersioned,
-        VersionedShardCodec,
+        ShardRequest, ShardRequestV2, ShardRequestVersioned, ShardResponse, ShardResponseV2,
+        ShardResponseVersioned,
     },
     correlation::{
         FailureOutcome, OUTBOUND_RECORD_TTL, OutboundKey, OutboundOrigin, OutboundRequestKind,
@@ -46,16 +47,28 @@ const REAPER_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Commands sent from the [`crate::SumNet`] handle into the running swarm loop.
 ///
-/// V1 and V2 outbound paths each get their own command variant; the
-/// libp2p `request_response::Behaviour` underneath is shared and the
-/// negotiated protocol is decided per-stream by libp2p (V2 preferred
-/// when both peers register both protocols).
+/// V1 and V2 outbound paths each get their own command variant **and their own
+/// behaviour**. There is no shared behaviour and no negotiation between the
+/// versions: [`SwarmCommand::RequestShard`] is routed to
+/// `LocalMeshBehaviour::shard_xfer_v1`, which advertises `/sum/storage/v1` and
+/// nothing else, and every V2 command is routed to `shard_xfer_v2`, which
+/// advertises `/sum/storage/v2` and nothing else. See [`crate::behaviour`].
+///
+/// There is deliberately **no outbound V1 push command**. V1 push was
+/// unauthenticated and unauthorized; it is retired, and its absence here is
+/// what makes "no V1-push fallback" a property of the type rather than of a
+/// convention. Pushes go out as [`SwarmCommand::RequestShardV2`] carrying
+/// `ShardRequestV2::Push` or `ShardRequestV2::ManifestPush`.
 #[derive(Debug)]
 pub enum SwarmCommand {
     /// Publish bytes to a named Gossipsub topic.
     Publish { topic: String, data: Vec<u8> },
 
-    /// Send a V1 chunk request to a remote peer.
+    /// Send a V1 **pull** to a remote peer, on the V1-only behaviour.
+    ///
+    /// This is the path that keeps V1-only peers reachable: the request
+    /// carries `/sum/storage/v1` alone, so a peer that speaks only V1
+    /// negotiates it, and a peer that speaks both does too.
     RequestShard {
         peer_id: PeerId,
         request: ShardRequest,
@@ -68,25 +81,19 @@ pub enum SwarmCommand {
         request: ShardRequestV2,
     },
 
-    /// Push a V1 chunk to a remote peer using a shared, ref-counted buffer.
+    /// Send a V1 response on a channel that arrived on the **V1** behaviour.
     ///
-    /// Multiple replicas can share the same `Arc<[u8]>` payload — the
-    /// command channel only buffers cheap pointer clones, not full copies
-    /// of the chunk. The `Vec<u8>` materialization happens once, in the
-    /// command handler, immediately before libp2p serializes the request.
-    PushShard {
-        peer_id: PeerId,
-        cid: String,
-        data: Arc<[u8]>,
-    },
-
-    /// Send a V1 response on a stored V1 response channel.
+    /// Both behaviours yield `ResponseChannel<ShardResponseVersioned>`, the
+    /// same Rust type, so the type system cannot tell them apart. The pending
+    /// map records which behaviour each channel came from and this command is
+    /// refused on a V2 channel — see [`take_channel`].
     SendShardResponse {
         channel_id: u64,
         response: ShardResponse,
     },
 
-    /// Send a V2 response on a stored V2 response channel.
+    /// Send a V2 response on a channel that arrived on the **V2** behaviour.
+    /// Refused on a V1 channel, for the reason above.
     SendShardResponseV2 {
         channel_id: u64,
         response: ShardResponseV2,
@@ -94,6 +101,98 @@ pub enum SwarmCommand {
 
     /// Exit the event loop cleanly.
     Shutdown,
+}
+
+// ── Response-channel provenance ──────────────────────────────────────────────
+
+/// A response channel, together with the behaviour it arrived on.
+///
+/// `request_response::Behaviour<VersionedShardCodec>` is instantiated twice —
+/// once per protocol — so both behaviours hand back the *same Rust type*,
+/// `ResponseChannel<ShardResponseVersioned>`. Nothing in that type records
+/// which behaviour minted it, and handing a channel back to the wrong
+/// behaviour is not a compile error: `send_response` takes it, fails to find
+/// the matching inbound request in its own table, and returns the response as
+/// an `Err` that reads exactly like a closed connection. The peer waits out the
+/// 120s timeout.
+///
+/// So provenance is recorded here, at the one point where it is still known,
+/// and checked at every respond path.
+///
+/// Generic over the channel type only so the domain check can be unit-tested
+/// without a live swarm; production always uses
+/// `PendingChannel<ResponseChannel<ShardResponseVersioned>>`.
+#[derive(Debug)]
+pub(crate) struct PendingChannel<C> {
+    /// The behaviour this channel arrived on. The respond path must match.
+    pub(crate) domain: RequestDomain,
+    pub(crate) channel: C,
+}
+
+/// The outcome of asking for a pending channel in a particular domain.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ChannelTake<C> {
+    /// The channel was filed under the requested domain and is now yours.
+    Taken(C),
+    /// A channel exists under this id, but it came from the other behaviour.
+    /// It is **left in place** — the domain that owns it may still answer on
+    /// it, and the reaper will collect it if nobody does.
+    WrongDomain { have: RequestDomain },
+    /// No channel under this id: already answered, or already reaped.
+    Missing,
+}
+
+/// Take the channel filed under `channel_id`, but only if it came from the
+/// behaviour named by `want`.
+///
+/// The mismatch case does not remove the entry. Removing it would convert a
+/// caller's routing bug into a silently dropped inbound request; leaving it
+/// means the correct responder can still answer, and the refusal is counted.
+pub(crate) fn take_channel<C>(
+    map: &mut HashMap<u64, (PendingChannel<C>, Instant)>,
+    channel_id: u64,
+    want: RequestDomain,
+) -> ChannelTake<C> {
+    match map.get(&channel_id) {
+        None => ChannelTake::Missing,
+        Some((pending, _)) if pending.domain != want => ChannelTake::WrongDomain {
+            have: pending.domain,
+        },
+        Some(_) => {
+            let (pending, _) = map.remove(&channel_id).expect("checked immediately above");
+            ChannelTake::Taken(pending.channel)
+        }
+    }
+}
+
+// ── Refusal telemetry ────────────────────────────────────────────────────────
+
+/// Counts of refusals the swarm made, as **fixed struct fields**.
+///
+/// Deliberately not a map keyed by anything. Every field below is one line of
+/// code in this file; a labelled counter would let a remote peer, a CID, or a
+/// protocol string it chose become a metric key, and an attacker who can name
+/// the key can grow the metric set without bound. Fixed fields make the
+/// cardinality of this telemetry a property of the source.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SwarmRefusals {
+    /// A V1 response was offered for a channel that arrived on the V2
+    /// behaviour.
+    pub v1_response_on_v2_channel: u64,
+    /// A V2 response was offered for a channel that arrived on the V1
+    /// behaviour.
+    pub v2_response_on_v1_channel: u64,
+    /// A response was offered for a channel id with no pending channel.
+    pub response_without_channel: u64,
+    /// An outbound request's recorded kind disagreed with the domain it was
+    /// filed under — a routing bug; the request is left unrecorded.
+    pub outbound_domain_protocol_mismatch: u64,
+    /// Two outbound requests claimed one key; both were abandoned.
+    pub outbound_id_collision: u64,
+    /// An inbound request whose payload version did not match the protocol
+    /// its behaviour speaks. Structurally impossible; counted so that
+    /// "impossible" stays observable.
+    pub inbound_version_domain_mismatch: u64,
 }
 
 // ── SumSwarm ─────────────────────────────────────────────────────────────────
@@ -104,14 +203,19 @@ pub struct SumSwarm {
     inner: libp2p::Swarm<LocalMeshBehaviour>,
     gossip: GossipManager,
 
-    /// Stores response channels received from inbound chunk requests,
-    /// together with the insertion time so orphaned entries can be reaped.
-    /// One map for both V1 and V2 since `request_response::Behaviour` is
-    /// codec-agnostic at the channel level — the channel is typed as
-    /// `ResponseChannel<ShardResponseVersioned>` and the V1/V2 wrap
-    /// happens in the [`SwarmCommand::SendShardResponse`] /
-    /// [`SwarmCommand::SendShardResponseV2`] handlers.
-    pending_shard_channels: HashMap<u64, (ResponseChannel<ShardResponseVersioned>, Instant)>,
+    /// Response channels from inbound shard requests, each tagged with the
+    /// behaviour it arrived on and the time it was filed.
+    ///
+    /// One map for both behaviours, because a channel id is allocated here and
+    /// is unique across both. The [`RequestDomain`] in each entry is what the
+    /// shared Rust type cannot carry — see [`PendingChannel`].
+    pending_shard_channels: HashMap<
+        u64,
+        (
+            PendingChannel<ResponseChannel<ShardResponseVersioned>>,
+            Instant,
+        ),
+    >,
 
     /// Monotonic counter for channel IDs.
     next_channel_id: u64,
@@ -119,8 +223,13 @@ pub struct SumSwarm {
     /// Identity of every outbound chunk request still awaiting a terminal
     /// event, recorded from the request this node built. A response is only
     /// surfaced to the upper layer if it matches the record filed under its
-    /// request id — see [`crate::correlation`].
+    /// request id — see [`crate::correlation`]. Keyed by
+    /// `(RequestDomain, OutboundRequestId)` because the two shard behaviours
+    /// mint colliding raw ids.
     outbound: OutboundTracker,
+
+    /// Fixed-cardinality refusal counters. See [`SwarmRefusals`].
+    refusals: SwarmRefusals,
 
     /// Candidate relay peers indexed by peer id. Seeded from
     /// `--bootstrap-peer` (with `confirmed: false`) and promoted to
@@ -209,25 +318,14 @@ impl SumSwarm {
                         key.public(),
                     ));
 
-                    // Register V2 first so libp2p prefers V2 when both peers
-                    // support both protocols. Order matters here: libp2p's
-                    // request_response negotiation picks the FIRST protocol
-                    // mutually supported in the iterator order. V1 stays
-                    // listed (Full) so legacy peers continue to flow.
-                    //
-                    // Both protocols share one `VersionedShardCodec` instance
-                    // — the codec dispatches on the negotiated protocol name
-                    // passed to each `read_*`/`write_*` call. See
-                    // `crate::codec::VersionedShardCodec`.
-                    let shard_xfer = request_response::Behaviour::with_codec(
-                        VersionedShardCodec::default(),
-                        [
-                            (SHARD_XFER_PROTOCOL_V2.to_string(), ProtocolSupport::Full),
-                            (SHARD_XFER_PROTOCOL_V1.to_string(), ProtocolSupport::Full),
-                        ],
-                        request_response::Config::default()
-                            .with_request_timeout(Duration::from_secs(120)),
-                    );
+                    // Two behaviours, one protocol each. `send_request`
+                    // attaches every protocol its behaviour was registered
+                    // with to every request, so a single behaviour carrying
+                    // both protocols cannot be asked to speak one of them —
+                    // the version has to be a choice of behaviour. See
+                    // `crate::behaviour` for the full argument.
+                    let shard_xfer_v1 = build_shard_xfer_v1();
+                    let shard_xfer_v2 = build_shard_xfer_v2();
 
                     let kademlia = discovery::build_kademlia(local_peer_id);
                     let autonat = nat::build_autonat(local_peer_id);
@@ -238,7 +336,8 @@ impl SumSwarm {
                         mdns,
                         gossipsub: gossipsub_behaviour,
                         identify,
-                        shard_xfer,
+                        shard_xfer_v1,
+                        shard_xfer_v2,
                         kademlia,
                         autonat,
                         relay,
@@ -274,6 +373,7 @@ impl SumSwarm {
             pending_shard_channels: HashMap::new(),
             next_channel_id: 0,
             outbound: OutboundTracker::default(),
+            refusals: SwarmRefusals::default(),
             relay_peers: HashMap::new(),
             nat_status: nat::NatStatus::Unknown,
             active_relay_reservation: nat::RelayReservationState::None,
@@ -378,83 +478,89 @@ impl SumSwarm {
                             }
                         }
                         Some(SwarmCommand::RequestShard { peer_id, request }) => {
+                            // Explicit V1 routing. The V1 behaviour advertises
+                            // `/sum/storage/v1` alone, so this negotiates V1
+                            // against a V1-only peer and against a dual peer
+                            // alike — which is what keeps V1 pull working now
+                            // that V2 is no longer preferred on a shared list.
+                            //
                             // Classify before the request is moved into libp2p:
                             // this is the last point at which the locally-built
                             // request is in hand.
                             let kind = OutboundRequestKind::from_v1(&request);
-                            let id = self.inner.behaviour_mut().shard_xfer
+                            let id = self.inner.behaviour_mut().shard_xfer_v1
                                 .send_request(&peer_id, ShardRequestVersioned::V1(request));
-                            if let Err(e) = self.outbound.record(
-                                OutboundKey::new(RequestDomain::ShardXfer, id),
-                                peer_id,
-                                kind,
-                            ) {
-                                error!(%peer_id, %e, "outbound request identity collision — key poisoned, both requests abandoned");
-                            }
+                            self.record_outbound(RequestDomain::ShardXferV1, id, peer_id, kind);
                         }
                         Some(SwarmCommand::RequestShardV2 { peer_id, request }) => {
+                            // Explicit V2 routing for every V2 operation —
+                            // Pull, Push, ManifestPush, ManifestPull all leave
+                            // on the V2-only behaviour.
                             let kind = OutboundRequestKind::from_v2(&request);
-                            let id = self.inner.behaviour_mut().shard_xfer
+                            let id = self.inner.behaviour_mut().shard_xfer_v2
                                 .send_request(&peer_id, ShardRequestVersioned::V2(request));
-                            if let Err(e) = self.outbound.record(
-                                OutboundKey::new(RequestDomain::ShardXfer, id),
-                                peer_id,
-                                kind,
-                            ) {
-                                error!(%peer_id, %e, "outbound request identity collision — key poisoned, both requests abandoned");
-                            }
-                        }
-                        Some(SwarmCommand::PushShard { peer_id, cid, data }) => {
-                            // Materialize the Vec<u8> exactly once, here at
-                            // the libp2p hand-off. The Arc<[u8]> may have been
-                            // cloned R times upstream, but those clones share
-                            // a single backing buffer until this point.
-                            //
-                            // V1 push path — V2 callers use
-                            // `RequestShardV2 { request: ShardRequestV2::Push { … } }`
-                            // which carries the Merkle proof inline.
-                            let request = ShardRequest {
-                                cid,
-                                offset: None,
-                                max_bytes: None,
-                                push_data: Some(data.to_vec()),
-                            };
-                            let kind = OutboundRequestKind::from_v1(&request);
-                            let id = self.inner.behaviour_mut().shard_xfer
-                                .send_request(&peer_id, ShardRequestVersioned::V1(request));
-                            if let Err(e) = self.outbound.record(
-                                OutboundKey::new(RequestDomain::ShardXfer, id),
-                                peer_id,
-                                kind,
-                            ) {
-                                error!(%peer_id, %e, "outbound request identity collision — key poisoned, both requests abandoned");
-                            }
+                            self.record_outbound(RequestDomain::ShardXferV2, id, peer_id, kind);
                         }
                         Some(SwarmCommand::SendShardResponse { channel_id, response }) => {
-                            if let Some((channel, _inserted)) = self.pending_shard_channels.remove(&channel_id) {
-                                let cid_for_log = response.cid.clone();
-                                if let Err(resp) = self.inner.behaviour_mut().shard_xfer
-                                    .send_response(channel, ShardResponseVersioned::V1(response))
-                                {
-                                    let resp_cid = match &resp {
-                                        ShardResponseVersioned::V1(r) => r.cid.as_str(),
-                                        ShardResponseVersioned::V2(_) => "<V2 response on V1 path?>",
-                                    };
-                                    warn!(cid = %cid_for_log, returned_cid = %resp_cid, "failed to send V1 chunk response — channel closed");
+                            let cid_for_log = response.cid.clone();
+                            match take_channel(
+                                &mut self.pending_shard_channels,
+                                channel_id,
+                                RequestDomain::ShardXferV1,
+                            ) {
+                                ChannelTake::Taken(channel) => {
+                                    if let Err(resp) = self.inner.behaviour_mut().shard_xfer_v1
+                                        .send_response(channel, ShardResponseVersioned::V1(response))
+                                    {
+                                        let resp_cid = match &resp {
+                                            ShardResponseVersioned::V1(r) => r.cid.as_str(),
+                                            ShardResponseVersioned::V2(_) => "<V2 response on V1 path?>",
+                                        };
+                                        warn!(cid = %cid_for_log, returned_cid = %resp_cid, "failed to send V1 chunk response — channel closed");
+                                    }
                                 }
-                            } else {
-                                warn!(channel_id, "no pending channel for V1 chunk response");
+                                ChannelTake::WrongDomain { have } => {
+                                    self.refusals.v1_response_on_v2_channel += 1;
+                                    error!(
+                                        channel_id,
+                                        cid = %cid_for_log,
+                                        channel_domain = have.label(),
+                                        "refused: V1 response offered for a channel that arrived on \
+                                         the V2 behaviour — the channel is left for its own domain"
+                                    );
+                                }
+                                ChannelTake::Missing => {
+                                    self.refusals.response_without_channel += 1;
+                                    warn!(channel_id, "no pending channel for V1 chunk response");
+                                }
                             }
                         }
                         Some(SwarmCommand::SendShardResponseV2 { channel_id, response }) => {
-                            if let Some((channel, _inserted)) = self.pending_shard_channels.remove(&channel_id) {
-                                if self.inner.behaviour_mut().shard_xfer
-                                    .send_response(channel, ShardResponseVersioned::V2(response)).is_err()
-                                {
-                                    warn!(channel_id, "failed to send V2 response — channel closed");
+                            match take_channel(
+                                &mut self.pending_shard_channels,
+                                channel_id,
+                                RequestDomain::ShardXferV2,
+                            ) {
+                                ChannelTake::Taken(channel) => {
+                                    if self.inner.behaviour_mut().shard_xfer_v2
+                                        .send_response(channel, ShardResponseVersioned::V2(response)).is_err()
+                                    {
+                                        warn!(channel_id, "failed to send V2 response — channel closed");
+                                    }
                                 }
-                            } else {
-                                warn!(channel_id, "no pending channel for V2 response");
+                                ChannelTake::WrongDomain { have } => {
+                                    self.refusals.v2_response_on_v1_channel += 1;
+                                    error!(
+                                        channel_id,
+                                        channel_domain = have.label(),
+                                        "refused: V2 response offered for a channel that arrived on \
+                                         the V1 behaviour — the channel is left for its own domain"
+                                    );
+                                }
+                                ChannelTake::Missing => {
+                                    self.refusals.response_without_channel += 1;
+                                    warn!(channel_id, "no pending channel for V2 response");
+                                }
                             }
                         }
                         Some(SwarmCommand::Shutdown) | None => {
@@ -495,6 +601,263 @@ impl SumSwarm {
                 remaining = self.outbound.len(),
                 "outbound request records expired without a terminal event"
             );
+        }
+    }
+
+    /// Snapshot of the fixed-field refusal counters.
+    pub fn refusals(&self) -> SwarmRefusals {
+        self.refusals
+    }
+
+    /// File an outbound request under the domain of the behaviour that sent it.
+    ///
+    /// One helper for both routes so the domain and the behaviour are chosen on
+    /// adjacent lines at each call site, and so the two refusal counters are
+    /// incremented in one place.
+    fn record_outbound(
+        &mut self,
+        domain: RequestDomain,
+        id: request_response::OutboundRequestId,
+        peer_id: PeerId,
+        kind: OutboundRequestKind,
+    ) {
+        let label = kind.label();
+        if let Err(e) = self
+            .outbound
+            .record(OutboundKey::new(domain, id), peer_id, kind)
+        {
+            if e.is_domain_protocol_mismatch() {
+                self.refusals.outbound_domain_protocol_mismatch += 1;
+                error!(%peer_id, %e, asked = label, "outbound request routed to the wrong behaviour — not recorded");
+            } else {
+                self.refusals.outbound_id_collision += 1;
+                error!(%peer_id, %e, "outbound request identity collision — key poisoned, both requests abandoned");
+            }
+        }
+    }
+
+    /// Handle one request-response event from either shard behaviour.
+    ///
+    /// `domain` names which behaviour it came from. Everything version-specific
+    /// downstream — the outbound key, the channel provenance, the refusal
+    /// counters — is derived from it rather than from anything on the wire.
+    fn on_shard_event(
+        &mut self,
+        domain: RequestDomain,
+        event: request_response::Event<ShardRequestVersioned, ShardResponseVersioned>,
+        event_tx: &mpsc::Sender<SumNetEvent>,
+    ) {
+        match event {
+            request_response::Event::Message { peer, message, .. } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => self.on_inbound_request(domain, peer, request, channel, event_tx),
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => self.on_inbound_response(domain, peer, request_id, response, event_tx),
+            },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => self.on_outbound_failure(domain, peer, request_id, &error, event_tx),
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                debug!(%peer, %error, protocol = domain.protocol(), "chunk request inbound failure");
+            }
+            request_response::Event::ResponseSent { peer, .. } => {
+                debug!(%peer, protocol = domain.protocol(), "chunk response sent");
+            }
+        }
+    }
+
+    fn on_inbound_request(
+        &mut self,
+        domain: RequestDomain,
+        peer: PeerId,
+        request: ShardRequestVersioned,
+        channel: ResponseChannel<ShardResponseVersioned>,
+        event_tx: &mpsc::Sender<SumNetEvent>,
+    ) {
+        // The codec decodes on the negotiated protocol name and each behaviour
+        // negotiates exactly one protocol, so the payload version and the
+        // domain cannot disagree. Check anyway: if they ever do, the channel is
+        // dropped here rather than filed under a domain that would refuse to
+        // answer on it, which would leave the peer waiting out the timeout.
+        let versions_agree = matches!(
+            (domain, &request),
+            (RequestDomain::ShardXferV1, ShardRequestVersioned::V1(_))
+                | (RequestDomain::ShardXferV2, ShardRequestVersioned::V2(_))
+        );
+        if !versions_agree {
+            self.refusals.inbound_version_domain_mismatch += 1;
+            error!(
+                %peer,
+                behaviour = domain.label(),
+                "inbound request version does not match the behaviour it arrived on — dropped"
+            );
+            drop(channel);
+            return;
+        }
+
+        let channel_id = self.next_channel_id;
+        self.next_channel_id += 1;
+        self.pending_shard_channels.insert(
+            channel_id,
+            (PendingChannel { domain, channel }, Instant::now()),
+        );
+
+        match request {
+            ShardRequestVersioned::V1(req) => {
+                info!(%peer, cid = %req.cid, channel_id, "inbound V1 chunk request");
+                if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequested {
+                    peer_id: peer,
+                    request: req,
+                    channel_id,
+                }) {
+                    self.pending_shard_channels.remove(&channel_id);
+                    warn!(%e, channel_id, "event channel full — dropping V1 ShardRequested and cleaning up pending channel");
+                }
+            }
+            ShardRequestVersioned::V2(req) => {
+                info!(%peer, channel_id, kind = v2_request_kind(&req), "inbound V2 chunk request");
+                if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequestedV2 {
+                    peer_id: peer,
+                    request: req,
+                    channel_id,
+                }) {
+                    self.pending_shard_channels.remove(&channel_id);
+                    warn!(%e, channel_id, "event channel full — dropping V2 ShardRequested and cleaning up pending channel");
+                }
+            }
+        }
+    }
+
+    fn on_inbound_response(
+        &mut self,
+        domain: RequestDomain,
+        peer: PeerId,
+        request_id: request_response::OutboundRequestId,
+        response: ShardResponseVersioned,
+        event_tx: &mpsc::Sender<SumNetEvent>,
+    ) {
+        // Correlate before anything else looks at the payload. The response is
+        // matched against the request record filed under this id **in this
+        // domain** — the raw id alone is ambiguous across the two behaviours.
+        let key = OutboundKey::new(domain, request_id);
+        let origin = match self.outbound.correlate_response(key, peer, &response) {
+            Ok(origin) => origin,
+            Err(e) => {
+                warn!(
+                    %peer,
+                    %request_id,
+                    behaviour = domain.label(),
+                    error = %e,
+                    "uncorrelated chunk response rejected — dropped before dispatch"
+                );
+                return;
+            }
+        };
+
+        match response {
+            ShardResponseVersioned::V1(resp) => {
+                info!(
+                    %peer,
+                    cid = %resp.cid,
+                    offset = resp.offset,
+                    bytes = resp.data.len(),
+                    asked = origin.kind().label(),
+                    "V1 chunk data received"
+                );
+                if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceived {
+                    peer_id: peer,
+                    response: resp,
+                    origin,
+                }) {
+                    warn!(%e, "event channel full — dropping V1 ShardReceived");
+                }
+            }
+            ShardResponseVersioned::V2(resp) => {
+                info!(
+                    %peer,
+                    kind = v2_response_kind(&resp),
+                    asked = origin.kind().label(),
+                    "V2 response received"
+                );
+                if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceivedV2 {
+                    peer_id: peer,
+                    response: resp,
+                    origin,
+                }) {
+                    warn!(%e, "event channel full — dropping V2 ShardReceived");
+                }
+            }
+        }
+    }
+
+    fn on_outbound_failure(
+        &mut self,
+        domain: RequestDomain,
+        peer: PeerId,
+        request_id: request_response::OutboundRequestId,
+        error: &request_response::OutboundFailure,
+        event_tx: &mpsc::Sender<SumNetEvent>,
+    ) {
+        // Terminal for this request id: drop the retained record so the pending
+        // set stays bounded and the id cannot later be matched.
+        let key = OutboundKey::new(domain, request_id);
+        let (asked_peer, kind) = match self.outbound.on_failure(key) {
+            FailureOutcome::Retained { peer, kind } => (peer, kind),
+            FailureOutcome::Unknown => {
+                // No record: we cannot say which request this failure is about.
+                // Emitting a peer-only failure would invite a consumer to settle
+                // every request outstanding to this peer, so it is logged and
+                // dropped instead.
+                warn!(
+                    %peer,
+                    %request_id,
+                    behaviour = domain.label(),
+                    %error,
+                    "outbound failure for an untracked request id — not surfaced"
+                );
+                return;
+            }
+            FailureOutcome::Poisoned => {
+                error!(
+                    %peer,
+                    %request_id,
+                    behaviour = domain.label(),
+                    %error,
+                    "outbound failure for a poisoned request id — not surfaced"
+                );
+                return;
+            }
+        };
+
+        // The failure event carries a peer too. It must agree with the one
+        // recorded at send time; a disagreement means the event cannot be
+        // attributed and is dropped rather than guessed at.
+        if asked_peer != peer {
+            warn!(
+                %request_id,
+                expected = %asked_peer,
+                got = %peer,
+                %error,
+                "outbound failure peer mismatch — not surfaced"
+            );
+            return;
+        }
+
+        warn!(%peer, %error, asked = kind.label(), "chunk request outbound failure");
+        // Every field of the event comes from the outbound record.
+        let origin = OutboundOrigin::new(asked_peer, kind);
+        if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequestFailed {
+            peer_id: origin.peer(),
+            error: error.to_string(),
+            origin,
+        }) {
+            warn!(%e, "event channel full — dropping ShardRequestFailed");
         }
     }
 
@@ -683,177 +1046,16 @@ impl SumSwarm {
 
             // ── Chunk transfer ────────────────────────────────────────────────
             //
-            // V1 and V2 streams share the underlying behaviour but emit
-            // distinct domain events so the call-site match is exhaustive
-            // and per-version dispatch (PushValidator, AssignmentAttestor
-            // for V2) can stay typed.
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
-                request_response::Event::Message { peer, message, .. },
-            )) => match message {
-                request_response::Message::Request {
-                    request, channel, ..
-                } => {
-                    let channel_id = self.next_channel_id;
-                    self.next_channel_id += 1;
-                    self.pending_shard_channels
-                        .insert(channel_id, (channel, Instant::now()));
-                    match request {
-                        ShardRequestVersioned::V1(req) => {
-                            info!(%peer, cid = %req.cid, channel_id, "inbound V1 chunk request");
-                            if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequested {
-                                peer_id: peer,
-                                request: req,
-                                channel_id,
-                            }) {
-                                self.pending_shard_channels.remove(&channel_id);
-                                warn!(%e, channel_id, "event channel full — dropping V1 ShardRequested and cleaning up pending channel");
-                            }
-                        }
-                        ShardRequestVersioned::V2(req) => {
-                            info!(%peer, channel_id, kind = v2_request_kind(&req), "inbound V2 chunk request");
-                            if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequestedV2 {
-                                peer_id: peer,
-                                request: req,
-                                channel_id,
-                            }) {
-                                self.pending_shard_channels.remove(&channel_id);
-                                warn!(%e, channel_id, "event channel full — dropping V2 ShardRequested and cleaning up pending channel");
-                            }
-                        }
-                    }
-                }
-                request_response::Message::Response {
-                    request_id,
-                    response,
-                } => {
-                    // Correlate before anything else looks at the payload. The
-                    // response is matched against the request record filed under
-                    // this id at send time; a mismatch is dropped here and never
-                    // becomes a domain event.
-                    let key = OutboundKey::new(RequestDomain::ShardXfer, request_id);
-                    let origin = match self.outbound.correlate_response(key, peer, &response) {
-                        Ok(origin) => origin,
-                        Err(e) => {
-                            warn!(
-                                %peer,
-                                %request_id,
-                                error = %e,
-                                "uncorrelated chunk response rejected — dropped before dispatch"
-                            );
-                            return;
-                        }
-                    };
-
-                    match response {
-                        ShardResponseVersioned::V1(resp) => {
-                            info!(
-                                %peer,
-                                cid = %resp.cid,
-                                offset = resp.offset,
-                                bytes = resp.data.len(),
-                                asked = origin.kind().label(),
-                                "V1 chunk data received"
-                            );
-                            if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceived {
-                                peer_id: peer,
-                                response: resp,
-                                origin,
-                            }) {
-                                warn!(%e, "event channel full — dropping V1 ShardReceived");
-                            }
-                        }
-                        ShardResponseVersioned::V2(resp) => {
-                            info!(
-                                %peer,
-                                kind = v2_response_kind(&resp),
-                                asked = origin.kind().label(),
-                                "V2 response received"
-                            );
-                            if let Err(e) = event_tx.try_send(SumNetEvent::ShardReceivedV2 {
-                                peer_id: peer,
-                                response: resp,
-                                origin,
-                            }) {
-                                warn!(%e, "event channel full — dropping V2 ShardReceived");
-                            }
-                        }
-                    }
-                }
-            },
-
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
-                request_response::Event::OutboundFailure {
-                    peer,
-                    request_id,
-                    error,
-                    ..
-                },
-            )) => {
-                // Terminal for this request id: drop the retained record so the
-                // pending set stays bounded and the id cannot later be matched.
-                let key = OutboundKey::new(RequestDomain::ShardXfer, request_id);
-                let (asked_peer, kind) = match self.outbound.on_failure(key) {
-                    FailureOutcome::Retained { peer, kind } => (peer, kind),
-                    FailureOutcome::Unknown => {
-                        // No record: we cannot say which request this failure
-                        // is about. Emitting a peer-only failure would invite a
-                        // consumer to settle every request outstanding to this
-                        // peer, so it is logged and dropped instead.
-                        warn!(
-                            %peer,
-                            %request_id,
-                            %error,
-                            "outbound failure for an untracked request id — not surfaced"
-                        );
-                        return;
-                    }
-                    FailureOutcome::Poisoned => {
-                        error!(
-                            %peer,
-                            %request_id,
-                            %error,
-                            "outbound failure for a poisoned request id — not surfaced"
-                        );
-                        return;
-                    }
-                };
-
-                // The failure event carries a peer too. It must agree with the
-                // one recorded at send time; a disagreement means the event
-                // cannot be attributed and is dropped rather than guessed at.
-                if asked_peer != peer {
-                    warn!(
-                        %request_id,
-                        expected = %asked_peer,
-                        got = %peer,
-                        %error,
-                        "outbound failure peer mismatch — not surfaced"
-                    );
-                    return;
-                }
-
-                warn!(%peer, %error, asked = kind.label(), "chunk request outbound failure");
-                // Every field of the event comes from the outbound record.
-                let origin = OutboundOrigin::new(asked_peer, kind);
-                if let Err(e) = event_tx.try_send(SumNetEvent::ShardRequestFailed {
-                    peer_id: origin.peer(),
-                    error: error.to_string(),
-                    origin,
-                }) {
-                    warn!(%e, "event channel full — dropping ShardRequestFailed");
-                }
+            // Two behaviours, so two sets of arms. Each carries its own
+            // `RequestDomain` into the shared handlers below: that domain is
+            // both half of the outbound key (raw ids collide across the two
+            // behaviours) and the provenance stamped on every inbound response
+            // channel.
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXferV1(ev)) => {
+                self.on_shard_event(RequestDomain::ShardXferV1, ev, event_tx);
             }
-
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
-                request_response::Event::InboundFailure { peer, error, .. },
-            )) => {
-                debug!(%peer, %error, "chunk request inbound failure");
-            }
-
-            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXfer(
-                request_response::Event::ResponseSent { peer, .. },
-            )) => {
-                debug!(%peer, "chunk response sent");
+            SwarmEvent::Behaviour(LocalMeshBehaviourEvent::ShardXferV2(ev)) => {
+                self.on_shard_event(RequestDomain::ShardXferV2, ev, event_tx);
             }
 
             // ── Transport ─────────────────────────────────────────────────────
@@ -1094,6 +1296,124 @@ mod tests {
 
     // A trivial stand-in for ResponseChannel (which we can't construct).
     // reap_stale_entries is generic over V, so any type works.
+
+    // ── Response-channel provenance ──────────────────────────────────────
+    //
+    // `ResponseChannel` cannot be constructed outside libp2p, and it does not
+    // need to be: the decision under test is "does the domain filed with this
+    // channel match the domain asking for it", which is independent of what
+    // the channel is. `take_channel` is generic for exactly that reason, so
+    // these use `String` and exercise the real function production calls.
+
+    fn filed(
+        domain: RequestDomain,
+        channel: &str,
+    ) -> HashMap<u64, (PendingChannel<String>, Instant)> {
+        HashMap::from([(
+            7,
+            (
+                PendingChannel {
+                    domain,
+                    channel: channel.to_string(),
+                },
+                Instant::now(),
+            ),
+        )])
+    }
+
+    #[test]
+    fn a_channel_is_taken_by_the_domain_it_arrived_on() {
+        let mut m = filed(RequestDomain::ShardXferV1, "v1-channel");
+        assert_eq!(
+            take_channel(&mut m, 7, RequestDomain::ShardXferV1),
+            ChannelTake::Taken("v1-channel".to_string())
+        );
+        assert!(m.is_empty(), "a taken channel is spent");
+    }
+
+    /// A V2 responder must not be handed a channel that arrived on the V1
+    /// behaviour. Both are `ResponseChannel<ShardResponseVersioned>`, so
+    /// nothing but this check stands between the two.
+    #[test]
+    fn a_v1_channel_is_refused_to_the_v2_domain() {
+        let mut m = filed(RequestDomain::ShardXferV1, "v1-channel");
+        assert_eq!(
+            take_channel(&mut m, 7, RequestDomain::ShardXferV2),
+            ChannelTake::WrongDomain {
+                have: RequestDomain::ShardXferV1
+            }
+        );
+        assert_eq!(m.len(), 1, "a refused channel is left for its own domain");
+
+        // And the domain it belongs to can still answer on it.
+        assert_eq!(
+            take_channel(&mut m, 7, RequestDomain::ShardXferV1),
+            ChannelTake::Taken("v1-channel".to_string())
+        );
+    }
+
+    /// The mirror image, because a check that only runs one way is half a
+    /// check.
+    #[test]
+    fn a_v2_channel_is_refused_to_the_v1_domain() {
+        let mut m = filed(RequestDomain::ShardXferV2, "v2-channel");
+        assert_eq!(
+            take_channel(&mut m, 7, RequestDomain::ShardXferV1),
+            ChannelTake::WrongDomain {
+                have: RequestDomain::ShardXferV2
+            }
+        );
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            take_channel(&mut m, 7, RequestDomain::ShardXferV2),
+            ChannelTake::Taken("v2-channel".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unknown_channel_id_is_missing_not_mismatched() {
+        let mut m = filed(RequestDomain::ShardXferV1, "v1-channel");
+        assert_eq!(
+            take_channel(&mut m, 999, RequestDomain::ShardXferV1),
+            ChannelTake::Missing
+        );
+        assert_eq!(
+            take_channel(&mut m, 999, RequestDomain::ShardXferV2),
+            ChannelTake::Missing
+        );
+    }
+
+    /// A channel is spent once. A second responder — of either domain — gets
+    /// `Missing`, never the channel again.
+    #[test]
+    fn a_channel_cannot_be_taken_twice() {
+        let mut m = filed(RequestDomain::ShardXferV2, "v2-channel");
+        assert!(matches!(
+            take_channel(&mut m, 7, RequestDomain::ShardXferV2),
+            ChannelTake::Taken(_)
+        ));
+        assert_eq!(
+            take_channel(&mut m, 7, RequestDomain::ShardXferV2),
+            ChannelTake::Missing
+        );
+        assert_eq!(
+            take_channel(&mut m, 7, RequestDomain::ShardXferV1),
+            ChannelTake::Missing
+        );
+    }
+
+    /// The counters are fixed struct fields. Nothing a peer supplies can
+    /// become a key, because there are no keys.
+    #[test]
+    fn refusal_counters_start_at_zero_and_are_plain_fields() {
+        let r = SwarmRefusals::default();
+        assert_eq!(r.v1_response_on_v2_channel, 0);
+        assert_eq!(r.v2_response_on_v1_channel, 0);
+        assert_eq!(r.response_without_channel, 0);
+        assert_eq!(r.outbound_domain_protocol_mismatch, 0);
+        assert_eq!(r.outbound_id_collision, 0);
+        assert_eq!(r.inbound_version_domain_mismatch, 0);
+    }
 
     #[test]
     fn reap_stale_entries_removes_expired() {

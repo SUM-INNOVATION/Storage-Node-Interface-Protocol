@@ -18,6 +18,7 @@ pub mod profile;
 pub mod push_validator;
 pub mod rpc_client;
 pub mod runtime_params;
+pub mod shard_dispatch;
 pub mod tx_builder;
 pub mod tx_wait;
 pub mod upload;

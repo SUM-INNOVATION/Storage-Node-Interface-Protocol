@@ -14,6 +14,10 @@ pub mod transport; // deferred — TCP/Noise fallback transport
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
+pub use behaviour::{
+    LocalMeshBehaviour, SHARD_XFER_REQUEST_TIMEOUT, build_shard_xfer_v1, build_shard_xfer_v2,
+    shard_xfer_config, shard_xfer_v1_protocols, shard_xfer_v2_protocols,
+};
 pub use codec::{
     SHARD_XFER_PROTOCOL, SHARD_XFER_PROTOCOL_V1, SHARD_XFER_PROTOCOL_V2, ShardCodec, ShardRequest,
     ShardRequestV2, ShardRequestVersioned, ShardResponse, ShardResponseV2, ShardResponseVersioned,
@@ -21,7 +25,7 @@ pub use codec::{
 };
 pub use correlation::{
     CorrelationError, MANIFEST_CID_PREFIX, OutboundKey, OutboundOrigin, OutboundRequestKind,
-    PeerMismatch, RecordCollision, RequestDomain,
+    PeerMismatch, RecordCollision, RecordError, RequestDomain,
 };
 pub use events::SumNetEvent;
 pub use gossip::{TOPIC_CAPABILITY, TOPIC_STORAGE, TOPIC_TEST};
@@ -33,8 +37,6 @@ pub use libp2p::PeerId;
 pub use libp2p::identity::Keypair;
 
 // ── Imports ───────────────────────────────────────────────────────────────────
-
-use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -102,7 +104,11 @@ impl SumNet {
 
     // ── Chunk transfer ────────────────────────────────────────────────
 
-    /// Request a chunk from a remote peer.
+    /// Pull a chunk from a remote peer over V1.
+    ///
+    /// Routed to the V1-only behaviour, so it negotiates `/sum/storage/v1`
+    /// against a V1-only peer and against a dual-protocol peer alike. This is
+    /// the path that keeps legacy peers readable.
     pub async fn request_shard_chunk(
         &self,
         peer_id: PeerId,
@@ -124,10 +130,11 @@ impl SumNet {
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot request chunk"))
     }
 
-    /// Request a file's DataManifest from a peer.
+    /// Request a file's DataManifest from a peer over V1.
     ///
-    /// Uses the `"manifest:<hex_root>"` convention within the existing
-    /// `/sum/storage/v1` protocol.
+    /// Uses the `"manifest:<hex_root>"` convention within the
+    /// `/sum/storage/v1` protocol, and routes to the V1-only behaviour so a
+    /// V1-only peer can answer it.
     pub async fn request_manifest(&self, peer_id: PeerId, merkle_root_hex: String) -> Result<()> {
         let cid = format!("{MANIFEST_CID_PREFIX}{merkle_root_hex}");
         self.cmd_tx
@@ -144,39 +151,31 @@ impl SumNet {
             .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot request manifest"))
     }
 
-    /// Push a chunk to a remote peer for storage.
-    ///
-    /// The peer will verify the CID, store the chunk, and respond with an ACK.
-    ///
-    /// This method takes an owned `Vec<u8>` for backwards compatibility.
-    /// New callers fanning a single chunk to multiple replicas should
-    /// prefer [`Self::push_chunk_shared`], which avoids per-replica copies.
-    pub async fn push_chunk(&self, peer_id: PeerId, cid: String, data: Vec<u8>) -> Result<()> {
-        let shared: Arc<[u8]> = Arc::from(data.into_boxed_slice());
-        self.push_chunk_shared(peer_id, cid, shared).await
-    }
-
-    /// Push a chunk using a shared, ref-counted buffer.
-    ///
-    /// Multiple replica pushes for the same chunk can clone the same
-    /// `Arc<[u8]>` cheaply (pointer bump only). The full `Vec<u8>`
-    /// materialization happens once, inside the swarm command handler,
-    /// immediately before libp2p serializes the request — so buffered
-    /// commands in the channel hold pointer-sized handles instead of
-    /// full chunk copies.
-    pub async fn push_chunk_shared(
-        &self,
-        peer_id: PeerId,
-        cid: String,
-        data: Arc<[u8]>,
-    ) -> Result<()> {
-        self.cmd_tx
-            .send(SwarmCommand::PushShard { peer_id, cid, data })
-            .await
-            .map_err(|_| anyhow::anyhow!("swarm task has stopped — cannot push chunk"))
-    }
+    // ── No V1 push ──────────────────────────────────────────────────────
+    //
+    // `push_chunk` and `push_chunk_shared` were here. They are gone, along
+    // with `SwarmCommand::PushShard`, and nothing replaced them at this layer.
+    //
+    // V1 push was a `ShardRequest` with `push_data: Some(bytes)` — no Merkle
+    // proof, no assignment check, no signature. The receiving side verified the
+    // CID against the bytes and stored them, which proves only that the sender
+    // hashed what it sent. Any peer could fill any archive.
+    //
+    // The replacement is [`Self::push_chunk_v2`] / [`Self::push_manifest_v2`],
+    // which carry the proof the receiver validates. There is deliberately **no
+    // fallback path** from V2 push to V1 push: a fallback would mean a peer
+    // that declines the authenticated protocol gets the unauthenticated one,
+    // which is the whole defect restored on demand. A V2 push to a peer that
+    // does not speak `/sum/storage/v2` fails, and failing is the point.
+    //
+    // Inbound V1 pushes are refused by `sum-node`'s inbound dispatcher before
+    // any lock is taken; see `sum_node::shard_dispatch`.
 
     /// Send a V1 chunk response on a pending response channel.
+    ///
+    /// Refused by the swarm if the channel arrived on the V2 behaviour; both
+    /// behaviours yield the same Rust channel type, so provenance is tracked
+    /// explicitly. See `swarm::PendingChannel`.
     pub async fn respond_shard(&self, channel_id: u64, response: ShardResponse) -> Result<()> {
         self.cmd_tx
             .send(SwarmCommand::SendShardResponse {
@@ -192,15 +191,12 @@ impl SumNet {
     // Each helper carries the precise on-wire shape — no `Option<>`
     // squeezing like V1 — so call sites can't miss a field.
     //
-    // Outbound negotiation prefers V2 (we register V2 first in the
-    // protocol list passed to `request_response::Behaviour::with_codec`,
-    // and libp2p picks the first mutually-supported protocol). There is
-    // **no automatic V2 → V1 fallback** for the helpers here: if a
-    // peer doesn't advertise `/sum/storage/v2`, the codec will refuse
-    // to write a V2 payload onto a V1 stream and the call surfaces as
-    // an `OutboundFailure` (see `VersionedShardCodec::write_request`).
-    // Callers that want V1 fallback semantics must catch that failure
-    // and retry via the V1 helpers explicitly.
+    // Every helper below routes to the V2-only behaviour, which advertises
+    // `/sum/storage/v2` and nothing else. Against a peer that speaks V2 the
+    // negotiation has exactly one candidate; against a peer that does not, the
+    // substream fails to negotiate and the call surfaces as an
+    // `OutboundFailure`. There is **no automatic V2 → V1 fallback**, and no V1
+    // push helper to fall back to — see the note above.
 
     /// V2 Pull — request `[offset, offset+max_bytes)` of the chunk at `cid`.
     pub async fn pull_chunk_v2(
@@ -281,6 +277,8 @@ impl SumNet {
     }
 
     /// Send a V2 response on a pending response channel.
+    ///
+    /// Refused by the swarm if the channel arrived on the V1 behaviour.
     pub async fn respond_shard_v2(&self, channel_id: u64, response: ShardResponseV2) -> Result<()> {
         self.cmd_tx
             .send(SwarmCommand::SendShardResponseV2 {
