@@ -35,10 +35,37 @@ see [`../roadmap/roadmap.md`](../roadmap/roadmap.md).
   files.
 - `store_dir_writable` — true if a probe write succeeded.
 
-The health check is not exposed on an HTTP endpoint today. Inspect
-it via a smoke script that instantiates a `SumStore` against the
-running archive's chunk directory, or observe it in the logs at
-startup.
+The health check is not exposed on an HTTP endpoint today. Observe
+it in the archive's own logs at startup.
+
+**Do not instantiate a second `SumStore` against a running
+archive's store root.** A `SumStore` takes an exclusive lease on
+its root — `flock(LOCK_EX | LOCK_NB)` on `<store_dir>/.store.lease`
+— and holds it for the life of the process, so a smoke script that
+opens one against a live root now fails with `store root ... is
+already in use` rather than reporting health. Earlier revisions of
+this page recommended exactly that; it was never safe. A second
+`SumStore` on a live root shares one chunk namespace and one
+`manifests/` directory with the archive, and `ChunkStore::mmap`'s
+safety argument rests on the root having a single manager. The
+lease refuses the procedure instead of letting it corrupt state
+quietly.
+
+To inspect a root without the archive's cooperation, read it
+directly — `ls <store_dir>/*.chunk | wc -l` for the chunk count,
+`du -sh <store_dir>` for disk usage. These are read-only and take
+no lease. `<store_dir>/.store.lease` is the lease file itself: it
+is zero bytes, carries no state, is recreated on demand, and is
+invisible to the garbage collector (which only ever considers
+entries ending in `.chunk`). Its presence says nothing about
+whether an archive is running — only a successful `flock` does —
+so do not treat it as a liveness signal, and do not delete it while
+an archive is up.
+
+To take over a root, stop the archive holding it. The lease lives
+in the open file description, so the kernel releases it when the
+process exits, including on a crash or `kill -9`; there is no stale
+lease to clear by hand.
 
 ## Observable failure modes
 
