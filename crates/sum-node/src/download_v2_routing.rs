@@ -165,6 +165,10 @@ pub enum ManifestDecodeError {
     Cbor(String),
     #[error("manifest merkle_root mismatch: peer returned {got} but caller expected {want}")]
     RootMismatch { got: String, want: String },
+    /// The manifest parsed and declared the expected root, but its contents
+    /// do not produce that root, or are otherwise internally inconsistent.
+    #[error("manifest failed validation against the requested root: {0}")]
+    Invalid(String),
 }
 
 /// Verify that `manifest_bytes` (CBOR `DataManifest`) parses cleanly
@@ -182,6 +186,8 @@ pub fn decode_v2_manifest_bytes(
     manifest_bytes: &[u8],
     expected_root: [u8; 32],
 ) -> std::result::Result<DataManifest, ManifestDecodeError> {
+    // Parse first, so a declared-root mismatch keeps its specific error and
+    // its existing tests rather than being folded into a generic failure.
     let manifest = deserialize_manifest_cbor(manifest_bytes)
         .map_err(|e| ManifestDecodeError::Cbor(e.to_string()))?;
     if manifest.merkle_root != expected_root {
@@ -190,6 +196,15 @@ pub fn decode_v2_manifest_bytes(
             want: hex::encode(expected_root),
         });
     }
+
+    // `merkle_root` is a self-declared field. Matching it proves only that the
+    // peer copied the value we asked for; it says nothing about the chunk list
+    // underneath. Recompute the root from the leaves and re-check the rest of
+    // the structure, so a manifest carrying the right root field with an
+    // attacker-chosen chunk list cannot be indexed.
+    sum_store::serve::validate_manifest_push(&hex::encode(expected_root), manifest_bytes)
+        .map_err(ManifestDecodeError::Invalid)?;
+
     Ok(manifest)
 }
 
@@ -206,22 +221,49 @@ mod tests {
 
     use sum_types::storage::{ChunkDescriptor, DataManifest};
 
-    fn fixture_manifest(root: [u8; 32]) -> DataManifest {
+    /// A genuinely well-formed manifest: real chunk hashes, CIDs derived from
+    /// those hashes, and a merkle root recomputed from the leaves.
+    ///
+    /// The previous fixture used a placeholder CID that never matched its own
+    /// `blake3_hash`. That passed only because the decoder compared the
+    /// declared `merkle_root` field and nothing else — which is precisely the
+    /// gap this change closes, so the fixture had to become real.
+    fn valid_manifest(bodies: &[&[u8]]) -> DataManifest {
+        let mut chunks = Vec::new();
+        let mut leaves = Vec::new();
+        let mut offset = 0u64;
+        for (i, body) in bodies.iter().enumerate() {
+            let hash = blake3::hash(body);
+            leaves.push(hash);
+            chunks.push(ChunkDescriptor {
+                chunk_index: i as u32,
+                offset,
+                size: body.len() as u64,
+                blake3_hash: *hash.as_bytes(),
+                cid: sum_store::content_id::cid_from_blake3_hash(&hash),
+                plaintext_blake3_hash: None,
+            });
+            offset += body.len() as u64;
+        }
+        let root = *sum_store::merkle::MerkleTree::build(&leaves)
+            .root()
+            .as_bytes();
         DataManifest {
             file_name: "fixture.bin".into(),
             file_hash: [0xAB; 32],
-            total_size_bytes: 1024,
-            chunk_count: 1,
+            total_size_bytes: offset,
+            chunk_count: chunks.len() as u32,
             merkle_root: root,
-            chunks: vec![ChunkDescriptor {
-                chunk_index: 0,
-                offset: 0,
-                size: 1024,
-                blake3_hash: [0xCC; 32],
-                cid: format!("cid:{}", hex::encode(root)),
-                plaintext_blake3_hash: None,
-            }],
+            chunks,
         }
+    }
+
+    /// A manifest that declares `claimed_root` while its chunks compute to a
+    /// different root — the forged shape the validation exists to reject.
+    fn manifest_claiming(claimed_root: [u8; 32], bodies: &[&[u8]]) -> DataManifest {
+        let mut m = valid_manifest(bodies);
+        m.merkle_root = claimed_root;
+        m
     }
 
     /// Match the CBOR encoder used by `sum_store::manifest::write_manifest`
@@ -235,13 +277,70 @@ mod tests {
 
     #[test]
     fn decode_v2_manifest_round_trips_when_root_matches() {
-        let root = [0x42u8; 32];
-        let m = fixture_manifest(root);
+        let m = valid_manifest(&[b"alpha", b"beta"]);
+        let root = m.merkle_root;
         let bytes = cbor_encode_manifest(&m);
         let got = decode_v2_manifest_bytes(&bytes, root).expect("decode");
         assert_eq!(got.merkle_root, root);
-        assert_eq!(got.chunk_count, 1);
+        assert_eq!(got.chunk_count, 2);
         assert_eq!(got.chunks[0].chunk_index, 0);
+    }
+
+    #[test]
+    fn decode_v2_manifest_rejects_a_forged_chunk_list_under_the_expected_root() {
+        // THE case this change closes: the peer returns a manifest whose
+        // `merkle_root` field is exactly what we asked for, but whose chunk
+        // list is its own. Field equality alone accepted this and every CID in
+        // it was indexed.
+        let asked = valid_manifest(&[b"real-chunk"]).merkle_root;
+        let forged = manifest_claiming(asked, &[b"attacker-chosen", b"and-another"]);
+        let bytes = cbor_encode_manifest(&forged);
+
+        let err = decode_v2_manifest_bytes(&bytes, asked).expect_err("must reject");
+        match err {
+            ManifestDecodeError::Invalid(msg) => {
+                assert!(msg.contains("merkle root recomputation failed"), "{msg}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_v2_manifest_rejects_a_cid_that_does_not_match_its_hash() {
+        let mut m = valid_manifest(&[b"alpha"]);
+        m.chunks[0].cid = "bafkr4iaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        let root = m.merkle_root;
+        let bytes = cbor_encode_manifest(&m);
+        match decode_v2_manifest_bytes(&bytes, root).expect_err("must reject") {
+            ManifestDecodeError::Invalid(msg) => {
+                assert!(msg.contains("does not match its blake3_hash"), "{msg}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_v2_manifest_rejects_out_of_order_chunks() {
+        let mut m = valid_manifest(&[b"alpha", b"beta"]);
+        m.chunks.swap(0, 1);
+        let root = m.merkle_root;
+        let bytes = cbor_encode_manifest(&m);
+        match decode_v2_manifest_bytes(&bytes, root).expect_err("must reject") {
+            ManifestDecodeError::Invalid(msg) => assert!(msg.contains("out of order"), "{msg}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_v2_manifest_rejects_a_chunk_count_mismatch() {
+        let mut m = valid_manifest(&[b"alpha", b"beta"]);
+        m.chunk_count = 5;
+        let root = m.merkle_root;
+        let bytes = cbor_encode_manifest(&m);
+        match decode_v2_manifest_bytes(&bytes, root).expect_err("must reject") {
+            ManifestDecodeError::Invalid(msg) => assert!(msg.contains("chunk_count"), "{msg}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]
@@ -253,7 +352,7 @@ mod tests {
         // load-bearing check.
         let asked = [0x42u8; 32];
         let returned = [0xAAu8; 32];
-        let m = fixture_manifest(returned);
+        let m = manifest_claiming(returned, &[b"alpha"]);
         let bytes = cbor_encode_manifest(&m);
         let err = decode_v2_manifest_bytes(&bytes, asked).expect_err("must reject");
         match err {

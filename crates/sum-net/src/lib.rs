@@ -3,6 +3,7 @@
 pub mod behaviour;
 pub mod capability; // deferred — WAN capability advertisement protocol
 pub mod codec;
+pub mod correlation;
 pub mod discovery;
 pub mod events;
 pub mod gossip;
@@ -17,6 +18,10 @@ pub use codec::{
     SHARD_XFER_PROTOCOL, SHARD_XFER_PROTOCOL_V1, SHARD_XFER_PROTOCOL_V2, ShardCodec, ShardRequest,
     ShardRequestV2, ShardRequestVersioned, ShardResponse, ShardResponseV2, ShardResponseVersioned,
     VersionedShardCodec,
+};
+pub use correlation::{
+    CorrelationError, MANIFEST_CID_PREFIX, OutboundKey, OutboundOrigin, OutboundRequestKind,
+    PeerMismatch, RecordCollision, RequestDomain,
 };
 pub use events::SumNetEvent;
 pub use gossip::{TOPIC_CAPABILITY, TOPIC_STORAGE, TOPIC_TEST};
@@ -124,7 +129,7 @@ impl SumNet {
     /// Uses the `"manifest:<hex_root>"` convention within the existing
     /// `/sum/storage/v1` protocol.
     pub async fn request_manifest(&self, peer_id: PeerId, merkle_root_hex: String) -> Result<()> {
-        let cid = format!("manifest:{merkle_root_hex}");
+        let cid = format!("{MANIFEST_CID_PREFIX}{merkle_root_hex}");
         self.cmd_tx
             .send(SwarmCommand::RequestShard {
                 peer_id,

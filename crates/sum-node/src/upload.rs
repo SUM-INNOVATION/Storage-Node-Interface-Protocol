@@ -459,7 +459,11 @@ impl UploadOrchestrator {
                 tokio::select! {
                     event = net.next_event() => {
                         match event {
-                            Some(SumNetEvent::ShardReceived { peer_id, response }) => {
+                            // `origin` unused: sum-net has already checked the
+                            // ACK's CID against the push we sent, so matching
+                            // `response.cid` into `slice_pending` is now a
+                            // lookup rather than a trust decision.
+                            Some(SumNetEvent::ShardReceived { peer_id, response, origin: _ }) => {
                                 if response.error.is_none() {
                                     if slice_pending.remove(&(response.cid.clone(), peer_id)) {
                                         confirmed += 1;

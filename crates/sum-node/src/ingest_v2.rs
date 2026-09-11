@@ -49,6 +49,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
+#[cfg(test)]
+use sum_net::{OutboundOrigin, OutboundRequestKind};
 use sum_net::{PeerId, ShardResponseV2, SumNet, SumNetEvent};
 use sum_store::assignment_v2::assigned_archives;
 use sum_store::chunker::BinaryChunker;
@@ -1547,6 +1549,7 @@ where
             match ev {
                 SumNetEvent::ShardReceivedV2 {
                     peer_id,
+                    origin: _,
                     response:
                         ShardResponseV2::PushAck {
                             merkle_root,
@@ -1695,6 +1698,7 @@ where
             if let SumNetEvent::ShardReceivedV2 {
                 peer_id,
                 response: ShardResponseV2::ManifestPushAck { merkle_root, error },
+                origin: _,
             } = ev
             {
                 if merkle_root == manifest.merkle_root
@@ -2941,6 +2945,13 @@ mod tests {
                         chunk_index,
                         error: None,
                     },
+                    origin: OutboundOrigin::new(
+                        *peer_id,
+                        OutboundRequestKind::V2Push {
+                            merkle_root,
+                            chunk_index,
+                        },
+                    ),
                 })
                 .await;
             }
@@ -2955,6 +2966,10 @@ mod tests {
                     merkle_root,
                     error: None,
                 },
+                origin: OutboundOrigin::new(
+                    *peer_id,
+                    OutboundRequestKind::V2ManifestPush { merkle_root },
+                ),
             })
             .await;
         }
@@ -3109,6 +3124,13 @@ mod tests {
                     chunk_index: 0,
                     error: None,
                 },
+                origin: OutboundOrigin::new(
+                    *peer_id,
+                    OutboundRequestKind::V2Push {
+                        merkle_root,
+                        chunk_index: 0,
+                    },
+                ),
             })
             .await;
         }
@@ -3184,6 +3206,13 @@ mod tests {
                         Some("temporary".into())
                     },
                 },
+                origin: OutboundOrigin::new(
+                    *peer_id,
+                    OutboundRequestKind::V2Push {
+                        merkle_root,
+                        chunk_index: 0,
+                    },
+                ),
             })
             .await;
         }
@@ -3196,6 +3225,13 @@ mod tests {
                     chunk_index: 0,
                     error: None,
                 },
+                origin: OutboundOrigin::new(
+                    *peer_id,
+                    OutboundRequestKind::V2Push {
+                        merkle_root,
+                        chunk_index: 0,
+                    },
+                ),
             })
             .await;
         }
@@ -3265,6 +3301,13 @@ mod tests {
                     chunk_index: 0,
                     error: None,
                 },
+                origin: OutboundOrigin::new(
+                    *peer_id,
+                    OutboundRequestKind::V2Push {
+                        merkle_root,
+                        chunk_index: 0,
+                    },
+                ),
             })
             .await;
         }
@@ -3278,6 +3321,13 @@ mod tests {
                     chunk_index: 0,
                     error: None,
                 },
+                origin: OutboundOrigin::new(
+                    peers[0],
+                    OutboundRequestKind::V2Push {
+                        merkle_root,
+                        chunk_index: 0,
+                    },
+                ),
             })
             .await;
         }
@@ -3346,6 +3396,10 @@ mod tests {
                     merkle_root,
                     error: None,
                 },
+                origin: OutboundOrigin::new(
+                    *peer_id,
+                    OutboundRequestKind::V2ManifestPush { merkle_root },
+                ),
             })
             .await;
         }
@@ -3356,6 +3410,10 @@ mod tests {
                     merkle_root,
                     error: None,
                 },
+                origin: OutboundOrigin::new(
+                    peers[0],
+                    OutboundRequestKind::V2ManifestPush { merkle_root },
+                ),
             })
             .await;
         }
@@ -3832,6 +3890,13 @@ mod tests {
                 chunk_index: 0,
                 error: None,
             },
+            origin: OutboundOrigin::new(
+                assigned_peers[0],
+                OutboundRequestKind::V2Push {
+                    merkle_root,
+                    chunk_index: 0,
+                },
+            ),
         })
         .await;
         for unassigned_peer in &unassigned_peers {
@@ -3842,6 +3907,13 @@ mod tests {
                     chunk_index: 0,
                     error: None,
                 },
+                origin: OutboundOrigin::new(
+                    *unassigned_peer,
+                    OutboundRequestKind::V2Push {
+                        merkle_root,
+                        chunk_index: 0,
+                    },
+                ),
             })
             .await;
         }
@@ -3919,6 +3991,13 @@ mod tests {
                     chunk_index: 0,
                     error: None,
                 },
+                origin: OutboundOrigin::new(
+                    *peer_id,
+                    OutboundRequestKind::V2Push {
+                        merkle_root,
+                        chunk_index: 0,
+                    },
+                ),
             })
             .await;
         }
@@ -3932,6 +4011,10 @@ mod tests {
                     merkle_root,
                     error: None,
                 },
+                origin: OutboundOrigin::new(
+                    *peer_id,
+                    OutboundRequestKind::V2ManifestPush { merkle_root },
+                ),
             })
             .await;
         }
@@ -4248,6 +4331,13 @@ mod tests {
                         chunk_index: chunk_idx,
                         error: None,
                     },
+                    origin: OutboundOrigin::new(
+                        arch_to_peer[archive],
+                        OutboundRequestKind::V2Push {
+                            merkle_root,
+                            chunk_index: chunk_idx,
+                        },
+                    ),
                 })
                 .await;
             }
@@ -4268,6 +4358,10 @@ mod tests {
                     merkle_root,
                     error: None,
                 },
+                origin: OutboundOrigin::new(
+                    arch_to_peer[archive],
+                    OutboundRequestKind::V2ManifestPush { merkle_root },
+                ),
             })
             .await;
         }
