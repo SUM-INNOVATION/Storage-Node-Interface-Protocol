@@ -337,6 +337,15 @@ attempting the first mainnet ingest:
    seeds, store roots, ports). Trust is concentrated until
    external operators onboard.
 
+   > **Distinct store roots are not yet expressible directly.** The
+   > root is `$HOME/.sumnode/store` and there is no flag or
+   > environment variable for it, so "distinct store roots" today
+   > means **a distinct `HOME` per node** — separate OS users, or an
+   > explicit `HOME=` in each unit file or container spec. Two nodes
+   > under one `HOME` share a root and corrupt each other's state
+   > with no warning. Both hosts in Option A and all three in Option
+   > B must satisfy this.
+
    Either shape is acceptable for unblocking the first mainnet
    ingest. Coordinated ramp is preferred for diversity; single-
    org bootstrap is faster to prove the path.
@@ -603,12 +612,26 @@ the next workstream.
   in flight, GC churn). Currently log-only; a Prometheus exporter
   is on the roadmap. Inspect via
   `RUST_LOG=info,sum_node::metrics=debug`.
-- **On-disk state.** All operator-facing state is under the configured
-  store root (default: relative to the working directory). Chunk
-  files, manifests (`<root>.opaque` for Private, `<root>.json` for
-  Public), and the per-Private-file ACL sidecar
-  (`<root>.private_chunks`) live there. Don't put the store root
+- **On-disk state.** All operator-facing state is under the store
+  root, which resolves to **`$HOME/.sumnode/store`**. The working
+  directory is **not** consulted — `cd`-ing somewhere else before
+  starting the node does not change where state is written. If
+  `HOME` is unset the root falls back to `/tmp/sumnode/.sumnode/store`,
+  which is shared and world-writable-adjacent; make sure `HOME` is
+  set in whatever unit or container starts the node. Chunk files,
+  manifests (`<hex_root>.cbor` for Public, `<hex_root>.opaque` for
+  Private), and the per-Private-file ACL sidecar
+  (`<hex_root>.private_chunks`) live there. Don't put the store root
   under cloud-sync.
+
+- **One node per store root.** Nothing currently enforces this. Two
+  `sum-node` processes started by the same OS user on the same host
+  resolve to the same root and will share one chunk namespace and one
+  `manifests/` directory — silently. Each writes into the other's
+  state, each garbage-collects against its own assignment set, and a
+  client-mode ingest run alongside a node can delete what that node
+  is serving. Running more than one node on a host therefore requires
+  giving each an explicit, distinct root; see below.
 
 ## Recovery scenarios
 
