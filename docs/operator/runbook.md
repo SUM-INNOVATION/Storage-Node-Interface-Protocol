@@ -17,7 +17,8 @@ Before starting any node, confirm:
 
 1. **Toolchain.** `rustc --version` matches
    [`rust-toolchain.toml`](../../rust-toolchain.toml). The repo pins
-   `stable`; pre-`1.85` toolchains will not build (`edition = "2024"`).
+   `stable`; pre-`1.88` toolchains will not build (`rust-version =
+   "1.88"`, required by libp2p 0.57).
 2. **Workspace path.** The repo MUST live on a non-iCloud, non-cloud-
    synced filesystem. Cloud-sync layers will silently evict source
    files and `Cargo.toml` artifacts during builds, causing
