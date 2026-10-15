@@ -328,22 +328,22 @@ pub(crate) fn validate_response_metadata(
 
     // (3) When the caller knows the manifest size, total_bytes must match
     //     it exactly. The peer cannot grow OR shrink the chunk.
-    if let Some(expected) = expected_size {
-        if total != expected {
-            return Err(format!(
-                "ShardResponse.total_bytes = {total} does not match expected size {expected}"
-            ));
-        }
+    if let Some(expected) = expected_size
+        && total != expected
+    {
+        return Err(format!(
+            "ShardResponse.total_bytes = {total} does not match expected size {expected}"
+        ));
     }
 
     // (4) The first response decides total_bytes; subsequent responses
     //     must agree. A peer that flips the value mid-stream is malicious.
-    if let Some(prev_total) = declared_total {
-        if total != prev_total {
-            return Err(format!(
-                "ShardResponse.total_bytes = {total} differs from previously declared {prev_total}"
-            ));
-        }
+    if let Some(prev_total) = declared_total
+        && total != prev_total
+    {
+        return Err(format!(
+            "ShardResponse.total_bytes = {total} differs from previously declared {prev_total}"
+        ));
     }
 
     // (5) A single piece cannot be larger than the whole chunk.

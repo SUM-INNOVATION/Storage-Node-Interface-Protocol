@@ -914,13 +914,12 @@ impl SumSwarm {
                 debug!(%peer_id, "identify received");
                 if let Some(l1_addr) =
                     crate::identity::l1_address_from_peer_public_key(&info.public_key)
-                {
-                    if let Err(e) = event_tx.try_send(SumNetEvent::PeerIdentified {
+                    && let Err(e) = event_tx.try_send(SumNetEvent::PeerIdentified {
                         peer_id,
                         l1_address: l1_addr,
-                    }) {
-                        warn!(%e, "event channel full — dropping PeerIdentified");
-                    }
+                    })
+                {
+                    warn!(%e, "event channel full — dropping PeerIdentified");
                 }
 
                 // Feed the observed-address hint into our external-address
@@ -981,12 +980,12 @@ impl SumSwarm {
                 // same peer/address pair, and dial errors are non-fatal,
                 // so it's safe to call this on every identify event for
                 // peers we don't already have a direct connection to.
-                if !self.direct_connections.contains_key(&peer_id) {
-                    if let Some(addr) = pick_direct_dial_candidate(&info.listen_addrs, peer_id) {
-                        debug!(%peer_id, %addr, "attempting direct dial (no direct connection yet)");
-                        if let Err(e) = self.inner.dial(addr) {
-                            debug!(%peer_id, %e, "direct-dial attempt rejected by swarm");
-                        }
+                if !self.direct_connections.contains_key(&peer_id)
+                    && let Some(addr) = pick_direct_dial_candidate(&info.listen_addrs, peer_id)
+                {
+                    debug!(%peer_id, %addr, "attempting direct dial (no direct connection yet)");
+                    if let Err(e) = self.inner.dial(addr) {
+                        debug!(%peer_id, %e, "direct-dial attempt rejected by swarm");
                     }
                 }
             }
@@ -1116,15 +1115,14 @@ impl SumSwarm {
                 ..
             } => {
                 let relayed = endpoint.is_relayed();
-                if !relayed {
-                    if let std::collections::hash_map::Entry::Occupied(mut e) =
+                if !relayed
+                    && let std::collections::hash_map::Entry::Occupied(mut e) =
                         self.direct_connections.entry(peer_id)
-                    {
-                        let v = e.get_mut();
-                        *v = v.saturating_sub(1);
-                        if *v == 0 {
-                            e.remove();
-                        }
+                {
+                    let v = e.get_mut();
+                    *v = v.saturating_sub(1);
+                    if *v == 0 {
+                        e.remove();
                     }
                 }
                 debug!(%peer_id, relayed, ?cause, "connection closed");

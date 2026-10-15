@@ -803,17 +803,17 @@ async fn run_listen(
                         }
                     }
                     SumNetEvent::MessageReceived { topic, data, from } => {
-                        if topic == TOPIC_STORAGE {
-                            if let Some(ann) = decode_announcement(data) {
-                                info!(
-                                    from = %from,
-                                    merkle_root = %ann.merkle_root,
-                                    chunk_index = ann.chunk_index,
-                                    cid = %ann.chunk_cid,
-                                    size = ann.size_bytes,
-                                    "chunk announced"
-                                );
-                            }
+                        if topic == TOPIC_STORAGE
+                            && let Some(ann) = decode_announcement(data)
+                        {
+                            info!(
+                                from = %from,
+                                merkle_root = %ann.merkle_root,
+                                chunk_index = ann.chunk_index,
+                                cid = %ann.chunk_cid,
+                                size = ann.size_bytes,
+                                "chunk announced"
+                            );
                         }
                         print_event(&event);
                     }
@@ -1860,12 +1860,12 @@ async fn run_fetch(
             Some(event) = net.next_event() => {
                 match &event {
                     SumNetEvent::MessageReceived { topic, data, from } if topic == TOPIC_STORAGE => {
-                        if let Some(ann) = decode_announcement(data) {
-                            if ann.chunk_cid == cid {
-                                info!(from = %from, "found peer with chunk");
-                                target_peer = Some(*from);
-                                break;
-                            }
+                        if let Some(ann) = decode_announcement(data)
+                            && ann.chunk_cid == cid
+                        {
+                            info!(from = %from, "found peer with chunk");
+                            target_peer = Some(*from);
+                            break;
                         }
                     }
                     SumNetEvent::PeerDiscovered { peer_id, .. } => {
@@ -1990,13 +1990,14 @@ async fn run_download(
         .flatten();
 
     // Private + missing seed → bail before SumNet::new.
-    if let Some(info) = v2_info.as_ref() {
-        if info.visibility.is_private() && seed.is_none() {
-            anyhow::bail!(
-                "download of Private file {merkle_root} requires --key-file \
+    if let Some(info) = v2_info.as_ref()
+        && info.visibility.is_private()
+        && seed.is_none()
+    {
+        anyhow::bail!(
+            "download of Private file {merkle_root} requires --key-file \
                  (no X25519 secret to unwrap K_file)"
-            );
-        }
+        );
     }
 
     // ── Step 2: route based on chain V2 row (fail closed on unknown

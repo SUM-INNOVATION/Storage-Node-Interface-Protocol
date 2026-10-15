@@ -219,13 +219,15 @@ impl ManifestIndex {
 
         // Migrate legacy manifest.cbor if the index is empty.
         let legacy_path = store_dir.join("manifest.cbor");
-        if index.by_root.is_empty() && index.private_bytes.is_empty() && legacy_path.exists() {
-            if let Ok(m) = manifest::read_manifest(&legacy_path) {
-                tracing::info!("migrating legacy manifest.cbor into manifests/");
-                // Write to new location (ignore write errors on migration).
-                let _ = index.write_manifest(&m);
-                index.add_to_maps(m);
-            }
+        if index.by_root.is_empty()
+            && index.private_bytes.is_empty()
+            && legacy_path.exists()
+            && let Ok(m) = manifest::read_manifest(&legacy_path)
+        {
+            tracing::info!("migrating legacy manifest.cbor into manifests/");
+            // Write to new location (ignore write errors on migration).
+            let _ = index.write_manifest(&m);
+            index.add_to_maps(m);
         }
 
         tracing::info!(
