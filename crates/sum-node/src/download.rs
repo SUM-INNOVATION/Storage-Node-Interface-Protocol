@@ -1168,27 +1168,27 @@ async fn fetch_v2_public_manifest(
                 if origin.requested_manifest_root() != Some(chain_root) {
                     continue;
                 }
-                if let Some(&archive) = dispatched_peers.get(&peer_id) {
-                    if status.get(&archive) == Some(&Status::Dispatched) {
-                        warn!(
-                            %peer_id,
-                            archive = %hex::encode(archive),
-                            %error,
-                            "V2Public manifest fan-out: outbound failure; marking failed"
-                        );
-                        last_reason =
-                            format!("archive {} outbound failure: {error}", hex::encode(archive));
-                        status.insert(archive, Status::Failed);
-                        dispatch_wave(
-                            net,
-                            peer_addresses,
-                            &mut status,
-                            &mut dispatched_peers,
-                            chain_root,
-                            fanout,
-                        )
-                        .await;
-                    }
+                if let Some(&archive) = dispatched_peers.get(&peer_id)
+                    && status.get(&archive) == Some(&Status::Dispatched)
+                {
+                    warn!(
+                        %peer_id,
+                        archive = %hex::encode(archive),
+                        %error,
+                        "V2Public manifest fan-out: outbound failure; marking failed"
+                    );
+                    last_reason =
+                        format!("archive {} outbound failure: {error}", hex::encode(archive));
+                    status.insert(archive, Status::Failed);
+                    dispatch_wave(
+                        net,
+                        peer_addresses,
+                        &mut status,
+                        &mut dispatched_peers,
+                        chain_root,
+                        fanout,
+                    )
+                    .await;
                 }
             }
             None => {

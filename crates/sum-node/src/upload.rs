@@ -504,24 +504,24 @@ impl UploadOrchestrator {
                                             "push confirmed"
                                         );
                                     }
-                                } else if let Some(ref err) = response.error {
-                                    if slice_pending.remove(&(response.cid.clone(), peer_id)) {
-                                        warn!(
-                                            cid = %response.cid,
-                                            %peer_id,
-                                            %err,
-                                            "push rejected by peer"
-                                        );
-                                        let chunk_index = cid_to_index
-                                            .get(&response.cid)
-                                            .copied()
-                                            .unwrap_or(u32::MAX);
-                                        failed.push(FailedPush {
-                                            chunk_index,
-                                            cid: response.cid.clone(),
-                                            error: err.clone(),
-                                        });
-                                    }
+                                } else if let Some(ref err) = response.error
+                                    && slice_pending.remove(&(response.cid.clone(), peer_id))
+                                {
+                                    warn!(
+                                        cid = %response.cid,
+                                        %peer_id,
+                                        %err,
+                                        "push rejected by peer"
+                                    );
+                                    let chunk_index = cid_to_index
+                                        .get(&response.cid)
+                                        .copied()
+                                        .unwrap_or(u32::MAX);
+                                    failed.push(FailedPush {
+                                        chunk_index,
+                                        cid: response.cid.clone(),
+                                        error: err.clone(),
+                                    });
                                 }
                             }
                             None => {

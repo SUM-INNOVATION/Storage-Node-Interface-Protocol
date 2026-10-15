@@ -100,7 +100,11 @@ impl MerkleTree {
 
         // Walk from leaf level (0) up to one below the root
         for level in 0..self.levels.len() - 1 {
-            let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+            let sibling_idx = if idx.is_multiple_of(2) {
+                idx + 1
+            } else {
+                idx - 1
+            };
             let sibling = if sibling_idx < self.levels[level].len() {
                 self.levels[level][sibling_idx]
             } else {

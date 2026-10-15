@@ -1700,13 +1700,11 @@ where
                 response: ShardResponseV2::ManifestPushAck { merkle_root, error },
                 origin: _,
             } = ev
+                && merkle_root == manifest.merkle_root
+                && error.is_none()
+                && needed.contains(&peer_id)
             {
-                if merkle_root == manifest.merkle_root
-                    && error.is_none()
-                    && needed.contains(&peer_id)
-                {
-                    acked.insert(peer_id);
-                }
+                acked.insert(peer_id);
             }
         }
 
