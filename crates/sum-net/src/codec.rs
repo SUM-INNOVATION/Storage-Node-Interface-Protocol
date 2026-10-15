@@ -31,7 +31,6 @@
 
 use std::io;
 
-use async_trait::async_trait;
 use futures::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -111,7 +110,6 @@ impl Default for ShardCodec {
     }
 }
 
-#[async_trait]
 impl libp2p::request_response::Codec for ShardCodec {
     type Protocol = String;
     type Request = ShardRequest;
@@ -298,7 +296,6 @@ impl Default for VersionedShardCodec {
     }
 }
 
-#[async_trait]
 impl libp2p::request_response::Codec for VersionedShardCodec {
     type Protocol = String;
     type Request = ShardRequestVersioned;

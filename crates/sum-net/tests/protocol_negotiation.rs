@@ -36,7 +36,6 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use futures::StreamExt;
 use futures::prelude::*;
 use libp2p::request_response::{self, Codec, ProtocolSupport};
@@ -67,7 +66,6 @@ struct ProbeCodec {
     seen: Arc<Mutex<Vec<String>>>,
 }
 
-#[async_trait]
 impl Codec for ProbeCodec {
     type Protocol = String;
     type Request = ShardRequestVersioned;
