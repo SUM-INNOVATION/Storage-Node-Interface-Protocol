@@ -9,19 +9,22 @@
 #   macOS arm64             macos-26           § 2.2 + § 2.3
 #   macOS Intel             macos-26-intel     § 2.2 + § 2.3; workflow_dispatch
 #                                              only ("Skip unless requested")
-#   WSL2 userland proxy     ubuntu:24.04       § 3.2 setup, § 1 rustup, § 3.4
-#   Crostini userland proxy debian:12 x86_64   § 4.2 setup, § 1 rustup, § 4.4
-#   Crostini userland proxy debian:12 aarch64  same, on an arm64 runner
-#   Windows native          windows-2025       fail-closed only (SNIP #49)
+#   STAND-IN for WSL2       ubuntu:24.04       § 3.2 setup, § 1 rustup, § 3.4
+#   STAND-IN for Crostini   debian:12 x86_64   § 4.2 setup, § 1 rustup, § 4.4
+#   STAND-IN for Crostini   debian:12 aarch64  same, on an arm64 runner
+#   Windows fail-closed     windows-2025       refusal only (SNIP #49)
 #
-# The proxy cells run the documented apt and rustup commands in a plain
-# container, so they check the setup snippets and the build on that userland.
-# They are not WSL2 (no WSL kernel, NAT or /mnt/c) and not Crostini (no
-# ChromeOS VM or container), so they cannot close those #24 cells on their
-# own; § 8 still needs a report from the real platform.
+# STAND-INS ARE NOT WSL2 OR CROSTINI COVERAGE. They run the documented apt
+# and rustup commands in a plain container on a GitHub-hosted Linux runner,
+# so they check only the setup snippets and the build on that userland.
+# There is no WSL kernel, NAT or /mnt/c and no ChromeOS VM or container.
+# A stand-in result never closes, or counts towards, the #24 WSL2 or
+# Crostini cells; § 8 still needs a report from a tester on the real
+# platform. The script labels every stand-in report and verdict as such.
 #
-# Native Windows is not a SNIP target. Its cell checks only that store
-# publication and the store lease refuse before touching the filesystem
+# The Windows job is NOT native Windows support: native Windows is not a
+# SNIP target (SNIP #49). It checks only that store publication and the
+# store lease refuse before touching the filesystem
 # (crates/sum-store/tests/platform_fail_closed.rs). It never builds or runs
 # the client.
 #
@@ -89,7 +92,7 @@ jobs:
       - name: '#24 § 2.2 + § 2.3'
         run: scripts/platform-validation.sh client
 
-  linux-userland:
+  linux-stand-ins:
     name: ${{ matrix.cell.name }}
     runs-on: ${{ matrix.cell.runner }}
     container: ${{ matrix.cell.image }}
@@ -98,18 +101,21 @@ jobs:
       fail-fast: false
       matrix:
         cell:
-          - name: WSL2 userland proxy (ubuntu:24.04, x86_64)
+          - name: STAND-IN for WSL2, not WSL2 (ubuntu:24.04 container, x86_64)
             runner: ubuntu-24.04
             image: ubuntu:24.04
-            note: Ubuntu 24.04 container on a Linux runner; the WSL2 userland, not WSL2
-          - name: Crostini userland proxy (debian:12, x86_64)
+            stands_in_for: WSL2
+            note: Ubuntu 24.04 container on a GitHub-hosted Linux runner; not WSL2
+          - name: STAND-IN for Crostini, not Crostini (debian:12 container, x86_64)
             runner: ubuntu-24.04
             image: debian:12
-            note: Debian 12 container on a Linux runner; the Crostini userland, not Crostini
-          - name: Crostini userland proxy (debian:12, aarch64)
+            stands_in_for: Crostini
+            note: Debian 12 container on a GitHub-hosted Linux runner; not Crostini
+          - name: STAND-IN for Crostini, not Crostini (debian:12 container, aarch64)
             runner: ubuntu-24.04-arm
             image: debian:12
-            note: Debian 12 container on an arm64 Linux runner; the Crostini userland, not Crostini
+            stands_in_for: Crostini
+            note: Debian 12 container on a GitHub-hosted arm64 Linux runner; not Crostini
     defaults:
       run:
         shell: bash
@@ -117,6 +123,7 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
       SNIP_PLATFORM_LABEL: ${{ matrix.cell.name }}
       SNIP_CELL_NOTE: ${{ matrix.cell.note }}
+      SNIP_STAND_IN_FOR: ${{ matrix.cell.stands_in_for }}
     steps:
       # The container runs as root, so the documented commands run without sudo.
       - name: '#24 § 3.2 / § 4.2 pre-flight, as documented'
@@ -132,20 +139,20 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: '#24 § 3.4 / § 4.4'
+      - name: '#24 § 3.4 / § 4.4 commands (stand-in; not WSL2/Crostini coverage)'
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           scripts/platform-validation.sh client
 
   windows-fail-closed:
-    name: Windows native — store fails closed (SNIP #49)
+    name: Windows fail-closed refusal only, not native Windows support (SNIP #49)
     runs-on: windows-2025
     timeout-minutes: 60
     defaults:
       run:
         shell: bash
     env:
-      SNIP_PLATFORM_LABEL: Windows native (GitHub-hosted windows-2025)
+      SNIP_PLATFORM_LABEL: Windows, fail-closed check only (GitHub-hosted windows-2025)
     steps:
       # The script runs under Git Bash; keep its LF line endings.
       - name: Keep LF line endings for Git Bash

@@ -31,6 +31,11 @@
 #   SNIP_EXPECT_CHAIN_ID (1)  SNIP_EXPECT_R (3)  SNIP_EXPECT_V2_FROM (5200000)
 # Optional report fields: SNIP_PLATFORM_LABEL, SNIP_CELL_NOTE.
 #
+# SNIP_STAND_IN_FOR=<platform> marks a stand-in run, e.g. the documented
+# WSL2 or Crostini commands in a plain container on a Linux CI runner. The
+# report and verdict then say STAND-IN: such a run is not coverage of that
+# platform and never closes its #24 cell.
+#
 # Prints a § 7 report on stdout (also appended to $GITHUB_STEP_SUMMARY when
 # set). Exit 0 = PASS or PARTIAL (no check failed), 1 = a check failed,
 # 2 = usage error or wrong platform for the mode.
@@ -42,6 +47,7 @@ EXPECT_CHAIN_ID="${SNIP_EXPECT_CHAIN_ID:-1}"
 EXPECT_R="${SNIP_EXPECT_R:-3}"
 EXPECT_V2_FROM="${SNIP_EXPECT_V2_FROM:-5200000}"
 FAIL_CLOSED_TESTS=3
+STAND_IN_FOR="${SNIP_STAND_IN_FOR:-}"
 export CARGO_TERM_COLOR=never
 
 usage() {
@@ -248,6 +254,7 @@ report() {
 
 Platform: $(detect_platform)
 ${SNIP_CELL_NOTE:+Cell note: $SNIP_CELL_NOTE
+}${STAND_IN_FOR:+Coverage: STAND-IN for $STAND_IN_FOR. Not $STAND_IN_FOR coverage; does not close the #24 $STAND_IN_FOR cell.
 }
 OS version:
 $(os_version | sed 's/^/  /')
@@ -303,7 +310,7 @@ case "$MODE" in
         fi
         ran "cargo --version; rustc --version; git rev-parse HEAD"
         windows_fail_closed
-        scope="native Windows fail-closed (SNIP #49); no client cycle"
+        scope="Windows fail-closed refusal only (SNIP #49); not native Windows support; no client cycle"
         ;;
     *) usage ;;
 esac
@@ -314,6 +321,9 @@ elif [ "$MODE" = client ] && [ "$SMOKE" -eq 0 ]; then
     verdict="PARTIAL (smoke not run; not a § 8 pass)"
 else
     verdict=PASS
+fi
+if [ "$FAILED" -eq 0 ] && [ -n "$STAND_IN_FOR" ]; then
+    verdict="$verdict, STAND-IN for $STAND_IN_FOR (not $STAND_IN_FOR coverage; not a § 8 pass for that cell)"
 fi
 
 REPORT=$(report "$verdict" "$scope")
