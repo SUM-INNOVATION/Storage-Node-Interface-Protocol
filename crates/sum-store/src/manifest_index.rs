@@ -376,6 +376,13 @@ impl ManifestIndex {
             .or_else(|| self.private_cid_to_root.get(cid))
     }
 
+    /// Whether `cid` is a Private (ciphertext) chunk recorded by
+    /// [`Self::record_private_chunk_cid`]. Checked independently of the
+    /// Public reverse index, which can map the same CID elsewhere.
+    pub fn is_private_chunk_cid(&self, cid: &str) -> bool {
+        self.private_cid_to_root.contains_key(cid)
+    }
+
     /// All tracked merkle roots (Public + Private). Useful for the
     /// market-sync sweep, which gates further behavior on whether the
     /// archive holds *any* shape of manifest for a given file.

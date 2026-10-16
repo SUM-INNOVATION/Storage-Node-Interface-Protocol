@@ -76,6 +76,30 @@ impl GarbageCollector {
         assigned_cids: &HashSet<String>,
         last_l1_poll: Instant,
     ) -> Result<GcResult> {
+        self.sweep_where(store, last_l1_poll, |cid| !assigned_cids.contains(cid))
+    }
+
+    /// Run a mark-and-sweep cycle over `candidates` only.
+    ///
+    /// The inverse contract of [`Self::mark_and_sweep`]: a CID is eligible
+    /// for deletion only if the caller has positively attributed it to
+    /// `candidates`. Every other chunk on disk is retained and untracked,
+    /// including chunks whose ownership the caller cannot determine.
+    pub fn sweep_candidates(
+        &mut self,
+        store: &ChunkStore,
+        candidates: &HashSet<String>,
+        last_l1_poll: Instant,
+    ) -> Result<GcResult> {
+        self.sweep_where(store, last_l1_poll, |cid| candidates.contains(cid))
+    }
+
+    fn sweep_where(
+        &mut self,
+        store: &ChunkStore,
+        last_l1_poll: Instant,
+        deletable: impl Fn(&str) -> bool,
+    ) -> Result<GcResult> {
         // Safety: don't GC based on stale L1 state
         if last_l1_poll.elapsed() > MAX_L1_POLL_AGE {
             warn!(
@@ -92,13 +116,12 @@ impl GarbageCollector {
         let now = Instant::now();
         let mut result = GcResult::default();
 
-        // Remove from tracking any CIDs that are now assigned (re-assigned)
-        self.unassigned_since
-            .retain(|cid, _| !assigned_cids.contains(cid));
+        // Stop tracking any CID that is no longer deletable (re-assigned)
+        self.unassigned_since.retain(|cid, _| deletable(cid));
 
         for cid in &all_cids {
-            if assigned_cids.contains(cid) {
-                // Assigned — keep it, don't track
+            if !deletable(cid) {
+                // Not deletable — keep it, don't track
                 continue;
             }
 
@@ -355,5 +378,61 @@ mod tests {
 
         assert_eq!(result.chunks_deleted, 1);
         assert_eq!(result.bytes_freed, 4096);
+    }
+
+    #[test]
+    fn sweep_candidates_deletes_only_candidates() {
+        let (_dir, store) = make_store();
+        let cand = crate::content_id::cid_from_data(b"candidate chunk");
+        let other = crate::content_id::cid_from_data(b"unattributed chunk");
+        store.put(cand.as_str(), b"candidate chunk").unwrap();
+        store.put(other.as_str(), b"unattributed chunk").unwrap();
+
+        let candidates: HashSet<String> = [cand.to_string()].into_iter().collect();
+        let mut gc = GarbageCollector::new(Duration::from_secs(0));
+        let result = gc
+            .sweep_candidates(&store, &candidates, Instant::now())
+            .unwrap();
+
+        assert_eq!(result.chunks_deleted, 1);
+        assert!(!store.has(cand.as_str()));
+        assert!(
+            store.has(other.as_str()),
+            "a non-candidate is never deleted"
+        );
+        assert_eq!(gc.tracked_count(), 0);
+    }
+
+    #[test]
+    fn sweep_candidates_untracks_a_cid_that_stops_being_a_candidate() {
+        let (_dir, store) = make_store();
+        let cid = crate::content_id::cid_from_data(b"briefly a candidate");
+        store.put(cid.as_str(), b"briefly a candidate").unwrap();
+
+        let candidates: HashSet<String> = [cid.to_string()].into_iter().collect();
+        let mut gc = GarbageCollector::new(Duration::from_secs(3600));
+        gc.sweep_candidates(&store, &candidates, Instant::now())
+            .unwrap();
+        assert_eq!(gc.tracked_count(), 1);
+
+        gc.sweep_candidates(&store, &HashSet::new(), Instant::now())
+            .unwrap();
+        assert_eq!(gc.tracked_count(), 0, "grace restarts if it returns");
+        assert!(store.has(cid.as_str()));
+    }
+
+    #[test]
+    fn sweep_candidates_skips_on_stale_l1_state() {
+        let (_dir, store) = make_store();
+        let cid = crate::content_id::cid_from_data(b"stale-state candidate");
+        store.put(cid.as_str(), b"stale-state candidate").unwrap();
+        let candidates: HashSet<String> = [cid.to_string()].into_iter().collect();
+
+        let mut gc = GarbageCollector::new(Duration::from_secs(0));
+        let stale = Instant::now() - Duration::from_secs(600);
+        let result = gc.sweep_candidates(&store, &candidates, stale).unwrap();
+
+        assert!(result.skipped);
+        assert!(store.has(cid.as_str()));
     }
 }
