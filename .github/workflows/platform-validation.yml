@@ -1,0 +1,166 @@
+# Platform validation — the read-only cycle of the SNIP cross-platform
+# validation instructions (#24), run per OS cell on GitHub-hosted runners.
+#
+# Not a merge gate: "release-check (linux)" in ci.yml is. Every cell runs
+# scripts/platform-validation.sh, which names each expected output and fails
+# on any difference, then writes a #24 § 7 report to the job summary.
+#
+# Cells:
+#   macOS arm64             macos-26           § 2.2 + § 2.3
+#   macOS Intel             macos-26-intel     § 2.2 + § 2.3; workflow_dispatch
+#                                              only ("Skip unless requested")
+#   WSL2 userland proxy     ubuntu:24.04       § 3.2 setup, § 1 rustup, § 3.4
+#   Crostini userland proxy debian:12 x86_64   § 4.2 setup, § 1 rustup, § 4.4
+#   Crostini userland proxy debian:12 aarch64  same, on an arm64 runner
+#   Windows native          windows-2025       fail-closed only (SNIP #49)
+#
+# The proxy cells run the documented apt and rustup commands in a plain
+# container, so they check the setup snippets and the build on that userland.
+# They are not WSL2 (no WSL kernel, NAT or /mnt/c) and not Crostini (no
+# ChromeOS VM or container), so they cannot close those #24 cells on their
+# own; § 8 still needs a report from the real platform.
+#
+# Native Windows is not a SNIP target. Its cell checks only that store
+# publication and the store lease refuse before touching the filesystem
+# (crates/sum-store/tests/platform_fail_closed.rs). It never builds or runs
+# the client.
+#
+# The smoke (§ 2.3) reads two RPC methods from a public endpoint and writes
+# nothing. It runs on workflow_dispatch only, so pull requests do not depend
+# on mainnet availability; a pull-request cell is PARTIAL, never a § 8 pass.
+# Client writes (§ 2.4 / 3.6 / 4.6) and archive mode (§ 5) are never run:
+# they need coordinator approval and funded keys, and this workflow reads
+# no secrets.
+#
+# Third-party actions are pinned to the same full commit SHAs as ci.yml.
+
+name: platform-validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      rpc_url:
+        description: Public read-only RPC for the § 2.3 smoke
+        type: string
+        default: https://rpc.sumchain.io
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/platform-validation.sh'
+      - '.github/workflows/platform-validation.yml'
+
+concurrency:
+  group: platform-validation-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  SNIP_SMOKE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+  SNIP_RPC_URL: ${{ inputs.rpc_url || 'https://rpc.sumchain.io' }}
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.cell.arch }} client (§ 2.2 + § 2.3)
+    runs-on: ${{ matrix.cell.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '[{"runner":"macos-26","arch":"arm64"},{"runner":"macos-26-intel","arch":"x86_64"}]' || '[{"runner":"macos-26","arch":"arm64"}]') }}
+    env:
+      SNIP_PLATFORM_LABEL: macOS (${{ matrix.cell.arch }}, GitHub-hosted ${{ matrix.cell.runner }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: '#24 § 2.2 + § 2.3'
+        run: scripts/platform-validation.sh client
+
+  linux-userland:
+    name: ${{ matrix.cell.name }}
+    runs-on: ${{ matrix.cell.runner }}
+    container: ${{ matrix.cell.image }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        cell:
+          - name: WSL2 userland proxy (ubuntu:24.04, x86_64)
+            runner: ubuntu-24.04
+            image: ubuntu:24.04
+            note: Ubuntu 24.04 container on a Linux runner; the WSL2 userland, not WSL2
+          - name: Crostini userland proxy (debian:12, x86_64)
+            runner: ubuntu-24.04
+            image: debian:12
+            note: Debian 12 container on a Linux runner; the Crostini userland, not Crostini
+          - name: Crostini userland proxy (debian:12, aarch64)
+            runner: ubuntu-24.04-arm
+            image: debian:12
+            note: Debian 12 container on an arm64 Linux runner; the Crostini userland, not Crostini
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      SNIP_PLATFORM_LABEL: ${{ matrix.cell.name }}
+      SNIP_CELL_NOTE: ${{ matrix.cell.note }}
+    steps:
+      # The container runs as root, so the documented commands run without sudo.
+      - name: '#24 § 3.2 / § 4.2 pre-flight, as documented'
+        run: |
+          apt update
+          apt install -y build-essential pkg-config libssl-dev git make curl
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: '#24 § 1 toolchain, as documented'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: '#24 § 3.4 / § 4.4'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          scripts/platform-validation.sh client
+
+  windows-fail-closed:
+    name: Windows native — store fails closed (SNIP #49)
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      SNIP_PLATFORM_LABEL: Windows native (GitHub-hosted windows-2025)
+    steps:
+      # The script runs under Git Bash; keep its LF line endings.
+      - name: Keep LF line endings for Git Bash
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: Store publication and lease refuse on native Windows
+        run: bash scripts/platform-validation.sh windows-fail-closed
