@@ -1380,4 +1380,96 @@ mod tests {
             .expect_err("mismatched response root must reject");
         assert!(matches!(err, PushReject::BadChainShape(_)), "got {err:?}");
     }
+
+    // ── #129 cross-repository evidence: pushes after a reassignment epoch ──
+    //
+    // The chain records a reassignment epoch in a separate list; the
+    // `storage_getFileInfoV2` row keeps the original `assignment_height`.
+    // These tests pin what the push validator does with that row: it
+    // validates every push against the epoch-0 snapshot and never asks for
+    // the latest epoch's snapshot. So an owner re-pushing a chunk to the
+    // archives the latest epoch assigns can be refused.
+
+    /// The epoch-0 snapshot (archive 0xAA has since left) and the latest
+    /// epoch's snapshot (0xAA gone, replacement 0xC0 added), both sorted.
+    fn reassignment_snapshots() -> (Vec<[u8; 20]>, Vec<[u8; 20]>) {
+        let epoch0 = five_archives();
+        let mut latest: Vec<[u8; 20]> = epoch0[1..].to_vec();
+        latest.push([0xC0; 20]);
+        latest.sort();
+        (epoch0, latest)
+    }
+
+    #[tokio::test]
+    async fn reassignment_replacement_archive_refuses_push_of_its_latest_epoch_chunk() {
+        let (epoch0, latest) = reassignment_snapshots();
+        let replacement = [0xC0; 20];
+        let tree = TreeFixture::new(32, 0x66);
+        let (h0, h_latest) = (700u64, 900u64);
+        let r = V2Params::DEFAULTS.assignment_replication_factor;
+        let idx = first_chunk_assigned_to(&tree.root, &latest, tree.chunk_count, &replacement, r);
+
+        let rpc = MockRpc::default();
+        rpc.add_file(
+            &format!("0x{}", hex::encode(tree.root)),
+            file_info(&tree.root, tree.chunk_count, LifecycleV2::ACTIVE, h0),
+        );
+        rpc.add_snapshot(h0, epoch0.iter().map(node_record).collect());
+        rpc.add_snapshot(h_latest, latest.iter().map(node_record).collect());
+        let validator = PushValidator::new(rpc, replacement, V2Params::DEFAULTS);
+
+        let err = validator
+            .validate_push(tree.root, idx, tree.data(idx), &tree.proof(idx))
+            .await
+            .expect_err("a replacement archive is judged against the epoch-0 snapshot");
+        match err {
+            PushReject::NotInSnapshot { height, .. } => assert_eq!(height, h0),
+            other => panic!("expected NotInSnapshot at epoch 0, got {other:?}"),
+        }
+        assert_eq!(
+            *validator.rpc.snapshot_calls.lock().unwrap(),
+            vec![h0],
+            "the latest epoch's snapshot is never consulted"
+        );
+    }
+
+    #[tokio::test]
+    async fn reassignment_survivor_refuses_push_of_a_newly_assigned_chunk() {
+        let (epoch0, latest) = reassignment_snapshots();
+        let tree = TreeFixture::new(64, 0x77);
+        let h0 = 700u64;
+        let r = V2Params::DEFAULTS.assignment_replication_factor;
+
+        // A surviving archive and a chunk the latest epoch assigns to it
+        // that epoch 0 did not.
+        let (survivor, idx) = latest
+            .iter()
+            .filter(|a| epoch0.contains(a))
+            .find_map(|a| {
+                (0..tree.chunk_count)
+                    .find(|&i| {
+                        assigned_archives(&tree.root, &latest, i, r).contains(a)
+                            && !assigned_archives(&tree.root, &epoch0, i, r).contains(a)
+                    })
+                    .map(|i| (*a, i))
+            })
+            .expect("fixture has a survivor with a newly assigned chunk");
+
+        let rpc = MockRpc::default();
+        rpc.add_file(
+            &format!("0x{}", hex::encode(tree.root)),
+            file_info(&tree.root, tree.chunk_count, LifecycleV2::ACTIVE, h0),
+        );
+        rpc.add_snapshot(h0, epoch0.iter().map(node_record).collect());
+        let validator = PushValidator::new(rpc, survivor, V2Params::DEFAULTS);
+
+        let err = validator
+            .validate_push(tree.root, idx, tree.data(idx), &tree.proof(idx))
+            .await
+            .expect_err("a chunk assigned only in the latest epoch is refused");
+        match err {
+            PushReject::NotAssigned { chunk_index } => assert_eq!(chunk_index, idx),
+            other => panic!("expected NotAssigned, got {other:?}"),
+        }
+    }
 }
