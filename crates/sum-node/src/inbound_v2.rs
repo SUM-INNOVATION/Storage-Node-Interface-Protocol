@@ -2723,4 +2723,169 @@ mod tests {
         let got = v2_pull(&d, &net, &cid, 0, narrowing, 21).await;
         expect_ok(got, 21, &cid, 0, 4, b"abcd");
     }
+
+    // ── sum-chain #129 evidence: attestation after a reassignment epoch ──
+    //
+    // The chain (sum-chain `execute_accept_assignment_v2`) validates every
+    // `AcceptAssignmentV2` index against the assignment over the LATEST
+    // reassignment epoch's snapshot, and rejects the whole transaction if
+    // any index is not assigned to the signer in that epoch. SNIP's trigger
+    // path reads `assignment_height` (epoch 0) from `getFileInfoV2` and
+    // attests against the epoch-0 snapshot only. These two tests pin that
+    // behaviour so the gap is visible; they do not change it.
+
+    /// Epoch 0 at h=500 is `five_archives()`. A reassignment epoch at h=900
+    /// replaced the fifth archive with `replacement`. The replacement holds
+    /// every chunk the latest epoch assigns it, yet the ManifestPush-driven
+    /// attestation submits nothing: the epoch-0 snapshot does not contain it.
+    #[tokio::test]
+    async fn reassignment_epoch_replacement_archive_is_never_attested() {
+        use sum_store::assignment_v2::chunks_for_archive_v2;
+        let epoch0 = five_archives();
+        let mut epoch1 = epoch0.clone();
+        let replacement = [0xF0u8; 20];
+        epoch1[4] = replacement;
+        epoch1.sort();
+        let r = 3u32;
+
+        let (manifest, _chunks, _tree) = make_manifest(64, 0x29);
+        let root = manifest.merkle_root;
+        let latest_epoch_set =
+            chunks_for_archive_v2(&root, manifest.chunk_count, &epoch1, r, &replacement);
+        assert!(
+            !latest_epoch_set.is_empty(),
+            "fixture: the latest epoch must assign the replacement some chunks"
+        );
+
+        let rpc = AllMockRpc::new();
+        // getFileInfoV2 reports the file's ORIGINAL assignment_height.
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            file_info_active(&root, manifest.chunk_count, 500),
+        );
+        rpc.add_snapshot(
+            500,
+            epoch0.iter().map(node_record).collect(),
+            epoch0.clone(),
+        );
+        rpc.add_snapshot(
+            900,
+            epoch1.iter().map(node_record).collect(),
+            epoch1.clone(),
+        );
+        rpc.set_nonce(&l1_address_base58(&replacement), 0);
+        let rpc_arc = Arc::new(rpc);
+        let attestor = Arc::new(AssignmentAttestor::new(
+            ArcRpc(rpc_arc.clone()),
+            [42u8; 32],
+            replacement,
+            1337,
+            1_000_000,
+            crate::push_validator::V2Params {
+                assignment_replication_factor: r,
+                max_chunk_indices_per_tx: 1024,
+            },
+        ));
+
+        let summary = run_attestation(
+            attestor,
+            Arc::new(ArcRpcTrigger(rpc_arc.clone())),
+            root,
+            latest_epoch_set.clone(),
+            l1_address_base58(&replacement),
+            Duration::from_millis(10),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("trigger runs");
+        assert_eq!(summary.attested_count(), 0);
+        assert_eq!(
+            rpc_arc.sent_count(),
+            0,
+            "no AcceptAssignmentV2 is submitted for the latest-epoch assignment"
+        );
+    }
+
+    /// A surviving archive attests its EPOCH-0 assignment after a
+    /// reassignment. Every index outside its latest-epoch assignment would
+    /// make the chain reject the whole transaction (code 33), and indices
+    /// only the latest epoch assigns it are never attested.
+    #[tokio::test]
+    async fn reassignment_epoch_survivor_attests_epoch_zero_assignment() {
+        use sum_store::assignment_v2::chunks_for_archive_v2;
+        let epoch0 = five_archives();
+        let mut epoch1 = epoch0.clone();
+        epoch1[4] = [0xF0u8; 20];
+        epoch1.sort();
+        let r = 3u32;
+        let me = epoch0[0];
+
+        let (manifest, _chunks, _tree) = make_manifest(64, 0x29);
+        let root = manifest.merkle_root;
+        let s0 = chunks_for_archive_v2(&root, manifest.chunk_count, &epoch0, r, &me);
+        let s1 = chunks_for_archive_v2(&root, manifest.chunk_count, &epoch1, r, &me);
+        let only_epoch0: Vec<u32> = s0.difference(&s1).copied().collect();
+        let only_latest: Vec<u32> = s1.difference(&s0).copied().collect();
+        assert!(
+            !only_epoch0.is_empty() && !only_latest.is_empty(),
+            "fixture: the reassignment must move this archive's assignment both ways \
+             (only_epoch0={only_epoch0:?}, only_latest={only_latest:?})"
+        );
+
+        let rpc = AllMockRpc::new();
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            file_info_active(&root, manifest.chunk_count, 500),
+        );
+        rpc.add_snapshot(
+            500,
+            epoch0.iter().map(node_record).collect(),
+            epoch0.clone(),
+        );
+        rpc.add_snapshot(
+            900,
+            epoch1.iter().map(node_record).collect(),
+            epoch1.clone(),
+        );
+        rpc.set_nonce(&l1_address_base58(&me), 7);
+        rpc.enqueue_send("0xtx-attest");
+        rpc.enqueue_status(TxStatusV2::Finalized { block_height: 1000 });
+        let rpc_arc = Arc::new(rpc);
+        let attestor = Arc::new(AssignmentAttestor::new(
+            ArcRpc(rpc_arc.clone()),
+            [42u8; 32],
+            me,
+            1337,
+            1_000_000,
+            crate::push_validator::V2Params {
+                assignment_replication_factor: r,
+                max_chunk_indices_per_tx: 1024,
+            },
+        ));
+        // The archive holds every chunk of the file.
+        let held: BTreeSet<u32> = (0..manifest.chunk_count).collect();
+
+        let summary = run_attestation(
+            attestor,
+            Arc::new(ArcRpcTrigger(rpc_arc.clone())),
+            root,
+            held,
+            l1_address_base58(&me),
+            Duration::from_millis(10),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("trigger runs");
+        assert_eq!(summary.batches.len(), 1);
+        let submitted: BTreeSet<u32> = summary.batches[0].chunk_indices.iter().copied().collect();
+        assert_eq!(submitted, s0, "attests the epoch-0 assignment");
+        assert!(
+            only_epoch0.iter().all(|i| submitted.contains(i)),
+            "includes indices the latest epoch does not assign (chain rejects the tx)"
+        );
+        assert!(
+            only_latest.iter().all(|i| !submitted.contains(i)),
+            "omits indices only the latest epoch assigns"
+        );
+    }
 }
