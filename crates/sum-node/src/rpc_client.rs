@@ -10,7 +10,7 @@ use tracing::debug;
 
 use sum_types::rpc_types::{
     AssignmentCoverageV2, BlockHeightInfo, ChainParamsInfo, ChallengeInfo, NodeRecordInfo,
-    StorageFileInfo, StorageFileInfoV2, TxStatusV2,
+    StorageBuildResponse, StorageFileInfo, StorageFileInfoV2, TxStatusV2,
 };
 
 /// JSON-RPC client connected to a SUM Chain L1 node.
@@ -300,6 +300,28 @@ impl L1RpcClient {
         self.call(
             "storage_getAssignmentCoverageV2",
             json!([merkle_root_hex, missing_offset, missing_limit]),
+        )
+        .await
+    }
+
+    /// `storage_buildReassignChunksV2` — the chain's no-key builder for an
+    /// owner-triggered `ReassignChunksV2`. Returns the unsigned
+    /// `TransactionV2` and its signing hash; it signs nothing and checks no
+    /// ownership (the executor stays authoritative). Callers must verify the
+    /// returned bytes before signing them.
+    pub async fn storage_build_reassign_chunks_v2(
+        &self,
+        from_base58: &str,
+        merkle_root_hex: &str,
+        fee: u128,
+    ) -> Result<StorageBuildResponse> {
+        self.call(
+            "storage_buildReassignChunksV2",
+            json!([{
+                "from": from_base58,
+                "merkle_root": merkle_root_hex,
+                "fee": fee,
+            }]),
         )
         .await
     }

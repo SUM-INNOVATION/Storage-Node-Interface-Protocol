@@ -16,6 +16,7 @@ pub mod peer_state;
 pub mod por_worker;
 pub mod profile;
 pub mod push_validator;
+pub mod reassign_v2;
 pub mod rpc_client;
 pub mod runtime_params;
 pub mod shard_dispatch;

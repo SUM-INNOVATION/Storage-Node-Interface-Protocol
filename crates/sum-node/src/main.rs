@@ -256,6 +256,24 @@ enum Command {
         merkle_root: String,
     },
 
+    /// V2 reassign: submit an owner-triggered `ReassignChunksV2` for a file
+    /// this key owns, when the chain reports `reassignment_needed`.
+    ///
+    /// The chain's no-key builder (`storage_buildReassignChunksV2`)
+    /// assembles the unsigned transaction; this command verifies it against
+    /// the request, then signs it with `--key-file` (the same owner key as
+    /// `abandon` and ingest) and waits for finality. It refuses a file owned
+    /// by another address, a file the chain does not mark
+    /// `reassignment_needed`, and any built transaction that disagrees with
+    /// the request. `--dry-run` verifies and stops without signing.
+    Reassign {
+        /// Hex-encoded 32-byte merkle root of the file.
+        merkle_root: String,
+        /// Verify the built transaction and print it; sign and send nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Phase 4a — register an X25519 encryption public key on chain so
     /// other accounts can wrap private-file `K_file`s for this account.
     ///
@@ -473,6 +491,26 @@ async fn main() -> Result<()> {
                 cli.profile,
                 net_config,
                 merkle_root,
+            )
+            .await
+        }
+        Command::Reassign {
+            merkle_root,
+            dry_run,
+        } => {
+            let seed = seed.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "reassign requires --key-file (ReassignChunksV2 is signed by the file owner)"
+                )
+            })?;
+            run_reassign_v2(
+                seed,
+                cli.rpc_url.clone(),
+                cli.chain_id,
+                cli.attest_fee,
+                cli.profile,
+                merkle_root,
+                dry_run,
             )
             .await
         }
@@ -1320,8 +1358,8 @@ async fn run_resume_v2(
     //
     // Unlike fresh ingest, the file is already Pending on chain. We
     // do NOT claim registration was refused. We report the existing
-    // lifecycle and suggest abandon (SNIP-side) or external
-    // ReassignChunksV2 (chain-side; not implemented here).
+    // lifecycle and suggest abandon. `sum-node reassign` submits
+    // ReassignChunksV2 only when the chain reports reassignment_needed.
     match rpc_early.chain_get_chain_params().await {
         Ok(cp) if cp.assignment_replication_factor == 0 => {
             // Fetch the existing file info to include assignment_height
@@ -1338,7 +1376,7 @@ async fn run_resume_v2(
                  assignment_replication_factor is 0; no push plan can be produced. \
                  The file remains Pending on chain (assignment_height={:?}). \
                  Abandon may be admissible per activation_grace_blocks; \
-                 SNIP does not implement client-side ReassignChunksV2.",
+                 `sum-node reassign` applies only if the chain reports reassignment_needed.",
                 assignment_height,
             );
         }
@@ -1483,6 +1521,80 @@ async fn run_resume_v2(
     }
     net.shutdown().await?;
     Ok(())
+}
+
+/// Owner-triggered `ReassignChunksV2` (see `sum_node::reassign_v2`).
+/// Chain-only: no network stack. Exits non-zero on every outcome except a
+/// finalized reassignment or a verified dry run.
+async fn run_reassign_v2(
+    seed: [u8; 32],
+    rpc_url: String,
+    chain_id_arg: u64,
+    fee_per_tx: u128,
+    profile: NodeProfile,
+    merkle_root_hex: String,
+    dry_run: bool,
+) -> Result<()> {
+    use sum_node::reassign_v2::{ReassignOutcome, ReassignRequest, reassign_chunks_v2};
+
+    let merkle_root = parse_merkle_root_hex(&merkle_root_hex)?;
+    let rpc = Arc::new(L1RpcClient::new(rpc_url));
+    let defaults = sum_node::ingest_v2::IngestParamsDefaults::default();
+    let params = build_v2_ingest_params(&rpc, profile, chain_id_arg, fee_per_tx, defaults).await?;
+    let req = ReassignRequest {
+        merkle_root,
+        chain_id: params.chain_id,
+        fee: params.fee_per_tx,
+        dry_run,
+        poll_interval: params.poll_interval,
+        finality_timeout: params.finality_timeout,
+    };
+    let root = format!("0x{}", hex::encode(merkle_root));
+    match reassign_chunks_v2(rpc.as_ref(), &seed, &req).await {
+        ReassignOutcome::Reassigned {
+            tx_hash,
+            finalized_at_height,
+        } => {
+            info!(%root, %tx_hash, finalized_at_height, "REASSIGN finalized");
+            println!("reassigned: {root} tx={tx_hash} finalized_at_height={finalized_at_height}");
+            Ok(())
+        }
+        ReassignOutcome::DryRun {
+            nonce,
+            fee,
+            signing_hash,
+        } => {
+            println!(
+                "dry run: ReassignChunksV2 for {root} verified (nonce={nonce} fee={fee} \
+                 signing_hash={signing_hash}); nothing signed or sent"
+            );
+            Ok(())
+        }
+        ReassignOutcome::NotRegistered => {
+            anyhow::bail!("reassign: {root} has no V2 file or coverage row on chain")
+        }
+        ReassignOutcome::NotOwner { owner } => {
+            anyhow::bail!("reassign: {root} is owned by {owner}, not this key; refusing to sign")
+        }
+        ReassignOutcome::NotNeeded {
+            latest_assignment_epoch,
+        } => anyhow::bail!(
+            "reassign: the chain does not report reassignment_needed for {root} \
+             (latest_assignment_epoch={latest_assignment_epoch:?}); nothing submitted"
+        ),
+        ReassignOutcome::BuildMismatch { reason } => anyhow::bail!(
+            "reassign: storage_buildReassignChunksV2 output does not match the request \
+             ({reason}); nothing signed"
+        ),
+        ReassignOutcome::Refused {
+            tx_hash,
+            block_height,
+            reason,
+        } => anyhow::bail!(
+            "reassign: chain refused {tx_hash} (block_height={block_height:?}): {reason}"
+        ),
+        ReassignOutcome::Failed { source } => Err(source.context("reassign failed")),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

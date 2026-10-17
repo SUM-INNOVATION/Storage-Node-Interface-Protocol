@@ -22,7 +22,8 @@ coordination with the chain team.
 | `chain_id` | Live-RPC chain id read | `register-node`; used to be safe against `--chain-id` misconfiguration |
 | `storage_getFileInfoV2` | Read a V2 file's row: visibility, lifecycle, access list, fee pool | Route Public vs Private; verify preconditions before write; ACL check on serve |
 | `storage_getActiveNodesAtHeight` | Snapshot of active-`ArchiveNode` rows at a chain height | V2 ingest assignment; three-archive bootstrap gate |
-| `storage_getAssignmentCoverageV2` | Coverage bitmap + `can_activate_now` predicate for a Pending V2 file | Ingest S4 coverage poll |
+| `storage_getAssignmentCoverageV2` | Coverage bitmap + `can_activate_now` predicate for a Pending V2 file; `reassignment_needed` | Ingest S4 coverage poll; `reassign` precondition |
+| `storage_buildReassignChunksV2` | Chain's no-key builder for the unsigned owner `ReassignChunksV2` transaction | `reassign` (output verified before signing) |
 | `storage_getActiveNodes` | Legacy bare snapshot (unsupported/removed on chain) | **No longer called by SNIP** — V1 MarketSync, upload, and legacy download read the finalized height and call `storage_getActiveNodesAtHeight` |
 | `storage_getFundedFiles` | V1 files with `fee_pool > 0` | V1 MarketSync path |
 | `storage_getActiveChallenges` | Pending PoR challenges targeting a specific address | `PorWorker` background loop |
@@ -50,6 +51,7 @@ Transactions SNIP submits:
 - `TxPayload::StorageMetadataV2(RegisterFilePendingV2)` — `ingest-v2`
 - `TxPayload::StorageMetadataV2(ActivateFileV2)` — `ingest-v2` S5, `resume` residual
 - `TxPayload::StorageMetadataV2(AbandonFileV2)` — `abandon`
+- `TxPayload::StorageMetadataV2(ReassignChunksV2)` — `reassign` (built by the chain, verified and signed locally)
 - `TxPayload::StorageMetadataV2(AcceptAssignmentV2)` — `AssignmentAttestor` background
 - `TxPayload::StorageMetadataV2(AddAccessV2)` — `share`
 - `TxPayload::StorageMetadataV2(RemoveAccessV2)` — `revoke`
