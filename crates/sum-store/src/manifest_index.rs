@@ -19,7 +19,7 @@
 //!
 //! On startup both shapes are scanned and loaded into memory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -57,7 +57,23 @@ pub struct ManifestIndex {
     /// Persisted as one CID per line in `<hex_root>.private_chunks`
     /// so Private downloads survive node restarts.
     private_cid_to_root: HashMap<String, [u8; 32]>,
+    /// Chunk CIDs garbage collection must never delete: every chunk
+    /// accepted by a V2 Push (recorded before the chunk is written), plus
+    /// every chunk already on disk when this store first ran a version
+    /// that keeps this list (provenance unknown, so retained). Persisted
+    /// in [`GC_PROTECTED_FILE`]; see [`Self::record_v2_held_chunk`].
+    gc_protected: HashSet<String>,
+    /// `Some(false)` when the protected list exists but could not be read:
+    /// garbage collection must then delete nothing. `None` until the list
+    /// has been created (first run of this version, before seeding).
+    gc_protection_intact: Option<bool>,
 }
+
+/// File (under `manifests/`) listing chunk CIDs that garbage collection
+/// must never delete. One entry per line: `v2 <hex_root> <cid>` for a chunk
+/// accepted by a V2 Push, `legacy - <cid>` for a chunk present when the list
+/// was first created.
+pub const GC_PROTECTED_FILE: &str = "gc_protected.list";
 
 /// Result of accepting a validated network manifest.
 #[derive(Debug)]
@@ -160,7 +176,11 @@ impl ManifestIndex {
             cid_to_root: HashMap::new(),
             private_bytes: HashMap::new(),
             private_cid_to_root: HashMap::new(),
+            gc_protected: HashSet::new(),
+            gc_protection_intact: None,
         };
+
+        index.load_gc_protected();
 
         // Load all existing manifests. `.cbor` → Public manifest;
         // `.opaque` → Private encrypted manifest blob; `.private_chunks`
@@ -383,6 +403,70 @@ impl ManifestIndex {
         self.private_cid_to_root.contains_key(cid)
     }
 
+    /// Record, durably, that `cid` was accepted by a V2 Push for
+    /// `merkle_root`, so garbage collection never deletes it. Call this
+    /// BEFORE writing the chunk: a V2 chunk must never be on disk without
+    /// its exemption. Idempotent.
+    pub fn record_v2_held_chunk(&mut self, merkle_root: [u8; 32], cid: &str) -> Result<()> {
+        if self.gc_protected.contains(cid) {
+            return Ok(());
+        }
+        if !self.gc_protection_initialized() {
+            // Appending first would create the list without the legacy
+            // seed, and a restart would then trust it as complete.
+            return Err(crate::error::StoreError::Other(
+                "GC-protected chunk list not initialized (open the store via SumStore::new)".into(),
+            ));
+        }
+        let line = format!("v2 {} {cid}\n", hex::encode(merkle_root));
+        self.append_gc_protected_line(&line)?;
+        self.gc_protected.insert(cid.to_string());
+        Ok(())
+    }
+
+    /// Whether garbage collection must never delete `cid`.
+    pub fn is_gc_protected(&self, cid: &str) -> bool {
+        self.gc_protected.contains(cid)
+    }
+
+    /// Whether garbage collection may delete anything at all: the protected
+    /// list exists and was read in full. Fails closed when it is missing or
+    /// unreadable.
+    pub fn gc_protection_intact(&self) -> bool {
+        self.gc_protection_intact == Some(true)
+    }
+
+    /// Whether the protected list has been created (by a previous run, or by
+    /// [`Self::seed_gc_protected_legacy`]).
+    pub fn gc_protection_initialized(&self) -> bool {
+        self.gc_protection_intact.is_some()
+    }
+
+    /// First run of a version that keeps the protected list: protect every
+    /// chunk already on disk, because nothing records which of them arrived
+    /// by V2 Push. Writes the list atomically (temp file, fsync, rename);
+    /// a crash before the rename simply repeats the seeding on next start.
+    pub fn seed_gc_protected_legacy(&mut self, cids_on_disk: &[String]) -> Result<()> {
+        use std::io::Write;
+        let path = self.manifests_dir.join(GC_PROTECTED_FILE);
+        let tmp = self.manifests_dir.join(format!("{GC_PROTECTED_FILE}.tmp"));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            for cid in cids_on_disk {
+                writeln!(f, "legacy - {cid}")?;
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        self.gc_protected.extend(cids_on_disk.iter().cloned());
+        self.gc_protection_intact = Some(true);
+        tracing::info!(
+            protected = cids_on_disk.len(),
+            "created the GC-protected chunk list; every chunk already on disk is retained"
+        );
+        Ok(())
+    }
+
     /// All tracked merkle roots (Public + Private). Useful for the
     /// market-sync sweep, which gates further behavior on whether the
     /// archive holds *any* shape of manifest for a given file.
@@ -432,6 +516,44 @@ impl ManifestIndex {
     /// Append one CID line to `<hex_root>.private_chunks`. Each line
     /// is independently complete (`<cid>\n`), so a crash mid-write
     /// loses at most the in-flight line — the rest reloads cleanly.
+    /// Read [`GC_PROTECTED_FILE`] if it exists. An unreadable list leaves
+    /// protection marked broken, so garbage collection deletes nothing.
+    fn load_gc_protected(&mut self) {
+        let path = self.manifests_dir.join(GC_PROTECTED_FILE);
+        if !path.exists() {
+            return;
+        }
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                for line in content.lines() {
+                    // `<kind> <root|-> <cid>`. A torn final line (crash
+                    // mid-append) names no chunk that was ever written,
+                    // because the line is synced before the chunk is.
+                    if let Some(cid) = line.split_whitespace().nth(2) {
+                        self.gc_protected.insert(cid.to_string());
+                    }
+                }
+                self.gc_protection_intact = Some(true);
+            }
+            Err(e) => {
+                tracing::error!(path = %path.display(), %e, "GC-protected chunk list unreadable; garbage collection disabled");
+                self.gc_protection_intact = Some(false);
+            }
+        }
+    }
+
+    fn append_gc_protected_line(&self, line: &str) -> Result<()> {
+        use std::io::Write;
+        let path = self.manifests_dir.join(GC_PROTECTED_FILE);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        f.write_all(line.as_bytes())?;
+        f.sync_data()?;
+        Ok(())
+    }
+
     fn append_private_chunk_cid_to_disk(&self, root: &[u8; 32], cid: &str) -> Result<()> {
         use std::io::Write;
         let hex_root: String = root.iter().map(|b| format!("{b:02x}")).collect();
@@ -767,6 +889,63 @@ mod tests {
     /// same root simply overwrites; callers (push handler) usually
     /// gate on `get_private_bytes` first to log idempotency, but the
     /// store doesn't reject re-inserts.
+    #[test]
+    fn gc_protected_list_refuses_records_until_initialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        assert!(!idx.gc_protection_initialized());
+        assert!(!idx.gc_protection_intact(), "fails closed before seeding");
+        assert!(idx.record_v2_held_chunk([1u8; 32], "cid-a").is_err());
+        assert!(
+            !dir.path()
+                .join("manifests")
+                .join(GC_PROTECTED_FILE)
+                .exists(),
+            "a refused record must not create an unseeded list"
+        );
+    }
+
+    #[test]
+    fn gc_protected_list_survives_reload_and_seeds_legacy_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            idx.seed_gc_protected_legacy(&["legacy-cid".to_string()])
+                .unwrap();
+            idx.record_v2_held_chunk([2u8; 32], "v2-cid").unwrap();
+            idx.record_v2_held_chunk([2u8; 32], "v2-cid").unwrap(); // idempotent
+            assert!(idx.gc_protection_intact());
+        }
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        assert!(idx.gc_protection_intact());
+        assert!(idx.is_gc_protected("legacy-cid"));
+        assert!(idx.is_gc_protected("v2-cid"));
+        assert!(!idx.is_gc_protected("other"));
+        let content =
+            fs::read_to_string(dir.path().join("manifests").join(GC_PROTECTED_FILE)).unwrap();
+        assert_eq!(content.lines().count(), 2, "one line per protected chunk");
+    }
+
+    #[test]
+    fn gc_protected_list_ignores_a_torn_final_line() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            idx.seed_gc_protected_legacy(&[]).unwrap();
+            idx.record_v2_held_chunk([3u8; 32], "whole").unwrap();
+        }
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("manifests").join(GC_PROTECTED_FILE))
+            .unwrap();
+        f.write_all(b"v2 0303").unwrap(); // crash mid-append
+        drop(f);
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        assert!(idx.gc_protection_intact());
+        assert!(idx.is_gc_protected("whole"));
+    }
+
     #[test]
     fn private_manifest_insert_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();

@@ -523,8 +523,22 @@ where
                 visibility,
             }) => {
                 let cid = cid_from_blake3_hash(&blake3::Hash::from(leaf_hash));
+                // Record the GC exemption BEFORE the chunk is written, under
+                // the write lock the GC also takes: a V2 chunk is never on
+                // disk without it, whichever manifest later names its CID.
+                let exempt = {
+                    let mut stores = self.store.write().await;
+                    stores.manifest_idx.record_v2_held_chunk(merkle_root, &cid)
+                };
                 let stores = self.store.read().await;
-                if let Err(e) = stores.local.put(&cid, &data) {
+                if let Err(e) = exempt {
+                    warn!(%peer_id, %cid, %e, "V2 Push: GC exemption write failed — refusing ACK");
+                    ShardResponseV2::PushAck {
+                        merkle_root,
+                        chunk_index,
+                        error: Some(format!("gc exemption persistence failed: {e}")),
+                    }
+                } else if let Err(e) = stores.local.put(&cid, &data) {
                     warn!(%peer_id, %cid, %e, "V2 Push: store.put failed");
                     ShardResponseV2::PushAck {
                         merkle_root,
@@ -2211,6 +2225,63 @@ mod tests {
     /// on the manifest's CBOR-decoded chunk list to populate
     /// `cid_to_root`. Pin that the Phase 4b change didn't accidentally
     /// double-write.
+    /// A V2 Push records the chunk's GC exemption, durably, so garbage
+    /// collection never deletes it whichever manifest later names its CID.
+    #[tokio::test]
+    async fn v2_push_records_a_durable_gc_exemption_for_the_chunk() {
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let assignment_height = 800u64;
+        let (manifest, chunks, tree) = make_manifest(8, 0x4D);
+        let root = manifest.merkle_root;
+
+        let rpc = AllMockRpc::new();
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            file_info_active(&root, manifest.chunk_count, assignment_height),
+        );
+        rpc.add_snapshot(
+            assignment_height,
+            snapshot.iter().map(node_record).collect(),
+            snapshot.clone(),
+        );
+        rpc.set_nonce(&l1_address_base58(&my_addr), 1);
+
+        let stores = make_stores();
+        let dispatcher = build_dispatcher(rpc, snapshot.clone(), my_addr, stores.clone());
+
+        let r = crate::push_validator::V2Params::DEFAULTS.assignment_replication_factor;
+        let i = (0..manifest.chunk_count)
+            .find(|&i| {
+                sum_store::assignment_v2::assigned_archives(&root, &snapshot, i, r)
+                    .contains(&my_addr)
+            })
+            .expect("at least one assigned chunk");
+        let cid = sum_store::cid_from_data(&chunks[i as usize]);
+
+        let net = RecorderNet::new();
+        dispatcher
+            .handle_push(
+                &net,
+                fake_peer(),
+                1,
+                chunks[i as usize].clone(),
+                root,
+                i,
+                tree.proof_bytes(i),
+            )
+            .await;
+
+        let s = stores.read().await;
+        assert!(s.local.has(&cid), "chunk stored");
+        assert!(s.manifest_idx.is_gc_protected(&cid), "exemption in memory");
+        let reloaded = sum_store::manifest_index::ManifestIndex::load(&s.config.store_dir).unwrap();
+        assert!(
+            reloaded.is_gc_protected(&cid),
+            "exemption survives a restart"
+        );
+    }
+
     #[tokio::test]
     async fn public_v2_push_does_not_touch_private_cid_index() {
         let snapshot = five_archives();

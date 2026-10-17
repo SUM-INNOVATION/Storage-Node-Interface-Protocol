@@ -174,13 +174,17 @@ impl MarketSyncWorker {
         // 4. Run garbage collection over positively attributed candidates
         // only. Anything else on disk (V2 pushes, Private ciphertext, chunks
         // of files outside the funded V1 set, orphans) is retained.
+        //
+        // Attribution and deletion happen under ONE write guard: a V2 Push
+        // records its GC exemption under the write lock, so no push can land
+        // between computing the candidates and deleting them.
         self.last_l1_poll = Instant::now();
-        let candidates = self.compute_gc_candidates(&files, &node_addrs, store).await;
         {
-            let store_read = store.read().await;
+            let store_guard = store.write().await;
+            let candidates = self.compute_gc_candidates(&files, &node_addrs, &store_guard);
             match self
                 .gc
-                .sweep_candidates(&store_read.local, &candidates, self.last_l1_poll)
+                .sweep_candidates(&store_guard.local, &candidates, self.last_l1_poll)
             {
                 Ok(result) if result.chunks_deleted > 0 => {
                     info!(
@@ -364,14 +368,19 @@ impl MarketSyncWorker {
     /// mapping. The funded set (`storage_getFundedFiles`) lists V1 files
     /// only, so V2 chunks are never candidates. A chunk whose ownership
     /// cannot be determined is retained.
-    async fn compute_gc_candidates(
+    fn compute_gc_candidates(
         &self,
         files: &[StorageFileInfo],
         node_addrs: &[[u8; 20]],
-        store: &Arc<RwLock<SumStore>>,
+        store: &SumStore,
     ) -> HashSet<String> {
-        let store_read = store.read().await;
-        let idx = &store_read.manifest_idx;
+        let idx = &store.manifest_idx;
+        if !idx.gc_protection_intact() {
+            // The GC-protected list is missing or unreadable: which chunks
+            // arrived by V2 Push is unknown, so nothing is a candidate.
+            warn!("GC-protected chunk list unavailable; deleting nothing");
+            return HashSet::new();
+        }
 
         let mut funded_roots: HashSet<[u8; 32]> = HashSet::new();
         let mut protected: HashSet<String> = HashSet::new();
@@ -424,7 +433,13 @@ impl MarketSyncWorker {
             }
         }
 
-        unassigned.retain(|cid| !protected.contains(cid) && !idx.is_private_chunk_cid(cid));
+        // A chunk accepted by a V2 Push (or present when the protected list
+        // was created) is never a candidate, whichever manifest it is read
+        // through: a funded V1 registration may reuse a V2 file's root, and
+        // the manifest index is keyed by root alone.
+        unassigned.retain(|cid| {
+            !protected.contains(cid) && !idx.is_private_chunk_cid(cid) && !idx.is_gc_protected(cid)
+        });
         unassigned
     }
 }
@@ -824,11 +839,20 @@ mod tests {
             s.manifest_idx
                 .insert(&synthetic_manifest([0x52u8; 32], &v2_public))
                 .unwrap();
-            for d in v1.iter().chain(&v2_public).chain([&v2_pre_manifest]) {
+            for d in &v1 {
                 s.local.put(&sum_store::cid_from_data(d), d).unwrap();
             }
+            // V2 chunks arrive the way `inbound_v2::handle_push` stores them:
+            // GC exemption first, then the chunk.
+            for (root, d) in v2_public.iter().map(|d| ([0x52u8; 32], d)).chain([
+                ([0x56u8; 32], &v2_pre_manifest),
+                ([0x53u8; 32], &v2_private),
+            ]) {
+                let cid = sum_store::cid_from_data(d);
+                s.manifest_idx.record_v2_held_chunk(root, &cid).unwrap();
+                s.local.put(&cid, d).unwrap();
+            }
             let pc = sum_store::cid_from_data(&v2_private);
-            s.local.put(&pc, &v2_private).unwrap();
             s.manifest_idx
                 .record_private_chunk_cid([0x53u8; 32], &pc)
                 .unwrap();
@@ -858,10 +882,8 @@ mod tests {
         f: &GcFixture,
         node_addrs: &[[u8; 20]],
     ) -> sum_store::gc::GcResult {
-        let candidates = worker
-            .compute_gc_candidates(&f.files, node_addrs, &f.store)
-            .await;
-        let s = f.store.read().await;
+        let s = f.store.write().await;
+        let candidates = worker.compute_gc_candidates(&f.files, node_addrs, &s);
         worker
             .gc
             .sweep_candidates(&s.local, &candidates, Instant::now())
@@ -991,6 +1013,131 @@ mod tests {
         sweep(&mut worker, &f, &node_addrs).await;
 
         assert!(has(&f.store, &shared).await);
+    }
+
+    /// Adversarial: anyone can register a funded V1 file whose merkle root
+    /// equals an existing V2 file's root (the chain's V1 registration only
+    /// checks the V1 family). The manifest index is keyed by root alone, so
+    /// the V2 manifest is then read as the funded V1 file's manifest, and the
+    /// attacker-chosen `total_size_bytes` decides which of its chunks are
+    /// "assigned" here. Every V2 chunk must still survive.
+    #[tokio::test]
+    async fn gc_keeps_v2_chunks_when_a_funded_v1_file_reuses_the_v2_root() {
+        let mut f = gc_fixture().await;
+        let v2_root = [0x52u8; 32];
+        // One chunk declared: at most chunk 0 can be "assigned" here, so the
+        // V2 manifest's chunks 1 and 2 become V1-unassigned.
+        f.files.push(funded_v1(v2_root, 1));
+
+        let mut worker = zero_grace_worker();
+        sweep(&mut worker, &f, &snapshot_with_self()).await;
+
+        for d in &f.v2 {
+            assert!(
+                has(&f.store, d).await,
+                "a V1 registration reusing a V2 root must not delete V2 data"
+            );
+        }
+    }
+
+    /// The residual case of the first fix: a V2 Public chunk pushed before
+    /// its manifest, byte-identical to a funded V1 chunk this node is NOT
+    /// assigned. Content addressing gives both one CID; the V2 exemption,
+    /// recorded at push time, keeps it.
+    #[tokio::test]
+    async fn gc_keeps_a_pre_manifest_v2_chunk_identical_to_an_unassigned_v1_chunk() {
+        let f = gc_fixture().await;
+        let node_addrs = snapshot_with_self();
+        let mine = my_v1_indices(&node_addrs);
+        let i = (0..8u32).find(|i| !mine.contains(i)).unwrap();
+        let shared = f.v1[i as usize].clone();
+        let cid = sum_store::cid_from_data(&shared);
+        // A V2 push of the same bytes, with no manifest indexed for it.
+        f.store
+            .write()
+            .await
+            .manifest_idx
+            .record_v2_held_chunk([0x57u8; 32], &cid)
+            .unwrap();
+
+        let mut worker = zero_grace_worker();
+        sweep(&mut worker, &f, &node_addrs).await;
+
+        assert!(has(&f.store, &shared).await);
+    }
+
+    /// Chunks already on disk when a store first runs this version carry no
+    /// provenance; all of them are protected, so the root-collision attack
+    /// cannot reach V2 data pushed under an older version either.
+    #[tokio::test]
+    async fn gc_protects_every_chunk_present_before_the_protected_list_existed() {
+        let (dir, store) = synthetic_store();
+        let v2_root = [0x52u8; 32];
+        let v2 = chunks_named("v2 chunk pushed by an older version", 3);
+        {
+            let mut s = store.write().await;
+            s.manifest_idx
+                .insert(&synthetic_manifest(v2_root, &v2))
+                .unwrap();
+            for d in &v2 {
+                s.local.put(&sum_store::cid_from_data(d), d).unwrap();
+            }
+        }
+        // Simulate an upgrade from a version without the list.
+        drop(store);
+        std::fs::remove_file(
+            dir.path()
+                .join("store/manifests")
+                .join(sum_store::manifest_index::GC_PROTECTED_FILE),
+        )
+        .unwrap();
+        let reopened = Arc::new(RwLock::new(
+            SumStore::new(sum_types::config::StoreConfig {
+                store_dir: dir.path().join("store"),
+                max_chunk_msg_bytes: 64 * 1024,
+            })
+            .unwrap(),
+        ));
+        let f = GcFixture {
+            _dir: dir,
+            store: reopened,
+            v1: Vec::new(),
+            v2,
+            files: vec![funded_v1(v2_root, 1)],
+        };
+
+        let mut worker = zero_grace_worker();
+        sweep(&mut worker, &f, &snapshot_with_self()).await;
+
+        for d in &f.v2 {
+            assert!(has(&f.store, d).await, "pre-upgrade V2 chunk retained");
+        }
+    }
+
+    /// An unreadable protected list means provenance is unknown: nothing is
+    /// deleted, not even an unassigned V1 chunk.
+    #[tokio::test]
+    async fn gc_deletes_nothing_when_the_protected_list_is_unreadable() {
+        let f = gc_fixture().await;
+        let list = f
+            ._dir
+            .path()
+            .join("store/manifests")
+            .join(sum_store::manifest_index::GC_PROTECTED_FILE);
+        std::fs::remove_file(&list).unwrap();
+        std::fs::create_dir(&list).unwrap(); // reads now fail
+        let idx =
+            sum_store::manifest_index::ManifestIndex::load(&f._dir.path().join("store")).unwrap();
+        assert!(!idx.gc_protection_intact());
+        f.store.write().await.manifest_idx = idx;
+
+        let mut worker = zero_grace_worker();
+        let result = sweep(&mut worker, &f, &snapshot_with_self()).await;
+
+        assert_eq!(result.chunks_deleted, 0);
+        for d in f.v1.iter().chain(&f.v2) {
+            assert!(has(&f.store, d).await);
+        }
     }
 
     #[tokio::test]
