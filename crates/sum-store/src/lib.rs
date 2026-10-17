@@ -68,7 +68,13 @@ impl SumStore {
         let lease = StoreLease::acquire(&config.store_dir)?;
         let local = ChunkStore::new(config.store_dir.clone())?;
         let fetcher = FetchManager::new(config.max_chunk_msg_bytes);
-        let manifest_idx = ManifestIndex::load(&config.store_dir)?;
+        let mut manifest_idx = ManifestIndex::load(&config.store_dir)?;
+        if !manifest_idx.gc_protection_initialized() {
+            // First run with the GC-protected list: nothing records which
+            // chunks already on disk arrived by V2 Push, so keep them all.
+            let on_disk = local.list_all_cids()?;
+            manifest_idx.seed_gc_protected_legacy(&on_disk)?;
+        }
         Ok(Self {
             config,
             local,
