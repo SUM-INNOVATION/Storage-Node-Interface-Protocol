@@ -98,10 +98,49 @@ coverage or activation stalled — the file is recoverable:
   `activation_grace_blocks` blocks past `created_at`, submit
   `AbandonFileV2` to release the deposit (minus the
   chain-configured `abandonment_fee_percent`).
+- **`sum-node reassign <merkle-root-hex> [--dry-run]`** — submit an
+  owner-triggered `ReassignChunksV2` for a file this key owns, only
+  when `storage_getAssignmentCoverageV2` reports
+  `reassignment_needed` (an archive assigned under the latest epoch
+  has left the active set). See [Reassignment](#reassignment) below.
 
-Both commands read `chain_id` from the CLI value on the current
+`resume` and `abandon` read `chain_id` from the CLI value on the current
 release, so pass `--chain-id 1` on mainnet until the runtime fix
 lands (see [`../roadmap/roadmap.md`](../roadmap/roadmap.md)).
+
+### Reassignment
+
+`sum-node --key-file <owner.seed.hex> reassign <merkle-root-hex>`:
+
+1. Reads `storage_getFileInfoV2` and refuses unless the file's owner
+   is the `--key-file` address. It never signs for another owner's file.
+2. Reads `storage_getAssignmentCoverageV2` and refuses unless the chain
+   reports `reassignment_needed`, so no fee is spent on a transaction the
+   executor would refuse.
+3. Asks the chain's no-key builder, `storage_buildReassignChunksV2`, for
+   the unsigned transaction.
+4. Verifies the built bytes before signing: canonical encoding, chain
+   id, sender, fee, the exact `ReassignChunksV2 { merkle_root }`
+   payload, and agreement of the echoed nonce, fee, sender, chain id and
+   signing hash. `ReassignChunksV2` carries no epoch field; the executor
+   stamps the new epoch at the current height.
+5. Signs with the same owner key and signing path as every other owner
+   transaction, submits, and waits for finality. A chain refusal is
+   printed with its receipt reason, which carries the refusal code.
+
+`reassign` takes `chain_id` and the fee (`min_fee`) from `chain_getChainParams`; the production profile refuses to fall back to CLI values, and the built transaction must carry exactly that chain id and fee.
+
+`--dry-run` stops after step 4: nothing is signed or sent. Every refusal
+or failure exits non-zero. The command uses no network stack, adds no
+key, delegation or background signing, and runs only when invoked.
+
+**Limits in this release.**
+- The command submits the chain transaction only. SNIP's push, attestation
+  and download paths still use the file's original assignment snapshot, so a
+  reassignment does not by itself restore coverage under the new epoch.
+- How a newly assigned archive is protected from storage-proof challenges
+  before it has fetched its chunks is a separate, unratified protocol
+  decision.
 
 ## Download
 

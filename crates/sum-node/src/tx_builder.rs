@@ -368,6 +368,34 @@ fn sign_and_encode(
         payload,
     };
 
+    Ok(sign_v2(&signing_key, tx))
+}
+
+/// Sign an already-assembled `TransactionV2` with the owner key and return
+/// the hex-encoded production `SignedTransaction`.
+///
+/// For transactions assembled by one of the chain's no-key builders (for
+/// example `storage_buildReassignChunksV2`). The caller verifies the decoded
+/// transaction against its request first; this function adds one more
+/// guard: it refuses a transaction whose `from` is not the address of
+/// `ed25519_seed`. It signs with exactly the key and the signing path every
+/// builder above uses, and grants no new signing authority.
+pub fn sign_transaction_v2(ed25519_seed: &[u8; 32], tx: TransactionV2) -> Result<String> {
+    let signing_key = SigningKey::from_bytes(ed25519_seed);
+    let own = Address::from_public_key(&signing_key.verifying_key().to_bytes());
+    if tx.from != own {
+        anyhow::bail!(
+            "refusing to sign: transaction sender {} is not this key's address {}",
+            tx.from.to_base58(),
+            own.to_base58()
+        );
+    }
+    Ok(sign_v2(&signing_key, tx))
+}
+
+fn sign_v2(signing_key: &SigningKey, tx: TransactionV2) -> String {
+    let pubkey_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
+
     // Signing hash: blake3(bincode-v1(TransactionV2)). `TransactionV2::signing_hash`
     // performs exactly that.
     let signing_hash = tx.signing_hash();
@@ -376,7 +404,7 @@ fn sign_and_encode(
     let signature = signing_key.sign(signing_hash.as_bytes());
 
     let signed = SignedTransaction::new_v2(tx, signature.to_bytes(), pubkey_bytes);
-    Ok(signed.to_hex())
+    signed.to_hex()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -969,9 +997,10 @@ mod tests {
         }
     }
 
-    /// No builder emits `ReassignChunksV2` (#62 stays a separate PR). The
-    /// variant exists inside the imported upstream enum, but none of the seven
-    /// V2 builders produces it.
+    /// No local builder emits `ReassignChunksV2`. The owner-triggered
+    /// reassignment is assembled by the chain's no-key builder and only
+    /// signed here, via `sign_transaction_v2` (see `reassign_v2`); none of
+    /// the seven local V2 builders produces the variant.
     #[test]
     fn no_builder_emits_reassign_chunks_v2() {
         let v2_hexes = [
@@ -996,6 +1025,41 @@ mod tests {
                 other => panic!("expected StorageMetadataV2 payload, got {other:?}"),
             }
         }
+    }
+
+    /// `sign_transaction_v2` uses the same key and signing path as the
+    /// local builders: signing the transaction a builder would assemble
+    /// reproduces that builder's exact bytes.
+    #[test]
+    fn sign_transaction_v2_matches_the_builder_signing_path() {
+        let built = build_activate_file_v2_tx(
+            &LOCK_SEED,
+            LOCK_CHAIN_ID,
+            LOCK_NONCE,
+            LOCK_FEE,
+            LOCK_MERKLE_ROOT,
+        )
+        .unwrap();
+        let tx = v2(&decode(&built)).clone();
+        let resigned = sign_transaction_v2(&LOCK_SEED, tx).unwrap();
+        assert_eq!(resigned, built);
+        assert_eq!(resigned, BL_ACTIVATE_V2);
+    }
+
+    /// It never signs a transaction whose sender is another address.
+    #[test]
+    fn sign_transaction_v2_refuses_a_foreign_sender() {
+        let built = build_activate_file_v2_tx(
+            &LOCK_SEED,
+            LOCK_CHAIN_ID,
+            LOCK_NONCE,
+            LOCK_FEE,
+            LOCK_MERKLE_ROOT,
+        )
+        .unwrap();
+        let tx = v2(&decode(&built)).clone();
+        let err = sign_transaction_v2(&[8u8; 32], tx).unwrap_err();
+        assert!(err.to_string().contains("refusing to sign"), "{err}");
     }
 
     // ── Negative coverage ────────────────────────────────────────────────────

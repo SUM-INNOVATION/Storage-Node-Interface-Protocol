@@ -82,7 +82,7 @@ The V2 replication factor is not a compile-time constant. Every write path deriv
 Effective replication is `min(configured_r, eligible_snapshot.len())` — the same clamp that `sum-chain/crates/primitives/src/storage_metadata.rs:299-302` applies chain-side. Two boundary cases have explicit disposition:
 
 - **`R = 0`** — no assignment can be built for any chunk. The fresh ingest paths (`IngestPipeline::run`, `run_private`) and `resume` return `IngestOutcome::Failed { stage: Register }` BEFORE any RPC. No `RegisterFilePendingV2` is submitted; the on-chain Pending file (if any) is unchanged.
-- **Pinned assignment snapshot empty after `filter_active_archives`** — S1 has already finalized, but `storage_getActiveNodesAtHeight(assignment_height)` returns zero eligible archives. The pipeline returns `IngestOutcome::PendingNeedsAction { suggested: Abandon }` with the manifest preserved. The pinned assignment height is historical and immutable: subsequent `resume` calls will observe the same empty snapshot. External `ReassignChunksV2` (post-#62 chain call) is the only chain-side recovery; it is not implemented in this release, so the operator recourse is `abandon`.
+- **Pinned assignment snapshot empty after `filter_active_archives`** — S1 has already finalized, but `storage_getActiveNodesAtHeight(assignment_height)` returns zero eligible archives. The pipeline returns `IngestOutcome::PendingNeedsAction { suggested: Abandon }` with the manifest preserved. The pinned assignment height is historical and immutable: subsequent `resume` calls will observe the same empty snapshot. `ReassignChunksV2` (post-#62 chain call) is the only chain-side recovery. `sum-node reassign` submits it when the chain reports `reassignment_needed`, but SNIP does not yet push or attest under a later epoch, so the complete operator recourse is still `abandon`.
 
 ### Post-#62 `AssignmentCoverageV2` fields (observability)
 
@@ -93,7 +93,7 @@ Effective replication is `min(configured_r, eligible_snapshot.len())` — the sa
 - `reassignment_needed: bool` — the chain has decided the file needs `ReassignChunksV2`.
 - `per_epoch: Vec<AssignmentEpochCoverageV2>` — per-epoch shape of covered/missing indices.
 
-All four decode with `#[serde(default)]` so legacy chain responses that omit them continue to work. `AssignmentCoverageV2::resolved_latest_epoch()` returns `Some(latest_assignment_epoch)` when at least one epoch is populated, `None` otherwise — this lets callers distinguish a legacy response from a post-#62 response with a real epoch-0 result. Aggregate `can_activate_now` semantics are unchanged post-#62 (see upstream `storage_metadata.rs:2181-2200`). SNIP consumes these fields for observability only; `ReassignChunksV2` submission is not implemented and is tracked in the roadmap.
+All four decode with `#[serde(default)]` so legacy chain responses that omit them continue to work. `AssignmentCoverageV2::resolved_latest_epoch()` returns `Some(latest_assignment_epoch)` when at least one epoch is populated, `None` otherwise — this lets callers distinguish a legacy response from a post-#62 response with a real epoch-0 result. Aggregate `can_activate_now` semantics are unchanged post-#62 (see upstream `storage_metadata.rs:2181-2200`). SNIP reads `reassignment_needed` to gate `sum-node reassign`, which submits an owner-triggered `ReassignChunksV2`; the remaining epoch-aware push and attestation work is tracked in the roadmap.
 
 ### V2 vs V1 — when does each one fire?
 
