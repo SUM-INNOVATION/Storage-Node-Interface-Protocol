@@ -222,6 +222,30 @@ documented way to expose a port from the Crostini container to
 the public internet. Operators wanting to run an archive should
 provision a Linux VPS.
 
+## Hosted platform-validation workflow
+
+`.github/workflows/platform-validation.yml` runs the read-only cycle of
+the #24 validation instructions through `scripts/platform-validation.sh`
+on GitHub-hosted runners. What each job is evidence for:
+
+| Job | Runner | Evidence for |
+| --- | --- | --- |
+| macOS arm64 client | `macos-26` | The macOS client cell: § 2.2 build and tests; the § 2.3 smoke on manual dispatch only |
+| macOS Intel client | `macos-26-intel`, manual dispatch only | The same, on Intel |
+| STAND-IN for WSL2 | `ubuntu:24.04` container on `ubuntu-24.04` | The § 3.2 setup snippet and the build on the Ubuntu userland. **Not WSL2 coverage.** |
+| STAND-IN for Crostini (x86_64, aarch64) | `debian:12` container on `ubuntu-24.04` / `ubuntu-24.04-arm` | The § 4.2 setup snippet and the build on the Debian userland. **Not Crostini coverage.** |
+| Windows fail-closed | `windows-2025` | Only that store publication and the store lease refuse (SNIP #49). **Not native Windows support:** the client is never built or run. |
+
+- **Stand-ins are not WSL2 or Crostini.** The stand-in jobs have no WSL
+  kernel, NAT or `/mnt/c`, and no ChromeOS VM or container.
+  - Their results never close the WSL2 or Crostini cells, and never
+    count towards them under any promotion criterion below.
+  - Those cells still need a report from a tester on the real platform.
+  - The script marks every stand-in report and verdict `STAND-IN`.
+- **Pull-request runs stop after the tests and report PARTIAL.** The
+  smoke reads two RPC methods and runs only on manual dispatch.
+- **Never run:** client writes and archive mode.
+
 ## Promotion criteria (Experimental → Supported)
 
 A cell promotes from ⚠️ Experimental to ✅ Supported when all of
