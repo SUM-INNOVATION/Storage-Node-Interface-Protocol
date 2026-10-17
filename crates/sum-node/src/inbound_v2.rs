@@ -523,27 +523,12 @@ where
                 visibility,
             }) => {
                 let cid = cid_from_blake3_hash(&blake3::Hash::from(leaf_hash));
-                // Record the GC exemption BEFORE the chunk is written, under
-                // the write lock the GC also takes: a V2 chunk is never on
-                // disk without it, whichever manifest later names its CID.
-                let exempt = {
-                    let mut stores = self.store.write().await;
-                    stores.manifest_idx.record_v2_held_chunk(merkle_root, &cid)
-                };
-                let stores = self.store.read().await;
-                if let Err(e) = exempt {
-                    warn!(%peer_id, %cid, %e, "V2 Push: GC exemption write failed — refusing ACK");
+                if let Err(e) = store_v2_pushed_chunk(&self.store, merkle_root, &cid, &data).await {
+                    warn!(%peer_id, %cid, error = %e, "V2 Push: chunk not stored — refusing ACK");
                     ShardResponseV2::PushAck {
                         merkle_root,
                         chunk_index,
-                        error: Some(format!("gc exemption persistence failed: {e}")),
-                    }
-                } else if let Err(e) = stores.local.put(&cid, &data) {
-                    warn!(%peer_id, %cid, %e, "V2 Push: store.put failed");
-                    ShardResponseV2::PushAck {
-                        merkle_root,
-                        chunk_index,
-                        error: Some(format!("store error: {e}")),
+                        error: Some(e),
                     }
                 } else if visibility.is_private() {
                     // Phase 4b: for Private files, the serving-side
@@ -563,7 +548,6 @@ where
                     // safe: `local.put` is idempotent and
                     // `record_private_chunk_cid` is idempotent for
                     // the same `(cid, root)` pair.
-                    drop(stores);
                     let mut stores = self.store.write().await;
                     if let Err(e) = stores
                         .manifest_idx
@@ -602,7 +586,6 @@ where
                         }
                     }
                 } else {
-                    drop(stores);
                     self.held
                         .lock()
                         .expect("held mutex poisoned")
@@ -979,6 +962,32 @@ where
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Store one validated V2 Push chunk.
+///
+/// The chunk's GC exemption is recorded durably first, under the store
+/// write lock that garbage collection also takes, so a sweep never finds
+/// the chunk on disk without it, whichever manifest later names its CID.
+/// If the exemption cannot be recorded, the chunk is not written.
+pub(crate) async fn store_v2_pushed_chunk(
+    store: &RwLock<SumStore>,
+    merkle_root: [u8; 32],
+    cid: &str,
+    data: &[u8],
+) -> std::result::Result<(), String> {
+    store
+        .write()
+        .await
+        .manifest_idx
+        .record_v2_held_chunk(merkle_root, cid)
+        .map_err(|e| format!("gc exemption persistence failed: {e}"))?;
+    store
+        .read()
+        .await
+        .local
+        .put(cid, data)
+        .map_err(|e| format!("store error: {e}"))
+}
 
 #[cfg(test)]
 mod tests {
@@ -2221,10 +2230,6 @@ mod tests {
         );
     }
 
-    /// Public V2 Push doesn't touch the Private cid index — it relies
-    /// on the manifest's CBOR-decoded chunk list to populate
-    /// `cid_to_root`. Pin that the Phase 4b change didn't accidentally
-    /// double-write.
     /// A V2 Push records the chunk's GC exemption, durably, so garbage
     /// collection never deletes it whichever manifest later names its CID.
     #[tokio::test]
@@ -2282,6 +2287,10 @@ mod tests {
         );
     }
 
+    /// Public V2 Push doesn't touch the Private cid index — it relies
+    /// on the manifest's CBOR-decoded chunk list to populate
+    /// `cid_to_root`. Pin that the Phase 4b change didn't accidentally
+    /// double-write.
     #[tokio::test]
     async fn public_v2_push_does_not_touch_private_cid_index() {
         let snapshot = five_archives();

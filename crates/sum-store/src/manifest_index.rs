@@ -75,6 +75,11 @@ pub struct ManifestIndex {
 /// was first created.
 pub const GC_PROTECTED_FILE: &str = "gc_protected.list";
 
+/// Marker (under `manifests/`) written once the protected list has been
+/// created. With the marker present, a missing list is a lost list, not a
+/// first run: protection is then broken and nothing is seeded again.
+pub const GC_PROTECTED_MARKER: &str = "gc_protected.initialized";
+
 /// Result of accepting a validated network manifest.
 #[derive(Debug)]
 pub enum AcceptOutcome {
@@ -418,8 +423,21 @@ impl ManifestIndex {
                 "GC-protected chunk list not initialized (open the store via SumStore::new)".into(),
             ));
         }
+        if !self.gc_protection_intact() {
+            // The list is missing, unreadable or malformed: an exemption
+            // cannot be recorded durably, so the chunk must not be accepted.
+            return Err(crate::error::StoreError::Other(
+                "GC-protected chunk list is unavailable; refusing to accept a V2 chunk".into(),
+            ));
+        }
         let line = format!("v2 {} {cid}\n", hex::encode(merkle_root));
-        self.append_gc_protected_line(&line)?;
+        if let Err(e) = self.append_gc_protected_line(&line) {
+            // Whether the line reached disk is unknown: stop all deletion
+            // in this process too, not only after a restart.
+            self.gc_protection_intact = Some(false);
+            tracing::error!(%e, "GC-protected chunk list write failed; garbage collection disabled");
+            return Err(e);
+        }
         self.gc_protected.insert(cid.to_string());
         Ok(())
     }
@@ -430,8 +448,9 @@ impl ManifestIndex {
     }
 
     /// Whether garbage collection may delete anything at all: the protected
-    /// list exists and was read in full. Fails closed when it is missing or
-    /// unreadable.
+    /// list exists, was read in full, and every write to it has succeeded.
+    /// Fails closed when it is missing (after creation), unreadable,
+    /// malformed, or a write to it failed.
     pub fn gc_protection_intact(&self) -> bool {
         self.gc_protection_intact == Some(true)
     }
@@ -444,8 +463,10 @@ impl ManifestIndex {
 
     /// First run of a version that keeps the protected list: protect every
     /// chunk already on disk, because nothing records which of them arrived
-    /// by V2 Push. Writes the list atomically (temp file, fsync, rename);
-    /// a crash before the rename simply repeats the seeding on next start.
+    /// by V2 Push. Writes the list atomically (temp file, fsync, rename,
+    /// directory fsync), then the [`GC_PROTECTED_MARKER`]. A crash before
+    /// the rename simply repeats the seeding on next start; once the marker
+    /// exists, seeding never runs again.
     pub fn seed_gc_protected_legacy(&mut self, cids_on_disk: &[String]) -> Result<()> {
         use std::io::Write;
         let path = self.manifests_dir.join(GC_PROTECTED_FILE);
@@ -458,6 +479,11 @@ impl ManifestIndex {
             f.sync_all()?;
         }
         std::fs::rename(&tmp, &path)?;
+        sync_dir(&self.manifests_dir)?;
+        // The marker follows the list: a crash between the two leaves a
+        // complete list without a marker, which loads as intact and gets
+        // its marker on that load.
+        write_marker(&self.manifests_dir)?;
         self.gc_protected.extend(cids_on_disk.iter().cloned());
         self.gc_protection_intact = Some(true);
         tracing::info!(
@@ -513,47 +539,84 @@ impl ManifestIndex {
         Ok(())
     }
 
-    /// Append one CID line to `<hex_root>.private_chunks`. Each line
-    /// is independently complete (`<cid>\n`), so a crash mid-write
-    /// loses at most the in-flight line — the rest reloads cleanly.
-    /// Read [`GC_PROTECTED_FILE`] if it exists. An unreadable list leaves
-    /// protection marked broken, so garbage collection deletes nothing.
+    /// Read [`GC_PROTECTED_FILE`].
+    ///
+    /// - No list and no marker: first run of this version; protection stays
+    ///   uninitialized until [`Self::seed_gc_protected_legacy`].
+    /// - No list but a marker: the list was lost; protection is broken.
+    /// - A list: every complete line must parse, or protection is broken.
+    ///   A torn final line (crash mid-append) names no chunk that was ever
+    ///   written, because each line is synced before its chunk is, so it is
+    ///   truncated away before the next append can extend it.
+    ///
+    /// Broken protection means garbage collection deletes nothing and no V2
+    /// chunk is accepted.
     fn load_gc_protected(&mut self) {
         let path = self.manifests_dir.join(GC_PROTECTED_FILE);
+        let marker = self.manifests_dir.join(GC_PROTECTED_MARKER);
         if !path.exists() {
+            if marker.exists() {
+                tracing::error!(path = %path.display(), "GC-protected chunk list missing after it was created; garbage collection disabled");
+                self.gc_protection_intact = Some(false);
+            }
             return;
         }
-        match fs::read_to_string(&path) {
-            Ok(content) => {
-                for line in content.lines() {
-                    // `<kind> <root|-> <cid>`. A torn final line (crash
-                    // mid-append) names no chunk that was ever written,
-                    // because the line is synced before the chunk is.
-                    if let Some(cid) = line.split_whitespace().nth(2) {
-                        self.gc_protected.insert(cid.to_string());
-                    }
-                }
-                self.gc_protection_intact = Some(true);
-            }
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
             Err(e) => {
                 tracing::error!(path = %path.display(), %e, "GC-protected chunk list unreadable; garbage collection disabled");
                 self.gc_protection_intact = Some(false);
+                return;
+            }
+        };
+        let complete = match content.rfind('\n') {
+            Some(last) => &content[..=last],
+            None => "",
+        };
+        let mut cids = Vec::new();
+        for line in complete.lines() {
+            match parse_gc_protected_line(line) {
+                Some(cid) => cids.push(cid.to_string()),
+                None => {
+                    tracing::error!(path = %path.display(), line, "GC-protected chunk list malformed; garbage collection disabled");
+                    self.gc_protection_intact = Some(false);
+                    return;
+                }
             }
         }
+        if complete.len() != content.len()
+            && let Err(e) = truncate_to(&path, complete.len() as u64)
+        {
+            tracing::error!(path = %path.display(), %e, "could not drop a torn GC-protected line; garbage collection disabled");
+            self.gc_protection_intact = Some(false);
+            return;
+        }
+        if !marker.exists()
+            && let Err(e) = write_marker(&self.manifests_dir)
+        {
+            tracing::error!(%e, "could not write the GC-protected marker; garbage collection disabled");
+            self.gc_protection_intact = Some(false);
+            return;
+        }
+        self.gc_protected.extend(cids);
+        self.gc_protection_intact = Some(true);
     }
 
+    /// Append one complete line to an existing [`GC_PROTECTED_FILE`] and
+    /// sync it. Never creates the file: a list that has vanished is an
+    /// error, not a fresh start.
     fn append_gc_protected_line(&self, line: &str) -> Result<()> {
         use std::io::Write;
         let path = self.manifests_dir.join(GC_PROTECTED_FILE);
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
         f.write_all(line.as_bytes())?;
         f.sync_data()?;
         Ok(())
     }
 
+    /// Append one CID line to `<hex_root>.private_chunks`. Each line
+    /// is independently complete (`<cid>\n`), so a crash mid-write
+    /// loses at most the in-flight line — the rest reloads cleanly.
     fn append_private_chunk_cid_to_disk(&self, root: &[u8; 32], cid: &str) -> Result<()> {
         use std::io::Write;
         let hex_root: String = root.iter().map(|b| format!("{b:02x}")).collect();
@@ -585,6 +648,50 @@ fn decode_hex_root(s: &str) -> Option<[u8; 32]> {
         out[i] = u8::from_str_radix(s, 16).ok()?;
     }
     Some(out)
+}
+
+/// Parse one complete [`GC_PROTECTED_FILE`] line into its CID:
+/// `v2 <64 hex merkle root> <cid>` or `legacy - <cid>`.
+fn parse_gc_protected_line(line: &str) -> Option<&str> {
+    let mut parts = line.split(' ');
+    let (kind, root, cid) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || cid.is_empty() {
+        return None;
+    }
+    let root_ok = match kind {
+        "v2" => root.len() == 64 && root.bytes().all(|b| b.is_ascii_hexdigit()),
+        "legacy" => root == "-",
+        _ => false,
+    };
+    root_ok.then_some(cid)
+}
+
+fn truncate_to(path: &Path, len: u64) -> Result<()> {
+    let f = std::fs::OpenOptions::new().write(true).open(path)?;
+    f.set_len(len)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+fn write_marker(manifests_dir: &Path) -> Result<()> {
+    let f = std::fs::File::create(manifests_dir.join(GC_PROTECTED_MARKER))?;
+    f.sync_all()?;
+    drop(f);
+    sync_dir(manifests_dir)
+}
+
+/// Make a rename or create in `dir` durable (no-op where directories
+/// cannot be opened for syncing).
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -885,10 +992,6 @@ mod tests {
         assert_eq!(idx.merkle_root_for_cid(cid), Some(&[0xAAu8; 32]));
     }
 
-    /// `insert_private` is idempotent in that a re-insert with the
-    /// same root simply overwrites; callers (push handler) usually
-    /// gate on `get_private_bytes` first to log idempotency, but the
-    /// store doesn't reject re-inserts.
     #[test]
     fn gc_protected_list_refuses_records_until_initialized() {
         let dir = tempfile::tempdir().unwrap();
@@ -926,6 +1029,150 @@ mod tests {
         assert_eq!(content.lines().count(), 2, "one line per protected chunk");
     }
 
+    fn gc_list_path(dir: &Path) -> PathBuf {
+        dir.join("manifests").join(GC_PROTECTED_FILE)
+    }
+
+    #[test]
+    fn gc_protected_list_seeds_only_on_first_run() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            assert!(!idx.gc_protection_initialized(), "first run");
+            idx.seed_gc_protected_legacy(&["on-disk".to_string()])
+                .unwrap();
+        }
+        assert!(
+            dir.path()
+                .join("manifests")
+                .join(GC_PROTECTED_MARKER)
+                .exists()
+        );
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        assert!(
+            idx.gc_protection_initialized(),
+            "a later start is not a first run, so nothing is seeded again"
+        );
+        assert!(idx.gc_protection_intact());
+        assert!(idx.is_gc_protected("on-disk"));
+    }
+
+    #[test]
+    fn gc_protected_list_missing_after_creation_breaks_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            idx.seed_gc_protected_legacy(&[]).unwrap();
+            idx.record_v2_held_chunk([4u8; 32], "kept").unwrap();
+        }
+        fs::remove_file(gc_list_path(dir.path())).unwrap();
+
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        assert!(
+            idx.gc_protection_initialized(),
+            "a lost list is not a first run"
+        );
+        assert!(!idx.gc_protection_intact(), "fails closed");
+        assert!(
+            idx.record_v2_held_chunk([4u8; 32], "new").is_err(),
+            "no V2 chunk is accepted without a durable exemption"
+        );
+        assert!(
+            !gc_list_path(dir.path()).exists(),
+            "a refused record must not recreate a partial list"
+        );
+    }
+
+    #[test]
+    fn gc_protected_list_with_a_malformed_line_breaks_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            idx.seed_gc_protected_legacy(&["a".to_string()]).unwrap();
+        }
+        let root = hex::encode([5u8; 32]);
+        for corrupt in [
+            format!("legacy - a\ngarbage\nv2 {root} b\n"),
+            format!("legacy - a\nv2 {root}\n"),
+            "legacy - a\nv2 nothex b\n".to_string(),
+            format!("legacy - a\nv2 {root} b extra\n"),
+        ] {
+            fs::write(gc_list_path(dir.path()), corrupt.as_bytes()).unwrap();
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            assert!(!idx.gc_protection_intact(), "malformed list: {corrupt:?}");
+            assert!(idx.record_v2_held_chunk([5u8; 32], "c").is_err());
+        }
+        // Not UTF-8 at all.
+        fs::write(gc_list_path(dir.path()), b"legacy - a\n\xff\n").unwrap();
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        assert!(!idx.gc_protection_intact());
+    }
+
+    #[test]
+    fn gc_protected_list_drops_a_torn_tail_before_the_next_append() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            idx.seed_gc_protected_legacy(&[]).unwrap();
+            idx.record_v2_held_chunk([6u8; 32], "before").unwrap();
+        }
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(gc_list_path(dir.path()))
+                .unwrap();
+            f.write_all(b"v2 0606").unwrap(); // crash mid-append
+        }
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            assert!(idx.gc_protection_intact());
+            idx.record_v2_held_chunk([6u8; 32], "after").unwrap();
+        }
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        assert!(idx.gc_protection_intact());
+        assert!(idx.is_gc_protected("before"));
+        assert!(
+            idx.is_gc_protected("after"),
+            "the record after a torn line must survive a restart"
+        );
+        let content = fs::read_to_string(gc_list_path(dir.path())).unwrap();
+        assert_eq!(content.lines().count(), 2, "torn bytes were dropped");
+    }
+
+    #[test]
+    fn gc_protected_list_write_failure_stops_deletion_in_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        idx.seed_gc_protected_legacy(&[]).unwrap();
+        assert!(idx.gc_protection_intact());
+        // Any write to the list now fails, whoever runs the test.
+        fs::remove_file(gc_list_path(dir.path())).unwrap();
+        fs::create_dir(gc_list_path(dir.path())).unwrap();
+
+        assert!(idx.record_v2_held_chunk([7u8; 32], "x").is_err());
+        assert!(!idx.is_gc_protected("x"));
+        assert!(
+            !idx.gc_protection_intact(),
+            "after a failed write, garbage collection deletes nothing"
+        );
+    }
+
+    #[test]
+    fn gc_protected_marker_is_restored_for_an_intact_list() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            idx.seed_gc_protected_legacy(&["m".to_string()]).unwrap();
+        }
+        let marker = dir.path().join("manifests").join(GC_PROTECTED_MARKER);
+        fs::remove_file(&marker).unwrap(); // crash between list and marker
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        assert!(idx.gc_protection_intact());
+        assert!(idx.is_gc_protected("m"));
+        assert!(marker.exists());
+    }
+
     #[test]
     fn gc_protected_list_ignores_a_torn_final_line() {
         let dir = tempfile::tempdir().unwrap();
@@ -946,6 +1193,10 @@ mod tests {
         assert!(idx.is_gc_protected("whole"));
     }
 
+    /// `insert_private` is idempotent in that a re-insert with the
+    /// same root simply overwrites; callers (push handler) usually
+    /// gate on `get_private_bytes` first to log idempotency, but the
+    /// store doesn't reject re-inserts.
     #[test]
     fn private_manifest_insert_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();

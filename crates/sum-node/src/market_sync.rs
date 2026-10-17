@@ -1083,14 +1083,15 @@ mod tests {
                 s.local.put(&sum_store::cid_from_data(d), d).unwrap();
             }
         }
-        // Simulate an upgrade from a version without the list.
+        // Simulate an upgrade from a version without the list: neither the
+        // list nor its marker exists yet.
         drop(store);
-        std::fs::remove_file(
-            dir.path()
-                .join("store/manifests")
-                .join(sum_store::manifest_index::GC_PROTECTED_FILE),
-        )
-        .unwrap();
+        for name in [
+            sum_store::manifest_index::GC_PROTECTED_FILE,
+            sum_store::manifest_index::GC_PROTECTED_MARKER,
+        ] {
+            std::fs::remove_file(dir.path().join("store/manifests").join(name)).unwrap();
+        }
         let reopened = Arc::new(RwLock::new(
             SumStore::new(sum_types::config::StoreConfig {
                 store_dir: dir.path().join("store"),
@@ -1150,6 +1151,231 @@ mod tests {
         assert_eq!(result.chunks_deleted, 0);
         for d in f.v1.iter().chain(&f.v2) {
             assert!(has(&f.store, d).await);
+        }
+    }
+
+    fn gc_list(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        dir.path()
+            .join("store/manifests")
+            .join(sum_store::manifest_index::GC_PROTECTED_FILE)
+    }
+
+    fn reopen(dir: &tempfile::TempDir) -> Arc<RwLock<SumStore>> {
+        Arc::new(RwLock::new(
+            SumStore::new(sum_types::config::StoreConfig {
+                store_dir: dir.path().join("store"),
+                max_chunk_msg_bytes: 64 * 1024,
+            })
+            .unwrap(),
+        ))
+    }
+
+    /// Restart the fixture's store: drop every handle (releasing the store
+    /// lease), then open it again from disk.
+    fn restart(f: GcFixture) -> GcFixture {
+        let GcFixture {
+            _dir,
+            store,
+            v1,
+            v2,
+            files,
+        } = f;
+        drop(store);
+        let store = reopen(&_dir);
+        GcFixture {
+            _dir,
+            store,
+            v1,
+            v2,
+            files,
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_store_seeds_protection_only_on_first_open() {
+        let (dir, store) = synthetic_store();
+        let later = b"chunk written after the first open".to_vec();
+        let cid = sum_store::cid_from_data(&later);
+        store.read().await.local.put(&cid, &later).unwrap();
+        drop(store);
+
+        let store = reopen(&dir);
+        let s = store.read().await;
+        assert!(s.manifest_idx.gc_protection_intact());
+        assert!(
+            !s.manifest_idx.is_gc_protected(&cid),
+            "seeding runs once; later V1 chunks stay collectable"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_deletes_nothing_and_refuses_pushes_once_the_list_is_lost() {
+        let f = gc_fixture().await;
+        std::fs::remove_file(gc_list(&f._dir)).unwrap();
+        let f = restart(f);
+        assert!(!gc_list(&f._dir).exists(), "a lost list is not re-seeded");
+
+        let mut worker = zero_grace_worker();
+        let result = sweep(&mut worker, &f, &snapshot_with_self()).await;
+        assert_eq!(result.chunks_deleted, 0);
+        for d in f.v1.iter().chain(&f.v2) {
+            assert!(has(&f.store, d).await);
+        }
+
+        let late = b"V2 chunk pushed while the list is lost".to_vec();
+        let cid = sum_store::cid_from_data(&late);
+        assert!(
+            crate::inbound_v2::store_v2_pushed_chunk(&f.store, [0x52u8; 32], &cid, &late)
+                .await
+                .is_err()
+        );
+        assert!(
+            !has(&f.store, &late).await,
+            "a refused chunk is not written"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_deletes_nothing_when_the_list_is_corrupt() {
+        let f = gc_fixture().await;
+        let path = gc_list(&f._dir);
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.insert_str(0, "not a protected-list line\n");
+        std::fs::write(&path, content).unwrap();
+        let f = restart(f);
+
+        let mut worker = zero_grace_worker();
+        let result = sweep(&mut worker, &f, &snapshot_with_self()).await;
+        assert_eq!(result.chunks_deleted, 0);
+        for d in f.v1.iter().chain(&f.v2) {
+            assert!(has(&f.store, d).await);
+        }
+    }
+
+    /// A disk-write failure on the protected list: the V2 chunk is refused
+    /// and not written, and deletion stops in this process.
+    #[tokio::test]
+    async fn gc_fails_closed_when_an_exemption_cannot_be_written() {
+        let f = gc_fixture().await;
+        let path = gc_list(&f._dir);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap(); // every write now fails
+
+        let data = b"V2 chunk whose exemption write fails".to_vec();
+        let cid = sum_store::cid_from_data(&data);
+        let err = crate::inbound_v2::store_v2_pushed_chunk(&f.store, [0x52u8; 32], &cid, &data)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("gc exemption persistence failed"),
+            "got: {err}"
+        );
+        assert!(!has(&f.store, &data).await, "chunk not written");
+
+        let mut worker = zero_grace_worker();
+        let result = sweep(&mut worker, &f, &snapshot_with_self()).await;
+        assert_eq!(result.chunks_deleted, 0);
+        for d in f.v1.iter().chain(&f.v2) {
+            assert!(has(&f.store, d).await);
+        }
+    }
+
+    /// Crash after the exemption is synced but before the chunk is written:
+    /// after the restart, the retried push stores a chunk that is still
+    /// protected, even where a funded V1 file names it unassigned.
+    #[tokio::test]
+    async fn gc_keeps_a_chunk_whose_exemption_was_recorded_before_a_crash() {
+        let mut f = gc_fixture().await;
+        let root = [0x59u8; 32];
+        let named = chunks_named("v2 file whose push was interrupted", 3);
+        let data = named[2].clone();
+        let cid = sum_store::cid_from_data(&data);
+        {
+            let mut s = f.store.write().await;
+            s.manifest_idx
+                .insert(&synthetic_manifest(root, &named))
+                .unwrap();
+            s.manifest_idx.record_v2_held_chunk(root, &cid).unwrap();
+        }
+        // Chunk 2 is never "assigned" under a one-chunk V1 declaration.
+        f.files.push(funded_v1(root, 1));
+
+        let f = restart(f);
+        {
+            let s = f.store.read().await;
+            assert!(s.manifest_idx.gc_protection_intact());
+            assert!(s.manifest_idx.is_gc_protected(&cid));
+            assert!(!s.local.has(&cid), "the crash came before the write");
+        }
+        crate::inbound_v2::store_v2_pushed_chunk(&f.store, root, &cid, &data)
+            .await
+            .unwrap();
+
+        let mut worker = zero_grace_worker();
+        sweep(&mut worker, &f, &snapshot_with_self()).await;
+        assert!(has(&f.store, &data).await);
+    }
+
+    /// The grace clock is in memory: a restart in the middle of a grace
+    /// period starts it again, so nothing is deleted early.
+    #[tokio::test]
+    async fn gc_grace_period_restarts_after_a_restart() {
+        let f = gc_fixture().await;
+        let node_addrs = snapshot_with_self();
+        let unassigned = 8 - my_v1_indices(&node_addrs).len();
+
+        let mut worker = worker_with_rpc("http://127.0.0.1:9".into());
+        let first = sweep(&mut worker, &f, &node_addrs).await;
+        assert_eq!(first.chunks_deleted, 0);
+        assert_eq!(first.chunks_retained as usize, unassigned);
+
+        let f = restart(f);
+        let mut worker = worker_with_rpc("http://127.0.0.1:9".into());
+        let second = sweep(&mut worker, &f, &node_addrs).await;
+        assert_eq!(second.chunks_deleted, 0, "grace starts again");
+        assert_eq!(second.chunks_retained as usize, unassigned);
+        for d in f.v1.iter().chain(&f.v2) {
+            assert!(has(&f.store, d).await);
+        }
+    }
+
+    /// V2 pushes racing GC sweeps: every pushed chunk survives, even though
+    /// a funded V1 file reusing the V2 root makes them sweep candidates
+    /// absent their exemptions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gc_loses_no_v2_chunk_pushed_during_sweeps() {
+        let mut f = gc_fixture().await;
+        let root = [0x5Au8; 32];
+        let pushed = chunks_named("v2 chunk pushed during a sweep", 48);
+        f.store
+            .write()
+            .await
+            .manifest_idx
+            .insert(&synthetic_manifest(root, &pushed))
+            .unwrap();
+        f.files.push(funded_v1(root, 1));
+
+        let store = f.store.clone();
+        let to_push = pushed.clone();
+        let pusher = tokio::spawn(async move {
+            for d in &to_push {
+                let cid = sum_store::cid_from_data(d);
+                crate::inbound_v2::store_v2_pushed_chunk(&store, root, &cid, d)
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut worker = zero_grace_worker();
+        while !pusher.is_finished() {
+            sweep(&mut worker, &f, &snapshot_with_self()).await;
+            tokio::task::yield_now().await;
+        }
+        pusher.await.unwrap();
+        sweep(&mut worker, &f, &snapshot_with_self()).await;
+
+        for d in &pushed {
+            assert!(has(&f.store, d).await, "pushed during a sweep, still here");
         }
     }
 }
