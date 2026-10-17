@@ -101,6 +101,20 @@ strict-`>` rule before submitting.
 |---|---|---|
 | `<merkle_root>` | — | (positional) Hex-encoded 32-byte merkle root of the pending file. |
 
+### sum-node reassign
+
+V2 reassign: submit an owner-triggered `ReassignChunksV2` for a file
+owned by this key, only when the chain reports `reassignment_needed`.
+The chain's no-key builder assembles the unsigned transaction; the
+command verifies it against the request, signs it with this key and
+waits for finality. Details:
+[`../client/upload-and-download.md`](../client/upload-and-download.md#reassignment).
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `<merkle_root>` | — | (positional) Hex-encoded 32-byte merkle root of the file. |
+| `--dry-run` | off | Verify the built transaction and print it; sign and send nothing. |
+
 ### sum-node register-encryption-key
 
 Register the X25519 encryption pubkey derived from the archive's

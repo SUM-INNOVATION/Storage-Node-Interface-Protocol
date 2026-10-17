@@ -534,6 +534,24 @@ pub struct AssignmentEpochCoverageV2 {
     pub per_archive: Vec<ArchiveCoverageSummaryV2>,
 }
 
+/// Response from the chain's no-key storage builders, such as
+/// `storage_buildReassignChunksV2`. The chain assembles an unsigned
+/// `TransactionV2` and returns it with the hash the sender signs; it holds
+/// no key and signs nothing. Callers must verify `unsigned_tx` against what
+/// they asked for before signing it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageBuildResponse {
+    /// `0x`-prefixed hex of the bincode-encoded unsigned `TransactionV2`.
+    pub unsigned_tx: String,
+    /// `0x`-prefixed hex of the transaction's signing hash.
+    pub signing_hash: String,
+    /// Sender address (base58).
+    pub from: String,
+    pub nonce: u64,
+    pub fee: u128,
+    pub chain_id: u64,
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

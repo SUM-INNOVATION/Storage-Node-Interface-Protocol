@@ -79,13 +79,20 @@ metadata (`assignment_epochs`, `latest_assignment_epoch`,
 for observability only via `AssignmentCoverageV2` and
 `AssignmentEpochCoverageV2` at
 [`crates/sum-types/src/rpc_types.rs`](../../crates/sum-types/src/rpc_types.rs).
-The `ReassignChunksV2` chain call itself is NOT implemented in this
-release; today the only supported recovery from a pinned empty
-assignment snapshot is external abandon.
+`sum-node reassign` submits an owner-triggered `ReassignChunksV2`
+when the chain reports `reassignment_needed`. It uses the chain's no-key
+builder and the owner's existing key; see
+[`../client/upload-and-download.md`](../client/upload-and-download.md#reassignment).
+SNIP does not yet push, attest or route downloads under a later epoch, so
+abandon remains the only complete recovery from a pinned empty assignment
+snapshot.
 
-**Acceptance criteria** (whenever this ships):
-- New CLI subcommand or extension of `resume` that submits
-  `ReassignChunksV2` with the correct epoch reference.
+**Acceptance criteria** (remaining):
+- ~~New CLI subcommand that submits `ReassignChunksV2`~~ (done:
+  `sum-node reassign`; the operation carries no epoch field, and the
+  executor stamps the new epoch).
+- Push validation, attestation and download routing against the latest
+  assignment epoch, and re-fetch of newly assigned chunks.
 - End-to-end mirror scenario that lands a file with epoch-0
   empty-snapshot, calls the new path, and confirms the file
   activates against a fresh epoch snapshot.

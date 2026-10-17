@@ -924,8 +924,9 @@ where
         // `SuggestedAction::Abandon` — the pinned snapshot is
         // permanent for epoch 0 (`storage_getActiveNodesAtHeight(H)`
         // is a historical query) so subsequent ordinary `resume`
-        // cannot repair it. External `ReassignChunksV2` is an
-        // unsupported (chain-side) recovery.
+        // cannot repair it. `sum-node reassign` can submit
+        // `ReassignChunksV2` when the chain reports `reassignment_needed`,
+        // but SNIP does not yet push or attest under a later epoch.
         if snapshot.is_empty() {
             warn!(
                 assignment_height = info.assignment_height,
@@ -945,10 +946,11 @@ where
                      after filtering. That historical snapshot will not change when archives \
                      join later — storage_getActiveNodesAtHeight({H}) queries chain history at a \
                      fixed height. No chunks were pushed. Abandon the Pending file when \
-                     admissible (current_height > created_at + activation_grace_blocks), or \
-                     invoke an external ReassignChunksV2 through a chain-side builder to append \
-                     a new assignment epoch (SNIP does not implement that client-side recovery \
-                     path in this release).",
+                     admissible (current_height > created_at + activation_grace_blocks). If the \
+                     chain reports reassignment_needed, `sum-node reassign` can submit \
+                     ReassignChunksV2 to append a new assignment epoch, but SNIP does not yet push \
+                     or attest under a later epoch, so that is not a complete recovery in this \
+                     release.",
                     H = info.assignment_height,
                 )),
             };
@@ -1193,9 +1195,10 @@ where
                     "private file is registered as Pending, but its pinned assignment snapshot \
                      at height {H} contains no eligible archives (role=ArchiveNode && \
                      status=Active) after filtering. That historical snapshot will not change \
-                     when archives join later. No chunks were pushed. Abandon when admissible, \
-                     or invoke an external ReassignChunksV2 (SNIP does not implement that \
-                     client-side recovery path in this release).",
+                     when archives join later. No chunks were pushed. Abandon when admissible. \
+                     If the chain reports reassignment_needed, `sum-node reassign` can submit \
+                     ReassignChunksV2, but SNIP does not yet push or attest under a later \
+                     epoch, so that is not a complete recovery in this release.",
                     H = info.assignment_height,
                 )),
             };
@@ -2113,9 +2116,10 @@ where
         // IMMUTABLE. Repeated `resume` calls will always observe the
         // same snapshot. If it filters to zero eligible archives,
         // ordinary retry cannot repair it. The file remains Pending;
-        // suggest Abandon (SNIP-side) or external ReassignChunksV2
-        // (chain-side; not implemented here). No push, no
-        // re-registration.
+        // suggest Abandon. `sum-node reassign` can submit
+        // `ReassignChunksV2` when the chain reports `reassignment_needed`,
+        // but SNIP does not yet push or attest under a later epoch. No
+        // push, no re-registration.
         if snapshot.is_empty() {
             warn!(
                 assignment_height = info.assignment_height,
@@ -2132,9 +2136,11 @@ where
                     "resume: pinned assignment snapshot at height {H} contains no eligible \
                      archives after filtering. Historical chain state at that height is \
                      immutable — subsequent `resume` calls will observe the same empty \
-                     snapshot. The file remains Pending on chain. Abandon when admissible, \
-                     or invoke an external ReassignChunksV2 to append a new assignment epoch \
-                     (SNIP does not implement that client-side recovery path in this release).",
+                     snapshot. The file remains Pending on chain. Abandon when admissible. If \
+                     the chain reports reassignment_needed, `sum-node reassign` can submit \
+                     ReassignChunksV2 to append a new assignment epoch, but SNIP does not yet \
+                     push or attest under a later epoch, so that is not a complete recovery in \
+                     this release.",
                     H = info.assignment_height,
                 )),
             };
