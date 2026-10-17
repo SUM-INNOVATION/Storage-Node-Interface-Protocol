@@ -1015,12 +1015,11 @@ mod tests {
         assert!(has(&f.store, &shared).await);
     }
 
-    /// Adversarial: anyone can register a funded V1 file whose merkle root
-    /// equals an existing V2 file's root (the chain's V1 registration only
-    /// checks the V1 family). The manifest index is keyed by root alone, so
-    /// the V2 manifest is then read as the funded V1 file's manifest, and the
-    /// attacker-chosen `total_size_bytes` decides which of its chunks are
-    /// "assigned" here. Every V2 chunk must still survive.
+    /// A funded V1 file and a V2 file may share a merkle root. The manifest
+    /// index is keyed by root alone, so the V2 manifest can be read as the
+    /// funded V1 file's manifest, and that file's declared `total_size_bytes`
+    /// decides which of its chunks count as "assigned" here. Every V2 chunk
+    /// must still survive.
     #[tokio::test]
     async fn gc_keeps_v2_chunks_when_a_funded_v1_file_reuses_the_v2_root() {
         let mut f = gc_fixture().await;
