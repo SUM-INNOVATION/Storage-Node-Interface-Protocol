@@ -95,10 +95,49 @@ matrix; the highlights:
   for the eligibility rules governing which chunks the archive can
   be asked to prove.
 - **`gc: deleting unassigned chunk` in the logs.** Normal — the
-  assignment recomputed and this archive no longer holds the chunk.
+  assignment recomputed and this archive is no longer assigned the
+  chunk of a funded V1 file. V2 chunks are never deleted; see
+  [Garbage collection and the protected-chunk list](#garbage-collection-and-the-protected-chunk-list).
   If deletions are unexpectedly frequent, the active-node set may
   be churning; check `storage_getActiveNodesAtHeight` output vs
   what the archive expects.
+
+## Garbage collection and the protected-chunk list
+
+**What the collector deletes.** It deletes a chunk only if:
+- it belongs to a funded V1 file listed by the chain (`storage_getFundedFiles`) whose manifest this archive holds;
+- it is not assigned to this archive;
+- no other locally held manifest, Private chunk mapping or protected-list entry references it.
+
+Everything else is retained, including chunks whose ownership cannot be determined.
+
+**The protected-chunk list.**
+- `<store_dir>/manifests/gc_protected.list` names every chunk the collector must never delete.
+- **Each V2 push** appends one line, synced to disk *before* the chunk is written. If that write fails, the push is refused and the chunk is not stored.
+- **First start.** The first start of a version that keeps the list records every chunk already on disk, because nothing says which of them arrived by V2 push. It then writes `gc_protected.initialized`. Seeding happens only on that first start.
+- **Do not edit or delete either file while the archive is running.**
+
+**Storage growth.**
+- About 128 bytes per V2 chunk, plus about 69 bytes per chunk present at the first start.
+- Chunks present at the first start are kept permanently. This includes V1 chunks that would otherwise have been collected later.
+- V2 chunks are not collected at all. There is no V2-aware collection yet.
+- Chunks of files that left the funded set, and orphans, are also retained.
+
+**Fail-closed states.** The collector deletes nothing, and V2 pushes are refused, while any of these holds:
+- the list is missing after `gc_protected.initialized` exists;
+- the list is unreadable;
+- the list contains a malformed line;
+- a write to the list has failed.
+
+Each is logged at `error` level. A torn final line left by a crash in the middle of a write is not an error: it is dropped on the next start.
+
+**Recovery.** Stop the archive, then either:
+- restore `gc_protected.list` from a backup; or
+- remove both `gc_protected.list` and `gc_protected.initialized`. The next start then protects every chunk on disk again. This preserves data, but makes every chunk currently on disk permanent.
+
+**Limits.**
+- This does not recover chunks that earlier versions already deleted. They must be pushed again by the file's owner or another replica, and re-attested.
+- `SUM_GC_GRACE` delays deletion of collectable chunks only. A restart starts the grace clock again.
 
 ## Log guards
 

@@ -20,7 +20,7 @@ gates that the binary reads at runtime are listed in
 | `--attest-fee` | `SUM_ATTEST_FEE` | `1000000` (base units) | Per-tx fee used by V2 attestation paths. Must be ≥ chain `min_fee`. |
 | `--por-poll-secs` | `SUM_POR_INTERVAL` | `10` | PoR challenge polling interval. |
 | `--market-sync-secs` | `SUM_MARKET_SYNC_INTERVAL` | `30` | Market-sync polling interval. |
-| `--gc-grace-secs` | `SUM_GC_GRACE` | `3600` | Grace period before deleting unassigned chunks. |
+| `--gc-grace-secs` | `SUM_GC_GRACE` | `3600` | Grace period before deleting a collectable chunk: one of a funded V1 file's chunks that is no longer assigned to this node and that nothing else references. The clock is in memory, so a restart starts it again. See [garbage collection](../operator/monitoring.md#garbage-collection-and-the-protected-chunk-list). |
 | `--client` | `SUM_CLIENT_MODE` | `false` | Client mode: `ingest` exits after confirmation, `listen` is refused. |
 | `--enable-wan` | `SUM_ENABLE_WAN` | `false` | Enable Kademlia + TCP transport. |
 | `--bootstrap-peer` | `SUM_BOOTSTRAP_PEERS` | (empty) | Multiaddrs for Kademlia bootstrap; repeatable or comma-separated. |
