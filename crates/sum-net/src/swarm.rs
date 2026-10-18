@@ -1112,6 +1112,7 @@ impl SumSwarm {
                 peer_id,
                 endpoint,
                 cause,
+                num_established,
                 ..
             } => {
                 let relayed = endpoint.is_relayed();
@@ -1125,8 +1126,10 @@ impl SumSwarm {
                         e.remove();
                     }
                 }
-                debug!(%peer_id, relayed, ?cause, "connection closed");
-                if let Err(e) = event_tx.try_send(SumNetEvent::PeerDisconnected { peer_id }) {
+                debug!(%peer_id, relayed, ?cause, num_established, "connection closed");
+                if let Some(event) = disconnect_event(peer_id, num_established)
+                    && let Err(e) = event_tx.try_send(event)
+                {
                     warn!(%e, "event channel full — dropping PeerDisconnected");
                 }
             }
@@ -1285,6 +1288,13 @@ fn v2_response_kind(resp: &ShardResponseV2) -> &'static str {
         ShardResponseV2::ManifestPushAck { .. } => "ManifestPushAck",
         ShardResponseV2::ManifestData { .. } => "ManifestData",
     }
+}
+
+/// The event a closed connection produces. `remaining` is the number of
+/// other connections to the same peer that are still established; only the
+/// last one closing is a disconnect (see [`SumNetEvent::PeerDisconnected`]).
+fn disconnect_event(peer_id: PeerId, remaining: u32) -> Option<SumNetEvent> {
+    (remaining == 0).then_some(SumNetEvent::PeerDisconnected { peer_id })
 }
 
 #[cfg(test)]
@@ -1667,5 +1677,18 @@ mod tests {
             picked.to_string(),
             format!("/ip4/8.8.8.8/udp/4001/quic-v1/p2p/{peer}")
         );
+    }
+
+    /// Closing one of several connections to a peer leaves it connected (and
+    /// identified); only the last close is a disconnect.
+    #[test]
+    fn only_the_last_connection_close_is_a_disconnect() {
+        let peer = rand_peer();
+        assert!(disconnect_event(peer, 1).is_none());
+        assert!(disconnect_event(peer, 3).is_none());
+        match disconnect_event(peer, 0) {
+            Some(SumNetEvent::PeerDisconnected { peer_id }) => assert_eq!(peer_id, peer),
+            other => panic!("expected PeerDisconnected, got {other:?}"),
+        }
     }
 }

@@ -972,10 +972,15 @@ fn run_ingest(path: &std::path::Path) -> Result<()> {
 // ── V2 Ingest mode (chain plan v3.2) ────────────────────────────────────────
 //
 // Wires the W10a `IngestPipeline` into a CLI subcommand. CLI-only glue:
-// spin up SumNet, run the existing peer-discovery loop, build a
-// `MapPeerResolver`, populate `IngestParams` from
+// spin up SumNet, build an empty `MapPeerResolver` (the pipeline's own
+// discovery stage fills it), populate `IngestParams` from
 // `chain_get_chain_params` (profile-aware fallback), construct the
 // pipeline, run, print outcome.
+
+/// How long `ingest-v2` and `resume` wait for the archives a push needs to be
+/// identified on the network before giving up. Same bound as the previous
+/// first-peer wait; what changed is the condition it bounds.
+const INGEST_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[allow(clippy::too_many_arguments)]
 async fn run_ingest_v2(
@@ -1031,53 +1036,12 @@ async fn run_ingest_v2(
     let net = Arc::new(SumNet::new(net_config, keypair).await?);
     let rpc = rpc_early;
 
-    // ── Peer discovery (same pattern as V1 run_ingest) ──────────────
-    info!("waiting for peers on the LAN...");
-    let peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-    let discover_timeout = Duration::from_secs(30);
-    let discover_deadline = tokio::time::Instant::now() + discover_timeout;
-    let mut found_peer = false;
-    loop {
-        tokio::select! {
-            Some(event) = net.next_event() => {
-                print_event(&event);
-                match &event {
-                    SumNetEvent::PeerDiscovered { .. } => {
-                        found_peer = true;
-                    }
-                    _ => {
-                        let mut map = peer_addresses.write().await;
-                        apply_peer_event(&mut map, &event);
-                    }
-                }
-                let map_empty = peer_addresses.read().await.is_empty();
-                if found_peer && map_empty {
-                    continue;
-                }
-                if found_peer && !map_empty {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    while let Ok(Some(event)) = tokio::time::timeout(
-                        Duration::from_millis(200), net.next_event()
-                    ).await {
-                        let mut map = peer_addresses.write().await;
-                        apply_peer_event(&mut map, &event);
-                    }
-                    break;
-                }
-            }
-            _ = tokio::time::sleep_until(discover_deadline) => {
-                if !found_peer {
-                    warn!("timed out waiting for peers");
-                }
-                break;
-            }
-        }
-    }
-    info!(
-        peer_count = peer_addresses.read().await.len(),
-        "peer discovery complete; entering V2 ingest"
-    );
+    // Peer discovery is part of the pipeline: before registering, it waits
+    // until every archive the file would be assigned to is identified on the
+    // network, or refuses at the discovery deadline (`peer_discovery.rs`).
+    // The resolver starts empty and is filled from the identify events the
+    // pipeline reads.
+    let resolver = Arc::new(sum_node::ingest_v2::MapPeerResolver::new());
 
     // ── Build IngestParams ─────────────────────────────────────────
     //
@@ -1093,6 +1057,7 @@ async fn run_ingest_v2(
         push_retries: 2,
         push_wait_secs: Duration::from_secs(push_wait_secs),
         manifest_push_wait_secs: Duration::from_secs(manifest_push_wait_secs),
+        discovery_timeout: INGEST_DISCOVERY_TIMEOUT,
     };
     let params = match rpc.chain_get_chain_params().await {
         Ok(cp) => {
@@ -1130,6 +1095,7 @@ async fn run_ingest_v2(
                     push_retries: defaults.push_retries,
                     push_wait_secs: defaults.push_wait_secs,
                     manifest_push_wait_secs: defaults.manifest_push_wait_secs,
+                    discovery_timeout: defaults.discovery_timeout,
                     activation_grace_blocks: 50,
                     // Dev fallback assumes V2 is enabled from genesis
                     // (matches the local-mirror profile). Any production
@@ -1143,7 +1109,6 @@ async fn run_ingest_v2(
     };
 
     // ── Construct pipeline ─────────────────────────────────────────
-    let resolver = Arc::new(sum_node::ingest_v2::MapPeerResolver::new(peer_addresses));
     let pipeline = sum_node::ingest_v2::IngestPipeline::new(
         rpc.clone(),
         net.clone(),
@@ -1327,6 +1292,7 @@ async fn build_v2_ingest_params(
                     push_retries: defaults.push_retries,
                     push_wait_secs: defaults.push_wait_secs,
                     manifest_push_wait_secs: defaults.manifest_push_wait_secs,
+                    discovery_timeout: defaults.discovery_timeout,
                     activation_grace_blocks: 50,
                     v2_enabled_from_height: Some(0),
                 })
@@ -1395,43 +1361,9 @@ async fn run_resume_v2(
     let net = Arc::new(SumNet::new(net_config, keypair).await?);
     let rpc = rpc_early;
 
-    // Same peer-discovery scaffolding as run_ingest_v2 — resume needs
-    // peers for the partial S2 push wave.
-    info!("waiting for peers on the LAN...");
-    let peer_addresses: Arc<RwLock<HashMap<sum_net::PeerId, [u8; 20]>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-    let discover_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let mut found_peer = false;
-    loop {
-        tokio::select! {
-            Some(event) = net.next_event() => {
-                print_event(&event);
-                match &event {
-                    SumNetEvent::PeerDiscovered { .. } => { found_peer = true; }
-                    _ => {
-                        let mut map = peer_addresses.write().await;
-                        apply_peer_event(&mut map, &event);
-                    }
-                }
-                let map_empty = peer_addresses.read().await.is_empty();
-                if found_peer && !map_empty {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    while let Ok(Some(event)) = tokio::time::timeout(
-                        Duration::from_millis(200), net.next_event()
-                    ).await {
-                        let mut map = peer_addresses.write().await;
-                        apply_peer_event(&mut map, &event);
-                    }
-                    break;
-                }
-            }
-            _ = tokio::time::sleep_until(discover_deadline) => {
-                if !found_peer { warn!("timed out waiting for peers"); }
-                break;
-            }
-        }
-    }
-
+    // Resume discovers peers inside the pipeline too, and only when it has
+    // chunks to push: it waits for the archives assigned to those chunks
+    // under the file's pinned snapshot (`peer_discovery.rs`).
     let defaults = sum_node::ingest_v2::IngestParamsDefaults {
         poll_interval: Duration::from_secs(2),
         activation_wait_secs: Duration::from_secs(activation_wait_secs),
@@ -1439,9 +1371,10 @@ async fn run_resume_v2(
         push_retries: 2,
         push_wait_secs: Duration::from_secs(push_wait_secs),
         manifest_push_wait_secs: Duration::from_secs(manifest_push_wait_secs),
+        discovery_timeout: INGEST_DISCOVERY_TIMEOUT,
     };
     let params = build_v2_ingest_params(&rpc, profile, chain_id_arg, fee_per_tx, defaults).await?;
-    let resolver = Arc::new(sum_node::ingest_v2::MapPeerResolver::new(peer_addresses));
+    let resolver = Arc::new(sum_node::ingest_v2::MapPeerResolver::new());
     let pipeline =
         sum_node::ingest_v2::IngestPipeline::new(rpc, net.clone(), resolver, seed, l1_addr, params);
 
@@ -1622,9 +1555,7 @@ async fn run_abandon_v2(
     let defaults = sum_node::ingest_v2::IngestParamsDefaults::default();
     let params = build_v2_ingest_params(&rpc, profile, chain_id_arg, fee_per_tx, defaults).await?;
     // Empty resolver — abandon doesn't push, so peers don't matter.
-    let resolver = Arc::new(sum_node::ingest_v2::MapPeerResolver::new(Arc::new(
-        RwLock::new(HashMap::new()),
-    )));
+    let resolver = Arc::new(sum_node::ingest_v2::MapPeerResolver::new());
     // keypair would have been used to build a SumNet; threaded into
     // `_keypair` so we don't drop it unused.
     let _ = keypair;

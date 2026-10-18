@@ -22,7 +22,13 @@ pub enum SumNetEvent {
     /// A transport-layer connection was established.
     PeerConnected { peer_id: PeerId },
 
-    /// A transport-layer connection was closed.
+    /// The last established connection to this peer closed.
+    ///
+    /// Emitted only when no other connection to the peer remains. Closing
+    /// one of several connections (for example the redundant one left by a
+    /// simultaneous dial) is not a disconnect: identify is not re-run on the
+    /// surviving connection, so treating it as one would drop a reachable
+    /// peer from every `PeerId → L1 address` map.
     PeerDisconnected { peer_id: PeerId },
 
     /// A Gossipsub message was received.

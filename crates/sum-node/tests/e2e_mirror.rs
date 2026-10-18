@@ -1076,17 +1076,22 @@ async fn update_access_clear_expiry_grants_indefinite_access() {
 
 // ── 11. resume_pending_completes_to_active ──────────────────────────────────
 
-/// Pending file → resume → activated.
+/// No archives listening → refused before registration; Pending file →
+/// resume → activated.
 ///
-/// Driving a real `Pending` outcome on a healthy 3-archive fleet is
-/// timing-sensitive (S2 may complete inside even a 1-second budget
-/// over loopback), so this scenario forces the Pending state
-/// deterministically: the initial ingest runs **without** any
-/// archives listening, which guarantees S2 cannot push to R=3 and
-/// leaves the file in `Pending` after `RegisterFilePendingV2`.
-/// Then we stand up the full archive fleet and `resume` against the
-/// same root + file body — the resume must drive S2 to full
-/// replication and chain lifecycle to `Active`.
+/// Phase 0: with no archive listening, `ingest-v2` must refuse before
+/// `RegisterFilePendingV2`. The chain lists three active archives the
+/// file would be assigned to, none is identified within the discovery
+/// bound, and no row may exist for the file afterwards.
+///
+/// Phase 1 forces a `Pending` outcome deterministically on a healthy
+/// fleet: `--push-wait-secs 0` ends S2 right after the initial push
+/// wave, before any `PushAck` is read, so every chunk is
+/// under-replicated and the file stays `Pending` after registration.
+/// (Before discovery waited for every assigned archive, this phase ran
+/// with no archives listening; that now refuses before registering.)
+/// Phase 2: `resume` against the same root + file body must drive the
+/// file to `Active`.
 ///
 /// Uses a unique plaintext so the file's merkle root never collides
 /// with `public_ingest_then_download_round_trip` (which previously
@@ -1112,12 +1117,52 @@ async fn resume_pending_completes_to_active() {
     let (_pt_dir, pt_path) = write_test_plaintext(&plaintext);
 
     let owner_key = role_seed_path("owner");
-    // Phase 1 — induce Pending on purpose by submitting the initial
-    // ingest with NO archive listeners running. `RegisterFilePendingV2`
-    // will finalize, but S2's push wave finds no peers and the
-    // ingest exits in `Pending` after the budget elapses. The CLI
-    // exit code is non-zero (Pending is reported as a failure to
-    // activate), so we don't assert on `success()` here.
+    let (_m, manifest) = sum_store::chunker::BinaryChunker::chunk_file(&pt_path)
+        .expect("chunk the plaintext locally to learn its merkle root");
+    let expected_root = format!("0x{}", hex::encode(manifest.merkle_root));
+
+    // Phase 0 — no archive listeners: refused before registration.
+    let refused = spawn_bin(
+        "sum-node",
+        &[
+            "--key-file",
+            owner_key.to_str().unwrap(),
+            "--rpc-url",
+            &e2e_rpc_url(),
+            "--chain-id",
+            "1337",
+            "ingest-v2",
+            pt_path.to_str().unwrap(),
+            "--visibility",
+            "public",
+        ],
+        &[],
+    );
+    let combined_refused = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        combined_refused.contains("Refusing to register the file"),
+        "ingest-v2 with no archives listening must refuse before registration: \
+         {combined_refused}"
+    );
+    assert!(
+        !combined_refused.contains("lifecycle: Pending"),
+        "a refused ingest must not report a Pending file: {combined_refused}"
+    );
+    assert!(
+        rpc.storage_get_file_info_v2(&expected_root, None, None)
+            .await
+            .expect("storage_getFileInfoV2 after refused ingest")
+            .is_none(),
+        "a refused ingest must leave no chain row for {expected_root}"
+    );
+
+    // Phase 1 — fleet up; induce Pending with a zero push wait. The CLI
+    // exit code for Pending is not asserted on.
+    let (_archives, _archive_dirs) = spawn_archive_fleet(&rpc).await;
     let initial = spawn_bin(
         "sum-node",
         &[
@@ -1132,7 +1177,7 @@ async fn resume_pending_completes_to_active() {
             "--visibility",
             "public",
             "--push-wait-secs",
-            "1",
+            "0",
             "--manifest-push-wait-secs",
             "1",
             "--activation-wait-secs",
@@ -1146,11 +1191,17 @@ async fn resume_pending_completes_to_active() {
     let root_hex = extract_hex32(&combined_initial)
         .unwrap_or_else(|| panic!("ingest-v2 did not emit merkle root: {combined_initial}"));
     let prefixed = format!("0x{root_hex}");
+    assert_eq!(
+        prefixed, expected_root,
+        "the registered root is the local one"
+    );
+    assert!(
+        combined_initial.contains("lifecycle: Pending"),
+        "phase 1 must leave the file Pending: {combined_initial}"
+    );
 
-    // Phase 2 — stand up the archive fleet, then resume. With three
-    // listeners + chain-side registration confirmed, resume's S2
-    // wave can satisfy R=3 and drive the file to Active.
-    let (_archives, _archive_dirs) = spawn_archive_fleet(&rpc).await;
+    // Phase 2 — resume with the fleet still up. Discovery waits for the
+    // archives assigned to the missing chunks; S2 then reaches R=3.
 
     // resume against the same root + path. This MUST drive the
     // file to Active regardless of where S2 left it.
