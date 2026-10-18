@@ -474,9 +474,11 @@ pub struct AssignmentCoverageV2 {
     /// [`AssignmentCoverageV2::resolved_latest_epoch`].
     #[serde(default)]
     pub latest_assignment_epoch: u64,
-    /// True iff an archive assigned under the latest epoch has left
-    /// the active set — chain accepts `ReassignChunksV2` iff this is
-    /// true. Pre-#62 chain: `false` via `#[serde(default)]`. Safe
+    /// True iff an archive in the latest epoch's assignment snapshot has
+    /// left the active set — chain accepts `ReassignChunksV2` iff this is
+    /// true. The rule is snapshot-wide: that archive need not be assigned
+    /// any chunk of this file (`sum-node reassign` checks that separately,
+    /// from `per_epoch`). Pre-#62 chain: `false` via `#[serde(default)]`. Safe
     /// legacy default: pre-#62 chains have no reassignment concept,
     /// and aggregate `can_activate_now` semantics do not depend on
     /// this field.

@@ -257,15 +257,19 @@ enum Command {
     },
 
     /// V2 reassign: submit an owner-triggered `ReassignChunksV2` for a file
-    /// this key owns, when the chain reports `reassignment_needed`.
+    /// this key owns, when the chain reports `reassignment_needed` AND an
+    /// archive that has left the active set holds a chunk of the file under
+    /// the latest epoch.
     ///
     /// The chain's no-key builder (`storage_buildReassignChunksV2`)
     /// assembles the unsigned transaction; this command verifies it against
     /// the request, then signs it with `--key-file` (the same owner key as
     /// `abandon` and ingest) and waits for finality. It refuses a file owned
     /// by another address, a file the chain does not mark
-    /// `reassignment_needed`, and any built transaction that disagrees with
-    /// the request. `--dry-run` verifies and stops without signing.
+    /// `reassignment_needed`, a file no departed archive holds a chunk of, a
+    /// coverage read that does not come from one chain state, and any built
+    /// transaction that disagrees with the request. `--dry-run` verifies and
+    /// stops without signing.
     Reassign {
         /// Hex-encoded 32-byte merkle root of the file.
         merkle_root: String,
@@ -1487,22 +1491,50 @@ async fn run_reassign_v2(
         ReassignOutcome::Reassigned {
             tx_hash,
             finalized_at_height,
+            departed,
         } => {
-            info!(%root, %tx_hash, finalized_at_height, "REASSIGN finalized");
-            println!("reassigned: {root} tx={tx_hash} finalized_at_height={finalized_at_height}");
+            info!(%root, %tx_hash, finalized_at_height, departed = %departed.archive, "REASSIGN finalized");
+            println!(
+                "reassigned: {root} tx={tx_hash} finalized_at_height={finalized_at_height} \
+                 departed_assignee={} ({:?})",
+                departed.archive, departed.evidence
+            );
             Ok(())
         }
         ReassignOutcome::DryRun {
             nonce,
             fee,
             signing_hash,
+            departed,
+            at_height,
         } => {
             println!(
                 "dry run: ReassignChunksV2 for {root} verified (nonce={nonce} fee={fee} \
-                 signing_hash={signing_hash}); nothing signed or sent"
+                 signing_hash={signing_hash}); departed_assignee={} ({:?}) at latest \
+                 height {at_height}; nothing signed or sent",
+                departed.archive, departed.evidence
             );
             Ok(())
         }
+        ReassignOutcome::NoDepartedAssignee {
+            latest_assignment_epoch,
+            departed,
+            at_height,
+        } => anyhow::bail!(
+            "reassign: no departed assignee; not submitting. The chain reports \
+             reassignment_needed for {root}, but no archive that left the latest \
+             snapshot (epoch {latest_assignment_epoch}; departed: {}) holds a chunk of \
+             this file (read at latest height {at_height})",
+            departed.join(", ")
+        ),
+        ReassignOutcome::InconsistentSnapshot { attempts, reason } => anyhow::bail!(
+            "reassign: no consistent coverage read for {root} in {attempts} attempts \
+             ({reason}); nothing submitted, re-run the command"
+        ),
+        ReassignOutcome::UnusableCoverage { reason } => anyhow::bail!(
+            "reassign: the coverage response for {root} cannot support the decision \
+             ({reason}); nothing submitted"
+        ),
         ReassignOutcome::NotRegistered => {
             anyhow::bail!("reassign: {root} has no V2 file or coverage row on chain")
         }
