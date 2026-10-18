@@ -49,15 +49,22 @@ x86_64 only; every other platform builds from source
   which is the block producer's pacing parameter and not a consensus
   rule; the observed cadence is about 1.5 s. No SNIP code path
   consumes `block_time_ms`.
-- The pin identifies a chain source state for wire format, not a
-  network. The "Genesis SHA-256" that `chain-compat.md` listed from
+- The pin identifies a chain source state for wire format, not the
+  validators' binary or runtime configuration. The "Genesis
+  SHA-256" that `chain-compat.md` listed from
   2026-05-07 is withdrawn: it matches no genesis file in the chain
   repository's history, and the pin's `genesis/mainnet_genesis.json`
   is a placeholder template. A genesis-file hash does not identify
   the network, because activation heights are edited into each
   validator's runtime genesis. The only network identity SNIP uses
-  is still `chain_id`; no check changed. Mainnet's genesis block
-  hash is not recorded.
+  is still `chain_id`; no check changed.
+- Mainnet's network identity is now recorded: `chain_id` 1 and
+  genesis block hash
+  `0x1156d350e7d0ac45cb96bfca25d57c71675ceea5949ea44d81432d08baed68e6`,
+  read from the public RPC on 2026-10-18 (UTC) and reproduced
+  offline from the root `genesis.json` at the compatibility pin with
+  the chain's own genesis code. That file is not the validators'
+  runtime genesis, and the pin remains a wire-format pin.
 - The local mirror is the chain's synthetic five-validator devnet
   at the E2E workflow's `SUMCHAIN_COMMIT`
   (`d8130ead3b77f38eff6eeb82b4e68bb1aca8e3b2`), kept separate from
