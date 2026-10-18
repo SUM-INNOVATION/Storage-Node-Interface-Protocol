@@ -1,0 +1,76 @@
+# Local-mirror E2E (docs/release/release-checklist.md § 5) on a fresh
+# GitHub-hosted runner, for release-preparation pull requests only.
+#
+# It checks out the PUBLIC sum-chain repository at SUMCHAIN_COMMIT,
+# provisions that commit's synthetic five-validator devnet (chain id
+# 1337; throwaway keys generated on the runner, never committed, printed
+# or uploaded), builds and starts it with Docker Compose, and runs
+# scripts/local-mirror-e2e.sh: the read-only smoke, then SNIP's
+# local-mirror suite (`make e2e-mirror`). The devnet is torn down at the
+# end. Read-only token, no secrets, no production endpoint.
+#
+# It runs only on pull requests whose head branch starts with
+# `release/`, and it is not a required check.
+#
+# SUMCHAIN_COMMIT is the chain commit this end-to-end run uses. It is
+# not the chain-compatibility pin in docs/reference/chain-compat.md,
+# which names the commit SNIP's wire fixtures were confirmed against.
+#
+# All third-party actions are pinned to the full commit SHAs the other
+# workflows already use.
+
+name: release local-mirror E2E
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-local-mirror-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SUMCHAIN_COMMIT: d8130ead3b77f38eff6eeb82b4e68bb1aca8e3b2
+
+jobs:
+  local-mirror-e2e:
+    name: local-mirror E2E (synthetic sum-chain devnet)
+    if: startsWith(github.head_ref, 'release/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Checkout SNIP
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout sum-chain at SUMCHAIN_COMMIT
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: SUM-INNOVATION/sum-chain
+          ref: ${{ env.SUMCHAIN_COMMIT }}
+          path: sum-chain
+          persist-credentials: false
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: Toolchain versions
+        run: |
+          docker version
+          docker compose version
+          cargo --version
+          python3 --version
+
+      - name: Local-mirror E2E
+        env:
+          SUMCHAIN_DIR: ${{ github.workspace }}/sum-chain
+        run: scripts/local-mirror-e2e.sh

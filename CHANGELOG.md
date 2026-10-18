@@ -7,7 +7,7 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ## [Unreleased]
 
-## [0.4.0-rc4] - TBD
+## [0.4.0-rc4] - 2026-10-18
 
 First release candidate since `v0.4.0-rc3` (2026-05-08). It carries
 every change merged since then, including the documentation first
@@ -44,7 +44,11 @@ x86_64 only; every other platform builds from source
   `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0`
   ([`docs/reference/chain-compat.md`](docs/reference/chain-compat.md)).
 - Mainnet, as recorded there: `chain_id` 1,
-  `v2_enabled_from_height` 5,200,000, `finality_depth` 6.
+  `v2_enabled_from_height` 5,200,000, `finality_depth` 6, read from
+  the public RPC on 2026-10-18. `block_time_ms` reports 3000, which
+  is the block producer's pacing parameter and not a consensus rule;
+  the observed cadence is about 1.5 s. No SNIP code path consumes
+  `block_time_ms`.
 - Chain wire types come from `sumchain-wire`, exact-pinned at
   `=0.4.0` in the workspace `Cargo.toml`.
 
@@ -83,6 +87,16 @@ x86_64 only; every other platform builds from source
   (`scripts/test-verify-release-assets.sh`). The manual-dispatch
   workflow `release-install-smoke.yml` runs the documented curl-pipe
   install against a published release. Neither publishes anything.
+- **Local-mirror E2E on GitHub-hosted runners.** The
+  `release-local-mirror-e2e.yml` workflow runs on pull requests from
+  `release/` branches. `scripts/local-mirror-e2e.sh` brings up the
+  chain's synthetic five-validator devnet from a pinned public chain
+  commit, with throwaway keys generated on the runner, and runs the
+  read-only smoke and the local-mirror suite against it. Read-only
+  token, no secrets; not a required check.
+- **`e2e-helper smoke` reports `block_time_ms` and
+  `finality_depth`** alongside the chain id, R and the V2 height.
+  Informational only; the smoke's pass/fail rules are unchanged.
 - **Object/manifest cross-validation** (#45, #46). SNIP's object,
   manifest and Merkle encodings are tested byte for byte against
   vendored, hash-locked upstream golden vectors.
