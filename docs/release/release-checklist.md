@@ -265,9 +265,10 @@ section defines *what* must be true to promote; that guide describes
       environment. A green run on the original machine is necessary
       but not sufficient.
 
-- [ ] **Mainnet read-only smoke.** Against the live mainnet RPC at
-      the chain commit listed in [`CHAIN-COMPAT.md`](../reference/chain-compat.md)
-      "Mainnet pin / deployed chain":
+- [ ] **Mainnet read-only smoke.** Against the live mainnet RPC,
+      compared with the values in [`CHAIN-COMPAT.md`](../reference/chain-compat.md)
+      "Mainnet pin / deployed chain" (the RPC does not report which
+      chain commit mainnet runs):
 
       ```bash
       make smoke RPC=https://rpc.sumchain.io SMOKE_ARGS=--require-v2

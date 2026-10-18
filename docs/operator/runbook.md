@@ -153,7 +153,9 @@ cargo run --release -p sum-node -- \
 Sequence for bringing a brand-new archive operator onto live
 mainnet. Read [`CHAIN-COMPAT.md`](../reference/chain-compat.md) "Mainnet pin /
 deployed chain" first — the values quoted below are operator-
-visible facts confirmed at the pinned chain commit.
+visible facts read from the public RPC on the dates recorded there.
+The pinned chain commit is SNIP's wire-format pin; it does not
+identify the network or the validators' binary.
 
 ### 0. Mainnet vs local mirror
 
@@ -391,32 +393,43 @@ re-ingestion is required.
 
 ## Local mirror
 
-The local mirror is a **disposable single-validator devnet** for
-V2 client integration testing. It is NOT production, NOT a public
-testnet, and NOT representative of liveness or security
-characteristics. Use it only to validate that SNIP talks to the
-chain wire shape correctly at the pinned commit
-([`CHAIN-COMPAT.md`](../reference/chain-compat.md)).
+The local mirror is the chain's **disposable synthetic
+five-validator devnet** for V2 client integration testing. It is
+NOT production, NOT a public testnet, and NOT representative of
+liveness or security characteristics, and a passing run says
+nothing about mainnet. Its requirements, including the chain
+revision it runs, are in
+[`CHAIN-COMPAT.md`](../reference/chain-compat.md) "Local-mirror
+requirements". It does not run at the compatibility pin.
 
-Validator keys are generated on first boot into a Docker named
-volume. No validator signing material, faucet privates, or test
-seeds are committed to the chain repo, and SNIP must never
-consume an artifact that ships keys. The same rule applies
-prospectively to every future re-pin.
+Validator keys are throwaway keys generated on the host that runs
+the mirror, into the chain checkout's ignored `devnet/` directory.
+No validator signing material, faucet privates, or test seeds are
+committed to the chain repo, and SNIP must never consume an
+artifact that ships keys. The same rule applies prospectively to
+every future change of the mirror's chain revision and every
+future re-pin.
 
 ### Bring up
 
+Use the chain revision `SUMCHAIN_COMMIT` from
+[`.github/workflows/release-local-mirror-e2e.yml`](../../.github/workflows/release-local-mirror-e2e.yml),
+on a Docker-capable Linux host. The E2E script provisions the
+devnet, runs the smoke and the suite, and tears everything down:
+
 ```bash
-git clone <chain repo> sum-chain
-cd sum-chain
-git checkout 5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0  # current SNIP pin
-docker-compose -f deploy/snip-local-mirror.yaml up -d --build
+git clone https://github.com/SUM-INNOVATION/sum-chain.git /tmp/sum-chain
+git -C /tmp/sum-chain checkout <SUMCHAIN_COMMIT from the workflow>
+SUMCHAIN_DIR=/tmp/sum-chain SUMCHAIN_COMMIT=<same sha> \
+    scripts/local-mirror-e2e.sh
 ```
 
-The first `up --build` takes about **10 minutes** for the cargo
-release stage of the validator image. Subsequent builds reuse the
-docker layer cache (rust:1.85-slim base) and complete in seconds
-to a few minutes — this is normal, not hung.
+See [`RELEASE-CHECKLIST.md`](../release/release-checklist.md) § 5
+for what the script does. The subsections below ("Stop / wipe" and
+"Funded test accounts") describe the earlier single-validator
+preset and its funding overlay. They have not been re-verified
+against the five-validator devnet at `SUMCHAIN_COMMIT`, whose
+funded roles come from the chain's provisioner.
 
 ### Health check (read-only)
 
