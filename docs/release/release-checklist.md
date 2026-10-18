@@ -176,95 +176,54 @@ Asserts read-only:
 
 ## 5. Local-mirror full E2E
 
-> **Mirror is runnable at the pinned chain SHA.** The
-> chain-side compose preset at
-> `sum-chain:deploy/snip-local-mirror.yaml` (in the chain
-> repository, not this one) brings up a self-
-> bootstrapping single-validator devnet (validator key
-> generated into a Docker named volume on first boot; no
-> signing material in the repo). The SNIP-side **WS2 E2E
-> suite** that drives this mirror end-to-end through the full
-> V2 lifecycle is the next workstream — until it lands, the
-> mirror is verified via `make smoke` only.
+**First path: GitHub-hosted.** The `release local-mirror E2E`
+workflow
+([`.github/workflows/release-local-mirror-e2e.yml`](../../.github/workflows/release-local-mirror-e2e.yml))
+runs on every pull request whose head branch starts with `release/`,
+on a fresh GitHub-hosted runner. It runs
+[`scripts/local-mirror-e2e.sh`](../../scripts/local-mirror-e2e.sh),
+which:
 
-Bring up (from the chain checkout):
+1. checks out the public chain repository at the workflow's
+   `SUMCHAIN_COMMIT` and refuses any other commit;
+2. provisions the chain's synthetic five-validator devnet
+   (`setup-local-testnet --mode topology --validator-count 5
+   --output-dir devnet`: chain id 1337, V2 from genesis, throwaway
+   keys generated on the runner, never committed, printed or
+   uploaded);
+3. builds the images from that commit and starts the chain's
+   `deploy/snip-local-mirror.yaml`;
+4. writes SNIP's six role seed files from the devnet's funded roles
+   into a temporary directory outside both repositories;
+5. runs `make smoke RPC=http://localhost:8545 SMOKE_ARGS=--require-v2`,
+   then `make e2e-mirror`;
+6. tears the devnet down and deletes its keys, on success or failure.
 
-```bash
-git checkout 5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0
-docker-compose -f deploy/snip-local-mirror.yaml up -d --build
-```
+It uses a read-only token and no secrets, and it is not a required
+check. A failure is a hard release blocker. Record the run URL and
+the chain commit with the release evidence.
 
-Health check (read-only, no tx). After bringing the mirror up,
-verify all three:
+`SUMCHAIN_COMMIT` is the chain commit the end-to-end run uses. It is
+not the compatibility pin in
+[`chain-compat.md`](../reference/chain-compat.md): at that pin the
+chain's mirror preset mounts files the repository does not track, so
+it cannot be brought up from the repository alone.
 
-1. **chain_id returns `1337`** and finality is `"finalized"`:
-   ```bash
-   make smoke RPC=http://localhost:8545 SMOKE_ARGS=--require-v2
-   # Expect: chain_id=1337, V2 state ENABLED_FROM_GENESIS.
-   ```
-2. **Block height advances** (~2s block cadence). The smoke
-   line `chain_getBlockHeight ........... OK (finalized
-   height=N, finality=finalized)` confirms; re-running smoke a
-   few seconds later must show a higher N.
-3. **Each WS2b role address has a non-zero balance** (only
-   applies if you brought the mirror up with the funded-test-
-   accounts overlay; see
-   [`OPERATOR-RUNBOOK.md`](../operator/runbook.md)
-   "Funded test accounts" for the per-role balance check
-   loop).
-
-A failure in any of the three is a hard release blocker.
-
-Stop / wipe (from the chain checkout):
+**Fallback: a Docker-capable Linux host the owner names.** The same
+script runs there unchanged; no other setup is assumed:
 
 ```bash
-docker-compose -f deploy/snip-local-mirror.yaml down       # preserve volume
-docker-compose -f deploy/snip-local-mirror.yaml down -v    # wipe + regen keys
+git clone https://github.com/SUM-INNOVATION/sum-chain.git /tmp/sum-chain
+git -C /tmp/sum-chain checkout <SUMCHAIN_COMMIT from the workflow>
+SUMCHAIN_DIR=/tmp/sum-chain SUMCHAIN_COMMIT=<same sha> \
+    scripts/local-mirror-e2e.sh
 ```
 
-Optional fresh-genesis funded accounts: see
-[`OPERATOR-RUNBOOK.md`](../operator/runbook.md)
-"Funded test accounts (optional, fresh-genesis only)". The
-overlay file MUST use numeric balances (`{ "<base58>": <int>,
-... }`), not string-encoded balances. Compose volume mounts MUST
-be declared in YAML — `docker-compose` does not accept a `-v`
-flag for runtime volumes; use a separate override file. If the
-mirror has already been started, run
-`docker-compose -f deploy/snip-local-mirror.yaml down -v`
-before starting with the overlay (the overlay is fresh-genesis
-gated). DO NOT commit private keys for the funded addresses.
-
-When WS2 ships:
-
-```bash
-cargo test --test e2e_lifecycle -- --include-ignored
-```
-
-Asserts: Public ingest/download, Private owner-only, Private
-shared, share/revoke/update-access with finality boundary,
-archive restart recovery, V1 legacy compatibility.
->
-> Until then, releases gate on:
->
->   * `make release-check` (the linux CI gate, § 0).
->   * In-tree bincode v1 fixture tests (§ 3) — exhaustive for the
->     V2 wire surface SNIP submits / decodes.
->   * Live-chain read-only smoke (§ 4) — sanity-checks the target
->     RPC's V2 state without sending any tx.
-
-When unblocked:
-
-```bash
-# Bring up the chain-ops-supplied local mirror per their updated
-# instructions (exact command depends on the artifact they ship —
-# could be `docker-compose up`, a binary, etc).
-cargo test --test e2e_lifecycle -- --include-ignored
-# Tear down per the supplied runbook.
-```
-
-Asserts: Public ingest/download, Private owner-only, Private shared,
-share/revoke/update-access with finality boundary, archive restart
-recovery, V1 legacy compatibility.
+The suite (`crates/sum-node/tests/e2e_mirror.rs`) covers: mirror
+health; node and encryption-key registration; Public ingest and
+download; Private owner-only; Private shared; share, revoke and
+update-access across the finality boundary; and resuming a Pending
+file to Active. Archive-restart recovery is not covered yet.
 
 ## 6. Privacy audit
 

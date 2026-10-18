@@ -6,28 +6,28 @@ tests in this repo and MUST stay byte-for-byte aligned with whatever
 chain release SNIP is built against. This document is the
 operator-facing source of truth for how SNIP and chain stay aligned.
 
-> **The chain repository is private.** The exact chain commit is
-> maintained out-of-band by release managers. Public SNIP releases
-> pin an internal chain release tag, not a raw private SHA. Operators
-> and reviewers should treat the chain commit as a managed dependency
-> reference, similar to how a binary release is pinned by tag rather
-> than by source URL.
+> **The chain repository** (`SUM-INNOVATION/sum-chain`) is public
+> (checked 2026-10-18). The chain commit below is SNIP's
+> **compatibility pin**: the chain state SNIP's wire fixtures were
+> confirmed against. It is maintained by release managers and is
+> not a statement of which binary the mainnet validators run, which
+> this document does not track.
 
 ## Pinned chain version
 
 | Field                                 | Value                                                |
 |---------------------------------------|------------------------------------------------------|
-| Chain commit (internal private chain) | `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0`           |
+| Chain commit (compatibility pin)      | `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0`           |
 | Local-mirror RPC                      | `http://localhost:8545`                              |
 | Local-mirror `chain_id`               | `1337` (verify at runtime via `chain_getChainParams`) |
 | Local-mirror `v2_enabled_from_height` | emits `0` (V2 enabled from genesis)                  |
-| Local-mirror block cadence            | ~2 seconds                                           |
+| Local-mirror block cadence            | ~2 seconds (`block_time_ms` 2000)                    |
+| Local-mirror chain commit (E2E)       | `SUMCHAIN_COMMIT` in `.github/workflows/release-local-mirror-e2e.yml` |
 | Live-chain `v2_enabled_from_height`   | published with the live release tag                  |
 
-The chain commit recorded here is an internal private-chain
-reference. The chain repository, branch, and release tooling are
-not public; this SHA is the load-bearing identifier operators and
-reviewers use to say "SNIP is built against THIS chain state."
+This SHA is the load-bearing identifier operators and reviewers
+use to say "SNIP's wire format is confirmed against THIS chain
+state."
 
 Chain team confirmed the V2 wire-format fixture suite passes
 against this commit:
@@ -54,24 +54,27 @@ Re-pinning procedure is in [`RELEASE-CHECKLIST.md`](../release/release-checklist
 
 ## Mainnet pin / deployed chain
 
-Confirmed-public facts about the deployed mainnet at the pinned
-chain commit. These values are wire-protocol observable and safe
-to publish; chain-team-private fields (validator hostnames, RPC
-admin endpoints, validator binary SHA) deliberately do not appear
-in this table.
+Public facts about the deployed mainnet. These values are
+wire-protocol observable and safe to publish; chain-team-private
+fields (validator hostnames, RPC admin endpoints, validator binary
+SHA) deliberately do not appear in this table. Rows marked
+*verified 2026-10-18* were read from the public RPC with the
+read-only smoke (`make smoke RPC=https://rpc.sumchain.io
+SMOKE_ARGS=--require-v2`, run twice 61 s apart).
 
 | Field                                  | Value                                                       |
 |----------------------------------------|-------------------------------------------------------------|
-| `chain_id`                             | `1`                                                         |
+| `chain_id`                             | `1` (*verified 2026-10-18*)                                 |
 | Public RPC                             | `https://rpc.sumchain.io`                                   |
-| Chain commit                           | `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0`                  |
-| Genesis SHA-256                        | `040b1fd32bfab5008c8c6c048e853fa6717db82b5a3af56cab494f88fc1ec431` |
-| `v2_enabled_from_height`               | `5200000`                                                   |
-| `finality_depth`                       | `6` blocks                                                  |
-| `block_time_ms`                        | `3000` (≈ 3 s)                                              |
+| SNIP compatibility pin                 | `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0` (see above; not the validators' binary) |
+| Genesis SHA-256                        | `040b1fd32bfab5008c8c6c048e853fa6717db82b5a3af56cab494f88fc1ec431` (*not re-verified*: it does not match `genesis/mainnet_genesis.json` at the compatibility pin, checked 2026-10-18) |
+| `v2_enabled_from_height`               | `5200000` (*verified 2026-10-18*)                           |
+| `finality_depth`                       | `6` blocks (*verified 2026-10-18*)                          |
+| `block_time_ms`                        | `3000`, as `chain_getChainParams` reports it (*verified 2026-10-18*). The block producer's pacing parameter, not a consensus rule: the chain excludes it from its consensus-config commitment ("producer pacing only"), and no SNIP code path consumes it. |
+| Observed block cadence                 | ≈ 1.5 s: the finalized height advanced 40 blocks in 61 s (*observed 2026-10-18*). Use this, not `block_time_ms`, for wall-clock estimates. |
 | V2 live since                          | finalized height ≥ `5200000`                                |
 
-The chain commit is authoritative. Release builds are not byte-
+The compatibility pin is authoritative for wire format. Release builds are not byte-
 reproducible across hosts (toolchain version, build flags, system
 libraries vary), so the validator binary SHA is intentionally
 NOT listed here as a reproducibility requirement — operators
@@ -167,14 +170,15 @@ described in
 
 ### Mainnet vs local-mirror
 
-The local-mirror chain (compose preset at the pinned commit) is a
-single-validator devnet, NOT mainnet. Operator-visible differences:
+The local mirror (the chain's `deploy/snip-local-mirror.yaml` at the
+E2E workflow's chain commit) is a synthetic five-validator devnet,
+NOT mainnet. Operator-visible differences:
 
 | Field                          | Mainnet                  | Local mirror             |
 |--------------------------------|--------------------------|--------------------------|
 | `chain_id`                     | `1`                      | `1337`                  |
 | `v2_enabled_from_height`       | `5200000`                | `0` (V2 from genesis)    |
-| Block cadence                  | ~3 s                     | ~2 s                     |
+| Block cadence                  | ≈ 1.5 s observed (`block_time_ms` reports 3000) | ~2 s (`block_time_ms` 2000) |
 | Pre-funded test addresses      | none                     | yes (overlay-funded)     |
 
 Operators MUST verify `chain_id` at runtime via
@@ -183,20 +187,19 @@ Signing the wrong `chain_id` means the chain rejects the tx and
 the fee is burned. The fastest way to catch a mis-configured RPC
 URL is to gate on the smoke check before any first write.
 
-> **Local mirror is runnable at this pin.** The compose preset
-> at `sum-chain:deploy/snip-local-mirror.yaml` (in the chain
-> repository, not this one), checked out at the pinned SHA,
-> brings up a single-validator devnet
-> with V2 enabled from genesis. Validator key is generated at
-> first boot into a Docker named volume — no signing material is
-> committed. The SNIP-side WS2 suite that drives this mirror
-> end-to-end is the next workstream; until it lands, operators
-> can still smoke-check the running mirror via
-> `make smoke RPC=http://localhost:8545`. See
-> [`OPERATOR-RUNBOOK.md`](../operator/runbook.md) for bring-up /
-> stop / wipe commands and
-> [`RELEASE-CHECKLIST.md`](../release/release-checklist.md) § 5 for the
-> release-flow integration.
+> **Where the mirror runs.** At the compatibility pin
+> `5ff6c748`, the chain's preset mounts
+> `genesis/snip-mirror-genesis.json` and `keys/validator1.json`,
+> neither of which is tracked at that commit, so it cannot be
+> brought up from the repository alone (checked 2026-10-18). The
+> runnable preset is the synthetic five-validator devnet on later
+> chain commits: `setup-local-testnet --mode topology` generates
+> throwaway keys and the genesis into the ignored `devnet/`
+> directory on the host that runs it. The `release local-mirror
+> E2E` workflow runs that devnet, with SNIP's local-mirror suite, on
+> a fresh GitHub-hosted runner for release pull requests. See
+> [`RELEASE-CHECKLIST.md`](../release/release-checklist.md) § 5 and
+> [`OPERATOR-RUNBOOK.md`](../operator/runbook.md).
 
 ## V2 enablement gate (load-bearing)
 
@@ -317,17 +320,18 @@ catches the case where a future mirror release silently bumps the
 id (e.g., dev → stage), which would otherwise let SNIP sign with
 a stale chain id.
 
-**Self-bootstrapping is a hard requirement.** The mirror at this
-pin generates validator keys at runtime into a Docker named
-volume; the keys are never committed to the chain repo, and SNIP
-must never consume an artifact that ships keys. The same rule
-applies prospectively to every future re-pin.
+**Self-bootstrapping is a hard requirement.** The mirror's
+validator keys are generated on the host that runs it
+(`setup-local-testnet --mode topology`, into the ignored `devnet/`);
+they are never committed to the chain repo, and SNIP must never
+consume an artifact that ships keys. The same rule applies
+prospectively to every future re-pin.
 
 The canonical truth for "SNIP-side correctness against the chain
 wire shape" remains the in-tree fixture + contract test surface
 listed above; the local-mirror E2E suite (WS2) is the operator
-gate that confirms SNIP and the chain agree end-to-end at this
-pin. The in-tree tests are stable, exhaustive for V2 operations,
+gate that confirms SNIP and the chain agree end-to-end at the
+E2E workflow's chain commit. The in-tree tests are stable, exhaustive for V2 operations,
 and run on every PR via the linux CI gate; the WS2 mirror suite
 is run before each release.
 
