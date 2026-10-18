@@ -25,24 +25,29 @@ Dates in this document are UTC.
 | Field                                 | Value                                                |
 |---------------------------------------|------------------------------------------------------|
 | Chain commit (compatibility pin)      | `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0`           |
-| What it identifies                    | a chain **source** state: the wire format SNIP's fixtures were confirmed against. Not a network, a genesis or a validator binary |
+| What it identifies                    | a chain **source** state: the wire format SNIP's fixtures were confirmed against. Not the validators' binary or their runtime configuration |
 | Live-chain `v2_enabled_from_height`   | read from the live chain; see "Mainnet pin / deployed chain" |
 
 The chain repository (`SUM-INNOVATION/sum-chain`) is public
 (checked 2026-10-18). The pin is maintained by release managers.
-What it does **not** identify:
+What it does and does not identify:
 
-- **Which binary the mainnet validators run.** This document does
-  not track that.
-- **Mainnet's genesis.** The pin's `genesis/mainnet_genesis.json` is
-  a template: its five validators and five allocations are
+- **Which binary the mainnet validators run:** not identified. This
+  document does not track that.
+- **Mainnet's genesis block: reproduced by the pin's root
+  `genesis.json`.** That file (`chain_id` 1, `genesis_time` 0, two
+  validators) produces mainnet's genesis block hash exactly; see
+  "Network identity" below. It is not the validators' runtime
+  genesis file: it has no V2 gate, while mainnet reports
+  `v2_enabled_from_height` 5200000, because activation heights are
+  added to the runtime file, and the genesis block does not depend
+  on them.
+- **`genesis/mainnet_genesis.json` is not mainnet's genesis.** At the
+  pin it is a template: its five validators and five allocations are
   placeholders, and the chain later labelled the file "TEMPLATE
   ONLY — production validators boot from the root runtime
-  genesis.json, NOT this file" (chain commit `2e53e46d`). The pin's
-  root `genesis.json` is not mainnet's either: it has `chain_id` 1,
-  `genesis_time` 0, two validators and no V2 gate, while mainnet
-  reports `v2_enabled_from_height` 5200000. See "Network identity"
-  below.
+  genesis.json, NOT this file" (chain commit `2e53e46d`). It does not
+  produce a genesis block at all.
 
 This SHA is the load-bearing identifier operators and reviewers
 use to say "SNIP's wire format is confirmed against THIS chain
@@ -88,7 +93,7 @@ that mainnet runs the compatibility pin.
 | `chain_id`                             | `1` (*verified 2026-10-18*)                                 |
 | Public RPC                             | `https://rpc.sumchain.io`                                   |
 | SNIP compatibility pin                 | `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0` (wire format; see above) |
-| Genesis                                | **Not recorded; unverified.** No genesis hash is published here. See "Network identity" below |
+| Genesis block hash                     | `0x1156d350e7d0ac45cb96bfca25d57c71675ceea5949ea44d81432d08baed68e6` (*verified 2026-10-18*, block 0 from the public RPC, and reproduced offline from the pin's root `genesis.json`). See "Network identity" below |
 | `v2_enabled_from_height`               | `5200000` (*verified 2026-10-18*)                           |
 | `finality_depth`                       | `6` blocks (*verified 2026-10-18*)                          |
 | `block_time_ms`                        | `3000`, as `chain_getChainParams` reports it (*verified 2026-10-18*). The block producer's pacing parameter, not a consensus rule: the chain excludes it from its consensus-config commitment ("producer pacing only"), and no SNIP code path consumes it. |
@@ -139,11 +144,37 @@ allocations' state root and the genesis proposer
 not from those parameters. `chain_id` plus the genesis block hash
 is the stable identity.
 
-**Not verified:** mainnet's genesis block hash is not recorded
-here. Recording it needs a read-only query of block 0 from the
-public RPC (`get_block_by_height` with height `0`), which has not
-been run. Until it is, no SNIP document claims that any genesis
-file or hash is mainnet's.
+**Mainnet's network identity: `chain_id` 1 and genesis block hash
+`0x1156d350e7d0ac45cb96bfca25d57c71675ceea5949ea44d81432d08baed68e6`.**
+
+- **Source:** block 0 from the public RPC (`sum_getBlockByHeight`
+  with height `0`, read-only, at 2026-10-18T23:11:44Z). It reported
+  that hash, timestamp `0`, state root
+  `0x5fa18c9e8b229ac4cec3aca0b28eba87e2bb1b54c249510f16f084c421511ff2`
+  and no transactions. The hash is BLAKE3 over the bincode encoding
+  of the header (header v1).
+- **Offline reproduction (2026-10-18):** the chain's own
+  `Genesis::create_genesis_block`, run over every `chain_id` 1
+  genesis file in the chain repository's history (all refs) and the
+  `genesis/` files at the pin and at `d8130ead`.
+  - **Reproduces it:** the root `genesis.json`, the only version of
+    that file (blob `2726051d`). It was added on 2026-01-02 and is
+    unchanged at the pin `5ff6c748` and at chain `main` `d8130ead`.
+    The hash, state root, proposer, timestamp and transaction count
+    all match, under both the pin's code and `d8130ead`'s.
+  - **Does not:** `genesis/mainnet_genesis.json` at either commit
+    (placeholder validators and allocations, so no block can be
+    built). Every other genesis file in the history is for chain
+    1337 or 31337.
+- **What this establishes:** mainnet's genesis block is the one the
+  root `genesis.json` at the pin defines: the same genesis time,
+  allocations (state root) and genesis proposer. The genesis block
+  does not cover `chain_id`; the file's `chain_id` 1 agrees with what
+  the RPC reports. It does not establish the
+  validators' binary, their runtime genesis file or its activation
+  heights, or the current validator set, and it does not make the
+  pin a statement about any of them. The compatibility pin remains a
+  wire-format pin; this changes no check and no pin.
 
 ### Transaction payloads SNIP submits to mainnet
 
