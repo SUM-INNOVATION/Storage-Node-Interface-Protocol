@@ -44,6 +44,7 @@ KEYS_DIR="$(mktemp -d)"
 chmod 0700 "$KEYS_DIR"
 started=0
 
+# shellcheck disable=SC2329  # invoked by the EXIT trap below
 cleanup() {
     local status=$?
     if [ "$started" = 1 ]; then
@@ -127,6 +128,43 @@ echo "== 4. read-only smoke against the devnet"
 make smoke RPC="$RPC" SMOKE_ARGS=--require-v2
 
 echo "== 5. local-mirror E2E suite"
-SNIP_E2E_RPC_URL="$RPC" SNIP_E2E_KEYS_DIR="$KEYS_DIR" make e2e-mirror
+suite=0
+SNIP_E2E_RPC_URL="$RPC" SNIP_E2E_KEYS_DIR="$KEYS_DIR" make e2e-mirror || suite=$?
+if [ "$suite" -eq 0 ]; then
+    echo "local-mirror E2E: ok (chain commit $SUMCHAIN_COMMIT)"
+    exit 0
+fi
 
-echo "local-mirror E2E: ok (chain commit $SUMCHAIN_COMMIT)"
+# Diagnostics, on failure only. The suite discards its archives' output, so
+# repeat its basic flow by hand with every log kept: three archives, one
+# Public ingest, then print the ingest output and the archives' warnings.
+# Synthetic keys only; the logs carry peer ids and devnet addresses, never
+# key material.
+echo "== 6. diagnostics: one Public ingest with archive logs kept" >&2
+SUM_NODE="$SNIP_DIR/target/debug/sum-node"
+DIAG="$(mktemp -d)"
+pids=()
+for i in 1 2 3; do
+    RUST_LOG=info "$SUM_NODE" --key-file "$KEYS_DIR/archive_$i.seed.hex" \
+        --store-dir "$DIAG/archive_$i" --rpc-url "$RPC" --chain-id 1337 listen \
+        >"$DIAG/archive_$i.log" 2>&1 &
+    pids+=("$!")
+done
+sleep 15
+printf 'local-mirror diagnostics %s\n' "$(date -u +%s)" >"$DIAG/probe.txt"
+head -c 4096 /dev/urandom >>"$DIAG/probe.txt"
+RUST_LOG=info timeout 300 "$SUM_NODE" --key-file "$KEYS_DIR/owner.seed.hex" \
+    --store-dir "$DIAG/owner" --rpc-url "$RPC" --chain-id 1337 \
+    ingest-v2 "$DIAG/probe.txt" --visibility public >"$DIAG/ingest.log" 2>&1 \
+    && echo "diagnostic ingest exit: 0" >&2 \
+    || echo "diagnostic ingest exit: $?" >&2
+kill "${pids[@]}" 2>/dev/null || true
+wait 2>/dev/null || true
+echo "--- diagnostic ingest output (last 80 lines) ---" >&2
+tail -n 80 "$DIAG/ingest.log" >&2 || true
+for i in 1 2 3; do
+    echo "--- archive_$i: warnings, errors and V2 push lines (last 60) ---" >&2
+    grep -E "WARN|ERROR|refus|[Pp]ush|ManifestPush|attest" "$DIAG/archive_$i.log" | tail -n 60 >&2 || true
+done
+rm -rf "$DIAG"
+exit "$suite"
