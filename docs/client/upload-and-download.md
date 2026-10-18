@@ -133,16 +133,24 @@ lands (see [`../roadmap/roadmap.md`](../roadmap/roadmap.md)).
      entry, which is the chain's snapshot at that epoch. Chain-generated
      vectors check this computation on both sides of the cap
      (`crates/sum-store/tests/n2_assignment_vectors.rs`).
-5. **One chain state.** The snapshot, the chunk count and the active flags
-   all come from one coverage response. The coverage RPC takes no height and
-   reports none, so the command reads the latest block height before and
-   after it, and uses the response only when the two are equal and the
-   response agrees with itself (the flag is set only if some archive in the
-   latest snapshot is inactive). Otherwise it reads again, three attempts in
-   all, then refuses. Equal heights cannot rule out a read that overlaps a
-   block the node is still executing; the chain re-checks its own rule when
-   it executes the transaction, so the worst case is one fee for a
-   reassignment the chain still accepts, or a skipped one you can re-run.
+5. **Read stability (not an atomic snapshot).** The snapshot, the chunk
+   count and the active flags all come from one coverage response. The chain
+   offers no coverage query pinned to a height or state root, and the
+   response carries no height, block hash or state root. So each attempt
+   reads the latest block (`get_latest_block`: height, hash and state root of
+   one block), then coverage twice, then the latest block again. It uses the
+   response only if both block reads are identical (a new block, or a
+   different block at the same height, in between is caught), both coverage
+   reads are identical, and the response agrees with itself (the flag is set
+   only if some archive in the latest snapshot is inactive). Otherwise it
+   tries again, three attempts in all, then refuses.
+
+   This is a stability check, not an atomic snapshot. The node writes some
+   state while it is still executing a block, before it stores the block and
+   moves its head, so a read can show state from a block in progress while
+   both block reads still agree. The chain re-checks its own rule when it
+   executes the transaction, so the worst case is one fee for a reassignment
+   the chain still accepts, or a skipped one you can re-run.
 6. Asks the chain's no-key builder, `storage_buildReassignChunksV2`, for
    the unsigned transaction.
 7. Verifies the built bytes before signing: canonical encoding, chain

@@ -261,6 +261,16 @@ pub struct BlockHeightInfo {
     pub finality: String,
 }
 
+/// Height, hash and state root of a block, read from the chain's
+/// `get_latest_block` (`BlockInfo`; its other fields are ignored). The chain
+/// fills all three from one block record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockHeadInfo {
+    pub height: u64,
+    pub hash: String,
+    pub state_root: String,
+}
+
 /// Response from `chain_getChainParams` (chain-confirmed wire shape).
 ///
 /// Flat JSON shape (no nested `staking`/`messaging`/`docclass`
