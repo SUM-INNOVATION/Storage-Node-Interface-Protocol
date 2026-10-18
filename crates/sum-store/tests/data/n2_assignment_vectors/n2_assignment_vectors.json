@@ -1,0 +1,328 @@
+{
+  "cases": [
+    {
+      "assignment_digest_blake3": "a7f47171e1b90e976675aba8080e0ac845716d06026b57206d637cc1cca06d95",
+      "assignment_epochs": [
+        2
+      ],
+      "chunk_count": 1,
+      "departed_assignee": false,
+      "label": "one-chunk",
+      "latest_epoch_height": 2,
+      "latest_per_archive": [
+        {
+          "address_hex": "0179935a0cdd18049ca392df59286d1dc4bb6f71",
+          "archive": "8oKQuLJJSNEp2STg3WZHrhiYMMViNG8J",
+          "currently_active": true,
+          "executor_assigned_count": 1,
+          "rpc_assigned_count": 1
+        },
+        {
+          "address_hex": "1e21a3eec53069439f89f3288538ad3a51d5bf72",
+          "archive": "3kKa8SRhWAuaZQGGgUDBth4Wi3Dzz1CsL",
+          "currently_active": true,
+          "executor_assigned_count": 1,
+          "rpc_assigned_count": 1
+        },
+        {
+          "address_hex": "a0a4c6ce17c017d96b409c390ecb06fff5224a88",
+          "archive": "FeQWa6CqhbYpgGYoBtqBM8F79n19xHx3a",
+          "currently_active": false,
+          "executor_assigned_count": 0,
+          "rpc_assigned_count": 0
+        },
+        {
+          "address_hex": "dbb40806cdf7201cdb7687175e5f6ab43e7db0aa",
+          "archive": "M2geouCSyrg8Kxedb7UgVF8H63DgWJSy1",
+          "currently_active": false,
+          "executor_assigned_count": 0,
+          "rpc_assigned_count": 0
+        },
+        {
+          "address_hex": "ebe95fdd9f81d65309590536f5326643e032764d",
+          "archive": "NWPNDw5njJedV5X9ZwzAMLYJeayLYPcuD",
+          "currently_active": true,
+          "executor_assigned_count": 1,
+          "rpc_assigned_count": 1
+        },
+        {
+          "address_hex": "ef780182cb9ec51f83c435bec508d8c1d9dcb655",
+          "archive": "NqCG1DX1XVgMg5omMHi9Fyq2FaEQQXLMP",
+          "currently_active": true,
+          "executor_assigned_count": 0,
+          "rpc_assigned_count": 0
+        },
+        {
+          "address_hex": "fd8eea15b3c468276c01b50724f231d0fd1538f4",
+          "archive": "Q7hAQA5JoW15x5ukW9xiWFUTaYBb8S55T",
+          "currently_active": true,
+          "executor_assigned_count": 0,
+          "rpc_assigned_count": 0
+        }
+      ],
+      "merkle_root": "34aabe5ca25680b8c4562a16a9b1352c2322aa6eedd6c94448a72742aedac6c9",
+      "reassignment_needed": true
+    },
+    {
+      "assignment_digest_blake3": "b57d7ad1341e4a14d579ff04682b7ec26c02d85bdf28ea5597fa5a2438f6bb23",
+      "assignment_epochs": [
+        2
+      ],
+      "chunk_count": 37,
+      "departed_assignee": true,
+      "label": "small-37",
+      "latest_epoch_height": 2,
+      "latest_per_archive": [
+        {
+          "address_hex": "0179935a0cdd18049ca392df59286d1dc4bb6f71",
+          "archive": "8oKQuLJJSNEp2STg3WZHrhiYMMViNG8J",
+          "currently_active": true,
+          "executor_assigned_count": 19,
+          "rpc_assigned_count": 19
+        },
+        {
+          "address_hex": "1e21a3eec53069439f89f3288538ad3a51d5bf72",
+          "archive": "3kKa8SRhWAuaZQGGgUDBth4Wi3Dzz1CsL",
+          "currently_active": true,
+          "executor_assigned_count": 13,
+          "rpc_assigned_count": 13
+        },
+        {
+          "address_hex": "a0a4c6ce17c017d96b409c390ecb06fff5224a88",
+          "archive": "FeQWa6CqhbYpgGYoBtqBM8F79n19xHx3a",
+          "currently_active": false,
+          "executor_assigned_count": 15,
+          "rpc_assigned_count": 15
+        },
+        {
+          "address_hex": "dbb40806cdf7201cdb7687175e5f6ab43e7db0aa",
+          "archive": "M2geouCSyrg8Kxedb7UgVF8H63DgWJSy1",
+          "currently_active": false,
+          "executor_assigned_count": 16,
+          "rpc_assigned_count": 16
+        },
+        {
+          "address_hex": "ebe95fdd9f81d65309590536f5326643e032764d",
+          "archive": "NWPNDw5njJedV5X9ZwzAMLYJeayLYPcuD",
+          "currently_active": true,
+          "executor_assigned_count": 13,
+          "rpc_assigned_count": 13
+        },
+        {
+          "address_hex": "ef780182cb9ec51f83c435bec508d8c1d9dcb655",
+          "archive": "NqCG1DX1XVgMg5omMHi9Fyq2FaEQQXLMP",
+          "currently_active": true,
+          "executor_assigned_count": 18,
+          "rpc_assigned_count": 18
+        },
+        {
+          "address_hex": "fd8eea15b3c468276c01b50724f231d0fd1538f4",
+          "archive": "Q7hAQA5JoW15x5ukW9xiWFUTaYBb8S55T",
+          "currently_active": true,
+          "executor_assigned_count": 17,
+          "rpc_assigned_count": 17
+        }
+      ],
+      "merkle_root": "4dd6531c8ebe47eb88a7cad8c4daecaa5831ae52d17401d2e66acdb9204fc8a3",
+      "reassignment_needed": true
+    },
+    {
+      "assignment_digest_blake3": "7ffadcabc2b2c5b90a1c2ba514a28bd7d401bcb46ff3a5d9e0a104be3248c7c1",
+      "assignment_epochs": [
+        2
+      ],
+      "chunk_count": 16384,
+      "departed_assignee": true,
+      "label": "at-cap-16384",
+      "latest_epoch_height": 2,
+      "latest_per_archive": [
+        {
+          "address_hex": "0179935a0cdd18049ca392df59286d1dc4bb6f71",
+          "archive": "8oKQuLJJSNEp2STg3WZHrhiYMMViNG8J",
+          "currently_active": true,
+          "executor_assigned_count": 7029,
+          "rpc_assigned_count": 7029
+        },
+        {
+          "address_hex": "1e21a3eec53069439f89f3288538ad3a51d5bf72",
+          "archive": "3kKa8SRhWAuaZQGGgUDBth4Wi3Dzz1CsL",
+          "currently_active": true,
+          "executor_assigned_count": 7013,
+          "rpc_assigned_count": 7013
+        },
+        {
+          "address_hex": "a0a4c6ce17c017d96b409c390ecb06fff5224a88",
+          "archive": "FeQWa6CqhbYpgGYoBtqBM8F79n19xHx3a",
+          "currently_active": false,
+          "executor_assigned_count": 7047,
+          "rpc_assigned_count": 7047
+        },
+        {
+          "address_hex": "dbb40806cdf7201cdb7687175e5f6ab43e7db0aa",
+          "archive": "M2geouCSyrg8Kxedb7UgVF8H63DgWJSy1",
+          "currently_active": false,
+          "executor_assigned_count": 7092,
+          "rpc_assigned_count": 7092
+        },
+        {
+          "address_hex": "ebe95fdd9f81d65309590536f5326643e032764d",
+          "archive": "NWPNDw5njJedV5X9ZwzAMLYJeayLYPcuD",
+          "currently_active": true,
+          "executor_assigned_count": 7019,
+          "rpc_assigned_count": 7019
+        },
+        {
+          "address_hex": "ef780182cb9ec51f83c435bec508d8c1d9dcb655",
+          "archive": "NqCG1DX1XVgMg5omMHi9Fyq2FaEQQXLMP",
+          "currently_active": true,
+          "executor_assigned_count": 7013,
+          "rpc_assigned_count": 7013
+        },
+        {
+          "address_hex": "fd8eea15b3c468276c01b50724f231d0fd1538f4",
+          "archive": "Q7hAQA5JoW15x5ukW9xiWFUTaYBb8S55T",
+          "currently_active": true,
+          "executor_assigned_count": 6939,
+          "rpc_assigned_count": 6939
+        }
+      ],
+      "merkle_root": "7250a7a042a6e909a3541317c6da7e48fc0847e6d2fee0c679aac315f0600687",
+      "reassignment_needed": true
+    },
+    {
+      "assignment_digest_blake3": "844a0a16a1fb371e9c1afc3e7b5ed91157f2a17519b2c3ecae72ac9d66a51506",
+      "assignment_epochs": [
+        2
+      ],
+      "chunk_count": 16385,
+      "departed_assignee": true,
+      "label": "above-cap-16385",
+      "latest_epoch_height": 2,
+      "latest_per_archive": [
+        {
+          "address_hex": "0179935a0cdd18049ca392df59286d1dc4bb6f71",
+          "archive": "8oKQuLJJSNEp2STg3WZHrhiYMMViNG8J",
+          "currently_active": true,
+          "executor_assigned_count": 6995,
+          "rpc_assigned_count": null
+        },
+        {
+          "address_hex": "1e21a3eec53069439f89f3288538ad3a51d5bf72",
+          "archive": "3kKa8SRhWAuaZQGGgUDBth4Wi3Dzz1CsL",
+          "currently_active": true,
+          "executor_assigned_count": 7093,
+          "rpc_assigned_count": null
+        },
+        {
+          "address_hex": "a0a4c6ce17c017d96b409c390ecb06fff5224a88",
+          "archive": "FeQWa6CqhbYpgGYoBtqBM8F79n19xHx3a",
+          "currently_active": false,
+          "executor_assigned_count": 6957,
+          "rpc_assigned_count": null
+        },
+        {
+          "address_hex": "dbb40806cdf7201cdb7687175e5f6ab43e7db0aa",
+          "archive": "M2geouCSyrg8Kxedb7UgVF8H63DgWJSy1",
+          "currently_active": false,
+          "executor_assigned_count": 7166,
+          "rpc_assigned_count": null
+        },
+        {
+          "address_hex": "ebe95fdd9f81d65309590536f5326643e032764d",
+          "archive": "NWPNDw5njJedV5X9ZwzAMLYJeayLYPcuD",
+          "currently_active": true,
+          "executor_assigned_count": 7001,
+          "rpc_assigned_count": null
+        },
+        {
+          "address_hex": "ef780182cb9ec51f83c435bec508d8c1d9dcb655",
+          "archive": "NqCG1DX1XVgMg5omMHi9Fyq2FaEQQXLMP",
+          "currently_active": true,
+          "executor_assigned_count": 6982,
+          "rpc_assigned_count": null
+        },
+        {
+          "address_hex": "fd8eea15b3c468276c01b50724f231d0fd1538f4",
+          "archive": "Q7hAQA5JoW15x5ukW9xiWFUTaYBb8S55T",
+          "currently_active": true,
+          "executor_assigned_count": 6961,
+          "rpc_assigned_count": null
+        }
+      ],
+      "merkle_root": "45b966164481fd0fe6a95559f2016329640cce321996e442735af9f07be921df",
+      "reassignment_needed": true
+    },
+    {
+      "assignment_digest_blake3": "5895987a9847155bb3529806877ef164164fffbe95e7002869f255e672b61be3",
+      "assignment_epochs": [
+        2,
+        4
+      ],
+      "chunk_count": 40000,
+      "departed_assignee": true,
+      "label": "large-40000",
+      "latest_epoch_height": 4,
+      "latest_per_archive": [
+        {
+          "address_hex": "0179935a0cdd18049ca392df59286d1dc4bb6f71",
+          "archive": "8oKQuLJJSNEp2STg3WZHrhiYMMViNG8J",
+          "currently_active": true,
+          "executor_assigned_count": 20108,
+          "rpc_assigned_count": null
+        },
+        {
+          "address_hex": "1e21a3eec53069439f89f3288538ad3a51d5bf72",
+          "archive": "3kKa8SRhWAuaZQGGgUDBth4Wi3Dzz1CsL",
+          "currently_active": true,
+          "executor_assigned_count": 19966,
+          "rpc_assigned_count": null
+        },
+        {
+          "address_hex": "dbb40806cdf7201cdb7687175e5f6ab43e7db0aa",
+          "archive": "M2geouCSyrg8Kxedb7UgVF8H63DgWJSy1",
+          "currently_active": false,
+          "executor_assigned_count": 20110,
+          "rpc_assigned_count": null
+        },
+        {
+          "address_hex": "ebe95fdd9f81d65309590536f5326643e032764d",
+          "archive": "NWPNDw5njJedV5X9ZwzAMLYJeayLYPcuD",
+          "currently_active": true,
+          "executor_assigned_count": 20001,
+          "rpc_assigned_count": null
+        },
+        {
+          "address_hex": "ef780182cb9ec51f83c435bec508d8c1d9dcb655",
+          "archive": "NqCG1DX1XVgMg5omMHi9Fyq2FaEQQXLMP",
+          "currently_active": true,
+          "executor_assigned_count": 19928,
+          "rpc_assigned_count": null
+        },
+        {
+          "address_hex": "fd8eea15b3c468276c01b50724f231d0fd1538f4",
+          "archive": "Q7hAQA5JoW15x5ukW9xiWFUTaYBb8S55T",
+          "currently_active": true,
+          "executor_assigned_count": 19887,
+          "rpc_assigned_count": null
+        }
+      ],
+      "merkle_root": "25f27742e967222891554cf61c3e72e9126db147462b97c589245e83365e1d63",
+      "reassignment_needed": true
+    }
+  ],
+  "digest": "BLAKE3 over, for each chunk index ascending, the 20-byte addresses assigned_archives_presorted returns for it, in its order",
+  "max_assigned_count_chunk_count": 16384,
+  "provenance": {
+    "chain_code_paths": [
+      "StorageMetadataExecutor::compute_coverage_v2 (committed reader behind storage_getAssignmentCoverageV2)",
+      "sumchain_primitives::is_archive_assigned_to_chunk (AcceptAssignmentV2 validity)",
+      "sumchain_primitives::assigned_archives_presorted (per-chunk digest)",
+      "NodeRegistryExecutor::get_active_archive_nodes_at_height (epoch snapshot)"
+    ],
+    "command": "SNIP_N2_VECTORS_OUT=<path> cargo test -p sumchain-state --test snip_n2_assignment_vectors -- --nocapture",
+    "generator": "crates/sum-store/tests/data/n2_assignment_vectors/generate_in_sum_chain.rs, copied to sum-chain crates/state/tests/snip_n2_assignment_vectors.rs",
+    "keys": "fixed test keys [0xA0+i; 32] (archives), [0x0E; 32] (owner); test-only",
+    "sum_chain_commit": "d8130ead3b77f38eff6eeb82b4e68bb1aca8e3b2"
+  },
+  "replication_factor": 3
+}
