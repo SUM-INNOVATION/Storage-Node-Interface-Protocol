@@ -9,9 +9,13 @@
 //!
 //! ```text
 //! S0  Chunk + build DataManifest + cache Merkle proofs
+//! S1a Predict the assignment from the current eligible snapshot;
+//!     wait until every assigned archive is identified, else refuse
+//!     before S1 (no tx, no fee)
 //! S1  RegisterFilePendingV2 → submit → wait Finalized
 //! S2  storage_getFileInfoV2 → snapshot at assignment_height
 //!     compute V2 assignment per chunk
+//!     wait (bounded) for the assigned archives being pushed to
 //!     push chunks (parallel, 2 retries per (chunk, peer))
 //!     require R distinct PushAcks per chunk
 //! S3  ManifestPush to each *distinct* assigned archive
@@ -31,6 +35,16 @@
 //! caller must `resume` or `abandon` via W11).
 //!
 //! W10a never abandons. The pipeline never escalates to S7.
+//!
+//! ## Peer discovery
+//!
+//! Discovery ends on an explicit condition, not a timing guess: every
+//! archive the push needs, counted by chain address, has a live identified
+//! peer ([`crate::peer_discovery`]). S1a applies it before registration, so
+//! an unreachable or insufficient archive set costs no fee and leaves
+//! nothing `Pending`. S2 applies it again to the pinned snapshot (which can
+//! differ from the S1a prediction if the active set changed in between), and
+//! `resume` applies it to the archives assigned to the chunks it pushes.
 //!
 //! ## activation_grace_blocks is reporting-only here
 //!
@@ -57,12 +71,16 @@ use sum_store::chunker::BinaryChunker;
 use sum_store::cid_from_data;
 use sum_store::merkle::MerkleTree;
 use sum_types::rpc_types::{
-    AssignmentCoverageV2, BlockHeightInfo, ChainParamsInfo, StorageFileInfoV2,
+    AssignmentCoverageV2, BlockHeightInfo, ChainParamsInfo, NodeRecordInfo, StorageFileInfoV2,
 };
 use sum_types::storage::{CHUNK_SIZE, ChunkDescriptor, DataManifest};
 use tracing::{debug, info, warn};
 
 use crate::assignment_attestor::AttestorRpc;
+use crate::peer_discovery::{
+    ArchiveDiscovery, DiscoveryFailure, DiscoveryStatus, required_archives,
+};
+use crate::peer_state::apply_peer_event;
 use crate::push_validator::V2RpcClient;
 use crate::tx_builder::{
     AccessEntryV2Mirror, Bundle80, build_activate_file_v2_tx, build_register_file_pending_v2_tx,
@@ -248,6 +266,10 @@ pub struct IngestParams {
     /// S3 manifest-push wall-clock timeout. Same shape as
     /// `push_wait_secs` but per-archive.
     pub manifest_push_wait_secs: Duration,
+    /// Upper bound on each peer-discovery wait (S1a, and S2's wait for the
+    /// pinned assignment). Discovery ends earlier, as soon as every required
+    /// archive is identified; this only bounds how long it may take.
+    pub discovery_timeout: Duration,
     /// Reporting-only. Carries the chain's `activation_grace_blocks`
     /// so operators (and W11 abandon decisions) can reason about when
     /// `AbandonFileV2` is admissible. **Not used to control S4
@@ -285,6 +307,7 @@ impl IngestParams {
             push_retries: defaults.push_retries,
             push_wait_secs: defaults.push_wait_secs,
             manifest_push_wait_secs: defaults.manifest_push_wait_secs,
+            discovery_timeout: defaults.discovery_timeout,
             activation_grace_blocks: p.activation_grace_blocks,
             v2_enabled_from_height: p.v2_enabled_from_height,
         }
@@ -301,6 +324,7 @@ pub struct IngestParamsDefaults {
     pub push_retries: u32,
     pub push_wait_secs: Duration,
     pub manifest_push_wait_secs: Duration,
+    pub discovery_timeout: Duration,
 }
 
 impl Default for IngestParamsDefaults {
@@ -312,6 +336,7 @@ impl Default for IngestParamsDefaults {
             push_retries: 2,
             push_wait_secs: Duration::from_secs(60),
             manifest_push_wait_secs: Duration::from_secs(30),
+            discovery_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -452,43 +477,53 @@ impl V2IngestNet for SumNet {
     }
 }
 
-/// `[u8; 20]` archive address → libp2p `PeerId`. Production wraps the
-/// existing `peer_addresses: Arc<RwLock<HashMap<PeerId, [u8; 20]>>>`;
-/// tests use a static map.
+/// `[u8; 20]` archive address → libp2p `PeerId`. Production uses
+/// [`MapPeerResolver`], filled from identify events; tests use a static map.
 pub trait PeerResolver: Send + Sync {
     fn resolve(&self, addr: &[u8; 20]) -> Option<PeerId>;
+
+    /// Learn from a network event the pipeline read. Called for every event
+    /// read during peer discovery. Static resolvers ignore it.
+    fn observe(&self, _event: &SumNetEvent) {}
 }
 
-/// Production [`PeerResolver`] backed by the same
-/// `peer_addresses: Arc<RwLock<HashMap<PeerId, [u8; 20]>>>` map V1's
-/// upload path uses. Walks the map on each call (O(n), n = tens of
-/// peers in Phase 0b) so newly-identified peers become resolvable
-/// without rebuilding the resolver.
+/// Production [`PeerResolver`]: the live `PeerId → L1 address` identities,
+/// kept by [`PeerResolver::observe`] with the same rules as every other peer
+/// map ([`apply_peer_event`]: identify inserts, the last connection closing
+/// removes).
+///
+/// When several live peers report the same address, `resolve` returns the
+/// smallest `PeerId`, so pushes for one archive go to one peer and the
+/// choice does not depend on map iteration order.
+#[derive(Default)]
 pub struct MapPeerResolver {
-    peer_addresses: Arc<tokio::sync::RwLock<HashMap<PeerId, [u8; 20]>>>,
+    peer_addresses: std::sync::RwLock<HashMap<PeerId, [u8; 20]>>,
 }
 
 impl MapPeerResolver {
-    pub fn new(peer_addresses: Arc<tokio::sync::RwLock<HashMap<PeerId, [u8; 20]>>>) -> Self {
-        Self { peer_addresses }
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
 impl PeerResolver for MapPeerResolver {
     fn resolve(&self, addr: &[u8; 20]) -> Option<PeerId> {
-        // `try_read` rather than `read().await` so the trait can stay
-        // sync. Under contention we fall back to "unknown peer", which
-        // surfaces as an `unresolved_per_chunk` count → under-replicated.
-        // The retry pass on the next assignment iteration finds the peer
-        // when the lock is free. For Phase 0b's typical peer-discovery
-        // pattern (peer map written once at startup, then read-mostly)
-        // this is a non-issue.
-        match self.peer_addresses.try_read() {
-            Ok(map) => map
-                .iter()
-                .find_map(|(peer_id, l1)| if l1 == addr { Some(*peer_id) } else { None }),
-            Err(_) => None,
-        }
+        let map = self
+            .peer_addresses
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.iter()
+            .filter(|(_, l1)| *l1 == addr)
+            .map(|(peer_id, _)| *peer_id)
+            .min()
+    }
+
+    fn observe(&self, event: &SumNetEvent) {
+        let mut map = self
+            .peer_addresses
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        apply_peer_event(&mut map, event);
     }
 }
 
@@ -780,6 +815,20 @@ fn file_name_from_path(path: &Path) -> String {
         .unwrap_or_else(|| "unnamed".to_string())
 }
 
+/// Apply the shared eligibility contract to a raw active-nodes snapshot and
+/// decode the addresses, sorted and deduplicated. Non-ArchiveNode or
+/// non-Active records never reach the assignment computation.
+fn eligible_archive_addresses(raw: Vec<NodeRecordInfo>) -> Result<Vec<[u8; 20]>> {
+    let filtered = sum_types::rpc_types::filter_active_archives(raw);
+    let mut snapshot = Vec::with_capacity(filtered.len());
+    for record in &filtered {
+        snapshot.push(sum_net::l1_address_from_base58(&record.address)?);
+    }
+    snapshot.sort();
+    snapshot.dedup();
+    Ok(snapshot)
+}
+
 // ── Pipeline ────────────────────────────────────────────────────────────────
 
 pub struct IngestPipeline<R, N, P>
@@ -878,6 +927,20 @@ where
                     manifest.chunk_count,
                     self.params.max_chunk_count_per_file
                 ),
+            };
+        }
+
+        // ── S1a ────────────────────────────────────────────────────
+        // Refuse before registering unless every archive the file would
+        // be assigned to is reachable. No tx is sent on failure.
+        if let Err(e) = self
+            .s1a_require_archives(&manifest.merkle_root, manifest.chunk_count)
+            .await
+        {
+            return IngestOutcome::Failed {
+                stage: IngestStage::Register,
+                manifest: Some(manifest),
+                source: e,
             };
         }
 
@@ -1141,6 +1204,18 @@ where
             .collect();
         let tree = MerkleTree::build(&leaves);
         debug_assert_eq!(*tree.root().as_bytes(), manifest.merkle_root);
+
+        // ── S1a (Private) — same rule as `run` ─────────────────────
+        if let Err(e) = self
+            .s1a_require_archives(&merkle_root, manifest.chunk_count)
+            .await
+        {
+            return IngestOutcome::Failed {
+                stage: IngestStage::Register,
+                manifest: Some(manifest),
+                source: e,
+            };
+        }
 
         // ── S1 (Private register) ──────────────────────────────────
         let (register_tx_hash, register_height) = match self
@@ -1448,15 +1523,133 @@ where
             .rpc
             .storage_get_active_nodes_at_height(info.assignment_height)
             .await?;
-        let filtered = sum_types::rpc_types::filter_active_archives(raw);
-        let mut snapshot = Vec::with_capacity(filtered.len());
-        for record in &filtered {
-            let addr = sum_net::l1_address_from_base58(&record.address)?;
-            snapshot.push(addr);
-        }
-        snapshot.sort();
-        snapshot.dedup();
+        let snapshot = eligible_archive_addresses(raw)?;
         Ok((info, snapshot))
+    }
+
+    /// S1a: before `RegisterFilePendingV2`, predict the file's assignment
+    /// from the eligible snapshot at the current height and wait until every
+    /// archive it names is identified on the network.
+    ///
+    /// Fails closed, before any tx, when the chain lists fewer eligible
+    /// archives than `R` (no chunk could reach `R` distinct `PushAck`s, so
+    /// the file could only end `Pending`), or when discovery does not
+    /// complete within `discovery_timeout`.
+    ///
+    /// The prediction can differ from the snapshot the chain pins at
+    /// `assignment_height` if the active set changes in between; S2 waits
+    /// for the pinned assignment again before pushing.
+    async fn s1a_require_archives(&self, merkle_root: &[u8; 32], chunk_count: u32) -> Result<()> {
+        let r = self.params.assignment_replication_factor;
+        let head = self
+            .rpc
+            .chain_get_block_height()
+            .await
+            .map_err(|e| e.context("S1a: chain_getBlockHeight before registration"))?;
+        let raw = self
+            .rpc
+            .storage_get_active_nodes_at_height(head.height)
+            .await
+            .map_err(|e| {
+                e.context(format!(
+                    "S1a: storage_getActiveNodesAtHeight({}) before registration",
+                    head.height
+                ))
+            })?;
+        let snapshot = eligible_archive_addresses(raw)?;
+        if (snapshot.len() as u64) < u64::from(r) {
+            anyhow::bail!(
+                "ingest-v2: the chain lists {} eligible archives at height {}, but every \
+                 chunk needs R={r} distinct archives, so the file could not be replicated. \
+                 Refusing to register it: no S1 tx was submitted; no chain state created; \
+                 no fees spent.",
+                snapshot.len(),
+                head.height,
+            );
+        }
+        let required = required_archives(merkle_root, &snapshot, 0..chunk_count, r);
+        info!(
+            required = required.len(),
+            eligible = snapshot.len(),
+            height = head.height,
+            "S1a: waiting until every archive this file would be assigned to is identified"
+        );
+        self.await_archives(&required).await.map_err(|f| {
+            anyhow::anyhow!(
+                "ingest-v2: {f}. Refusing to register the file: no S1 tx was submitted; \
+                 no chain state created; no fees spent. Retry once those archives are \
+                 reachable."
+            )
+        })
+    }
+
+    /// Wait until every archive in `required` has a live identified peer, or
+    /// `discovery_timeout` passes ([`ArchiveDiscovery`] decides which).
+    ///
+    /// Every event read here also goes to the resolver, so the push waves
+    /// that follow resolve the same peers discovery counted. Other events are
+    /// dropped: this runs before the pipeline has sent any push in this
+    /// process, so none of them can be a response it is waiting for.
+    async fn await_archives(&self, required: &BTreeSet<[u8; 20]>) -> Result<(), DiscoveryFailure> {
+        let started = tokio::time::Instant::now();
+        let mut discovery =
+            ArchiveDiscovery::new(required.clone(), started + self.params.discovery_timeout);
+        for addr in required {
+            if let Some(peer) = self.peers.resolve(addr) {
+                discovery.seed(peer, *addr);
+            }
+        }
+        loop {
+            match discovery.status(tokio::time::Instant::now()) {
+                DiscoveryStatus::Complete => {
+                    info!(
+                        required = discovery.required_len(),
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "peer discovery complete: every required archive is identified"
+                    );
+                    return Ok(());
+                }
+                DiscoveryStatus::TimedOut { missing } => {
+                    return Err(DiscoveryFailure::TimedOut {
+                        required: discovery.required_len(),
+                        missing,
+                        waited: self.params.discovery_timeout,
+                    });
+                }
+                DiscoveryStatus::Waiting { .. } => {}
+            }
+            let event = tokio::select! {
+                ev = self.net.next_event() => ev,
+                _ = tokio::time::sleep_until(discovery.deadline()) => continue,
+            };
+            let Some(event) = event else {
+                return Err(DiscoveryFailure::NetworkClosed {
+                    required: discovery.required_len(),
+                    missing: discovery.missing(),
+                });
+            };
+            self.peers.observe(&event);
+            if discovery.observe(&event) {
+                match &event {
+                    SumNetEvent::PeerIdentified {
+                        peer_id,
+                        l1_address,
+                    } => info!(
+                        peer = %peer_id,
+                        l1 = %sum_net::l1_address_base58(l1_address),
+                        required = required.contains(l1_address),
+                        still_missing = discovery.missing().len(),
+                        "discovery: peer identified"
+                    ),
+                    SumNetEvent::PeerDisconnected { peer_id } => info!(
+                        peer = %peer_id,
+                        still_missing = discovery.missing().len(),
+                        "discovery: peer disconnected"
+                    ),
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Push chunks in `chunks_to_push` to their assigned archives.
@@ -1478,6 +1671,27 @@ where
         chunks_to_push: &BTreeSet<u32>,
     ) -> Result<BTreeSet<[u8; 20]>, PushFailure> {
         let r = self.params.assignment_replication_factor;
+        // Wait (bounded) for every archive the pinned assignment gives the
+        // chunks being pushed. On a timeout, push to the archives that are
+        // reachable: the rest stay under-replicated, the file stays Pending,
+        // and the discovery failure is reported as the cause.
+        let required = required_archives(
+            &manifest.merkle_root,
+            snapshot,
+            chunks_to_push.iter().copied(),
+            r,
+        );
+        let discovery_failure = match self.await_archives(&required).await {
+            Ok(()) => None,
+            Err(f) => {
+                warn!(
+                    missing = f.missing().len(),
+                    required = required.len(),
+                    "S2: {f}; pushing to the reachable archives only"
+                );
+                Some(f)
+            }
+        };
         // Build (chunk_index, peer_id) targets ONLY for the subset
         // we're pushing. Track peers we couldn't resolve up front —
         // those become "permanently un-pushable" and contribute to
@@ -1623,7 +1837,7 @@ where
             warn!(count = under.len(), "S2 under-replicated chunks");
             Err(PushFailure {
                 under_replicated: under,
-                source: None,
+                source: discovery_failure.map(anyhow::Error::new),
             })
         }
     }
@@ -2588,7 +2802,7 @@ mod tests {
     #[derive(Default)]
     struct MockRpc {
         files: StdMutex<HashMap<String, StorageFileInfoV2>>,
-        snapshots: StdMutex<HashMap<u64, Vec<NodeRecordInfo>>>,
+        snapshots: StdMutex<std::collections::BTreeMap<u64, Vec<NodeRecordInfo>>>,
         coverages: StdMutex<VecDeque<Result<Option<AssignmentCoverageV2>, String>>>,
         statuses: StdMutex<VecDeque<Result<TxStatusV2, String>>>,
         sends: StdMutex<VecDeque<Result<String, String>>>,
@@ -2647,11 +2861,16 @@ mod tests {
             &self,
             height: u64,
         ) -> Result<Vec<NodeRecordInfo>> {
+            // Chain-history semantics: the active set at `height` is the
+            // most recent snapshot recorded at or below it. A test that adds
+            // one snapshot therefore serves both S1a's current-height
+            // prediction and S2's pinned `assignment_height` lookup.
             self.snapshots
                 .lock()
                 .unwrap()
-                .get(&height)
-                .cloned()
+                .range(..=height)
+                .next_back()
+                .map(|(_, nodes)| nodes.clone())
                 .ok_or_else(|| anyhow::anyhow!("no snapshot at height {height}"))
         }
     }
@@ -2870,6 +3089,7 @@ mod tests {
             push_retries: 2,
             push_wait_secs: Duration::from_millis(500),
             manifest_push_wait_secs: Duration::from_millis(500),
+            discovery_timeout: Duration::from_millis(300),
         }
     }
 
@@ -2886,6 +3106,7 @@ mod tests {
             push_retries: d.push_retries,
             push_wait_secs: d.push_wait_secs,
             manifest_push_wait_secs: d.manifest_push_wait_secs,
+            discovery_timeout: d.discovery_timeout,
             activation_grace_blocks: 50,
             // V2 enabled from genesis in tests — gate logic for the
             // `None` and `not-yet-enabled` failure modes is covered
@@ -3064,12 +3285,15 @@ mod tests {
         let rpc = Arc::new(MockRpc::default());
         rpc.set_nonce(&l1_address_base58(&my_addr), 5);
         rpc.enqueue_send_err("RegisterFilePendingV2 rejected: visibility/bundle mismatch");
+        // S1a must pass so the S1 rejection is what this test observes.
+        rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+        let arch_to_peer: HashMap<_, _> = snapshot.iter().map(|a| (*a, fake_peer())).collect();
         let net = Arc::new(MockNet::new());
 
         let pipeline = build_pipeline(
             rpc,
             net,
-            HashMap::new(),
+            arch_to_peer,
             my_addr,
             params_for_test(defaults_for_tests()),
         );
@@ -3276,7 +3500,7 @@ mod tests {
             .collect();
         let my_addr = snapshot[0];
         let peers: Vec<PeerId> = (0..3).map(|_| fake_peer()).collect();
-        let arch_to_peer: HashMap<_, _> = snapshot
+        let mut arch_to_peer: HashMap<_, _> = snapshot
             .iter()
             .zip(peers.iter())
             .map(|(a, p)| (*a, *p))
@@ -3294,6 +3518,17 @@ mod tests {
             pending_file_info(&merkle_root, 1, 50),
         );
         rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+        // S1a refuses a current set smaller than R, so the current height
+        // (1000) lists five reachable archives; the pinned set at 50 is the
+        // three above, which is what drives S2's under-replication here.
+        let current: Vec<[u8; 20]> = snapshot
+            .iter()
+            .copied()
+            .chain([[0x1E; 20], [0x1F; 20]])
+            .collect();
+        rpc.add_snapshot(1000, current.iter().map(node_record).collect());
+        arch_to_peer.insert([0x1E; 20], fake_peer());
+        arch_to_peer.insert([0x1F; 20], fake_peer());
 
         let net = Arc::new(MockNet::new());
         // 3 distinct peers ACK once each.
@@ -4049,19 +4284,41 @@ mod tests {
         let addr_a = [0xAA; 20];
         let addr_b = [0xBB; 20];
 
-        let map: Arc<tokio::sync::RwLock<HashMap<PeerId, [u8; 20]>>> =
-            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        {
-            let mut w = map.write().await;
-            w.insert(peer_a, addr_a);
-            w.insert(peer_b, addr_b);
+        let resolver = MapPeerResolver::new();
+        for (peer_id, l1_address) in [(peer_a, addr_a), (peer_b, addr_b)] {
+            resolver.observe(&SumNetEvent::PeerIdentified {
+                peer_id,
+                l1_address,
+            });
         }
-
-        let resolver = MapPeerResolver::new(map);
         assert_eq!(resolver.resolve(&addr_a), Some(peer_a));
         assert_eq!(resolver.resolve(&addr_b), Some(peer_b));
         // Unknown address → None (does not panic, does not wrap-around).
         assert_eq!(resolver.resolve(&[0xCC; 20]), None);
+
+        // The last connection closing removes the identity.
+        resolver.observe(&SumNetEvent::PeerDisconnected { peer_id: peer_a });
+        assert_eq!(resolver.resolve(&addr_a), None);
+        assert_eq!(resolver.resolve(&addr_b), Some(peer_b));
+    }
+
+    /// Two live peers reporting one address resolve to the same one every
+    /// time (the smallest `PeerId`), and the other takes over when it goes.
+    #[tokio::test]
+    async fn map_peer_resolver_picks_one_peer_per_address_deterministically() {
+        let addr = [0xAB; 20];
+        let (p1, p2) = (fake_peer(), fake_peer());
+        let (low, high) = if p1 < p2 { (p1, p2) } else { (p2, p1) };
+        let resolver = MapPeerResolver::new();
+        for peer_id in [high, low] {
+            resolver.observe(&SumNetEvent::PeerIdentified {
+                peer_id,
+                l1_address: addr,
+            });
+        }
+        assert_eq!(resolver.resolve(&addr), Some(low));
+        resolver.observe(&SumNetEvent::PeerDisconnected { peer_id: low });
+        assert_eq!(resolver.resolve(&addr), Some(high));
     }
 
     /// Reviewer-required regression guard: changing
@@ -5779,13 +6036,20 @@ mod tests {
             pending_file_info(&merkle_root, manifest_dryrun.chunk_count, 50),
         );
         rpc.add_snapshot(50, all_slashed);
+        // S1a predicts from the current height (1000 in MockRpc), where the
+        // five archives are Active and identified: the active set changed
+        // between that prediction and the pinned assignment height. This is
+        // the only way to reach the post-S1 guard now that S1a refuses an
+        // empty current set before registering.
+        rpc.add_snapshot(1000, snapshot.iter().map(node_record).collect());
+        let arch_to_peer: HashMap<_, _> = snapshot.iter().map(|a| (*a, fake_peer())).collect();
 
         let net = Arc::new(MockNet::new());
 
         let pipeline = build_pipeline(
             rpc.clone(),
             net.clone(),
-            HashMap::new(),
+            arch_to_peer,
             my_addr,
             params_for_test(defaults_for_tests()),
         );
@@ -6003,5 +6267,617 @@ mod tests {
             "repeated resume calls MUST reuse the same historical height {PINNED_HEIGHT}, \
              recorded probes: {all_heights:?}",
         );
+    }
+
+    // ── Peer discovery: explicit completion condition ───────────────────
+    //
+    // These run the real pipeline against a network double whose
+    // `next_event` waits for events (like the swarm) instead of returning
+    // `None` when idle, and whose simulated archives ACK every push. The
+    // resolver is the production `MapPeerResolver`, filled only from the
+    // identify events the pipeline reads.
+    mod discovery {
+        use super::*;
+        use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+        struct ChannelNet {
+            rx: tokio::sync::Mutex<UnboundedReceiver<SumNetEvent>>,
+            /// Used to inject ACKs. `None` after `shut_down`.
+            tx: StdMutex<Option<UnboundedSender<SumNetEvent>>>,
+            pushes: StdMutex<Vec<(PeerId, u32)>>,
+            manifest_pushes: StdMutex<Vec<PeerId>>,
+        }
+
+        impl ChannelNet {
+            fn new() -> (Arc<Self>, UnboundedSender<SumNetEvent>) {
+                let (tx, rx) = unbounded_channel();
+                let net = Arc::new(Self {
+                    rx: tokio::sync::Mutex::new(rx),
+                    tx: StdMutex::new(Some(tx.clone())),
+                    pushes: StdMutex::new(vec![]),
+                    manifest_pushes: StdMutex::new(vec![]),
+                });
+                (net, tx)
+            }
+            /// Drop the net's own sender. Once the test drops its sender
+            /// too, `next_event` returns `None`: the swarm shut down.
+            fn shut_down(&self) {
+                self.tx.lock().unwrap().take();
+            }
+            fn send(&self, ev: SumNetEvent) {
+                if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+                    let _ = tx.send(ev);
+                }
+            }
+            fn pushed_peers(&self, chunk_index: u32) -> BTreeSet<PeerId> {
+                self.pushes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, c)| *c == chunk_index)
+                    .map(|(p, _)| *p)
+                    .collect()
+            }
+            fn push_count(&self) -> usize {
+                self.pushes.lock().unwrap().len()
+            }
+            fn manifest_peers(&self) -> BTreeSet<PeerId> {
+                self.manifest_pushes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .collect()
+            }
+        }
+
+        #[async_trait]
+        impl V2IngestNet for ChannelNet {
+            async fn push_chunk_v2(
+                &self,
+                peer_id: PeerId,
+                _data: Vec<u8>,
+                merkle_root: [u8; 32],
+                chunk_index: u32,
+                _merkle_path: Vec<[u8; 32]>,
+            ) -> Result<()> {
+                self.pushes.lock().unwrap().push((peer_id, chunk_index));
+                self.send(SumNetEvent::ShardReceivedV2 {
+                    peer_id,
+                    response: ShardResponseV2::PushAck {
+                        merkle_root,
+                        chunk_index,
+                        error: None,
+                    },
+                    origin: OutboundOrigin::new(
+                        peer_id,
+                        OutboundRequestKind::V2Push {
+                            merkle_root,
+                            chunk_index,
+                        },
+                    ),
+                });
+                Ok(())
+            }
+            async fn push_manifest_v2(
+                &self,
+                peer_id: PeerId,
+                merkle_root: [u8; 32],
+                _manifest_bytes: Vec<u8>,
+            ) -> Result<()> {
+                self.manifest_pushes.lock().unwrap().push(peer_id);
+                self.send(SumNetEvent::ShardReceivedV2 {
+                    peer_id,
+                    response: ShardResponseV2::ManifestPushAck {
+                        merkle_root,
+                        error: None,
+                    },
+                    origin: OutboundOrigin::new(
+                        peer_id,
+                        OutboundRequestKind::V2ManifestPush { merkle_root },
+                    ),
+                });
+                Ok(())
+            }
+            async fn next_event(&self) -> Option<SumNetEvent> {
+                self.rx.lock().await.recv().await
+            }
+        }
+
+        fn identified(peer_id: PeerId, l1_address: [u8; 20]) -> SumNetEvent {
+            SumNetEvent::PeerIdentified {
+                peer_id,
+                l1_address,
+            }
+        }
+
+        /// Send `events` after the given delays, from a background task.
+        fn schedule(tx: &UnboundedSender<SumNetEvent>, events: Vec<(u64, SumNetEvent)>) {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                for (delay_ms, ev) in events {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    let _ = tx.send(ev);
+                }
+            });
+        }
+
+        fn archives(n: u8) -> Vec<[u8; 20]> {
+            (0..n)
+                .map(|i| {
+                    let mut a = [0u8; 20];
+                    a[0] = 0xC0 + i;
+                    a
+                })
+                .collect()
+        }
+
+        fn r3_params(discovery_timeout: Duration) -> IngestParams {
+            let mut p = params_for_test(defaults_for_tests());
+            p.assignment_replication_factor = 3;
+            p.discovery_timeout = discovery_timeout;
+            p.push_wait_secs = Duration::from_secs(5);
+            p.manifest_push_wait_secs = Duration::from_secs(5);
+            p
+        }
+
+        /// A 2-chunk file plus an RPC mock scripted for a full ingest:
+        /// S1 finalizes at 100, the pinned assignment height is 50,
+        /// coverage is complete on the first poll, S5 finalizes at 200.
+        fn fresh_ingest(
+            seed_byte: u8,
+            snapshot: &[[u8; 20]],
+        ) -> (tempfile::TempDir, PathBuf, [u8; 32], u32, Arc<MockRpc>) {
+            let bytes = vec![seed_byte; 2 * 1_048_576];
+            let (dir, path) = write_test_file(&bytes);
+            let (_m, manifest) = BinaryChunker::chunk_file(&path).unwrap();
+            let rpc = Arc::new(MockRpc::default());
+            rpc.set_nonce(&l1_address_base58(&[0x01; 20]), 1);
+            rpc.enqueue_send("0xtx-register");
+            rpc.enqueue_status(TxStatusV2::Finalized { block_height: 100 });
+            rpc.enqueue_send("0xtx-activate");
+            rpc.enqueue_status(TxStatusV2::Finalized { block_height: 200 });
+            rpc.enqueue_coverage(coverage_active(manifest.chunk_count, true));
+            rpc.add_file(
+                &format!("0x{}", hex::encode(manifest.merkle_root)),
+                pending_file_info(&manifest.merkle_root, manifest.chunk_count, 50),
+            );
+            rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+            (dir, path, manifest.merkle_root, manifest.chunk_count, rpc)
+        }
+
+        fn pipeline(
+            rpc: Arc<MockRpc>,
+            net: Arc<ChannelNet>,
+            params: IngestParams,
+        ) -> IngestPipeline<MockRpc, ChannelNet, MapPeerResolver> {
+            IngestPipeline::new(
+                rpc,
+                net,
+                Arc::new(MapPeerResolver::new()),
+                [42u8; 32],
+                [0x01; 20],
+                params,
+            )
+        }
+
+        fn sent(rpc: &MockRpc) -> usize {
+            rpc.sent_txs.lock().unwrap().len()
+        }
+
+        /// The E2E failure: the third archive identifies after the old
+        /// 0.7 s window. Discovery waits for it, then every chunk reaches
+        /// all three distinct archives and the file activates.
+        #[tokio::test]
+        async fn a_late_archive_is_waited_for_and_every_assigned_archive_gets_its_pushes() {
+            let snap = archives(3);
+            let (_d, path, _root, chunk_count, rpc) = fresh_ingest(0x51, &snap);
+            let (net, tx) = ChannelNet::new();
+            let peers: Vec<PeerId> = (0..3).map(|_| fake_peer()).collect();
+            schedule(
+                &tx,
+                vec![
+                    (0, identified(peers[0], snap[0])),
+                    (20, identified(peers[1], snap[1])),
+                    (900, identified(peers[2], snap[2])),
+                ],
+            );
+            let outcome = pipeline(rpc.clone(), net.clone(), r3_params(Duration::from_secs(10)))
+                .run(&path)
+                .await;
+            assert!(
+                matches!(outcome, IngestOutcome::Activated { .. }),
+                "expected Activated, got {outcome:?}"
+            );
+            let all: BTreeSet<PeerId> = peers.iter().copied().collect();
+            for chunk in 0..chunk_count {
+                assert_eq!(
+                    net.pushed_peers(chunk),
+                    all,
+                    "chunk {chunk} pushed to all 3"
+                );
+            }
+            assert_eq!(net.push_count(), 3 * chunk_count as usize);
+            assert_eq!(net.manifest_peers(), all);
+            assert_eq!(sent(&rpc), 2, "register + activate");
+        }
+
+        /// An assigned archive that never identifies: refused before S1,
+        /// naming how many are missing. No tx, no push.
+        #[tokio::test]
+        async fn an_unreachable_assigned_archive_refuses_before_registration() {
+            let snap = archives(3);
+            let (_d, path, _root, _n, rpc) = fresh_ingest(0x52, &snap);
+            let (net, tx) = ChannelNet::new();
+            schedule(
+                &tx,
+                vec![
+                    (0, identified(fake_peer(), snap[0])),
+                    (10, identified(fake_peer(), snap[2])),
+                ],
+            );
+            match pipeline(
+                rpc.clone(),
+                net.clone(),
+                r3_params(Duration::from_millis(400)),
+            )
+            .run(&path)
+            .await
+            {
+                IngestOutcome::Failed { stage, source, .. } => {
+                    assert_eq!(stage, IngestStage::Register);
+                    let msg = source.to_string();
+                    assert!(msg.contains("1 of 3 required archives"), "{msg}");
+                    assert!(msg.contains(&l1_address_base58(&snap[1])), "{msg}");
+                    assert!(msg.contains("no S1 tx was submitted"), "{msg}");
+                }
+                other => panic!("expected Failed(Register), got {other:?}"),
+            }
+            assert_eq!(sent(&rpc), 0, "no tx before discovery completes");
+            assert_eq!(net.push_count(), 0);
+        }
+
+        /// Fewer eligible archives than R: no chunk could reach R distinct
+        /// ACKs, so S1a refuses at once, without waiting.
+        #[tokio::test]
+        async fn fewer_eligible_archives_than_r_refuses_before_registration() {
+            let snap = archives(2);
+            let (_d, path, _root, _n, rpc) = fresh_ingest(0x53, &snap);
+            let (net, _tx) = ChannelNet::new();
+            let started = tokio::time::Instant::now();
+            match pipeline(rpc.clone(), net, r3_params(Duration::from_secs(30)))
+                .run(&path)
+                .await
+            {
+                IngestOutcome::Failed { stage, source, .. } => {
+                    assert_eq!(stage, IngestStage::Register);
+                    let msg = source.to_string();
+                    assert!(msg.contains("lists 2 eligible archives"), "{msg}");
+                    assert!(msg.contains("R=3"), "{msg}");
+                }
+                other => panic!("expected Failed(Register), got {other:?}"),
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "no discovery wait"
+            );
+            assert_eq!(sent(&rpc), 0);
+        }
+
+        /// An archive that identifies and then disconnects does not count.
+        #[tokio::test]
+        async fn an_archive_that_disconnects_after_identifying_is_not_counted() {
+            let snap = archives(3);
+            let (_d, path, _root, _n, rpc) = fresh_ingest(0x54, &snap);
+            let (net, tx) = ChannelNet::new();
+            let gone = fake_peer();
+            // Archive 2 identifies and disconnects before the others
+            // arrive, so discovery never sees all three live at once.
+            schedule(
+                &tx,
+                vec![
+                    (0, identified(gone, snap[2])),
+                    (0, SumNetEvent::PeerDisconnected { peer_id: gone }),
+                    (20, identified(fake_peer(), snap[0])),
+                    (0, identified(fake_peer(), snap[1])),
+                ],
+            );
+            match pipeline(
+                rpc.clone(),
+                net.clone(),
+                r3_params(Duration::from_millis(400)),
+            )
+            .run(&path)
+            .await
+            {
+                IngestOutcome::Failed { source, .. } => {
+                    let msg = source.to_string();
+                    assert!(msg.contains("1 of 3 required archives"), "{msg}");
+                    assert!(msg.contains(&l1_address_base58(&snap[2])), "{msg}");
+                }
+                other => panic!("expected Failed(Register), got {other:?}"),
+            }
+            assert_eq!(sent(&rpc), 0);
+        }
+
+        /// Archives are counted by chain address: a repeated identify and a
+        /// second peer id for the same archive do not stand in for a third.
+        #[tokio::test]
+        async fn duplicate_peers_do_not_stand_in_for_a_missing_archive() {
+            let snap = archives(3);
+            let (_d, path, _root, _n, rpc) = fresh_ingest(0x55, &snap);
+            let (net, tx) = ChannelNet::new();
+            let (p1, p2, pb) = (fake_peer(), fake_peer(), fake_peer());
+            schedule(
+                &tx,
+                vec![
+                    (0, identified(p1, snap[0])),
+                    (0, identified(p1, snap[0])),
+                    (0, identified(p2, snap[0])),
+                    (0, identified(pb, snap[1])),
+                    (0, identified(pb, snap[1])),
+                ],
+            );
+            match pipeline(
+                rpc.clone(),
+                net.clone(),
+                r3_params(Duration::from_millis(400)),
+            )
+            .run(&path)
+            .await
+            {
+                IngestOutcome::Failed { source, .. } => {
+                    let msg = source.to_string();
+                    assert!(msg.contains("1 of 3 required archives"), "{msg}");
+                    assert!(msg.contains(&l1_address_base58(&snap[2])), "{msg}");
+                }
+                other => panic!("expected Failed(Register), got {other:?}"),
+            }
+            assert_eq!(sent(&rpc), 0);
+        }
+
+        /// With two peer ids for one archive and the other archives present,
+        /// each chunk goes to exactly one peer per archive: three distinct
+        /// archives, three pushes per chunk.
+        #[tokio::test]
+        async fn two_peer_ids_for_one_archive_get_one_push_per_chunk() {
+            let snap = archives(3);
+            let (_d, path, _root, chunk_count, rpc) = fresh_ingest(0x56, &snap);
+            let (net, tx) = ChannelNet::new();
+            let (p1, p2, pb, pc) = (fake_peer(), fake_peer(), fake_peer(), fake_peer());
+            schedule(
+                &tx,
+                vec![
+                    (0, identified(p1, snap[0])),
+                    (0, identified(p2, snap[0])),
+                    (0, identified(pb, snap[1])),
+                    (0, identified(pc, snap[2])),
+                ],
+            );
+            let outcome = pipeline(rpc.clone(), net.clone(), r3_params(Duration::from_secs(5)))
+                .run(&path)
+                .await;
+            assert!(
+                matches!(outcome, IngestOutcome::Activated { .. }),
+                "expected Activated, got {outcome:?}"
+            );
+            let chosen = p1.min(p2);
+            let expected: BTreeSet<PeerId> = [chosen, pb, pc].into_iter().collect();
+            for chunk in 0..chunk_count {
+                assert_eq!(net.pushed_peers(chunk), expected);
+            }
+            assert_eq!(net.push_count(), 3 * chunk_count as usize);
+        }
+
+        /// The swarm shutting down during discovery ends it cleanly, before
+        /// registration.
+        #[tokio::test]
+        async fn network_shutdown_during_discovery_refuses_before_registration() {
+            let snap = archives(3);
+            let (_d, path, _root, _n, rpc) = fresh_ingest(0x57, &snap);
+            let (net, tx) = ChannelNet::new();
+            tx.send(identified(fake_peer(), snap[0])).unwrap();
+            drop(tx);
+            net.shut_down();
+            match pipeline(rpc.clone(), net.clone(), r3_params(Duration::from_secs(30)))
+                .run(&path)
+                .await
+            {
+                IngestOutcome::Failed { stage, source, .. } => {
+                    assert_eq!(stage, IngestStage::Register);
+                    let msg = source.to_string();
+                    assert!(msg.contains("network shut down"), "{msg}");
+                    assert!(msg.contains("2 of 3 required archives"), "{msg}");
+                }
+                other => panic!("expected Failed(Register), got {other:?}"),
+            }
+            assert_eq!(sent(&rpc), 0);
+        }
+
+        /// Cancelling an ingest while it waits for peers (dropping the
+        /// future, as a shutdown or Ctrl-C does) leaves nothing on chain,
+        /// and a later attempt completes normally.
+        #[tokio::test]
+        async fn cancelling_during_discovery_sends_nothing_and_a_retry_completes() {
+            let snap = archives(3);
+            let (_d, path, _root, _n, rpc) = fresh_ingest(0x58, &snap);
+            let (net, tx) = ChannelNet::new();
+            let p = pipeline(rpc.clone(), net.clone(), r3_params(Duration::from_secs(30)));
+            let peers: Vec<PeerId> = (0..3).map(|_| fake_peer()).collect();
+            tx.send(identified(peers[0], snap[0])).unwrap();
+            let cancelled = tokio::time::timeout(Duration::from_millis(300), p.run(&path)).await;
+            assert!(cancelled.is_err(), "still discovering when cancelled");
+            assert_eq!(sent(&rpc), 0, "no tx from the cancelled attempt");
+            assert_eq!(net.push_count(), 0);
+
+            // The archives come up; the same pipeline (and resolver, which
+            // already knows the first archive) completes.
+            tx.send(identified(peers[1], snap[1])).unwrap();
+            tx.send(identified(peers[2], snap[2])).unwrap();
+            let outcome = p.run(&path).await;
+            assert!(
+                matches!(outcome, IngestOutcome::Activated { .. }),
+                "expected Activated, got {outcome:?}"
+            );
+            assert_eq!(sent(&rpc), 2);
+        }
+
+        /// The pinned snapshot can differ from the S1a prediction. S2 waits
+        /// for the archive only the pinned assignment names, then pushes to
+        /// it.
+        #[tokio::test]
+        async fn s2_waits_for_an_archive_only_the_pinned_snapshot_names() {
+            let all = archives(4);
+            // Pinned (height 50): archives 0, 1, 3. Current (height 1000,
+            // what S1a predicts from): archives 0, 1, 2.
+            let pinned = vec![all[0], all[1], all[3]];
+            let (_d, path, _root, chunk_count, rpc) = fresh_ingest(0x59, &pinned);
+            rpc.add_snapshot(
+                1000,
+                [all[0], all[1], all[2]].iter().map(node_record).collect(),
+            );
+            let (net, tx) = ChannelNet::new();
+            let peers: Vec<PeerId> = (0..4).map(|_| fake_peer()).collect();
+            schedule(
+                &tx,
+                vec![
+                    (0, identified(peers[0], all[0])),
+                    (0, identified(peers[1], all[1])),
+                    (0, identified(peers[2], all[2])),
+                    (400, identified(peers[3], all[3])),
+                ],
+            );
+            let outcome = pipeline(rpc.clone(), net.clone(), r3_params(Duration::from_secs(10)))
+                .run(&path)
+                .await;
+            assert!(
+                matches!(outcome, IngestOutcome::Activated { .. }),
+                "expected Activated, got {outcome:?}"
+            );
+            let expected: BTreeSet<PeerId> = [peers[0], peers[1], peers[3]].into_iter().collect();
+            for chunk in 0..chunk_count {
+                assert_eq!(net.pushed_peers(chunk), expected);
+            }
+        }
+
+        /// A Pending file whose chunk 1 is missing, with five archives and
+        /// R=3. Resume waits only for chunk 1's three assignees (the other two
+        /// never appear), pushes chunk 1 to each, and activates.
+        #[tokio::test]
+        async fn resume_waits_for_the_missing_chunks_archives_then_activates() {
+            let snap = archives(5);
+            let bytes = vec![0x5A; 2 * 1_048_576];
+            let (_d, path) = write_test_file(&bytes);
+            let (_m, manifest) = BinaryChunker::chunk_file(&path).unwrap();
+            let root = manifest.merkle_root;
+            let rpc = Arc::new(MockRpc::default());
+            rpc.set_nonce(&l1_address_base58(&[0x01; 20]), 1);
+            rpc.add_file(
+                &format!("0x{}", hex::encode(root)),
+                file_info_with_lifecycle(&root, 2, 50, LifecycleV2::PENDING, None, None),
+            );
+            rpc.add_snapshot(50, snap.iter().map(node_record).collect());
+            let mut missing = coverage_active(2, false);
+            missing.missing_indices = vec![1];
+            missing.missing_total = 1;
+            rpc.enqueue_coverage(missing.clone());
+            rpc.enqueue_coverage(missing);
+            let mut done = coverage_active(2, false);
+            done.missing_indices = vec![];
+            done.missing_total = 0;
+            rpc.enqueue_coverage(done);
+            rpc.enqueue_coverage(coverage_active(2, true));
+            rpc.enqueue_send("0xtx-activate");
+            rpc.enqueue_status(TxStatusV2::Finalized { block_height: 300 });
+
+            let assigned = sum_store::assignment_v2::assigned_archives(&root, &snap, 1, 3);
+            let (net, tx) = ChannelNet::new();
+            let peer_of: HashMap<[u8; 20], PeerId> =
+                assigned.iter().map(|a| (*a, fake_peer())).collect();
+            schedule(
+                &tx,
+                assigned
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| (if i == 2 { 500 } else { 0 }, identified(peer_of[a], *a)))
+                    .collect(),
+            );
+            let outcome = pipeline(rpc.clone(), net.clone(), r3_params(Duration::from_secs(10)))
+                .resume(root, &path)
+                .await;
+            assert!(
+                matches!(outcome, IngestOutcome::ResumedActivated { .. }),
+                "expected ResumedActivated, got {outcome:?}"
+            );
+            let expected: BTreeSet<PeerId> = peer_of.values().copied().collect();
+            assert_eq!(net.pushed_peers(1), expected, "chunk 1 to its 3 assignees");
+            assert!(
+                net.pushed_peers(0).is_empty(),
+                "covered chunk 0 not re-pushed"
+            );
+            assert_eq!(sent(&rpc), 1, "activate only");
+        }
+
+        /// Resume when one of the missing chunk's assignees never appears:
+        /// the file stays Pending, the cause names the missing archive, and
+        /// no activation is sent.
+        #[tokio::test]
+        async fn resume_with_an_assignee_that_never_appears_stays_pending() {
+            let snap = archives(3);
+            let bytes = vec![0x5B; 1_048_576];
+            let (_d, path) = write_test_file(&bytes);
+            let (_m, manifest) = BinaryChunker::chunk_file(&path).unwrap();
+            let root = manifest.merkle_root;
+            let rpc = Arc::new(MockRpc::default());
+            rpc.set_nonce(&l1_address_base58(&[0x01; 20]), 1);
+            rpc.add_file(
+                &format!("0x{}", hex::encode(root)),
+                file_info_with_lifecycle(&root, 1, 50, LifecycleV2::PENDING, None, None),
+            );
+            rpc.add_snapshot(50, snap.iter().map(node_record).collect());
+            let mut missing = coverage_active(1, false);
+            missing.missing_indices = vec![0];
+            missing.missing_total = 1;
+            rpc.enqueue_coverage(missing.clone());
+            rpc.enqueue_coverage(missing);
+            let mut end = coverage_active(1, false);
+            end.missing_indices = vec![];
+            end.missing_total = 0;
+            rpc.enqueue_coverage(end);
+
+            let (net, tx) = ChannelNet::new();
+            let (pa, pb) = (fake_peer(), fake_peer());
+            tx.send(identified(pa, snap[0])).unwrap();
+            tx.send(identified(pb, snap[1])).unwrap();
+            let mut params = r3_params(Duration::from_millis(400));
+            params.push_wait_secs = Duration::from_millis(300);
+            match pipeline(rpc.clone(), net.clone(), params)
+                .resume(root, &path)
+                .await
+            {
+                IngestOutcome::PendingNeedsAction {
+                    failed_stage,
+                    under_replicated_chunks,
+                    suggested,
+                    source,
+                    ..
+                } => {
+                    assert_eq!(failed_stage, IngestStage::Push);
+                    assert_eq!(under_replicated_chunks, Some(vec![0]));
+                    assert_eq!(suggested, SuggestedAction::Resume);
+                    let msg = source.expect("discovery failure is the cause").to_string();
+                    assert!(msg.contains("1 of 3 required archives"), "{msg}");
+                    assert!(msg.contains(&l1_address_base58(&snap[2])), "{msg}");
+                }
+                other => panic!("expected PendingNeedsAction(Push), got {other:?}"),
+            }
+            let reachable: BTreeSet<PeerId> = [pa, pb].into_iter().collect();
+            assert_eq!(
+                net.pushed_peers(0),
+                reachable,
+                "pushed to the reachable two"
+            );
+            assert_eq!(sent(&rpc), 0, "no activation");
+        }
     }
 }
