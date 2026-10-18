@@ -1,0 +1,58 @@
+# Post-publish install smoke — manual dispatch only.
+#
+# Runs the documented curl-pipe install line (README,
+# docs/getting-started/install.md, docs/release/release-checklist.md
+# § 8a) against an already PUBLISHED release, on fresh GitHub-hosted
+# runners, then checks `sum-node --version`. It reads only the public
+# release URLs: no checkout, no secrets, read-only token. It never runs
+# on push, pull request or tag, and it never creates, edits or
+# publishes a release.
+# It uses no third-party actions.
+
+name: release install smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to install (vX.Y.Z or vX.Y.Z-rcN)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install-smoke:
+    name: curl-pipe install of ${{ inputs.tag }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Validate tag format
+        run: |
+          set -eu
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*) ;;
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "error: tag '$TAG' does not match vX.Y.Z or vX.Y.Z-rcN" >&2; exit 1 ;;
+          esac
+
+      - name: Install with the documented curl-pipe line
+        run: |
+          set -eu
+          curl -fsSL "https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/${TAG}/install.sh" \
+              | sh -s -- --version "${TAG}"
+
+      - name: sum-node --version reports the tag
+        run: |
+          set -eu
+          out="$("$HOME/.local/bin/sum-node" --version)"
+          echo "$out"
+          test "$out" = "sum-node ${TAG#v}"
+          test -x "$HOME/.local/bin/e2e-helper"

@@ -3,8 +3,13 @@
 # tarball, computes SHA256SUMS, and uploads the artifacts together
 # with `scripts/install.sh` to a DRAFT GitHub Release.
 #
-# The release is never auto-published. A human verifies the assets
-# and runs the documented install command before clicking publish.
+# The release is never auto-published. After upload, the
+# `verify-draft` job downloads the draft's assets on fresh GitHub-hosted
+# runners and checks them with scripts/verify-release-assets.sh (asset
+# set, SHA256SUMS, tarball layout, `sum-node --version`). A human
+# reviews that result, replaces the draft body and publishes. The
+# post-publish curl-pipe smoke is the manual-dispatch workflow
+# release-install-smoke.yml.
 # Both rc and final tags create a draft (rc tags additionally carry
 # the GitHub "pre-release" flag once published).
 #
@@ -25,13 +30,15 @@ on:
       - 'v*'
 
 permissions:
-  contents: write  # required to create / upload to the draft release
+  contents: read
 
 jobs:
   linux-x86_64:
     name: package linux-x86_64
     runs-on: ubuntu-22.04
     timeout-minutes: 30
+    permissions:
+      contents: write  # required to create / upload to the draft release
     steps:
       - name: Checkout (tag)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -134,3 +141,58 @@ jobs:
                 "${{ steps.stage.outputs.checksums }}" \
                 scripts/install.sh
           fi
+
+  verify-draft:
+    # Each job runs on a fresh GitHub-hosted VM, so this checks the assets
+    # as uploaded, on machines that did not build them: ubuntu-22.04 (the
+    # build image, the checklist's reference host) and ubuntu-24.04 (a
+    # newer userland). It only reads; nothing is published or re-uploaded.
+    name: verify draft assets (${{ matrix.os }})
+    needs: linux-x86_64
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      # Draft releases and their assets are visible only to a token with
+      # push access; this job never writes.
+      contents: write
+    steps:
+      - name: Checkout (tag)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: The release is a draft with the expected flags and assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --json tagName,isDraft,isPrerelease,assets > release.json
+          test "$(jq -r .tagName release.json)" = "$TAG"
+          test "$(jq -r .isDraft release.json)" = "true"
+          case "$TAG" in
+            *-rc*) test "$(jq -r .isPrerelease release.json)" = "true" ;;
+            *)     test "$(jq -r .isPrerelease release.json)" = "false" ;;
+          esac
+          jq -r '.assets[].name' release.json | LC_ALL=C sort > names.txt
+          printf '%s\n' SHA256SUMS install.sh "snip-${TAG}-linux-x86_64.tar.gz" \
+              | LC_ALL=C sort > want.txt
+          diff -u want.txt names.txt
+
+      - name: Download the draft's assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir "$RUNNER_TEMP/assets"
+          gh release download "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+              --dir "$RUNNER_TEMP/assets"
+
+      - name: Verify the assets on this runner
+        run: scripts/verify-release-assets.sh "$RUNNER_TEMP/assets" "${GITHUB_REF_NAME}" scripts/install.sh

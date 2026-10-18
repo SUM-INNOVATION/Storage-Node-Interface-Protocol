@@ -370,42 +370,87 @@ Pushing the tag triggers
 which builds the Linux x86_64 release binaries, packages them as
 `snip-vX.Y.Z-linux-x86_64.tar.gz`, computes `SHA256SUMS`, and
 uploads those plus `scripts/install.sh` to a **draft** GitHub
-Release. The workflow never auto-publishes. A human must:
+Release. The workflow never auto-publishes.
 
-- [ ] Wait for the `release` workflow on the tag to finish green.
-- [ ] Open the draft release in the GitHub UI and confirm the
-      asset list contains exactly three files:
-      `snip-vX.Y.Z-linux-x86_64.tar.gz`, `SHA256SUMS`,
-      `install.sh`.
-- [ ] On a clean Linux x86_64 host (or an Ubuntu 22.04 VM /
-      container), exercise the **manual-verify path** end-to-end
-      against the draft assets:
+**First path: GitHub-hosted verification.** The same workflow's
+`verify-draft` job then runs on two fresh GitHub-hosted runners that
+did not build the assets, `ubuntu-22.04` and `ubuntu-24.04`. Each
+one:
 
-      ```bash
-      # Authenticated download from the draft release.
-      # Draft assets are NOT reachable via the unauthenticated
-      # releases URL; use `gh release download` from a logged-in
-      # gh CLI for the preflight.
-      gh release download vX.Y.Z \
-          --repo SUM-INNOVATION/Storage-Node-Interface-Protocol \
-          --pattern 'snip-*-linux-x86_64.tar.gz' \
-          --pattern 'SHA256SUMS'
+- confirms the release is a draft for this tag, flagged pre-release
+  exactly when the tag is an rc, with exactly three assets:
+  `snip-vX.Y.Z-linux-x86_64.tar.gz`, `SHA256SUMS`, `install.sh`;
+- downloads them with `gh release download` and runs
+  [`scripts/verify-release-assets.sh`](../../scripts/verify-release-assets.sh),
+  which checks:
+  - the asset set is exactly those three regular files;
+  - `SHA256SUMS` has one entry, for the tarball, and it matches;
+  - every tarball entry is confined to `snip-vX.Y.Z-linux-x86_64/`,
+    with no `..` component and no link or special file;
+  - the layout is exactly `bin/sum-node`, `bin/e2e-helper`,
+    `README.md`, `CHANGELOG.md`, `LICENSE-MIT` and `LICENSE-APACHE`,
+    with both binaries executable;
+  - the bundled `CHANGELOG.md` has a `## [X.Y.Z]` section;
+  - `bin/sum-node --version` prints exactly `sum-node X.Y.Z` on that
+    runner;
+  - the `install.sh` asset is byte-identical to the tag's
+    `scripts/install.sh`.
 
-      sha256sum --check --ignore-missing SHA256SUMS
-      tar xzf snip-vX.Y.Z-linux-x86_64.tar.gz
-      ./snip-vX.Y.Z-linux-x86_64/bin/sum-node --version
-      ```
+`make release-check` self-tests the verifier against a synthetic good
+release and 16 broken ones
+([`scripts/test-verify-release-assets.sh`](../../scripts/test-verify-release-assets.sh)).
 
-      Confirms tarball integrity, layout, and that the binary
-      runs on a clean host. After publishing the release, the
-      curl-pipe install line from the README/INSTALL becomes
-      reachable; that is the next gate.
+- [ ] Wait for the `release` workflow on the tag to finish green,
+      including both `verify draft assets` jobs. Keep the run URL as
+      evidence.
+- [ ] Open the draft release in the GitHub UI and confirm the asset
+      list is the one the job checked.
+
+**Fallback: a clean host.** If the GitHub-hosted job cannot run, or
+as an additional check, verify by hand on a clean Linux x86_64 host
+(or an Ubuntu 22.04 VM / container). From a checkout of the tag:
+
+```bash
+# Authenticated download from the draft release.
+# Draft assets are NOT reachable via the unauthenticated
+# releases URL; use `gh release download` from a logged-in
+# gh CLI for the preflight.
+mkdir assets
+gh release download vX.Y.Z \
+    --repo SUM-INNOVATION/Storage-Node-Interface-Protocol \
+    --dir assets
+scripts/verify-release-assets.sh assets vX.Y.Z scripts/install.sh
+```
+
+Without a checkout, the minimal manual steps are:
+
+```bash
+gh release download vX.Y.Z \
+    --repo SUM-INNOVATION/Storage-Node-Interface-Protocol \
+    --pattern 'snip-*-linux-x86_64.tar.gz' \
+    --pattern 'SHA256SUMS'
+
+sha256sum --check --ignore-missing SHA256SUMS
+tar xzf snip-vX.Y.Z-linux-x86_64.tar.gz
+./snip-vX.Y.Z-linux-x86_64/bin/sum-node --version
+```
+
+Either way this confirms tarball integrity, layout, and that the
+binary runs on a clean host. After publishing the release, the
+curl-pipe install line from the README/INSTALL becomes reachable;
+that is the next gate.
+
 - [ ] Replace the auto-generated draft body with the matching
       `CHANGELOG.md` section + the install command.
 - [ ] Manually publish the draft. For rc tags, keep the
       "pre-release" flag checked.
-- [ ] After publishing, re-run the documented curl-pipe install
-      line on a clean host as a final smoke:
+- [ ] After publishing, run the post-publish install smoke.
+      **First path:** dispatch
+      [`.github/workflows/release-install-smoke.yml`](../../.github/workflows/release-install-smoke.yml)
+      with the tag. It runs the line below on fresh `ubuntu-22.04`
+      and `ubuntu-24.04` runners and checks `sum-node --version`.
+      It runs only on manual dispatch and reads only the public
+      release URLs. **Fallback:** run the line on a clean host:
 
       ```bash
       curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/vX.Y.Z/install.sh \
