@@ -90,7 +90,7 @@ Effective replication is `min(configured_r, eligible_snapshot.len())` — the sa
 
 - `assignment_epochs: Vec<u64>` — every epoch for which the chain has recorded coverage on this file.
 - `latest_assignment_epoch: u64` — the epoch whose targets the chain considers current for admission.
-- `reassignment_needed: bool` — the chain has decided the file needs `ReassignChunksV2`.
+- `reassignment_needed: bool` — the chain would accept `ReassignChunksV2`: an archive in the latest epoch's snapshot has left the active set. The rule is snapshot-wide; that archive need not hold a chunk of this file. `sum-node reassign` additionally requires a departed archive that holds one.
 - `per_epoch: Vec<AssignmentEpochCoverageV2>` — per-epoch shape of covered/missing indices.
 
 All four decode with `#[serde(default)]` so legacy chain responses that omit them continue to work. `AssignmentCoverageV2::resolved_latest_epoch()` returns `Some(latest_assignment_epoch)` when at least one epoch is populated, `None` otherwise — this lets callers distinguish a legacy response from a post-#62 response with a real epoch-0 result. Aggregate `can_activate_now` semantics are unchanged post-#62 (see upstream `storage_metadata.rs:2181-2200`). SNIP reads `reassignment_needed` to gate `sum-node reassign`, which submits an owner-triggered `ReassignChunksV2`; the remaining epoch-aware push and attestation work is tracked in the roadmap.

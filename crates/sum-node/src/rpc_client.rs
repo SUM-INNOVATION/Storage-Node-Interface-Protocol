@@ -167,6 +167,16 @@ impl L1RpcClient {
             .await
     }
 
+    /// `chain_getBlockHeight(["latest"])` — the latest included height.
+    ///
+    /// Not a finality check. Its one caller, `sum-node reassign`, reads it
+    /// before and after a coverage read to confirm no block was applied in
+    /// between: the coverage RPC reads the node's latest committed state and
+    /// reports no height of its own.
+    pub async fn chain_get_latest_block_height(&self) -> Result<BlockHeightInfo> {
+        self.call("chain_getBlockHeight", json!(["latest"])).await
+    }
+
     /// `chain_getChainParams` — live consensus + V2 protocol constants.
     ///
     /// Read at startup; values are protocol-constant per genesis (a
@@ -852,6 +862,28 @@ mod contract_tests {
             server.first_params("chain_getBlockHeight"),
             Some(json!(["finalized"])),
             "must request the finalized head explicitly"
+        );
+    }
+
+    /// `chain_get_latest_block_height` asks for `["latest"]` explicitly, so it
+    /// can never be mistaken for the finalized head.
+    #[tokio::test]
+    async fn chain_get_latest_block_height_uses_latest_param() {
+        use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+        let server = start_mock_rpc(routes([(
+            "chain_getBlockHeight",
+            MockResponse::Result(json!({"height": 4248, "finality": "latest"})),
+        )]))
+        .await;
+        let client = L1RpcClient::new(server.url());
+        let info = client
+            .chain_get_latest_block_height()
+            .await
+            .expect("latest height must decode");
+        assert_eq!(info.height, 4248);
+        assert_eq!(
+            server.first_params("chain_getBlockHeight"),
+            Some(json!(["latest"]))
         );
     }
 

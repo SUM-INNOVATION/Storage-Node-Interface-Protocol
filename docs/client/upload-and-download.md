@@ -101,8 +101,9 @@ coverage or activation stalled — the file is recoverable:
 - **`sum-node reassign <merkle-root-hex> [--dry-run]`** — submit an
   owner-triggered `ReassignChunksV2` for a file this key owns, only
   when `storage_getAssignmentCoverageV2` reports
-  `reassignment_needed` (an archive assigned under the latest epoch
-  has left the active set). See [Reassignment](#reassignment) below.
+  `reassignment_needed` and an archive that has left the active set
+  holds a chunk of the file under the latest epoch. See
+  [Reassignment](#reassignment) below.
 
 `resume` and `abandon` read `chain_id` from the CLI value on the current
 release, so pass `--chain-id 1` on mainnet until the runtime fix
@@ -114,25 +115,52 @@ lands (see [`../roadmap/roadmap.md`](../roadmap/roadmap.md)).
 
 1. Reads `storage_getFileInfoV2` and refuses unless the file's owner
    is the `--key-file` address. It never signs for another owner's file.
-2. Reads `storage_getAssignmentCoverageV2` and refuses unless the chain
+2. Reads the replication factor from `chain_getChainParams`.
+3. Reads `storage_getAssignmentCoverageV2` and refuses unless the chain
    reports `reassignment_needed`, so no fee is spent on a transaction the
    executor would refuse.
-3. Asks the chain's no-key builder, `storage_buildReassignChunksV2`, for
+4. **Selection policy (N2).** The chain accepts a reassignment as soon as
+   *any* archive in the latest epoch's snapshot leaves, whether or not it
+   held part of this file. The command is stricter: it submits only if an
+   archive that has left (`currently_active: false` in the latest
+   `per_epoch` entry) is assigned at least one chunk of the file under that
+   epoch. Otherwise it prints `no departed assignee; not submitting` and
+   exits without building or signing anything.
+   - The chain's own `assigned_count` decides when the response carries it.
+   - Above 16,384 chunks the chain returns `assigned_count: null`. The
+     command then computes the assignment locally, with the chain's scorer
+     (`sumchain-wire`), over the archive list of that same latest `per_epoch`
+     entry, which is the chain's snapshot at that epoch. Chain-generated
+     vectors check this computation on both sides of the cap
+     (`crates/sum-store/tests/n2_assignment_vectors.rs`).
+5. **One chain state.** The snapshot, the chunk count and the active flags
+   all come from one coverage response. The coverage RPC takes no height and
+   reports none, so the command reads the latest block height before and
+   after it, and uses the response only when the two are equal and the
+   response agrees with itself (the flag is set only if some archive in the
+   latest snapshot is inactive). Otherwise it reads again, three attempts in
+   all, then refuses. Equal heights cannot rule out a read that overlaps a
+   block the node is still executing; the chain re-checks its own rule when
+   it executes the transaction, so the worst case is one fee for a
+   reassignment the chain still accepts, or a skipped one you can re-run.
+6. Asks the chain's no-key builder, `storage_buildReassignChunksV2`, for
    the unsigned transaction.
-4. Verifies the built bytes before signing: canonical encoding, chain
+7. Verifies the built bytes before signing: canonical encoding, chain
    id, sender, fee, the exact `ReassignChunksV2 { merkle_root }`
    payload, and agreement of the echoed nonce, fee, sender, chain id and
    signing hash. `ReassignChunksV2` carries no epoch field; the executor
    stamps the new epoch at the current height.
-5. Signs with the same owner key and signing path as every other owner
+8. Signs with the same owner key and signing path as every other owner
    transaction, submits, and waits for finality. A chain refusal is
    printed with its receipt reason, which carries the refusal code.
 
 `reassign` takes `chain_id` and the fee (`min_fee`) from `chain_getChainParams`; the production profile refuses to fall back to CLI values, and the built transaction must carry exactly that chain id and fee.
 
-`--dry-run` stops after step 4: nothing is signed or sent. Every refusal
-or failure exits non-zero. The command uses no network stack, adds no
-key, delegation or background signing, and runs only when invoked.
+`--dry-run` stops after step 7: nothing is signed or sent; it prints the
+departed assignee that justified the reassignment. Every refusal or
+failure exits non-zero. The command uses no network stack, adds no key,
+delegation or background signing, and runs only when invoked. Only the
+file's owner can submit; the chain enforces that too.
 
 **Limits in this release.**
 - The command submits the chain transaction only. SNIP's push, attestation

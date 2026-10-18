@@ -104,8 +104,10 @@ strict-`>` rule before submitting.
 ### sum-node reassign
 
 V2 reassign: submit an owner-triggered `ReassignChunksV2` for a file
-owned by this key, only when the chain reports `reassignment_needed`.
-The chain's no-key builder assembles the unsigned transaction; the
+owned by this key, only when the chain reports `reassignment_needed`
+and an archive that has left the active set holds a chunk of the file
+under the latest epoch (otherwise: `no departed assignee; not
+submitting`). The chain's no-key builder assembles the unsigned transaction; the
 command verifies it against the request, signs it with this key and
 waits for finality. Details:
 [`../client/upload-and-download.md`](../client/upload-and-download.md#reassignment).
