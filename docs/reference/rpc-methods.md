@@ -16,13 +16,14 @@ coordination with the chain team.
 |---|---|---|
 | `chain_getChainParams` | Read `chain_id`, `v2_enabled_from_height`, `assignment_replication_factor`, `max_chunk_indices_per_tx`, `activation_grace_blocks`, `assignment_targeting`, other tunables | Ingest preflight; smoke gate; feature-gate discovery |
 | `chain_getBlockHeight` | Read finalized head | V2 enablement gate; abandon grace check; finality budgets |
+| `get_latest_block` | Height, hash and state root of the latest stored block (other fields ignored) | `reassign`: read before and after its two coverage reads, as a stability check |
 | `chain_getTransactionStatus` | Poll a submitted tx to `Finalized` / `Failed` / `Dropped` | Every tx-submitting path after `send_raw_transaction` |
 | `get_balance` | Preflight: does this address have enough Koppa? | Runbook smoke / manual preflight |
 | `get_nonce` | Fetch nonce for signing the next tx | Every tx-signing path |
 | `chain_id` | Live-RPC chain id read | `register-node`; used to be safe against `--chain-id` misconfiguration |
 | `storage_getFileInfoV2` | Read a V2 file's row: visibility, lifecycle, access list, fee pool | Route Public vs Private; verify preconditions before write; ACL check on serve |
 | `storage_getActiveNodesAtHeight` | Snapshot of active-`ArchiveNode` rows at a chain height | V2 ingest assignment; three-archive bootstrap gate |
-| `storage_getAssignmentCoverageV2` | Coverage bitmap + `can_activate_now` predicate for a Pending V2 file; `reassignment_needed` | Ingest S4 coverage poll; `reassign` precondition |
+| `storage_getAssignmentCoverageV2` | Coverage bitmap + `can_activate_now` predicate for a Pending V2 file; `reassignment_needed`; per-epoch archive lists | Ingest S4 coverage poll; `reassign` precondition and N2 selection (read twice per attempt) |
 | `storage_buildReassignChunksV2` | Chain's no-key builder for the unsigned owner `ReassignChunksV2` transaction | `reassign` (output verified before signing) |
 | `storage_getActiveNodes` | Legacy bare snapshot (unsupported/removed on chain) | **No longer called by SNIP** — V1 MarketSync, upload, and legacy download read the finalized height and call `storage_getActiveNodesAtHeight` |
 | `storage_getFundedFiles` | V1 files with `fee_pool > 0` | V1 MarketSync path |

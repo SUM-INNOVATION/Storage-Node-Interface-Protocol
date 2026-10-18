@@ -17,8 +17,9 @@
 //!
 //! 1. Read the file row and refuse unless its owner is this key's address.
 //! 2. Read the chain's replication factor.
-//! 3. Read coverage inside a latest-height bracket (see *One chain state*
-//!    below) and refuse unless the chain reports `reassignment_needed`.
+//! 3. Read coverage twice between two reads of the chain head (see *Read
+//!    stability* below) and refuse unless the chain reports
+//!    `reassignment_needed`.
 //! 4. **N2:** look for a *departed assignee*: an archive in the latest
 //!    epoch's `per_archive` list with `currently_active == false` that is
 //!    assigned at least one chunk. The chain's own `assigned_count` decides
@@ -45,30 +46,41 @@
 //! bytes ends the call before anything is signed. The command runs only when
 //! the owner invokes it; nothing here runs in the background.
 //!
-//! # One chain state
+//! # Read stability (not an atomic snapshot)
 //!
 //! The assignment inputs (the latest epoch's snapshot and the file's chunk
 //! count) and the active-set inputs (`currently_active`, and the flag derived
-//! from it) must describe the same chain state. Both come from **one**
-//! coverage response: its latest `per_epoch.per_archive` list is exactly the
-//! chain's archive snapshot at the latest epoch height, and the chain fills
-//! `currently_active` for each entry in the same handler call. No second
-//! snapshot RPC is mixed in.
+//! from it) are all taken from **one** coverage response: its latest
+//! `per_epoch.per_archive` list is the chain's archive snapshot at the latest
+//! epoch height, and the chain fills `currently_active` for each entry in the
+//! same handler call. No second snapshot RPC is mixed in.
 //!
-//! The coverage RPC takes no height and reports none, and it reads the node's
-//! latest committed rows without a database snapshot. So the read is
-//! bracketed: the latest block height is read before and after, and the
-//! response is used only if the two are equal and the response is internally
-//! consistent (flag set ⇒ some archive in the latest snapshot is inactive).
-//! Otherwise it is read again, up to [`SNAPSHOT_ATTEMPTS`] times in all, then
-//! the command refuses.
+//! sum-chain (checked at `d8130ead`) offers no coverage query pinned to a
+//! height or a state root, and the coverage response carries no height, block
+//! hash or state root. The handler reads the node's latest rows without a
+//! database snapshot. So each attempt is:
 //!
-//! Residual: the node can write some state while executing a block before it
-//! advances its reported head, so equal heights cannot exclude every
-//! interleaving. The chain re-evaluates its own acceptance rule when it
-//! executes the transaction, so a stale read can at worst cost one fee for a
-//! reassignment the chain still accepts, or skip one the owner can re-run; it
-//! cannot make the chain accept an invalid reassignment.
+//! 1. `head_1` = (height, hash, state root) of the latest block, from
+//!    `get_latest_block`. The chain fills all three from one block record.
+//! 2. Coverage read A, then coverage read B.
+//! 3. `head_2` = the latest block again.
+//!
+//! The attempt is used only if `head_1 == head_2` (so a new block, or a
+//! different block at the same height, between the two head reads is
+//! detected), A and B are identical, and A agrees with itself (flag set ⇒ some
+//! archive in the latest snapshot is inactive). Otherwise the attempt is
+//! repeated, [`READ_ATTEMPTS`] attempts in all, and then the command refuses.
+//! A response that cannot support the decision is refused at once.
+//!
+//! This is a stability check, not an atomic snapshot. The node writes some
+//! state while it is still executing a block, before it stores that block and
+//! moves its head, so a read can expose state from a block in progress while
+//! both head reads still agree; a change that appears and is undone between
+//! two reads also goes unseen. The chain re-checks its own acceptance rule
+//! when it executes the transaction, so the worst a stale read can cause is
+//! one fee for a reassignment the chain still accepts, or a skipped one the
+//! owner can re-run. It cannot make the chain accept an invalid
+//! reassignment.
 //!
 //! Scope: this submits the chain transaction only. SNIP's push, attestation
 //! and download paths still use the file's original assignment snapshot, so
@@ -80,7 +92,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use sum_types::rpc_types::{
-    AssignmentCoverageV2, ChainParamsInfo, StorageBuildResponse, StorageFileInfoV2,
+    AssignmentCoverageV2, BlockHeadInfo, ChainParamsInfo, StorageBuildResponse, StorageFileInfoV2,
 };
 use sumchain_wire::{
     Address, Hash,
@@ -92,10 +104,10 @@ use tracing::info;
 use crate::rpc_client::L1RpcClient;
 use crate::tx_wait::{TxStatusSource, TxWaitError, wait_for_finalized};
 
-/// Bracketed coverage reads before the command gives up on one consistent
-/// chain state. Blocks arrive every few seconds and one read takes
-/// milliseconds, so a second attempt almost always lands inside one block.
-pub const SNAPSHOT_ATTEMPTS: usize = 3;
+/// Attempts (head, coverage, coverage, head) before the command refuses.
+/// Blocks arrive every few seconds and an attempt takes milliseconds, so a
+/// second attempt almost always falls between two blocks.
+pub const READ_ATTEMPTS: usize = 3;
 
 /// Chain calls the reassignment flow needs. Production impl on
 /// [`L1RpcClient`]; tests provide a scripted mock.
@@ -112,8 +124,9 @@ pub trait ReassignRpc: TxStatusSource + Send + Sync {
         merkle_root_hex: &str,
     ) -> Result<Option<AssignmentCoverageV2>>;
     async fn chain_get_chain_params(&self) -> Result<ChainParamsInfo>;
-    /// The latest included block height (not the finalized one).
-    async fn chain_get_latest_block_height(&self) -> Result<u64>;
+    /// Height, hash and state root of the node's latest stored block (not the
+    /// finalized one).
+    async fn get_latest_block_head(&self) -> Result<BlockHeadInfo>;
     async fn storage_build_reassign_chunks_v2(
         &self,
         from_base58: &str,
@@ -145,10 +158,8 @@ impl ReassignRpc for L1RpcClient {
         L1RpcClient::chain_get_chain_params(self).await
     }
 
-    async fn chain_get_latest_block_height(&self) -> Result<u64> {
-        Ok(L1RpcClient::chain_get_latest_block_height(self)
-            .await?
-            .height)
+    async fn get_latest_block_head(&self) -> Result<BlockHeadInfo> {
+        L1RpcClient::get_latest_block_head(self).await
     }
 
     async fn storage_build_reassign_chunks_v2(
@@ -215,7 +226,7 @@ pub enum N2Verdict {
 /// Why a coverage response cannot support the N2 decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum N2Error {
-    /// The response contradicts itself, as a read that straddles a block can.
+    /// The response contradicts itself, as a read that overlaps a block can.
     /// Read again.
     Inconsistent(String),
     /// The response lacks what the decision needs. Refuse.
@@ -382,8 +393,8 @@ pub enum ReassignOutcome {
         fee: u128,
         signing_hash: String,
         departed: DepartedAssignee,
-        /// Latest height the coverage read was bracketed by.
-        at_height: u64,
+        /// The chain head both head reads returned.
+        head: BlockHeadInfo,
     },
     /// The chain has no V2 row (or no coverage row) for this root.
     NotRegistered,
@@ -399,11 +410,12 @@ pub enum ReassignOutcome {
     NoDepartedAssignee {
         latest_assignment_epoch: u64,
         departed: Vec<String>,
-        at_height: u64,
+        head: BlockHeadInfo,
     },
-    /// No coverage read inside [`SNAPSHOT_ATTEMPTS`] came from one consistent
-    /// chain state. Nothing was built or signed.
-    InconsistentSnapshot { attempts: usize, reason: String },
+    /// No attempt in [`READ_ATTEMPTS`] passed the read-stability check (the
+    /// chain head changed, the two coverage reads differed, or the response
+    /// contradicted itself). Nothing was built or signed.
+    UnstableRead { attempts: usize, reason: String },
     /// The coverage response cannot support the N2 decision. Nothing was
     /// built or signed.
     UnusableCoverage { reason: String },
@@ -536,47 +548,64 @@ pub async fn reassign_chunks_v2_with<R: ReassignRpc + ?Sized>(
         Err(e) => return ReassignOutcome::Failed { source: e },
     };
 
-    // One consistent chain state: bracketed coverage reads (module docs).
-    let mut decided: Option<(N2Verdict, AssignmentCoverageV2, u64)> = None;
+    // Read stability: head, coverage, coverage, head (module docs). This is
+    // a stability check, not an atomic snapshot.
+    let mut decided: Option<(N2Verdict, AssignmentCoverageV2, BlockHeadInfo)> = None;
     let mut last_reason = String::new();
-    for _ in 0..SNAPSHOT_ATTEMPTS {
-        let before = match rpc.chain_get_latest_block_height().await {
+    for _ in 0..READ_ATTEMPTS {
+        let head_1 = match rpc.get_latest_block_head().await {
             Ok(h) => h,
             Err(e) => return ReassignOutcome::Failed { source: e },
         };
-        let coverage = match rpc.storage_get_assignment_coverage_v2(&root_hex).await {
+        let first = match rpc.storage_get_assignment_coverage_v2(&root_hex).await {
             Ok(Some(c)) => c,
             Ok(None) => return ReassignOutcome::NotRegistered,
             Err(e) => return ReassignOutcome::Failed { source: e },
         };
         // Not submitting is safe whatever state the read saw.
-        if !coverage.reassignment_needed {
+        if !first.reassignment_needed {
             return ReassignOutcome::NotNeeded {
-                latest_assignment_epoch: coverage.resolved_latest_epoch(),
+                latest_assignment_epoch: first.resolved_latest_epoch(),
             };
         }
-        let after = match rpc.chain_get_latest_block_height().await {
+        let second = match rpc.storage_get_assignment_coverage_v2(&root_hex).await {
+            Ok(Some(c)) => c,
+            Ok(None) => return ReassignOutcome::NotRegistered,
+            Err(e) => return ReassignOutcome::Failed { source: e },
+        };
+        let head_2 = match rpc.get_latest_block_head().await {
             Ok(h) => h,
             Err(e) => return ReassignOutcome::Failed { source: e },
         };
-        if before != after {
+        if head_1 != head_2 {
             last_reason = format!(
-                "a block was applied during the coverage read (latest height {before} -> {after})"
+                "the chain head changed during the reads: height {} hash {} state root {} \
+                 -> height {} hash {} state root {}",
+                head_1.height,
+                head_1.hash,
+                head_1.state_root,
+                head_2.height,
+                head_2.hash,
+                head_2.state_root
             );
             continue;
         }
-        match evaluate_n2(&coverage, &req.merkle_root, replication_factor, oracle) {
+        if first != second {
+            last_reason = "the two coverage reads differ".into();
+            continue;
+        }
+        match evaluate_n2(&first, &req.merkle_root, replication_factor, oracle) {
             Ok(verdict) => {
-                decided = Some((verdict, coverage, before));
+                decided = Some((verdict, first, head_1));
                 break;
             }
             Err(N2Error::Inconsistent(reason)) => last_reason = reason,
             Err(N2Error::Unusable(reason)) => return ReassignOutcome::UnusableCoverage { reason },
         }
     }
-    let Some((verdict, coverage, at_height)) = decided else {
-        return ReassignOutcome::InconsistentSnapshot {
-            attempts: SNAPSHOT_ATTEMPTS,
+    let Some((verdict, coverage, head)) = decided else {
+        return ReassignOutcome::UnstableRead {
+            attempts: READ_ATTEMPTS,
             reason: last_reason,
         };
     };
@@ -586,7 +615,7 @@ pub async fn reassign_chunks_v2_with<R: ReassignRpc + ?Sized>(
             return ReassignOutcome::NoDepartedAssignee {
                 latest_assignment_epoch: coverage.latest_assignment_epoch,
                 departed,
-                at_height,
+                head,
             };
         }
     };
@@ -594,7 +623,8 @@ pub async fn reassign_chunks_v2_with<R: ReassignRpc + ?Sized>(
         root = %root_hex,
         departed = %departed.archive,
         evidence = ?departed.evidence,
-        at_height,
+        head_height = head.height,
+        head_hash = %head.hash,
         "N2: a departed archive holds a chunk under the latest epoch"
     );
 
@@ -616,7 +646,7 @@ pub async fn reassign_chunks_v2_with<R: ReassignRpc + ?Sized>(
             fee: tx.fee,
             signing_hash: resp.signing_hash,
             departed,
-            at_height,
+            head,
         };
     }
 
@@ -755,6 +785,15 @@ mod tests {
         )
     }
 
+    /// A chain head: `tag` distinguishes blocks at the same height.
+    fn head(height: u64, tag: u8) -> BlockHeadInfo {
+        BlockHeadInfo {
+            height,
+            hash: format!("0x{}", hex::encode([tag; 32])),
+            state_root: format!("0x{}", hex::encode([!tag; 32])),
+        }
+    }
+
     fn chain_params(r: u32) -> ChainParamsInfo {
         ChainParamsInfo {
             chain_id: CHAIN_ID,
@@ -854,7 +893,7 @@ mod tests {
     struct MockRpc {
         info: Reply<Option<StorageFileInfoV2>>,
         params: Reply<ChainParamsInfo>,
-        heights: Script<Reply<u64>>,
+        heads: Script<Reply<BlockHeadInfo>>,
         coverage: Script<Reply<Option<AssignmentCoverageV2>>>,
         build: Reply<StorageBuildResponse>,
         send: Reply<String>,
@@ -872,7 +911,7 @@ mod tests {
             MockRpc {
                 info: Reply::Ok(Some(file_info(&own))),
                 params: Reply::Ok(chain_params(R)),
-                heights: Script::new(vec![Reply::Ok(500)]),
+                heads: Script::new(vec![Reply::Ok(head(500, 0xaa))]),
                 coverage: Script::new(responses.into_iter().map(|c| Reply::Ok(Some(c))).collect()),
                 build: Reply::Ok(honest_build(&own, ROOT, CHAIN_ID, FEE)),
                 send: Reply::Ok("0xfeed".into()),
@@ -916,8 +955,8 @@ mod tests {
         async fn chain_get_chain_params(&self) -> Result<ChainParamsInfo> {
             self.params.get()
         }
-        async fn chain_get_latest_block_height(&self) -> Result<u64> {
-            self.heights.next().get()
+        async fn get_latest_block_head(&self) -> Result<BlockHeadInfo> {
+            self.heads.next().get()
         }
         async fn storage_build_reassign_chunks_v2(
             &self,
@@ -1027,6 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn not_needed_is_refused_before_building_or_signing() {
         let rpc = MockRpc::with_coverage(vec![coverage(false)]);
+        // Not submitting is safe on any read, so the first read decides.
         let out = reassign_chunks_v2(&rpc, &SEED, &request(false)).await;
         assert!(
             matches!(
@@ -1061,11 +1101,11 @@ mod tests {
                 ReassignOutcome::NoDepartedAssignee {
                     latest_assignment_epoch,
                     departed,
-                    at_height,
+                    head: at,
                 } => {
                     assert_eq!(latest_assignment_epoch, 100);
                     assert_eq!(departed, vec![archive(LEFT), archive(0x34)]);
-                    assert_eq!(at_height, 500);
+                    assert_eq!(at, head(500, 0xaa));
                 }
                 other => panic!("expected NoDepartedAssignee, got {other:?}"),
             }
@@ -1171,42 +1211,167 @@ mod tests {
         assert!(oracle.asked.lock().unwrap().is_empty());
     }
 
-    /// A block applied during the read: the read is repeated, and the command
-    /// refuses after `SNAPSHOT_ATTEMPTS` without one consistent state.
+    /// Stable reads proceed: the head is read twice, coverage twice, and the
+    /// command goes on to the builder.
     #[tokio::test]
-    async fn height_mismatch_between_reads_is_retried_then_refused() {
-        // Every bracket straddles a block.
+    async fn stable_reads_proceed() {
+        let rpc = MockRpc::happy();
+        let out = reassign_chunks_v2(&rpc, &SEED, &request(true)).await;
+        assert!(
+            matches!(out, ReassignOutcome::DryRun { head: ref at, .. } if *at == head(500, 0xaa)),
+            "got {out:?}"
+        );
+        assert_eq!(rpc.heads.calls(), 2);
+        assert_eq!(rpc.coverage.calls(), 2);
+        assert_eq!(rpc.built(), 1);
+    }
+
+    /// A new block between the two head reads: the attempt is repeated, and
+    /// the command refuses after `READ_ATTEMPTS`.
+    #[tokio::test]
+    async fn a_new_block_between_head_reads_is_retried_then_refused() {
         let mut rpc = MockRpc::happy();
-        rpc.heights = Script::new((10..30).map(Reply::Ok).collect());
+        rpc.heads = Script::new((10..30).map(|h| Reply::Ok(head(h, 0xaa))).collect());
         let out = reassign_chunks_v2(&rpc, &SEED, &request(false)).await;
         match out {
-            ReassignOutcome::InconsistentSnapshot { attempts, reason } => {
-                assert_eq!(attempts, SNAPSHOT_ATTEMPTS);
-                assert!(reason.contains("block was applied"), "{reason}");
+            ReassignOutcome::UnstableRead { attempts, reason } => {
+                assert_eq!(attempts, READ_ATTEMPTS);
+                assert!(reason.contains("chain head changed"), "{reason}");
             }
-            other => panic!("expected InconsistentSnapshot, got {other:?}"),
+            other => panic!("expected UnstableRead, got {other:?}"),
         }
-        assert_eq!(rpc.coverage.calls(), SNAPSHOT_ATTEMPTS);
-        rpc.assert_untouched("heights never matched");
+        assert_eq!(rpc.coverage.calls(), 2 * READ_ATTEMPTS);
+        rpc.assert_untouched("a new block every attempt");
 
-        // The first bracket straddles a block, the second does not.
+        // The first attempt sees a new block, the second does not.
         let mut rpc = MockRpc::happy();
-        rpc.heights = Script::new(vec![
-            Reply::Ok(10),
-            Reply::Ok(11),
-            Reply::Ok(11),
-            Reply::Ok(11),
+        rpc.heads = Script::new(vec![
+            Reply::Ok(head(10, 0xaa)),
+            Reply::Ok(head(11, 0xbb)),
+            Reply::Ok(head(11, 0xbb)),
+            Reply::Ok(head(11, 0xbb)),
         ]);
         let out = reassign_chunks_v2(&rpc, &SEED, &request(true)).await;
         assert!(
-            matches!(out, ReassignOutcome::DryRun { at_height: 11, .. }),
+            matches!(out, ReassignOutcome::DryRun { head: ref at, .. } if *at == head(11, 0xbb)),
             "got {out:?}"
         );
-        assert_eq!(rpc.coverage.calls(), 2);
+        assert_eq!(rpc.coverage.calls(), 4);
+    }
+
+    /// A same-height reorg: both head reads report the same height but
+    /// different blocks. Height alone would pass; the hash catches it.
+    #[tokio::test]
+    async fn a_same_height_reorg_between_head_reads_is_retried_then_refused() {
+        let (a, b) = (head(500, 0xaa), head(500, 0xbb));
+        assert_eq!(a.height, b.height);
+        let mut rpc = MockRpc::happy();
+        rpc.heads = Script::new(
+            (0..READ_ATTEMPTS)
+                .flat_map(|_| [Reply::Ok(a.clone()), Reply::Ok(b.clone())])
+                .collect(),
+        );
+        let out = reassign_chunks_v2(&rpc, &SEED, &request(false)).await;
+        match out {
+            ReassignOutcome::UnstableRead { attempts, reason } => {
+                assert_eq!(attempts, READ_ATTEMPTS);
+                assert!(
+                    reason.contains(&a.hash) && reason.contains(&b.hash),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected UnstableRead, got {other:?}"),
+        }
+        rpc.assert_untouched("same-height reorg every attempt");
+
+        // Same height and hash but a different state root is refused too.
+        let mut other_root = a.clone();
+        other_root.state_root = b.state_root.clone();
+        let mut rpc = MockRpc::happy();
+        rpc.heads = Script::new(
+            (0..READ_ATTEMPTS)
+                .flat_map(|_| [Reply::Ok(a.clone()), Reply::Ok(other_root.clone())])
+                .collect(),
+        );
+        let out = reassign_chunks_v2(&rpc, &SEED, &request(false)).await;
+        assert!(
+            matches!(out, ReassignOutcome::UnstableRead { .. }),
+            "got {out:?}"
+        );
+        rpc.assert_untouched("state root changed every attempt");
+
+        // One reorg, then a stable attempt on the new block.
+        let mut rpc = MockRpc::happy();
+        rpc.heads = Script::new(vec![
+            Reply::Ok(a.clone()),
+            Reply::Ok(b.clone()),
+            Reply::Ok(b.clone()),
+            Reply::Ok(b.clone()),
+        ]);
+        let out = reassign_chunks_v2(&rpc, &SEED, &request(true)).await;
+        assert!(
+            matches!(out, ReassignOutcome::DryRun { head: ref at, .. } if *at == b),
+            "got {out:?}"
+        );
+    }
+
+    /// The assignment data changes between the two coverage reads (same
+    /// head): the attempt is repeated, and the command refuses after
+    /// `READ_ATTEMPTS`. Two identical reads are then used.
+    #[tokio::test]
+    async fn changed_assignment_data_between_coverage_reads_is_retried_then_refused() {
+        let a = coverage(true);
+        let b = coverage_with(
+            true,
+            2,
+            vec![entry(STAYS, Some(1), true), entry(LEFT, Some(2), false)],
+        );
+        assert_ne!(a, b);
+        let rpc = MockRpc::with_coverage(
+            (0..READ_ATTEMPTS)
+                .flat_map(|_| [a.clone(), b.clone()])
+                .collect(),
+        );
+        let out = reassign_chunks_v2(&rpc, &SEED, &request(false)).await;
+        match out {
+            ReassignOutcome::UnstableRead { attempts, reason } => {
+                assert_eq!(attempts, READ_ATTEMPTS);
+                assert!(reason.contains("coverage reads differ"), "{reason}");
+            }
+            other => panic!("expected UnstableRead, got {other:?}"),
+        }
+        assert_eq!(rpc.coverage.calls(), 2 * READ_ATTEMPTS);
+        rpc.assert_untouched("coverage changed every attempt");
+
+        // The active flags change instead: refused the same way.
+        let mut c = a.clone();
+        c.per_epoch[0].per_archive[0].currently_active = false;
+        let rpc = MockRpc::with_coverage(
+            (0..READ_ATTEMPTS)
+                .flat_map(|_| [a.clone(), c.clone()])
+                .collect(),
+        );
+        let out = reassign_chunks_v2(&rpc, &SEED, &request(false)).await;
+        assert!(
+            matches!(out, ReassignOutcome::UnstableRead { .. }),
+            "got {out:?}"
+        );
+        rpc.assert_untouched("active flags changed every attempt");
+
+        // Changed once, then stable: the stable pair is used.
+        let rpc = MockRpc::with_coverage(vec![a, b.clone(), b.clone(), b]);
+        let out = reassign_chunks_v2(&rpc, &SEED, &request(true)).await;
+        assert!(
+            matches!(out, ReassignOutcome::DryRun { ref departed, .. }
+                if departed.evidence == AssignedEvidence::ChainCount(2)),
+            "got {out:?}"
+        );
+        assert_eq!(rpc.coverage.calls(), 4);
     }
 
     /// Flag set but every archive in the latest snapshot active: the response
-    /// mixes two states. It is read again; a consistent read is used.
+    /// contradicts itself. The attempt is repeated; a later self-consistent
+    /// pair of reads is used.
     #[tokio::test]
     async fn a_self_contradicting_response_is_retried_then_refused() {
         let mixed = coverage_with(
@@ -1219,20 +1384,21 @@ mod tests {
         assert!(
             matches!(
                 out,
-                ReassignOutcome::InconsistentSnapshot {
-                    attempts: SNAPSHOT_ATTEMPTS,
+                ReassignOutcome::UnstableRead {
+                    attempts: READ_ATTEMPTS,
                     ..
                 }
             ),
             "got {out:?}"
         );
-        assert_eq!(rpc.coverage.calls(), SNAPSHOT_ATTEMPTS);
+        assert_eq!(rpc.coverage.calls(), 2 * READ_ATTEMPTS);
         rpc.assert_untouched("self-contradicting coverage");
 
-        let rpc = MockRpc::with_coverage(vec![mixed, coverage(true)]);
+        let rpc =
+            MockRpc::with_coverage(vec![mixed.clone(), mixed, coverage(true), coverage(true)]);
         let out = reassign_chunks_v2(&rpc, &SEED, &request(true)).await;
         assert!(matches!(out, ReassignOutcome::DryRun { .. }), "got {out:?}");
-        assert_eq!(rpc.coverage.calls(), 2);
+        assert_eq!(rpc.coverage.calls(), 4);
     }
 
     /// Responses that cannot support the decision are refused at once.
@@ -1264,7 +1430,7 @@ mod tests {
                 matches!(out, ReassignOutcome::UnusableCoverage { .. }),
                 "{name}: got {out:?}"
             );
-            assert_eq!(rpc.coverage.calls(), 1, "{name}: no retry");
+            assert_eq!(rpc.coverage.calls(), 2, "{name}: one attempt, no retry");
             rpc.assert_untouched(name);
         }
 
@@ -1301,7 +1467,7 @@ mod tests {
         };
         let out = reassign_chunks_v2(&rpc, &SEED, &request(false)).await;
         assert!(matches!(out, ReassignOutcome::NotRegistered), "got {out:?}");
-        assert!(rpc.sent().is_empty());
+        rpc.assert_untouched("no file row");
 
         let rpc = MockRpc {
             coverage: Script::new(vec![Reply::Ok(None)]),
@@ -1309,7 +1475,16 @@ mod tests {
         };
         let out = reassign_chunks_v2(&rpc, &SEED, &request(false)).await;
         assert!(matches!(out, ReassignOutcome::NotRegistered), "got {out:?}");
-        assert!(rpc.sent().is_empty());
+        rpc.assert_untouched("no coverage row");
+
+        // The row disappears between the two coverage reads.
+        let rpc = MockRpc {
+            coverage: Script::new(vec![Reply::Ok(Some(coverage(true))), Reply::Ok(None)]),
+            ..MockRpc::happy()
+        };
+        let out = reassign_chunks_v2(&rpc, &SEED, &request(false)).await;
+        assert!(matches!(out, ReassignOutcome::NotRegistered), "got {out:?}");
+        rpc.assert_untouched("coverage row gone on the second read");
     }
 
     /// Every way the builder's output can disagree with the request is
@@ -1398,37 +1573,73 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_errors_fail_closed_at_every_step() {
-        let cases = [
-            MockRpc {
-                info: Reply::Err("file info down"),
-                ..MockRpc::happy()
-            },
-            MockRpc {
-                params: Reply::Err("chain params down"),
-                ..MockRpc::happy()
-            },
-            MockRpc {
-                heights: Script::new(vec![Reply::Err("height down")]),
-                ..MockRpc::happy()
-            },
-            MockRpc {
-                heights: Script::new(vec![Reply::Ok(500), Reply::Err("height down after")]),
-                ..MockRpc::happy()
-            },
-            MockRpc {
-                coverage: Script::new(vec![Reply::Err("coverage down")]),
-                ..MockRpc::happy()
-            },
-            MockRpc {
-                build: Reply::Err("builder down"),
-                ..MockRpc::happy()
-            },
+        // Failures before the builder: it is never called, nothing is sent.
+        let before_builder = [
+            (
+                "file info",
+                MockRpc {
+                    info: Reply::Err("file info down"),
+                    ..MockRpc::happy()
+                },
+            ),
+            (
+                "chain params",
+                MockRpc {
+                    params: Reply::Err("chain params down"),
+                    ..MockRpc::happy()
+                },
+            ),
+            (
+                "first head read",
+                MockRpc {
+                    heads: Script::new(vec![Reply::Err("head down")]),
+                    ..MockRpc::happy()
+                },
+            ),
+            (
+                "second head read",
+                MockRpc {
+                    heads: Script::new(vec![
+                        Reply::Ok(head(500, 0xaa)),
+                        Reply::Err("head down after"),
+                    ]),
+                    ..MockRpc::happy()
+                },
+            ),
+            (
+                "first coverage read",
+                MockRpc {
+                    coverage: Script::new(vec![Reply::Err("coverage down")]),
+                    ..MockRpc::happy()
+                },
+            ),
+            (
+                "second coverage read",
+                MockRpc {
+                    coverage: Script::new(vec![
+                        Reply::Ok(Some(coverage(true))),
+                        Reply::Err("coverage down on the second read"),
+                    ]),
+                    ..MockRpc::happy()
+                },
+            ),
         ];
-        for rpc in cases {
+        for (name, rpc) in before_builder {
             let out = reassign_chunks_v2(&rpc, &SEED, &request(false)).await;
-            assert!(matches!(out, ReassignOutcome::Failed { .. }), "got {out:?}");
-            assert!(rpc.sent().is_empty());
+            assert!(
+                matches!(out, ReassignOutcome::Failed { .. }),
+                "{name}: got {out:?}"
+            );
+            rpc.assert_untouched(name);
         }
+
+        let rpc = MockRpc {
+            build: Reply::Err("builder down"),
+            ..MockRpc::happy()
+        };
+        let out = reassign_chunks_v2(&rpc, &SEED, &request(false)).await;
+        assert!(matches!(out, ReassignOutcome::Failed { .. }), "got {out:?}");
+        assert!(rpc.sent().is_empty());
 
         let rpc = MockRpc {
             send: Reply::Err("submission refused by the node"),
@@ -1448,7 +1659,7 @@ mod tests {
                 fee,
                 signing_hash,
                 departed,
-                at_height,
+                head: at,
             } => {
                 assert_eq!(nonce, NONCE);
                 assert_eq!(fee, FEE);
@@ -1457,7 +1668,7 @@ mod tests {
                     honest_build(&addr(&SEED), ROOT, CHAIN_ID, FEE).signing_hash
                 );
                 assert_eq!(departed.archive, archive(LEFT));
-                assert_eq!(at_height, 500);
+                assert_eq!(at, head(500, 0xaa));
             }
             other => panic!("expected DryRun, got {other:?}"),
         }

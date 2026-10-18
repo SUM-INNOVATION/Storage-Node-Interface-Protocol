@@ -266,10 +266,11 @@ enum Command {
     /// the request, then signs it with `--key-file` (the same owner key as
     /// `abandon` and ingest) and waits for finality. It refuses a file owned
     /// by another address, a file the chain does not mark
-    /// `reassignment_needed`, a file no departed archive holds a chunk of, a
-    /// coverage read that does not come from one chain state, and any built
-    /// transaction that disagrees with the request. `--dry-run` verifies and
-    /// stops without signing.
+    /// `reassignment_needed`, a file no departed archive holds a chunk of,
+    /// coverage reads that do not stay stable (the chain head or the
+    /// response changes between reads), and any built transaction that
+    /// disagrees with the request. `--dry-run` verifies and stops without
+    /// signing.
     Reassign {
         /// Hex-encoded 32-byte merkle root of the file.
         merkle_root: String,
@@ -1506,30 +1507,33 @@ async fn run_reassign_v2(
             fee,
             signing_hash,
             departed,
-            at_height,
+            head,
         } => {
             println!(
                 "dry run: ReassignChunksV2 for {root} verified (nonce={nonce} fee={fee} \
-                 signing_hash={signing_hash}); departed_assignee={} ({:?}) at latest \
-                 height {at_height}; nothing signed or sent",
-                departed.archive, departed.evidence
+                 signing_hash={signing_hash}); departed_assignee={} ({:?}); coverage read \
+                 twice between two reads of chain head height {} hash {}; nothing signed \
+                 or sent",
+                departed.archive, departed.evidence, head.height, head.hash
             );
             Ok(())
         }
         ReassignOutcome::NoDepartedAssignee {
             latest_assignment_epoch,
             departed,
-            at_height,
+            head,
         } => anyhow::bail!(
             "reassign: no departed assignee; not submitting. The chain reports \
              reassignment_needed for {root}, but no archive that left the latest \
              snapshot (epoch {latest_assignment_epoch}; departed: {}) holds a chunk of \
-             this file (read at latest height {at_height})",
-            departed.join(", ")
+             this file (chain head height {} hash {})",
+            departed.join(", "),
+            head.height,
+            head.hash
         ),
-        ReassignOutcome::InconsistentSnapshot { attempts, reason } => anyhow::bail!(
-            "reassign: no consistent coverage read for {root} in {attempts} attempts \
-             ({reason}); nothing submitted, re-run the command"
+        ReassignOutcome::UnstableRead { attempts, reason } => anyhow::bail!(
+            "reassign: the coverage reads for {root} did not stay stable in {attempts} \
+             attempts ({reason}); nothing submitted, re-run the command"
         ),
         ReassignOutcome::UnusableCoverage { reason } => anyhow::bail!(
             "reassign: the coverage response for {root} cannot support the decision \

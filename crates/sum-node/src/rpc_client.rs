@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use sum_types::rpc_types::{
-    AssignmentCoverageV2, BlockHeightInfo, ChainParamsInfo, ChallengeInfo, NodeRecordInfo,
-    StorageBuildResponse, StorageFileInfo, StorageFileInfoV2, TxStatusV2,
+    AssignmentCoverageV2, BlockHeadInfo, BlockHeightInfo, ChainParamsInfo, ChallengeInfo,
+    NodeRecordInfo, StorageBuildResponse, StorageFileInfo, StorageFileInfoV2, TxStatusV2,
 };
 
 /// JSON-RPC client connected to a SUM Chain L1 node.
@@ -167,14 +167,17 @@ impl L1RpcClient {
             .await
     }
 
-    /// `chain_getBlockHeight(["latest"])` — the latest included height.
+    /// `get_latest_block` — the node's latest stored block, reduced to its
+    /// height, hash and state root.
     ///
-    /// Not a finality check. Its one caller, `sum-node reassign`, reads it
-    /// before and after a coverage read to confirm no block was applied in
-    /// between: the coverage RPC reads the node's latest committed state and
-    /// reports no height of its own.
-    pub async fn chain_get_latest_block_height(&self) -> Result<BlockHeightInfo> {
-        self.call("chain_getBlockHeight", json!(["latest"])).await
+    /// The chain answers from one block record (its latest-block pointer,
+    /// then that block), so the three fields always belong to the same
+    /// block. Not a finality check. Its one caller, `sum-node reassign`,
+    /// reads it before and after its coverage reads to detect a block, or a
+    /// same-height replacement, landing in between: the coverage RPC carries
+    /// no height, hash or state root of its own.
+    pub async fn get_latest_block_head(&self) -> Result<BlockHeadInfo> {
+        self.call("get_latest_block", json!([])).await
     }
 
     /// `chain_getChainParams` — live consensus + V2 protocol constants.
@@ -865,26 +868,41 @@ mod contract_tests {
         );
     }
 
-    /// `chain_get_latest_block_height` asks for `["latest"]` explicitly, so it
-    /// can never be mistaken for the finalized head.
+    /// `get_latest_block_head` calls `get_latest_block` with no params and
+    /// keeps height, hash and state root from the chain's `BlockInfo`,
+    /// ignoring its other fields.
     #[tokio::test]
-    async fn chain_get_latest_block_height_uses_latest_param() {
+    async fn get_latest_block_head_decodes_height_hash_and_state_root() {
         use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
         let server = start_mock_rpc(routes([(
-            "chain_getBlockHeight",
-            MockResponse::Result(json!({"height": 4248, "finality": "latest"})),
+            "get_latest_block",
+            MockResponse::Result(json!({
+                "hash": "0xaa",
+                "height": 4248,
+                "parent_hash": "0x99",
+                "timestamp": 1,
+                "tx_root": "0x00",
+                "state_root": "0xbb",
+                "proposer": "x",
+                "tx_count": 0,
+                "transactions": [],
+            })),
         )]))
         .await;
         let client = L1RpcClient::new(server.url());
-        let info = client
-            .chain_get_latest_block_height()
+        let head = client
+            .get_latest_block_head()
             .await
-            .expect("latest height must decode");
-        assert_eq!(info.height, 4248);
+            .expect("latest block must decode");
         assert_eq!(
-            server.first_params("chain_getBlockHeight"),
-            Some(json!(["latest"]))
+            head,
+            BlockHeadInfo {
+                height: 4248,
+                hash: "0xaa".into(),
+                state_root: "0xbb".into(),
+            }
         );
+        assert_eq!(server.first_params("get_latest_block"), Some(json!([])));
     }
 
     /// (b) `storage_get_active_nodes_at_height(h)` MUST call
