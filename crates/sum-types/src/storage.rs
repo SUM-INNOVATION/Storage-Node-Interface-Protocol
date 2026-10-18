@@ -39,6 +39,7 @@ pub const DEFAULT_REPLICATION_FACTOR: u32 = 3;
 /// site, `RuntimeChainParams::dev_fallback`, and `#[cfg(test)]` code
 /// reference either name.
 #[deprecated(
+    since = "0.4.0-rc4",
     note = "renamed to DEFAULT_REPLICATION_FACTOR; production code MUST read \
             ChainParamsInfo::assignment_replication_factor at runtime. Only \
             sum_node::runtime_params::RuntimeChainParams::dev_fallback may \
