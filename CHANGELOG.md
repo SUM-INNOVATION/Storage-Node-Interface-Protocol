@@ -7,7 +7,7 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ## [Unreleased]
 
-## [0.4.0-rc4] - 2026-10-18
+## [0.4.0-rc4] - Unreleased
 
 First release candidate since `v0.4.0-rc3` (2026-05-08). It carries
 every change merged since then, including the documentation first
@@ -45,10 +45,24 @@ x86_64 only; every other platform builds from source
   ([`docs/reference/chain-compat.md`](docs/reference/chain-compat.md)).
 - Mainnet, as recorded there: `chain_id` 1,
   `v2_enabled_from_height` 5,200,000, `finality_depth` 6, read from
-  the public RPC on 2026-10-18. `block_time_ms` reports 3000, which
-  is the block producer's pacing parameter and not a consensus rule;
-  the observed cadence is about 1.5 s. No SNIP code path consumes
-  `block_time_ms`.
+  the public RPC on 2026-10-18 (UTC). `block_time_ms` reports 3000,
+  which is the block producer's pacing parameter and not a consensus
+  rule; the observed cadence is about 1.5 s. No SNIP code path
+  consumes `block_time_ms`.
+- The pin identifies a chain source state for wire format, not a
+  network. The "Genesis SHA-256" that `chain-compat.md` listed from
+  2026-05-07 is withdrawn: it matches no genesis file in the chain
+  repository's history, and the pin's `genesis/mainnet_genesis.json`
+  is a placeholder template. A genesis-file hash does not identify
+  the network, because activation heights are edited into each
+  validator's runtime genesis. The only network identity SNIP uses
+  is still `chain_id`; no check changed. Mainnet's genesis block
+  hash is not recorded.
+- The local mirror is the chain's synthetic five-validator devnet
+  at the E2E workflow's `SUMCHAIN_COMMIT`
+  (`d8130ead3b77f38eff6eeb82b4e68bb1aca8e3b2`), kept separate from
+  the compatibility pin. A mirror run is not evidence about
+  mainnet.
 - Chain wire types come from `sumchain-wire`, exact-pinned at
   `=0.4.0` in the workspace `Cargo.toml`.
 
