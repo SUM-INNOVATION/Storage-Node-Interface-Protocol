@@ -7,7 +7,7 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ## [Unreleased]
 
-## [0.4.0-rc4] - Unreleased
+## [0.4.0-rc4] - 2026-10-20
 
 First release candidate since `v0.4.0-rc3` (2026-05-08). It carries
 every change merged since then, including the documentation first
@@ -144,6 +144,34 @@ x86_64 only; every other platform builds from source
   docstring.
 
 ### Fixed
+- **Ingest peer discovery ends on an explicit completion condition**
+  (#68). `ingest-v2` and `resume` used to stop looking for archives
+  about 0.7 s after the first one identified itself, so an archive
+  that identified later received no push, a chunk stayed
+  under-replicated and the file stayed `Pending`. Releases since
+  rc1 have this. Discovery now completes only when every archive
+  the push needs has a live identified peer, counted by chain
+  address: two peer ids for one archive count once, and peers the
+  assignment does not use never count. Otherwise it fails at a
+  fixed 30 s bound and names the missing archives.
+  - **Before registration:** `ingest-v2` checks the archives the
+    file would be assigned under the current eligible snapshot. If
+    one is unreachable, or the chain lists fewer eligible archives
+    than R, it refuses before `RegisterFilePendingV2`: no
+    transaction, no fee, nothing `Pending`. Interrupting it while it
+    waits leaves no chain state.
+  - **Before pushing** (and in `resume`, for the missing chunks'
+    assignees only), it waits for the archives the pinned assignment
+    names; if one never appears, the file stays `Pending` with that
+    cause named. `resume` on a file that can already activate no
+    longer waits for peers.
+  - **Disconnects:** a peer counts as disconnected only when its
+    last connection closes. Closing one of several connections no
+    longer drops a still-connected, identified peer from the peer
+    map.
+
+  No CLI flag, wire format, chain interaction or compatibility
+  check changes.
 - **Garbage collection keeps V2 chunks** (#64). Earlier releases
   could delete chunks an archive had accepted through V2 Push. The
   collector now deletes a chunk only when it can positively
