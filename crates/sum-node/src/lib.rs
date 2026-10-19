@@ -7,6 +7,7 @@ pub mod download;
 pub mod download_private;
 pub mod download_route;
 pub mod download_v2_routing;
+pub mod epoch_watcher;
 pub mod inbound_v2;
 pub mod ingest_v2;
 pub mod manifest_ingress;

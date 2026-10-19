@@ -30,6 +30,7 @@ Applies to every subcommand.
 | `--por-poll-secs` | `SUM_POR_INTERVAL` | `10` | PoR challenge polling interval. |
 | `--market-sync-secs` | `SUM_MARKET_SYNC_INTERVAL` | `30` | Market-sync polling interval. |
 | `--gc-grace-secs` | `SUM_GC_GRACE` | `3600` | Grace period before garbage-collecting unassigned chunks. |
+| `--epoch-watch-secs` | `SUM_EPOCH_WATCH_INTERVAL` | `60` | Listen mode: how often to check held V2 files for a new assignment epoch and attest held chunks again under it. `0` disables. See [assignment epochs](../operator/monitoring.md#assignment-epochs-and-re-attestation). |
 | `--chain-id` | `SUM_CHAIN_ID` | `1337` | See [`config-flags.md`](config-flags.md) "Chain ID safety." |
 | `--attest-fee` | `SUM_ATTEST_FEE` | `1000000` | Per-tx fee for V2 attestation. Must be ≥ chain `min_fee`. |
 | `--client` | `SUM_CLIENT_MODE` | `false` | Client mode: upload / download only. `listen` refused. |
