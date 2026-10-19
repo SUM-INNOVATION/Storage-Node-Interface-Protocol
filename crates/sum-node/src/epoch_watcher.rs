@@ -742,4 +742,92 @@ mod tests {
         let report = w.tick().await;
         assert_eq!(report.attested, vec![(ROOT, 1200)]);
     }
+
+    /// Interaction with the owner's `sum-node reassign` (N2). The owner tool
+    /// submits only while a departed archive holds a chunk under the latest
+    /// epoch. Once the chain stamps the new epoch without it, that archive
+    /// holds nothing (so the owner tool would not submit again), its watcher
+    /// sends nothing, and each surviving archive attests exactly its
+    /// new-epoch assignment. A newly assigned archive that holds nothing yet
+    /// (there is no re-fetch) sends nothing either.
+    #[tokio::test]
+    async fn the_owners_reassignment_is_followed_by_latest_epoch_attestations() {
+        use sum_store::assignment_v2::first_chunk_assigned_to_any;
+        let departed = archives()[4];
+        let joiner = [0xF0; 20];
+        let new = epoch1_snapshot();
+        assert!(
+            first_chunk_assigned_to_any(&ROOT, CHUNKS, &archives(), R, &[departed]).is_some(),
+            "before: the owner tool's N2 condition holds"
+        );
+        assert_eq!(
+            first_chunk_assigned_to_any(&ROOT, CHUNKS, &new, R, &[departed]),
+            None,
+            "after: the owner tool would not submit again"
+        );
+
+        for me in archives().into_iter().chain([joiner]) {
+            let chain = Chain::with_epochs(&[(500, archives()), (900, new.clone())]);
+            set_attested(&chain, 500, &me, assigned(&archives(), &me).len());
+            chain.finalize_next(1);
+            let held = if me == joiner {
+                BTreeSet::new()
+            } else {
+                all_chunks()
+            };
+            let mut w = watcher(&chain, me, held);
+            let report = w.tick().await;
+            if me == departed || me == joiner {
+                assert!(report.attested.is_empty(), "{me:02x?}");
+                assert!(chain.sent.lock().unwrap().is_empty(), "{me:02x?}");
+            } else {
+                assert_eq!(report.attested, vec![(ROOT, 900)], "{me:02x?}");
+                assert_eq!(chain.sent_indices(), vec![assigned(&new, &me)], "{me:02x?}");
+            }
+        }
+    }
+
+    /// No new signing authority: everything the watcher sends is an
+    /// `AcceptAssignmentV2` for the held file, sent from the attestor's
+    /// existing key's own address and signed by that key over the
+    /// transaction's signing hash. The watcher holds no key of its own.
+    #[tokio::test]
+    async fn watcher_transactions_are_signed_only_by_the_attestors_key() {
+        use ed25519_dalek::{Signature, SigningKey};
+        let me = archives()[0];
+        let chain = Chain::with_epochs(&[(500, archives()), (900, epoch1_snapshot())]);
+        chain.finalize_next(1);
+        let mut w = watcher(&chain, me, all_chunks());
+        assert_eq!(w.tick().await.attested, vec![(ROOT, 900)]);
+
+        let sent = chain.sent.lock().unwrap().clone();
+        assert!(!sent.is_empty());
+        let key = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        for hex in sent {
+            let signed = SignedTransaction::from_hex(&hex).unwrap();
+            assert_eq!(signed.public_key, key.to_bytes(), "the attestor's key");
+            let TxInner::V2(tx) = &signed.inner else {
+                panic!("expected a V2 transaction");
+            };
+            assert!(signed.verify_signer(), "sent from the key's own address");
+            assert_eq!(
+                tx.from,
+                sumchain_wire::address::Address::from_public_key(&key.to_bytes())
+            );
+            key.verify_strict(
+                tx.signing_hash().as_bytes(),
+                &Signature::from_bytes(&signed.signature),
+            )
+            .expect("signature verifies over the signing hash");
+            match &tx.payload {
+                TxPayload::StorageMetadataV2(d) => match &d.operation {
+                    StorageMetadataOperationV2::AcceptAssignmentV2 { merkle_root, .. } => {
+                        assert_eq!(merkle_root.as_bytes(), &ROOT)
+                    }
+                    other => panic!("unexpected operation {other:?}"),
+                },
+                other => panic!("unexpected payload {other:?}"),
+            }
+        }
+    }
 }
