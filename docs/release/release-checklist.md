@@ -203,6 +203,13 @@ It uses a read-only token and no secrets, and it is not a required
 check. A failure is a hard release blocker. Record the run URL and
 the chain commit with the release evidence.
 
+The reassignment and re-fetch scenario
+(`reassignment_refetch_restores_public_coverage`) does not run in this
+workflow: the synthetic devnet keeps `archive_reassignment_enabled_from_height`
+unset, so it skips unless `SNIP_E2E_REASSIGNMENT=1` is set, which is only
+meaningful against a devnet with that gate set. Re-fetch therefore has no
+end-to-end evidence from this run.
+
 `SUMCHAIN_COMMIT` is the chain commit the end-to-end run uses. It is
 not the compatibility pin in
 [`chain-compat.md`](../reference/chain-compat.md): at that pin the

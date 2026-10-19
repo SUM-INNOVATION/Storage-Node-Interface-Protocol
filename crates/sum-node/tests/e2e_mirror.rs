@@ -27,6 +27,9 @@
 //!   9. update_access_extend_expiry_admits_past_original_cutoff
 //!  10. update_access_clear_expiry_grants_indefinite_access
 //!  11. resume_pending_completes_to_active
+//!  13. reassignment_refetch_restores_public_coverage — opt-in with
+//!      `SNIP_E2E_REASSIGNMENT=1` on a devnet with archive reassignment
+//!      enabled (the pinned synthetic devnet keeps it dormant)
 //!
 //! Scenario 12 (archive restart) is deferred to its own follow-up
 //! commit — process-lifecycle / port-reuse / store-reload concerns
@@ -141,9 +144,19 @@ fn extract_hex32(s: &str) -> Option<String> {
 /// testable without a chain: the root each archive is given appears in its
 /// own argv, and two archives are given two different roots.
 fn archive_listen_args(role: &str, store_dir: &std::path::Path) -> Vec<String> {
-    vec![
+    archive_listen_args_with(&role_seed_path(role), store_dir, &[])
+}
+
+/// [`archive_listen_args`] for any key file, with extra global flags placed
+/// before the `listen` subcommand (for example `--refetch-secs 5`).
+fn archive_listen_args_with(
+    key_file: &std::path::Path,
+    store_dir: &std::path::Path,
+    extra: &[&str],
+) -> Vec<String> {
+    let mut args = vec![
         "--key-file".to_string(),
-        role_seed_path(role).to_str().unwrap().to_string(),
+        key_file.to_str().unwrap().to_string(),
         // Each archive needs its own store root so they do not share one
         // chunk namespace. This must be said explicitly: store-root
         // resolution consults the `--store-dir` flag, then `$SUM_STORE_DIR`,
@@ -160,8 +173,10 @@ fn archive_listen_args(role: &str, store_dir: &std::path::Path) -> Vec<String> {
         e2e_rpc_url(),
         "--chain-id".to_string(),
         "1337".to_string(),
-        "listen".to_string(),
-    ]
+    ];
+    args.extend(extra.iter().map(|a| a.to_string()));
+    args.push("listen".to_string());
+    args
 }
 
 /// Spawn a long-running `sum-node listen` archive node. Returns
@@ -169,6 +184,12 @@ fn archive_listen_args(role: &str, store_dir: &std::path::Path) -> Vec<String> {
 /// Callers are responsible for waiting a few seconds before the
 /// archive is fully discoverable (libp2p mDNS / chain registration).
 fn spawn_archive_listen(role: &str, store_dir: &std::path::Path) -> std::process::Child {
+    spawn_listen_with_args(role, archive_listen_args(role, store_dir))
+}
+
+/// Spawn `sum-node` with `args` (a `listen` invocation); `label` names it in
+/// panics.
+fn spawn_listen_with_args(label: &str, args: Vec<String>) -> std::process::Child {
     use std::process::Stdio;
     let bin_path = env!("CARGO_BIN_EXE_sum-node");
     let mut cmd = std::process::Command::new(bin_path);
@@ -179,11 +200,11 @@ fn spawn_archive_listen(role: &str, store_dir: &std::path::Path) -> std::process
     if let Ok(path) = std::env::var("PATH") {
         cmd.env("PATH", path);
     }
-    cmd.args(archive_listen_args(role, store_dir));
+    cmd.args(args);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.spawn()
-        .unwrap_or_else(|e| panic!("e2e: spawn sum-node listen for {role}: {e}"))
+        .unwrap_or_else(|e| panic!("e2e: spawn sum-node listen for {label}: {e}"))
 }
 
 /// RAII guard that kills a child process when dropped. Tests use
@@ -1239,6 +1260,291 @@ async fn resume_pending_completes_to_active() {
         "file lifecycle after resume must be Active, got {:?}",
         info.lifecycle
     );
+}
+
+// ── 13. reassignment_refetch_restores_public_coverage ───────────────────────
+
+/// Opt-in switch for scenario 13. The pinned synthetic devnet keeps
+/// `archive_reassignment_enabled_from_height` unset (sum-chain
+/// `scripts/src/setup_local_testnet.rs`), so `ReassignChunksV2` cannot execute
+/// there and the scenario would fail at step 5. It runs only with this set to
+/// `1`, against a devnet where that gate is set.
+const REASSIGNMENT_OPT_IN: &str = "SNIP_E2E_REASSIGNMENT";
+
+/// Re-fetch and a short epoch watch, for archives in scenario 13.
+const REFETCH_FLAGS: [&str; 4] = ["--refetch-secs", "5", "--epoch-watch-secs", "5"];
+
+/// Build, sign and submit one V2 transaction from `seed`, then wait for
+/// finality. Synthetic devnet keys only.
+async fn submit_v2(
+    rpc: &L1RpcClient,
+    seed: &[u8; 32],
+    payload: sumchain_wire::transaction::TxPayload,
+) -> u64 {
+    let pubkey = ed25519_dalek::SigningKey::from_bytes(seed)
+        .verifying_key()
+        .to_bytes();
+    let from = sumchain_wire::Address::from_public_key(&pubkey);
+    let nonce = rpc
+        .get_nonce(&from.to_base58())
+        .await
+        .expect("e2e: get_nonce");
+    let fee = rpc
+        .chain_get_chain_params()
+        .await
+        .expect("e2e: chain_getChainParams")
+        .min_fee;
+    let tx = sumchain_wire::transaction::TransactionV2 {
+        chain_id: 1337,
+        from,
+        fee,
+        nonce,
+        payload,
+    };
+    let hex = sum_node::tx_builder::sign_transaction_v2(seed, tx).expect("e2e: sign");
+    let hash = rpc.send_raw_transaction(&hex).await.expect("e2e: submit");
+    await_tx_finality(rpc, &hash).await
+}
+
+/// Wait until the finalized active-node snapshot shows `n` archives.
+async fn wait_active_archives(rpc: &L1RpcClient, n: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let head = rpc.chain_get_block_height().await.expect("e2e: height");
+        let nodes = rpc
+            .storage_get_active_nodes_at_height(head.height)
+            .await
+            .expect("e2e: active nodes");
+        let archives = nodes.iter().filter(|x| x.role == "ArchiveNode").count();
+        if archives >= n {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "e2e: {archives} active archives after 60s, expected {n}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// G3 P3 end to end, Public file: an assigned archive leaves the active set,
+/// the owner reassigns, and a fourth archive that the reassignment newly
+/// assigns re-fetches the file's chunks from the survivors and attests them,
+/// restoring full coverage under the latest epoch.
+#[tokio::test]
+#[ignore]
+async fn reassignment_refetch_restores_public_coverage() {
+    if std::env::var(REASSIGNMENT_OPT_IN).as_deref() != Ok("1") {
+        eprintln!(
+            "skipped: set {REASSIGNMENT_OPT_IN}=1 to run this against a devnet with \
+             archive_reassignment_enabled_from_height set; the pinned synthetic devnet \
+             keeps reassignment dormant"
+        );
+        return;
+    }
+    let rpc = setup().await;
+    funded_or_skip(&rpc, "owner").await;
+    funded_or_skip(&rpc, "third_party").await;
+
+    // 1. Three archives with re-fetch on.
+    for role in ARCHIVE_ROLES {
+        funded_or_skip(&rpc, role).await;
+        ensure_archive_registered(&rpc, role).await;
+    }
+    let mut guards: Vec<Option<ChildGuard>> = Vec::new();
+    let mut dirs = Vec::new();
+    for role in ARCHIVE_ROLES {
+        let dir = tempfile::tempdir().expect("e2e: archive store dir");
+        let args = archive_listen_args_with(&role_seed_path(role), dir.path(), &REFETCH_FLAGS);
+        guards.push(Some(ChildGuard::new(spawn_listen_with_args(role, args))));
+        dirs.push(dir);
+    }
+    wait_active_archives(&rpc, ARCHIVE_ROLES.len()).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // 2. A Public file, assigned over these three archives.
+    let (_payload_dir, path) =
+        write_test_plaintext(&unique_plaintext("reassignment_refetch", 96 * 1024));
+    let root = spawn_ingest_and_extract_root(&role_seed_path("owner"), &path, "public", &[]);
+    let root_hex = format!("0x{}", hex::encode(root));
+    let info = rpc
+        .storage_get_file_info_v2(&root_hex, None, None)
+        .await
+        .expect("e2e: file info")
+        .expect("e2e: file registered");
+
+    // 3. A fourth archive, funded by `third_party` and registered after the
+    //    file's assignment height, so only the reassignment assigns it.
+    let seed4: [u8; 32] = {
+        use rand_core::{OsRng, RngCore};
+        let mut s = [0u8; 32];
+        OsRng.fill_bytes(&mut s);
+        s
+    };
+    let key4 = common::write_seed_tempfile(&seed4);
+    let pub4 = ed25519_dalek::SigningKey::from_bytes(&seed4)
+        .verifying_key()
+        .to_bytes();
+    let addr4 = sumchain_wire::Address::from_public_key(&pub4);
+    let stake = rpc
+        .get_node_record(&role_address("archive_1"))
+        .await
+        .expect("e2e: node record")
+        .expect("e2e: archive_1 registered")
+        .staked_balance;
+    submit_v2(
+        &rpc,
+        &common::read_e2e_seed("third_party"),
+        sumchain_wire::transaction::TxPayload::Transfer {
+            to: addr4,
+            amount: u128::from(stake) * 2 + 10_000_000_000,
+        },
+    )
+    .await;
+    let out = spawn_bin(
+        "sum-node",
+        &[
+            "--key-file",
+            key4.path().to_str().unwrap(),
+            "--rpc-url",
+            &e2e_rpc_url(),
+            "register-node",
+        ],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "e2e: register the fourth archive: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dir4 = tempfile::tempdir().expect("e2e: fourth archive store dir");
+    let args4 = archive_listen_args_with(key4.path(), dir4.path(), &REFETCH_FLAGS);
+    let _archive4 = ChildGuard::new(spawn_listen_with_args("archive_4", args4));
+
+    // 4. archive_3 leaves the active set: a full-stake BeginUnstake, and its
+    //    listener stops.
+    let staked3 = rpc
+        .get_node_record(&role_address("archive_3"))
+        .await
+        .expect("e2e: node record")
+        .expect("e2e: archive_3 registered")
+        .staked_balance;
+    submit_v2(
+        &rpc,
+        &common::read_e2e_seed("archive_3"),
+        sumchain_wire::transaction::TxPayload::NodeRegistry(
+            sumchain_wire::node_registry::NodeRegistryTxData {
+                operation: sumchain_wire::node_registry::NodeRegistryOperation::BeginUnstake {
+                    amount: staked3,
+                },
+            },
+        ),
+    )
+    .await;
+    guards[2].take();
+
+    // 5. The owner reassigns once the chain reports it needed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let cov = rpc
+            .storage_get_assignment_coverage_v2(&root_hex, None, None)
+            .await
+            .expect("e2e: coverage")
+            .expect("e2e: coverage row");
+        if cov.reassignment_needed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "e2e: the chain never reported reassignment_needed after archive_3 left; is \
+             archive_reassignment_enabled_from_height set on this devnet?"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let out = spawn_bin(
+        "sum-node",
+        &[
+            "--key-file",
+            role_seed_path("owner").to_str().unwrap(),
+            "--rpc-url",
+            &e2e_rpc_url(),
+            "--chain-id",
+            "1337",
+            "reassign",
+            &root_hex,
+        ],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "e2e: sum-node reassign failed (a gate refusal means this devnet keeps \
+         reassignment dormant): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 6. The fourth archive re-fetches and attests: the latest epoch is fully
+    //    covered, it attested every chunk assigned to it, and nothing more is
+    //    needed.
+    let addr4_b58 = addr4.to_base58();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    loop {
+        let cov = rpc
+            .storage_get_assignment_coverage_v2(&root_hex, None, None)
+            .await
+            .expect("e2e: coverage")
+            .expect("e2e: coverage row");
+        let latest = cov.per_epoch.last().expect("e2e: per-epoch coverage");
+        let fourth = latest.per_archive.iter().find(|a| a.archive == addr4_b58);
+        let fourth_done = fourth.is_some_and(|a| {
+            a.assigned_count
+                .is_some_and(|n| n > 0 && a.attested_count == n)
+        });
+        if latest.epoch_height == cov.latest_assignment_epoch
+            && latest.covered_count == info.chunk_count
+            && fourth_done
+            && !cov.reassignment_needed
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "e2e: coverage not restored under the latest epoch after 240s: covered \
+             {}/{}, fourth archive {fourth:?}",
+            latest.covered_count,
+            info.chunk_count
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    drop(guards);
+    drop(dirs);
+}
+
+/// Re-fetch flags reach the archive as global flags, and the default fleet
+/// runs with re-fetch off.
+mod refetch_args {
+    use super::{REFETCH_FLAGS, archive_listen_args, archive_listen_args_with};
+
+    #[test]
+    fn default_archives_do_not_enable_refetch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = archive_listen_args("archive_1", dir.path());
+        assert!(!args.iter().any(|a| a == "--refetch-secs"));
+    }
+
+    #[test]
+    fn extra_flags_precede_the_listen_subcommand() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("k.seed.hex");
+        let args = archive_listen_args_with(&key, dir.path(), &REFETCH_FLAGS);
+        let listen = args.iter().position(|a| a == "listen").expect("listen");
+        assert_eq!(listen, args.len() - 1, "listen is last");
+        let flag = args
+            .iter()
+            .position(|a| a == "--refetch-secs")
+            .expect("flag");
+        assert!(flag < listen);
+        assert_eq!(args[flag + 1], "5");
+    }
 }
 
 /// Store-root isolation for the archive fleet, provable without a chain.
