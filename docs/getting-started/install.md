@@ -14,10 +14,12 @@ what it does before piping arbitrary scripts into your shell.
 
 ## Manual-verify path (recommended for first install)
 
-For a target version `vX.Y.Z` (e.g. `v0.4.0`):
+For a target version `vX.Y.Z` or `vX.Y.Z-rcN` (here the current pre-release,
+[`v0.4.0-rc4`](https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/tag/v0.4.0-rc4);
+the final `v0.4.0` has not been released yet):
 
 ```bash
-VERSION=v0.4.0
+VERSION=v0.4.0-rc4
 PLATFORM=linux-x86_64
 BASE=https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/${VERSION}
 
@@ -64,16 +66,16 @@ than Linux x86_64 and does not invoke `sudo` itself.
 User-local install (default `$HOME/.local/bin`):
 
 ```bash
-curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/v0.4.0/install.sh \
-    | sh -s -- --version v0.4.0
+curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/v0.4.0-rc4/install.sh \
+    | sh -s -- --version v0.4.0-rc4
 ```
 
 System-wide install (user-supplied sudo, the script does not
 auto-elevate):
 
 ```bash
-curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/v0.4.0/install.sh \
-    | sudo sh -s -- --version v0.4.0 --prefix /usr/local
+curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/v0.4.0-rc4/install.sh \
+    | sudo sh -s -- --version v0.4.0-rc4 --prefix /usr/local
 ```
 
 What the script does, in order:
@@ -112,7 +114,7 @@ source "$HOME/.cargo/env"
 
 git clone https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol.git
 cd Storage-Node-Interface-Protocol
-git checkout v0.4.0            # or target release tag
+git checkout v0.4.0-rc4        # or target release tag
 make release-check
 ```
 

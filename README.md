@@ -45,13 +45,18 @@ supported platform builds from source — see
 [`docs/getting-started/install.md`](docs/getting-started/install.md)
 for both paths.
 
+The current release is the pre-release
+[`v0.4.0-rc4`](https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/tag/v0.4.0-rc4).
+The final `v0.4.0` has not been released yet, so install the release
+candidate. Releases are checksummed (`SHA256SUMS`), not signed.
+
 The recommended first install is the manual-verify path (download
 → check SHA256 → extract → move binaries). The curl-pipe
 convenience script is:
 
 ```bash
-curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/v0.4.0/install.sh \
-    | sh -s -- --version v0.4.0
+curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/v0.4.0-rc4/install.sh \
+    | sh -s -- --version v0.4.0-rc4
 ```
 
 The script installs `sum-node` and `e2e-helper` into

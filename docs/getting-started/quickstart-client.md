@@ -15,8 +15,8 @@ You will need:
 ## 1. Install
 
 ```bash
-curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/v0.4.0/install.sh \
-    | sh -s -- --version v0.4.0
+curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/v0.4.0-rc4/install.sh \
+    | sh -s -- --version v0.4.0-rc4
 sum-node --version
 ```
 
