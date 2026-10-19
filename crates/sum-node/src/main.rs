@@ -780,14 +780,19 @@ async fn run_listen(
         // V2 reuses the same `AclChecker` as V1 — chain governs access,
         // protocol version doesn't.
         let acl_for_v2: Arc<dyn sum_node::inbound_v2::AccessChecker> = acl.clone();
-        v2_dispatcher = Some(Arc::new(V2Dispatcher::new(
+        let dispatcher = Arc::new(V2Dispatcher::new(
             validator,
             attestor,
             rpc.clone(),
             store.clone(),
             acl_for_v2,
             l1_addr,
-        )));
+        ));
+        // The held set is in memory: rebuild it from the store's records
+        // so a restart does not forget what this archive holds.
+        let rebuilt = dispatcher.seed_held_from_disk().await;
+        info!(chunks = rebuilt, "V2 held set rebuilt from disk");
+        v2_dispatcher = Some(dispatcher);
         info!("V2 dispatcher initialized — accepting V2 ingest");
     } else {
         warn!("PoR/MarketSync workers not started — no L1 keypair available");
