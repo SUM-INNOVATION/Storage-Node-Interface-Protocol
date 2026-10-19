@@ -248,6 +248,10 @@ pub struct AssignmentAttestor<R: AttestorRpc> {
     chain_id: u64,
     fee_per_tx: u128,
     params: V2Params,
+    /// Held from reading the starting nonce until the run ends, so two
+    /// attestation runs (a ManifestPush trigger and the epoch watcher, or
+    /// two files) never start from the same nonce.
+    runs: tokio::sync::Mutex<()>,
 }
 
 impl<R: AttestorRpc> AssignmentAttestor<R> {
@@ -266,7 +270,15 @@ impl<R: AttestorRpc> AssignmentAttestor<R> {
             chain_id,
             fee_per_tx,
             params,
+            runs: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Exclusive right to submit attestations. Take it before reading the
+    /// starting nonce and hold it until [`Self::attest`] returns: runs are
+    /// sequential per account, and every batch waits for finality.
+    pub async fn exclusive_run(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.runs.lock().await
     }
 
     /// Compute the assigned set ∩ held set, batch, submit, and wait.

@@ -84,6 +84,7 @@ impl<T: RespondNet + ?Sized> RespondNet for Arc<T> {
 use sum_store::SumStore;
 use sum_store::content_id::cid_from_blake3_hash;
 use sum_store::serve::validate_manifest_push;
+use sum_types::rpc_types::AssignmentCoverageV2;
 use sum_types::storage::DataManifest;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -111,7 +112,9 @@ pub const DEFAULT_ATTEST_BATCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// can be tested without hitting a real RPC.
 #[async_trait::async_trait]
 pub trait AttestTriggerRpc: Send + Sync {
-    /// Get `(chunk_count, assignment_height)` for the file at `merkle_root`.
+    /// Get `(chunk_count, assignment_height, visibility)` for the file at
+    /// `merkle_root`. `assignment_height` is the file's FIRST assignment
+    /// epoch; attestation uses [`latest_assignment_epoch`].
     async fn fetch_file_shape(&self, merkle_root: &[u8; 32]) -> Result<FileShape>;
 
     /// Get the canonical (decoded, sorted, deduped) active-node
@@ -120,6 +123,53 @@ pub trait AttestTriggerRpc: Send + Sync {
 
     /// Get the next nonce slot for `address_base58`.
     async fn fetch_nonce(&self, address_base58: &str) -> Result<u64>;
+
+    /// `storage_getAssignmentCoverageV2` for the file, read for its
+    /// assignment epochs and per-epoch attestation counts. `Ok(None)` when
+    /// the chain has no coverage row for the root. Implementations may
+    /// request an empty missing-index window.
+    async fn fetch_coverage(&self, merkle_root: &[u8; 32]) -> Result<Option<AssignmentCoverageV2>>;
+}
+
+/// The snapshot height an attestation for this file is judged against
+/// now: the file's latest assignment epoch.
+///
+/// The chain validates every `AcceptAssignmentV2` index against the
+/// assignment over the latest epoch's snapshot (the original
+/// `assignment_height` until a `ReassignChunksV2` adds an epoch) and
+/// rejects the whole transaction for any index not assigned to the signer
+/// there. `getFileInfoV2.assignment_height` stays at the first epoch, so
+/// it is used only when the chain reports no epoch list at all (a chain
+/// without reassignment epochs, where it is the only epoch).
+///
+/// Errors when the epoch cannot be read, the chain has no coverage row
+/// for a registered file, or the reported latest epoch precedes the
+/// file's first one: attesting against a guessed epoch can only produce
+/// a transaction the chain refuses.
+pub async fn latest_assignment_epoch<T: AttestTriggerRpc + ?Sized>(
+    rpc: &T,
+    merkle_root: &[u8; 32],
+    shape: &FileShape,
+) -> Result<u64> {
+    let coverage = rpc.fetch_coverage(merkle_root).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no coverage row for registered root 0x{}",
+            hex::encode(merkle_root)
+        )
+    })?;
+    epoch_from_coverage(&coverage, shape.assignment_height)
+}
+
+/// [`latest_assignment_epoch`] for a coverage row already read.
+pub fn epoch_from_coverage(coverage: &AssignmentCoverageV2, assignment_height: u64) -> Result<u64> {
+    match coverage.resolved_latest_epoch() {
+        None => Ok(assignment_height),
+        Some(latest) if latest < assignment_height => Err(anyhow::anyhow!(
+            "chain reports latest assignment epoch {latest} below the file's \
+             assignment_height {assignment_height}"
+        )),
+        Some(latest) => Ok(latest),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -242,6 +292,13 @@ impl AttestTriggerRpc for L1RpcClient {
 
     async fn fetch_nonce(&self, address_base58: &str) -> Result<u64> {
         L1RpcClient::get_nonce(self, address_base58).await
+    }
+
+    async fn fetch_coverage(&self, merkle_root: &[u8; 32]) -> Result<Option<AssignmentCoverageV2>> {
+        let key = format!("0x{}", hex::encode(merkle_root));
+        // Only the epoch fields and per-epoch counts are read: ask for an
+        // empty missing-index window.
+        L1RpcClient::storage_get_assignment_coverage_v2(self, &key, None, Some(0)).await
     }
 }
 
@@ -698,8 +755,8 @@ where
             }
             // ACK and spawn attestation. Attestation does NOT consult
             // the manifest contents — it batches `held ∩ assignment`
-            // from the in-memory tracker and `chunk_count /
-            // assignment_height` from chain. Pass an empty stub
+            // from the in-memory tracker, with `chunk_count` and the
+            // latest assignment epoch from chain. Pass an empty stub
             // DataManifest only because the existing helper signature
             // takes one; the underlying `run_attestation` ignores it.
             let resp = ShardResponseV2::ManifestPushAck {
@@ -860,8 +917,9 @@ where
     /// `storage_getAssignmentCoverageV2` in W10/W11 resume flows.
     ///
     /// The `_manifest` argument is intentionally unused — attestation
-    /// reads `chunk_count` and `assignment_height` from chain via
-    /// `fetch_file_shape` and the `held` set from the in-memory tracker
+    /// reads `chunk_count` from chain via `fetch_file_shape`, the latest
+    /// assignment epoch via [`latest_assignment_epoch`], and the `held`
+    /// set from the in-memory tracker
     /// updated by the V2 push handler. This keeps the Private path
     /// (where no decoded manifest exists) source-compatible with the
     /// Public path.
@@ -909,6 +967,11 @@ where
         return None;
     }
 
+    // One run at a time per account, taken before the epoch and nonce are
+    // read: the nonce is only a safe starting point while no other run is
+    // submitting, and the epoch is read as close to submission as possible.
+    let _run = attestor.exclusive_run().await;
+
     let shape = match trigger_rpc.fetch_file_shape(&merkle_root).await {
         Ok(s) => s,
         Err(e) => {
@@ -916,10 +979,17 @@ where
             return None;
         }
     };
-    let snapshot = match trigger_rpc.fetch_snapshot(shape.assignment_height).await {
+    let epoch = match latest_assignment_epoch(trigger_rpc.as_ref(), &merkle_root, &shape).await {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(root = %root_hex, %e, "attestation trigger: latest assignment epoch unavailable — not attesting");
+            return None;
+        }
+    };
+    let snapshot = match trigger_rpc.fetch_snapshot(epoch).await {
         Ok(s) => s,
         Err(e) => {
-            warn!(root = %root_hex, %e, "attestation trigger: fetch_snapshot failed");
+            warn!(root = %root_hex, epoch, %e, "attestation trigger: fetch_snapshot failed");
             return None;
         }
     };
@@ -945,6 +1015,7 @@ where
     if summary.fully_attested() {
         info!(
             root = %root_hex,
+            epoch,
             batches = summary.batches.len(),
             attested_count = summary.attested_count(),
             "attestation: every AcceptAssignmentV2 batch finalized"
@@ -952,6 +1023,7 @@ where
     } else {
         warn!(
             root = %root_hex,
+            epoch,
             finalized_batches = summary.batches.len(),
             attested_count = summary.attested_count(),
             error = ?summary.error,
@@ -998,7 +1070,8 @@ mod tests {
     use sum_net::l1_address_base58;
     use sum_store::merkle::MerkleTree;
     use sum_types::rpc_types::{
-        LifecycleV2, NodeRecordInfo, StorageFileInfoV2, TxStatusV2, VisibilityV2,
+        AssignmentEpochCoverageV2, LifecycleV2, NodeRecordInfo, StorageFileInfoV2, TxStatusV2,
+        VisibilityV2,
     };
     use sum_types::storage::{ChunkDescriptor, DataManifest};
 
@@ -1014,6 +1087,14 @@ mod tests {
         status_responses: StdMutex<VecDeque<Result<TxStatusV2, String>>>,
         nonce_responses: StdMutex<HashMap<String, u64>>,
         sent_txs: StdMutex<Vec<String>>,
+        /// Coverage rows by root hex. A root with no entry here but a
+        /// registered file reports a coverage row without an epoch list
+        /// (a chain without reassignment epochs).
+        coverages: StdMutex<HashMap<String, Result<AssignmentCoverageV2, String>>>,
+        /// When set, `fetch_nonce` returns this base plus the number of
+        /// transactions sent so far (a chain whose nonce advances with each
+        /// accepted transaction), yielding once before it answers.
+        nonce_advances_from: StdMutex<Option<u64>>,
     }
 
     impl AllMockRpc {
@@ -1050,6 +1131,65 @@ mod tests {
         }
         fn sent_count(&self) -> usize {
             self.sent_txs.lock().unwrap().len()
+        }
+        /// Report `epochs` (ascending heights, epoch 0 first) as the
+        /// file's assignment epochs, with `per_epoch` attestation detail.
+        fn set_epochs(
+            &self,
+            root_hex: &str,
+            chunk_count: u32,
+            epochs: &[u64],
+            per_epoch: Vec<AssignmentEpochCoverageV2>,
+        ) {
+            self.coverages.lock().unwrap().insert(
+                root_hex.to_string(),
+                Ok(coverage_with_epochs(chunk_count, epochs, per_epoch)),
+            );
+        }
+        fn fail_coverage(&self, root_hex: &str) {
+            self.coverages.lock().unwrap().insert(
+                root_hex.to_string(),
+                Err("coverage transport failure".into()),
+            );
+        }
+        fn advance_nonce_from(&self, base: u64) {
+            *self.nonce_advances_from.lock().unwrap() = Some(base);
+        }
+        fn sent_nonces(&self) -> Vec<u64> {
+            self.sent_txs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|hex_tx| {
+                    let signed = sumchain_wire::transaction::SignedTransaction::from_hex(hex_tx)
+                        .expect("our own transaction decodes");
+                    match signed.inner {
+                        sumchain_wire::transaction::TxInner::V2(tx) => tx.nonce,
+                        other => panic!("expected a V2 transaction, got {other:?}"),
+                    }
+                })
+                .collect()
+        }
+    }
+
+    /// A coverage row carrying `epochs` as the file's assignment epochs.
+    fn coverage_with_epochs(
+        chunk_count: u32,
+        epochs: &[u64],
+        per_epoch: Vec<AssignmentEpochCoverageV2>,
+    ) -> AssignmentCoverageV2 {
+        AssignmentCoverageV2 {
+            chunk_count,
+            covered_count: 0,
+            can_activate_now: false,
+            missing_total: chunk_count,
+            missing_offset: 0,
+            missing_indices: vec![],
+            per_archive: vec![],
+            assignment_epochs: epochs.to_vec(),
+            latest_assignment_epoch: epochs.last().copied().unwrap_or(0),
+            reassignment_needed: false,
+            per_epoch,
         }
     }
 
@@ -1128,12 +1268,35 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("trigger: no snapshot"))
         }
         async fn fetch_nonce(&self, address_base58: &str) -> anyhow::Result<u64> {
+            let advancing = *self.nonce_advances_from.lock().unwrap();
+            if let Some(base) = advancing {
+                // Read, then yield before answering: two unserialized
+                // callers both read the same value, as on a real chain.
+                let nonce = base + self.sent_count() as u64;
+                tokio::task::yield_now().await;
+                return Ok(nonce);
+            }
             self.nonce_responses
                 .lock()
                 .unwrap()
                 .get(address_base58)
                 .copied()
                 .ok_or_else(|| anyhow::anyhow!("trigger: no nonce for {address_base58}"))
+        }
+        async fn fetch_coverage(
+            &self,
+            merkle_root: &[u8; 32],
+        ) -> anyhow::Result<Option<AssignmentCoverageV2>> {
+            let key = format!("0x{}", hex::encode(merkle_root));
+            if let Some(entry) = self.coverages.lock().unwrap().get(&key).cloned() {
+                return entry.map(Some).map_err(anyhow::Error::msg);
+            }
+            Ok(self
+                .files
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|info| coverage_with_epochs(info.chunk_count, &[], vec![])))
         }
     }
 
@@ -1365,6 +1528,12 @@ mod tests {
         }
         async fn fetch_nonce(&self, address_base58: &str) -> anyhow::Result<u64> {
             self.0.fetch_nonce(address_base58).await
+        }
+        async fn fetch_coverage(
+            &self,
+            merkle_root: &[u8; 32],
+        ) -> anyhow::Result<Option<AssignmentCoverageV2>> {
+            self.0.fetch_coverage(merkle_root).await
         }
     }
 
@@ -2724,106 +2893,136 @@ mod tests {
         expect_ok(got, 21, &cid, 0, 4, b"abcd");
     }
 
-    // ── sum-chain #129 evidence: attestation after a reassignment epoch ──
+    // ── Attestation after a reassignment epoch (sum-chain #129, P2/P4) ──
     //
     // The chain (sum-chain `execute_accept_assignment_v2`) validates every
     // `AcceptAssignmentV2` index against the assignment over the LATEST
     // reassignment epoch's snapshot, and rejects the whole transaction if
-    // any index is not assigned to the signer in that epoch. SNIP's trigger
-    // path reads `assignment_height` (epoch 0) from `getFileInfoV2` and
-    // attests against the epoch-0 snapshot only. These two tests pin that
-    // behaviour so the gap is visible; they do not change it.
+    // any index is not assigned to the signer in that epoch.
+    // `getFileInfoV2.assignment_height` stays at epoch 0, so the archive
+    // reads the epoch list from `storage_getAssignmentCoverageV2`.
 
-    /// Epoch 0 at h=500 is `five_archives()`. A reassignment epoch at h=900
-    /// replaced the fifth archive with `replacement`. The replacement holds
-    /// every chunk the latest epoch assigns it, yet the ManifestPush-driven
-    /// attestation submits nothing: the epoch-0 snapshot does not contain it.
+    /// Epoch 0 at h=500 is `five_archives()`; a reassignment epoch at h=900
+    /// replaces the fifth archive with `replacement`, plus the attestor the
+    /// tests below share.
+    struct ReassignedFixture {
+        epoch0: Vec<[u8; 20]>,
+        epoch1: Vec<[u8; 20]>,
+        replacement: [u8; 20],
+        manifest: DataManifest,
+        rpc: Arc<AllMockRpc>,
+        r: u32,
+    }
+
+    impl ReassignedFixture {
+        fn new() -> Self {
+            let epoch0 = five_archives();
+            let mut epoch1 = epoch0.clone();
+            let replacement = [0xF0u8; 20];
+            epoch1[4] = replacement;
+            epoch1.sort();
+            let (manifest, _chunks, _tree) = make_manifest(64, 0x29);
+            let root_hex = format!("0x{}", hex::encode(manifest.merkle_root));
+            let rpc = AllMockRpc::new();
+            // getFileInfoV2 reports the file's ORIGINAL assignment_height;
+            // the coverage row carries both epochs.
+            rpc.add_file(
+                &root_hex,
+                file_info_active(&manifest.merkle_root, manifest.chunk_count, 500),
+            );
+            rpc.set_epochs(&root_hex, manifest.chunk_count, &[500, 900], vec![]);
+            rpc.add_snapshot(
+                500,
+                epoch0.iter().map(node_record).collect(),
+                epoch0.clone(),
+            );
+            rpc.add_snapshot(
+                900,
+                epoch1.iter().map(node_record).collect(),
+                epoch1.clone(),
+            );
+            Self {
+                epoch0,
+                epoch1,
+                replacement,
+                manifest,
+                rpc: Arc::new(rpc),
+                r: 3,
+            }
+        }
+        fn attestor(&self, me: [u8; 20]) -> Arc<AssignmentAttestor<ArcRpc>> {
+            Arc::new(AssignmentAttestor::new(
+                ArcRpc(self.rpc.clone()),
+                [42u8; 32],
+                me,
+                1337,
+                1_000_000,
+                crate::push_validator::V2Params {
+                    assignment_replication_factor: self.r,
+                    max_chunk_indices_per_tx: 1024,
+                },
+            ))
+        }
+        fn assigned(&self, snapshot: &[[u8; 20]], me: &[u8; 20]) -> BTreeSet<u32> {
+            sum_store::assignment_v2::chunks_for_archive_v2(
+                &self.manifest.merkle_root,
+                self.manifest.chunk_count,
+                snapshot,
+                self.r,
+                me,
+            )
+        }
+        async fn run(&self, me: [u8; 20], held: BTreeSet<u32>) -> Option<AttestSummary> {
+            run_attestation(
+                self.attestor(me),
+                Arc::new(ArcRpcTrigger(self.rpc.clone())),
+                self.manifest.merkle_root,
+                held,
+                l1_address_base58(&me),
+                Duration::from_millis(10),
+                Duration::from_secs(2),
+            )
+            .await
+        }
+    }
+
+    /// The replacement holds every chunk the latest epoch assigns it (an
+    /// owner re-pushed them) and attests exactly that set, although the
+    /// epoch-0 snapshot does not contain it.
     #[tokio::test]
-    async fn reassignment_epoch_replacement_archive_is_never_attested() {
-        use sum_store::assignment_v2::chunks_for_archive_v2;
-        let epoch0 = five_archives();
-        let mut epoch1 = epoch0.clone();
-        let replacement = [0xF0u8; 20];
-        epoch1[4] = replacement;
-        epoch1.sort();
-        let r = 3u32;
-
-        let (manifest, _chunks, _tree) = make_manifest(64, 0x29);
-        let root = manifest.merkle_root;
-        let latest_epoch_set =
-            chunks_for_archive_v2(&root, manifest.chunk_count, &epoch1, r, &replacement);
+    async fn reassignment_epoch_replacement_archive_attests_its_latest_epoch_set() {
+        let f = ReassignedFixture::new();
+        let latest_epoch_set = f.assigned(&f.epoch1, &f.replacement);
         assert!(
             !latest_epoch_set.is_empty(),
             "fixture: the latest epoch must assign the replacement some chunks"
         );
+        f.rpc.set_nonce(&l1_address_base58(&f.replacement), 0);
+        f.rpc.enqueue_send("0xtx-replacement");
+        f.rpc
+            .enqueue_status(TxStatusV2::Finalized { block_height: 1000 });
 
-        let rpc = AllMockRpc::new();
-        // getFileInfoV2 reports the file's ORIGINAL assignment_height.
-        rpc.add_file(
-            &format!("0x{}", hex::encode(root)),
-            file_info_active(&root, manifest.chunk_count, 500),
-        );
-        rpc.add_snapshot(
-            500,
-            epoch0.iter().map(node_record).collect(),
-            epoch0.clone(),
-        );
-        rpc.add_snapshot(
-            900,
-            epoch1.iter().map(node_record).collect(),
-            epoch1.clone(),
-        );
-        rpc.set_nonce(&l1_address_base58(&replacement), 0);
-        let rpc_arc = Arc::new(rpc);
-        let attestor = Arc::new(AssignmentAttestor::new(
-            ArcRpc(rpc_arc.clone()),
-            [42u8; 32],
-            replacement,
-            1337,
-            1_000_000,
-            crate::push_validator::V2Params {
-                assignment_replication_factor: r,
-                max_chunk_indices_per_tx: 1024,
-            },
-        ));
-
-        let summary = run_attestation(
-            attestor,
-            Arc::new(ArcRpcTrigger(rpc_arc.clone())),
-            root,
-            latest_epoch_set.clone(),
-            l1_address_base58(&replacement),
-            Duration::from_millis(10),
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("trigger runs");
-        assert_eq!(summary.attested_count(), 0);
-        assert_eq!(
-            rpc_arc.sent_count(),
-            0,
-            "no AcceptAssignmentV2 is submitted for the latest-epoch assignment"
-        );
+        let summary = f
+            .run(f.replacement, latest_epoch_set.clone())
+            .await
+            .expect("trigger runs");
+        assert!(summary.fully_attested(), "{:?}", summary.error);
+        assert_eq!(summary.batches.len(), 1);
+        let submitted: BTreeSet<u32> = summary.batches[0].chunk_indices.iter().copied().collect();
+        assert_eq!(submitted, latest_epoch_set);
+        assert_eq!(f.rpc.sent_count(), 1);
     }
 
-    /// A surviving archive attests its EPOCH-0 assignment after a
-    /// reassignment. Every index outside its latest-epoch assignment would
-    /// make the chain reject the whole transaction (code 33), and indices
-    /// only the latest epoch assigns it are never attested.
+    /// A surviving archive holding the whole file attests exactly its
+    /// latest-epoch assignment: never an index only epoch 0 gave it (the
+    /// chain would refuse the whole transaction), always the indices the
+    /// latest epoch newly gives it.
     #[tokio::test]
-    async fn reassignment_epoch_survivor_attests_epoch_zero_assignment() {
-        use sum_store::assignment_v2::chunks_for_archive_v2;
-        let epoch0 = five_archives();
-        let mut epoch1 = epoch0.clone();
-        epoch1[4] = [0xF0u8; 20];
-        epoch1.sort();
-        let r = 3u32;
-        let me = epoch0[0];
-
-        let (manifest, _chunks, _tree) = make_manifest(64, 0x29);
-        let root = manifest.merkle_root;
-        let s0 = chunks_for_archive_v2(&root, manifest.chunk_count, &epoch0, r, &me);
-        let s1 = chunks_for_archive_v2(&root, manifest.chunk_count, &epoch1, r, &me);
+    async fn reassignment_epoch_survivor_attests_only_its_latest_epoch_assignment() {
+        let f = ReassignedFixture::new();
+        let me = f.epoch0[0];
+        let s0 = f.assigned(&f.epoch0, &me);
+        let s1 = f.assigned(&f.epoch1, &me);
         let only_epoch0: Vec<u32> = s0.difference(&s1).copied().collect();
         let only_latest: Vec<u32> = s1.difference(&s0).copied().collect();
         assert!(
@@ -2831,61 +3030,95 @@ mod tests {
             "fixture: the reassignment must move this archive's assignment both ways \
              (only_epoch0={only_epoch0:?}, only_latest={only_latest:?})"
         );
+        f.rpc.set_nonce(&l1_address_base58(&me), 7);
+        f.rpc.enqueue_send("0xtx-attest");
+        f.rpc
+            .enqueue_status(TxStatusV2::Finalized { block_height: 1000 });
+        let held: BTreeSet<u32> = (0..f.manifest.chunk_count).collect();
 
-        let rpc = AllMockRpc::new();
-        rpc.add_file(
-            &format!("0x{}", hex::encode(root)),
-            file_info_active(&root, manifest.chunk_count, 500),
-        );
-        rpc.add_snapshot(
-            500,
-            epoch0.iter().map(node_record).collect(),
-            epoch0.clone(),
-        );
-        rpc.add_snapshot(
-            900,
-            epoch1.iter().map(node_record).collect(),
-            epoch1.clone(),
-        );
-        rpc.set_nonce(&l1_address_base58(&me), 7);
-        rpc.enqueue_send("0xtx-attest");
-        rpc.enqueue_status(TxStatusV2::Finalized { block_height: 1000 });
-        let rpc_arc = Arc::new(rpc);
-        let attestor = Arc::new(AssignmentAttestor::new(
-            ArcRpc(rpc_arc.clone()),
-            [42u8; 32],
-            me,
-            1337,
-            1_000_000,
-            crate::push_validator::V2Params {
-                assignment_replication_factor: r,
-                max_chunk_indices_per_tx: 1024,
-            },
-        ));
-        // The archive holds every chunk of the file.
-        let held: BTreeSet<u32> = (0..manifest.chunk_count).collect();
-
-        let summary = run_attestation(
-            attestor,
-            Arc::new(ArcRpcTrigger(rpc_arc.clone())),
-            root,
-            held,
-            l1_address_base58(&me),
-            Duration::from_millis(10),
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("trigger runs");
+        let summary = f.run(me, held).await.expect("trigger runs");
         assert_eq!(summary.batches.len(), 1);
         let submitted: BTreeSet<u32> = summary.batches[0].chunk_indices.iter().copied().collect();
-        assert_eq!(submitted, s0, "attests the epoch-0 assignment");
-        assert!(
-            only_epoch0.iter().all(|i| submitted.contains(i)),
-            "includes indices the latest epoch does not assign (chain rejects the tx)"
-        );
-        assert!(
-            only_latest.iter().all(|i| !submitted.contains(i)),
-            "omits indices only the latest epoch assigns"
-        );
+        assert_eq!(submitted, s1, "attests the latest epoch's assignment");
+        assert!(only_epoch0.iter().all(|i| !submitted.contains(i)));
+        assert!(only_latest.iter().all(|i| submitted.contains(i)));
+    }
+
+    /// An archive the reassignment removed attests nothing for this file,
+    /// although it still holds its epoch-0 chunks.
+    #[tokio::test]
+    async fn reassignment_epoch_departed_archive_attests_nothing() {
+        let f = ReassignedFixture::new();
+        let departed = f.epoch0[4];
+        assert!(!f.epoch1.contains(&departed));
+        f.rpc.set_nonce(&l1_address_base58(&departed), 0);
+        let held = f.assigned(&f.epoch0, &departed);
+        assert!(!held.is_empty());
+
+        let summary = f.run(departed, held).await.expect("trigger runs");
+        assert!(summary.batches.is_empty() && summary.error.is_none());
+        assert_eq!(f.rpc.sent_count(), 0);
+    }
+
+    /// When the epoch list cannot be read, nothing is submitted: a guess
+    /// (epoch 0) produces a transaction the chain refuses after a
+    /// reassignment.
+    #[tokio::test]
+    async fn attestation_is_not_submitted_when_the_epoch_cannot_be_read() {
+        let f = ReassignedFixture::new();
+        let me = f.epoch0[0];
+        f.rpc.set_nonce(&l1_address_base58(&me), 0);
+        f.rpc
+            .fail_coverage(&format!("0x{}", hex::encode(f.manifest.merkle_root)));
+        let held: BTreeSet<u32> = (0..f.manifest.chunk_count).collect();
+        assert!(f.run(me, held).await.is_none());
+        assert_eq!(f.rpc.sent_count(), 0);
+    }
+
+    /// A latest epoch below the file's first epoch is a malformed chain
+    /// answer: refuse rather than attest against it.
+    #[test]
+    fn epoch_from_coverage_refuses_a_latest_epoch_below_the_first() {
+        let cov = coverage_with_epochs(4, &[300], vec![]);
+        assert!(epoch_from_coverage(&cov, 500).is_err());
+        let cov = coverage_with_epochs(4, &[500, 900], vec![]);
+        assert_eq!(epoch_from_coverage(&cov, 500).unwrap(), 900);
+        // No epoch list: the file's assignment_height is the only epoch.
+        let cov = coverage_with_epochs(4, &[], vec![]);
+        assert_eq!(epoch_from_coverage(&cov, 500).unwrap(), 500);
+    }
+
+    /// Two attestation runs (a ManifestPush trigger and the epoch watcher,
+    /// or two files) never start from the same nonce: the second reads the
+    /// nonce only after the first run's transaction is final.
+    #[tokio::test]
+    async fn concurrent_attestation_runs_use_distinct_nonces() {
+        let f = ReassignedFixture::new();
+        let me = f.epoch0[0];
+        f.rpc.advance_nonce_from(40);
+        for tx in ["0xtx-a", "0xtx-b"] {
+            f.rpc.enqueue_send(tx);
+            f.rpc
+                .enqueue_status(TxStatusV2::Finalized { block_height: 1000 });
+        }
+        let held: BTreeSet<u32> = (0..f.manifest.chunk_count).collect();
+        let attestor = f.attestor(me);
+        let trigger = Arc::new(ArcRpcTrigger(f.rpc.clone()));
+        let run = |held: BTreeSet<u32>| {
+            run_attestation(
+                attestor.clone(),
+                trigger.clone(),
+                f.manifest.merkle_root,
+                held,
+                l1_address_base58(&me),
+                Duration::from_millis(10),
+                Duration::from_secs(2),
+            )
+        };
+        let (a, b) = tokio::join!(run(held.clone()), run(held));
+        assert!(a.unwrap().fully_attested() && b.unwrap().fully_attested());
+        let mut nonces = f.rpc.sent_nonces();
+        nonces.sort();
+        assert_eq!(nonces, vec![40, 41]);
     }
 }
