@@ -599,8 +599,13 @@ async fn build_smoke_report(rpc: &L1RpcClient, rpc_url: &str, opts: &SmokeOpts) 
                 name: "chain_getChainParams".into(),
                 status: "ok",
                 detail: format!(
-                    "chain_id={}, R={}, v2_enabled_from_height={:?}",
-                    p.chain_id, p.assignment_replication_factor, p.v2_enabled_from_height
+                    "chain_id={}, R={}, v2_enabled_from_height={:?}, \
+                     block_time_ms={}, finality_depth={}",
+                    p.chain_id,
+                    p.assignment_replication_factor,
+                    p.v2_enabled_from_height,
+                    p.block_time_ms,
+                    p.finality_depth
                 ),
             });
             p
@@ -1263,6 +1268,17 @@ mod tests {
         let report = build_smoke_report(&rpc, &rpc_url, &opts).await;
 
         assert!(report.ok, "happy-path smoke should pass: {:#?}", report);
+        // The reported chain parameters are informational (operators and
+        // the chain-compat metadata read them); they gate nothing.
+        let params_check = &report.checks[0];
+        assert_eq!(params_check.name, "chain_getChainParams");
+        assert!(
+            params_check
+                .detail
+                .ends_with("block_time_ms=2000, finality_depth=3"),
+            "params detail should report block_time_ms and finality_depth: {:?}",
+            params_check.detail
+        );
         let v2 = report.v2_state.expect("v2 state should be reported");
         assert_eq!(v2.state, "ENABLED_FROM_GENESIS");
         assert_eq!(

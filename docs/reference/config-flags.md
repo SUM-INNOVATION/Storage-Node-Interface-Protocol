@@ -37,7 +37,7 @@ no documented deployment:**
 - Mainnet `chain_id` is `1`. See
   [`chain-compat.md`](chain-compat.md) "Mainnet pin / deployed chain."
 - Local mirror `chain_id` is `1337`. See
-  [`chain-compat.md`](chain-compat.md) "Pinned chain version."
+  [`chain-compat.md`](chain-compat.md) "Local-mirror requirements."
 
 ### What consumes `--chain-id` today
 

@@ -7,7 +7,120 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ## [Unreleased]
 
+## [0.4.0-rc4] - 2026-10-20
+
+First release candidate since `v0.4.0-rc3` (2026-05-08). It carries
+every change merged since then, including the documentation first
+drafted on 2026-05-12 for a docs-only rc4 that was never tagged
+(folded in at the end of this section). Prebuilt binaries are Linux
+x86_64 only; every other platform builds from source
+([`docs/compatibility/platform-support.md`](docs/compatibility/platform-support.md)).
+
+### Upgrade notes
+- **Rust 1.88 or newer** is required to build from source (was
+  1.85). CI and release builds use `stable`.
+- **The first start writes the protected-chunk list.** The node
+  records every chunk already on disk in
+  `<store_dir>/manifests/gc_protected.list` and writes the marker
+  `manifests/gc_protected.initialized`. Chunks recorded at that
+  first start are kept permanently, because their origin is unknown.
+  Check free disk space beforehand: about 69 B per chunk present at
+  the first start and about 128 B per later V2 chunk. See
+  [`docs/operator/monitoring.md`](docs/operator/monitoring.md),
+  "Garbage collection and the protected-chunk list".
+- **Store root.** `--store-dir`, then `SUM_STORE_DIR`, then
+  `$HOME/.sumnode/store`. With none of these the node refuses to
+  start instead of falling back to a shared `/tmp` path. Each root is
+  held under an exclusive lease: run one node per store root.
+- **V1 push is retired.** `sum-node ingest` (V1) refuses at entry;
+  use `ingest-v2`. Archives refuse inbound V1 chunk and manifest
+  pushes. V1 pull is unchanged and still reaches V1-only peers.
+- **Native Windows and other non-Unix targets:** the store refuses
+  to start, before any filesystem change. They are not supported
+  targets.
+
+### Chain compatibility
+- Pinned chain commit unchanged from `v0.4.0-rc3`:
+  `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0`
+  ([`docs/reference/chain-compat.md`](docs/reference/chain-compat.md)).
+- Mainnet, as recorded there: `chain_id` 1,
+  `v2_enabled_from_height` 5,200,000, `finality_depth` 6, read from
+  the public RPC on 2026-10-18 (UTC). `block_time_ms` reports 3000,
+  which is the block producer's pacing parameter and not a consensus
+  rule; the observed cadence is about 1.5 s. No SNIP code path
+  consumes `block_time_ms`.
+- The pin identifies a chain source state for wire format, not the
+  validators' binary or runtime configuration. The "Genesis
+  SHA-256" that `chain-compat.md` listed from
+  2026-05-07 is withdrawn: it matches no genesis file in the chain
+  repository's history, and the pin's `genesis/mainnet_genesis.json`
+  is a placeholder template. A genesis-file hash does not identify
+  the network, because activation heights are edited into each
+  validator's runtime genesis. The only network identity SNIP uses
+  is still `chain_id`; no check changed.
+- Mainnet's network identity is now recorded: `chain_id` 1 and
+  genesis block hash
+  `0x1156d350e7d0ac45cb96bfca25d57c71675ceea5949ea44d81432d08baed68e6`,
+  read from the public RPC on 2026-10-18 (UTC) and reproduced
+  offline from the root `genesis.json` at the compatibility pin with
+  the chain's own genesis code. That file is not the validators'
+  runtime genesis, and the pin remains a wire-format pin.
+- The local mirror is the chain's synthetic five-validator devnet
+  at the E2E workflow's `SUMCHAIN_COMMIT`
+  (`d8130ead3b77f38eff6eeb82b4e68bb1aca8e3b2`), kept separate from
+  the compatibility pin. A mirror run is not evidence about
+  mainnet.
+- Chain wire types come from `sumchain-wire`, exact-pinned at
+  `=0.4.0` in the workspace `Cargo.toml`.
+
 ### Added
+- **`sum-node reassign <merkle-root-hex> [--dry-run]`** (#65).
+  Submits an owner-triggered `ReassignChunksV2` for a V2 file owned
+  by the `--key-file` address, and only when
+  `storage_getAssignmentCoverageV2` reports `reassignment_needed`.
+  The unsigned transaction comes from the chain's
+  `storage_buildReassignChunksV2` builder and is checked byte for
+  byte against the request (encoding, chain id, fee, sender, payload
+  and the echoed fields) before it is signed with the existing owner
+  key; `--dry-run` stops before signing. No new key or signing
+  authority. **Limits:** this submits the chain transaction only.
+  SNIP's push, attestation and download routing still use the file's
+  original assignment snapshot, so a reassignment does not by itself
+  restore coverage. Retrieving the file for the new assignment epoch
+  and pushing it to the newly assigned archives, re-attestation under
+  the new epoch, and garbage collection under the new epoch remain
+  open requirements. How a newly assigned archive is protected from
+  storage-proof challenges before it has fetched its chunks is not
+  yet decided.
+- **Platform validation** (#63). `scripts/platform-validation.sh`
+  and the `platform-validation` workflow run the documented client
+  checks per OS cell. The Ubuntu and Debian container jobs are
+  labelled stand-ins and are not WSL2 or Crostini coverage. The
+  Windows job checks only that the store refuses to run on native
+  Windows, which is not a supported target.
+- **GitHub-hosted verification of the draft release.** `release.yml`
+  gains a `verify-draft` job that downloads the draft's assets on
+  fresh `ubuntu-22.04` and `ubuntu-24.04` runners and checks them
+  with `scripts/verify-release-assets.sh`: the exact asset set,
+  `SHA256SUMS`, the tarball's confinement and layout, the bundled
+  CHANGELOG section, `sum-node --version`, and that `install.sh` is
+  the tag's. `make release-check` self-tests the verifier
+  (`scripts/test-verify-release-assets.sh`). The manual-dispatch
+  workflow `release-install-smoke.yml` runs the documented curl-pipe
+  install against a published release. Neither publishes anything.
+- **Local-mirror E2E on GitHub-hosted runners.** The
+  `release-local-mirror-e2e.yml` workflow runs on pull requests from
+  `release/` branches. `scripts/local-mirror-e2e.sh` brings up the
+  chain's synthetic five-validator devnet from a pinned public chain
+  commit, with throwaway keys generated on the runner, and runs the
+  read-only smoke and the local-mirror suite against it. Read-only
+  token, no secrets; not a required check.
+- **`e2e-helper smoke` reports `block_time_ms` and
+  `finality_depth`** alongside the chain id, R and the V2 height.
+  Informational only; the smoke's pass/fail rules are unchanged.
+- **Object/manifest cross-validation** (#45, #46). SNIP's object,
+  manifest and Merkle encodings are tested byte for byte against
+  vendored, hash-locked upstream golden vectors.
 - **AssignmentCoverageV2 epoch fields** (closes #34). Adds four
   `#[serde(default)]` fields (`assignment_epochs`,
   `latest_assignment_epoch`, `reassignment_needed`, `per_epoch`) to
@@ -31,6 +144,77 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
   docstring.
 
 ### Fixed
+- **Ingest peer discovery ends on an explicit completion condition**
+  (#68). `ingest-v2` and `resume` used to stop looking for archives
+  about 0.7 s after the first one identified itself, so an archive
+  that identified later received no push, a chunk stayed
+  under-replicated and the file stayed `Pending`. Releases since
+  rc1 have this. Discovery now completes only when every archive
+  the push needs has a live identified peer, counted by chain
+  address: two peer ids for one archive count once, and peers the
+  assignment does not use never count. Otherwise it fails at a
+  fixed 30 s bound and names the missing archives.
+  - **Before registration:** `ingest-v2` checks the archives the
+    file would be assigned under the current eligible snapshot. If
+    one is unreachable, or the chain lists fewer eligible archives
+    than R, it refuses before `RegisterFilePendingV2`: no
+    transaction, no fee, nothing `Pending`. Interrupting it while it
+    waits leaves no chain state.
+  - **Before pushing** (and in `resume`, for the missing chunks'
+    assignees only), it waits for the archives the pinned assignment
+    names; if one never appears, the file stays `Pending` with that
+    cause named. `resume` on a file that can already activate no
+    longer waits for peers.
+  - **Disconnects:** a peer counts as disconnected only when its
+    last connection closes. Closing one of several connections no
+    longer drops a still-connected, identified peer from the peer
+    map.
+
+  No CLI flag, wire format, chain interaction or compatibility
+  check changes.
+- **Garbage collection keeps V2 chunks** (#64). Earlier releases
+  could delete chunks an archive had accepted through V2 Push. The
+  collector now deletes a chunk only when it can positively
+  attribute it: it belongs to a funded V1 file whose manifest is held
+  locally, it is not assigned to this archive, and no other locally
+  held manifest, Private chunk mapping or protected-list entry
+  references it. Anything of uncertain ownership is kept. Each V2
+  Push records its chunk in `manifests/gc_protected.list`, synced
+  before the chunk is written; if the record cannot be written the
+  push is refused. While the list is missing after its marker exists,
+  unreadable, malformed, or after a failed write, the collector
+  deletes nothing and V2 pushes are refused (recovery steps in
+  [`docs/operator/monitoring.md`](docs/operator/monitoring.md)).
+  Candidate selection and the sweep run under one store write guard.
+  Storage grows as described under "Upgrade notes", and V2 chunks are
+  retained until V2-aware collection exists. Chunks already deleted
+  by an earlier release are not recovered by upgrading: they must be
+  pushed again and re-attested. No wire, chain or configuration
+  change; `SUM_GC_GRACE` behaves as before.
+- **Bounded chunk-range arithmetic** (#50). Peer-supplied
+  `offset`/`max_bytes` on V1 and V2 chunk pulls are resolved with
+  checked `u64` arithmetic, so a malformed range request can no
+  longer crash the node. Each endpoint keeps its out-of-range policy:
+  V1 returns an empty read past the end, V2 returns its error.
+- **Response correlation and manifest binding** (#52). Every
+  response and failure is matched to the request this node issued
+  (peer, protocol, request kind, CID or root, chunk index); anything
+  unmatched is refused. A downloaded manifest is validated against
+  the root this node requested, outside the store's write guard.
+- **One store root per node** (#55). `--store-dir` and
+  `SUM_STORE_DIR` select the root (an empty `SUM_STORE_DIR` is
+  ignored); resolution fails closed when nothing names one; each
+  root is held under an exclusive `flock` lease on
+  `<root>/.store.lease` for the store's lifetime. The lease is
+  advisory. `SumStore::cleanup`, which removed every chunk under the
+  root, is gone.
+- **Dependency security updates** (#60, #61, #62). quinn-proto
+  0.11.18, rustls 0.23.46, rustls-webpki 0.103.15, crossbeam-epoch
+  0.9.20, h2 0.4.16; libp2p 0.55 → 0.57 with hickory-proto 0.26.3;
+  lru 0.18; soundness fixes for anyhow, event-listener, memmap2 and
+  rand. `cargo audit` reports no vulnerabilities for this lockfile;
+  the remaining warnings are unmaintained or yanked crates with no
+  fixed release, and no advisory exception is configured.
 - **Runtime replication factor plumbing** (closes #33). SNIP no
   longer hardcodes `R = 3` in receive-side and V1 code paths. Every
   production runtime consumer receives the live
@@ -66,9 +250,9 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
   `DEFAULT_REPLICATION_FACTOR`; the old name kept as a
   `#[deprecated(note = "...")]` alias for one release cycle to
   avoid breaking downstream compilations. **No production code
-  path consumes either name.** The `since` field is intentionally
-  omitted so the release-cutting PR can populate it with the
-  actual tag. Non-consumption invariant is enforced by the
+  path consumes either name.** The alias carries
+  `since = "0.4.0-rc4"`, the release that introduces it.
+  Non-consumption invariant is enforced by the
   release-checklist audit command
   `rg -n '\b(REPLICATION_FACTOR|DEFAULT_REPLICATION_FACTOR)\b' crates -g '*.rs'`
   — the only allowed matches are the constant definition site in
@@ -93,6 +277,46 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
   cache, V2 public + private routing, V2 attest trigger, and
   the operator `--require-archives` gate. The consumer audit is
   documented in `docs/architecture/chain-integration.md`.
+
+### Changed
+- **Shard transfer split into two protocols; V1 push retired**
+  (#53). V1 and V2 each run on their own request-response behaviour
+  (`/sum/storage/v1`, `/sum/storage/v2`), so each request negotiates
+  exactly its protocol. Outbound V1 push is removed; inbound V1 chunk
+  and manifest pushes are refused before the store is touched, with
+  an error naming the V2 replacement. Legacy `ingest` refuses at
+  entry. One inbound dispatcher answers every shard request exactly
+  once.
+- **Immutable chunk publication** (#51). Chunks are staged in a
+  private directory, verified, synced and published with a
+  no-clobber link; an existing chunk is never overwritten. On
+  non-Unix targets the store refuses construction
+  (`StoreError::UnsupportedPlatform`) before any filesystem change.
+- **Shared wire crate** (#42, #43, #44, #46, #47, #48). Storage
+  primitives, V2 assignment scoring and transaction envelope types
+  come from the published `sumchain-wire` crate, now exact-pinned at
+  `=0.4.0`; SNIP's local mirrors and duplicate scorer are removed.
+  Every builder's signed bytes, the Appendix-C assignment vectors and
+  Merkle roots are locked by tests and unchanged. Decoding a signed
+  transaction rejects trailing bytes.
+- **Chain reads and access control** (#41; issues #37, #38, #39).
+  V1 market-sync, upload and legacy download read the finalized
+  height once per operation and call
+  `storage_getActiveNodesAtHeight`. `storage_getFileInfoV2` and
+  `storage_getAssignmentCoverageV2` return `Option`, and JSON `null`
+  is the only authoritative absence: any V2 RPC error denies access
+  with no V1 fallback, and the V1 fallback itself denies on null,
+  malformed, error or an unlisted requester. The dev-profile
+  fallback chain id is 1337 (was 31337); production `chain_id` 1 is
+  unchanged and signing does not read this value.
+- **libp2p 0.57** (#62). The request-response codecs drop
+  `#[async_trait]`; the relay HOP protocol is still advertised as
+  under 0.55. The upgrade itself changes no protocol name, gossipsub
+  topic or mDNS default.
+- **Documentation** (#28, #54, #63, #64, #65). README and diagram
+  edits; the operator runbook states the store-root rules; platform
+  support, monitoring, CLI and RPC references and status pages
+  updated with the changes above.
 
 ### Changed (docs — audit)
 - **Documentation restructure and audit** (closes #29, #31). The
@@ -239,7 +463,15 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
   `gh release download`, the manual publish step (no
   auto-publish), and a post-publish curl-pipe smoke gate.
 
-## [0.4.0-rc4] - 2026-05-12
+### Documentation first drafted for rc4 on 2026-05-12
+
+This part was written on 2026-05-12 for a docs-only rc4 that was
+never tagged. Its documentation ships in this release. Its
+statements that rc4 has the same binary surface as rc1–rc3 and no
+code changes described that plan, not this release, and its
+"Verified" results were obtained with the `v0.4.0-rc3` binary; they
+have not been re-run for this tag. File names are as they were then;
+the documents have since moved (see "Changed (docs — audit)").
 
 Docs-only release candidate. Same binary surface as `v0.4.0-rc1` /
 `rc2` / `rc3`. Lands the mainnet bring-up field guide previously
@@ -248,7 +480,7 @@ runbook, corrects the README's client-vs-archive workflow language,
 and records the first verified mainnet Public V2 round-trip
 artifacts.
 
-### Added (docs)
+#### Added (docs)
 - `docs/MAINNET-BRINGUP.md`. Standalone field guide for mainnet
   archive bring-up. Covers host prerequisites (including the
   recommended separate owner/client identity), install at the
@@ -260,7 +492,7 @@ artifacts.
   from `RELEASE-CHECKLIST.md` § 7, and mainnet-specific failure
   triage.
 
-### Changed (docs)
+#### Changed (docs)
 - `docs/OPERATOR-RUNBOOK.md` § Mainnet bring-up step 3.1 smoke
   sample updated to match the actual `format_smoke_human` output
   (`ENABLED_FROM_HEIGHT`, two-line `[1/2]` + `[2/2]` check format).
@@ -278,7 +510,7 @@ artifacts.
   before `listen --profile production`. Cross-links to
   `docs/MAINNET-BRINGUP.md` and `docs/CHAIN-COMPAT.md` added.
 
-### Verified (informational; no code changes)
+#### Verified (informational; no code changes)
 First mainnet Public V2 round-trip executed against `v0.4.0-rc3`
 with a three-archive fleet:
 
@@ -296,7 +528,7 @@ against the rc3 binary: fresh-machine local-mirror E2E (11/11),
 mainnet read-only smoke, ≥ 3 archives registered + listening,
 single-pass byte-identical Public V2 round-trip.
 
-### Constraints honored
+#### Constraints honored
 - No code changes; no tests changed.
 - `v0.4.0-rc1`, `rc2`, `rc3` tags unchanged. `v0.4.0-rc4` is a
   separate annotated tag at the new main tip.

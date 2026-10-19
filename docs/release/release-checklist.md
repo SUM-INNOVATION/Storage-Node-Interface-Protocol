@@ -176,95 +176,54 @@ Asserts read-only:
 
 ## 5. Local-mirror full E2E
 
-> **Mirror is runnable at the pinned chain SHA.** The
-> chain-side compose preset at
-> `sum-chain:deploy/snip-local-mirror.yaml` (in the chain
-> repository, not this one) brings up a self-
-> bootstrapping single-validator devnet (validator key
-> generated into a Docker named volume on first boot; no
-> signing material in the repo). The SNIP-side **WS2 E2E
-> suite** that drives this mirror end-to-end through the full
-> V2 lifecycle is the next workstream — until it lands, the
-> mirror is verified via `make smoke` only.
+**First path: GitHub-hosted.** The `release local-mirror E2E`
+workflow
+([`.github/workflows/release-local-mirror-e2e.yml`](../../.github/workflows/release-local-mirror-e2e.yml))
+runs on every pull request whose head branch starts with `release/`,
+on a fresh GitHub-hosted runner. It runs
+[`scripts/local-mirror-e2e.sh`](../../scripts/local-mirror-e2e.sh),
+which:
 
-Bring up (from the chain checkout):
+1. checks out the public chain repository at the workflow's
+   `SUMCHAIN_COMMIT` and refuses any other commit;
+2. provisions the chain's synthetic five-validator devnet
+   (`setup-local-testnet --mode topology --validator-count 5
+   --output-dir devnet`: chain id 1337, V2 from genesis, throwaway
+   keys generated on the runner, never committed, printed or
+   uploaded);
+3. builds the images from that commit and starts the chain's
+   `deploy/snip-local-mirror.yaml`;
+4. writes SNIP's six role seed files from the devnet's funded roles
+   into a temporary directory outside both repositories;
+5. runs `make smoke RPC=http://localhost:8545 SMOKE_ARGS=--require-v2`,
+   then `make e2e-mirror`;
+6. tears the devnet down and deletes its keys, on success or failure.
 
-```bash
-git checkout 5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0
-docker-compose -f deploy/snip-local-mirror.yaml up -d --build
-```
+It uses a read-only token and no secrets, and it is not a required
+check. A failure is a hard release blocker. Record the run URL and
+the chain commit with the release evidence.
 
-Health check (read-only, no tx). After bringing the mirror up,
-verify all three:
+`SUMCHAIN_COMMIT` is the chain commit the end-to-end run uses. It is
+not the compatibility pin in
+[`chain-compat.md`](../reference/chain-compat.md): at that pin the
+chain's mirror preset mounts files the repository does not track, so
+it cannot be brought up from the repository alone.
 
-1. **chain_id returns `1337`** and finality is `"finalized"`:
-   ```bash
-   make smoke RPC=http://localhost:8545 SMOKE_ARGS=--require-v2
-   # Expect: chain_id=1337, V2 state ENABLED_FROM_GENESIS.
-   ```
-2. **Block height advances** (~2s block cadence). The smoke
-   line `chain_getBlockHeight ........... OK (finalized
-   height=N, finality=finalized)` confirms; re-running smoke a
-   few seconds later must show a higher N.
-3. **Each WS2b role address has a non-zero balance** (only
-   applies if you brought the mirror up with the funded-test-
-   accounts overlay; see
-   [`OPERATOR-RUNBOOK.md`](../operator/runbook.md)
-   "Funded test accounts" for the per-role balance check
-   loop).
-
-A failure in any of the three is a hard release blocker.
-
-Stop / wipe (from the chain checkout):
+**Fallback: a Docker-capable Linux host the owner names.** The same
+script runs there unchanged; no other setup is assumed:
 
 ```bash
-docker-compose -f deploy/snip-local-mirror.yaml down       # preserve volume
-docker-compose -f deploy/snip-local-mirror.yaml down -v    # wipe + regen keys
+git clone https://github.com/SUM-INNOVATION/sum-chain.git /tmp/sum-chain
+git -C /tmp/sum-chain checkout <SUMCHAIN_COMMIT from the workflow>
+SUMCHAIN_DIR=/tmp/sum-chain SUMCHAIN_COMMIT=<same sha> \
+    scripts/local-mirror-e2e.sh
 ```
 
-Optional fresh-genesis funded accounts: see
-[`OPERATOR-RUNBOOK.md`](../operator/runbook.md)
-"Funded test accounts (optional, fresh-genesis only)". The
-overlay file MUST use numeric balances (`{ "<base58>": <int>,
-... }`), not string-encoded balances. Compose volume mounts MUST
-be declared in YAML — `docker-compose` does not accept a `-v`
-flag for runtime volumes; use a separate override file. If the
-mirror has already been started, run
-`docker-compose -f deploy/snip-local-mirror.yaml down -v`
-before starting with the overlay (the overlay is fresh-genesis
-gated). DO NOT commit private keys for the funded addresses.
-
-When WS2 ships:
-
-```bash
-cargo test --test e2e_lifecycle -- --include-ignored
-```
-
-Asserts: Public ingest/download, Private owner-only, Private
-shared, share/revoke/update-access with finality boundary,
-archive restart recovery, V1 legacy compatibility.
->
-> Until then, releases gate on:
->
->   * `make release-check` (the linux CI gate, § 0).
->   * In-tree bincode v1 fixture tests (§ 3) — exhaustive for the
->     V2 wire surface SNIP submits / decodes.
->   * Live-chain read-only smoke (§ 4) — sanity-checks the target
->     RPC's V2 state without sending any tx.
-
-When unblocked:
-
-```bash
-# Bring up the chain-ops-supplied local mirror per their updated
-# instructions (exact command depends on the artifact they ship —
-# could be `docker-compose up`, a binary, etc).
-cargo test --test e2e_lifecycle -- --include-ignored
-# Tear down per the supplied runbook.
-```
-
-Asserts: Public ingest/download, Private owner-only, Private shared,
-share/revoke/update-access with finality boundary, archive restart
-recovery, V1 legacy compatibility.
+The suite (`crates/sum-node/tests/e2e_mirror.rs`) covers: mirror
+health; node and encryption-key registration; Public ingest and
+download; Private owner-only; Private shared; share, revoke and
+update-access across the finality boundary; and resuming a Pending
+file to Active. Archive-restart recovery is not covered yet.
 
 ## 6. Privacy audit
 
@@ -306,9 +265,10 @@ section defines *what* must be true to promote; that guide describes
       environment. A green run on the original machine is necessary
       but not sufficient.
 
-- [ ] **Mainnet read-only smoke.** Against the live mainnet RPC at
-      the chain commit listed in [`CHAIN-COMPAT.md`](../reference/chain-compat.md)
-      "Mainnet pin / deployed chain":
+- [ ] **Mainnet read-only smoke.** Against the live mainnet RPC,
+      compared with the values in [`CHAIN-COMPAT.md`](../reference/chain-compat.md)
+      "Mainnet pin / deployed chain" (the RPC does not report which
+      chain commit mainnet runs):
 
       ```bash
       make smoke RPC=https://rpc.sumchain.io SMOKE_ARGS=--require-v2
@@ -370,42 +330,87 @@ Pushing the tag triggers
 which builds the Linux x86_64 release binaries, packages them as
 `snip-vX.Y.Z-linux-x86_64.tar.gz`, computes `SHA256SUMS`, and
 uploads those plus `scripts/install.sh` to a **draft** GitHub
-Release. The workflow never auto-publishes. A human must:
+Release. The workflow never auto-publishes.
 
-- [ ] Wait for the `release` workflow on the tag to finish green.
-- [ ] Open the draft release in the GitHub UI and confirm the
-      asset list contains exactly three files:
-      `snip-vX.Y.Z-linux-x86_64.tar.gz`, `SHA256SUMS`,
-      `install.sh`.
-- [ ] On a clean Linux x86_64 host (or an Ubuntu 22.04 VM /
-      container), exercise the **manual-verify path** end-to-end
-      against the draft assets:
+**First path: GitHub-hosted verification.** The same workflow's
+`verify-draft` job then runs on two fresh GitHub-hosted runners that
+did not build the assets, `ubuntu-22.04` and `ubuntu-24.04`. Each
+one:
 
-      ```bash
-      # Authenticated download from the draft release.
-      # Draft assets are NOT reachable via the unauthenticated
-      # releases URL; use `gh release download` from a logged-in
-      # gh CLI for the preflight.
-      gh release download vX.Y.Z \
-          --repo SUM-INNOVATION/Storage-Node-Interface-Protocol \
-          --pattern 'snip-*-linux-x86_64.tar.gz' \
-          --pattern 'SHA256SUMS'
+- confirms the release is a draft for this tag, flagged pre-release
+  exactly when the tag is an rc, with exactly three assets:
+  `snip-vX.Y.Z-linux-x86_64.tar.gz`, `SHA256SUMS`, `install.sh`;
+- downloads them with `gh release download` and runs
+  [`scripts/verify-release-assets.sh`](../../scripts/verify-release-assets.sh),
+  which checks:
+  - the asset set is exactly those three regular files;
+  - `SHA256SUMS` has one entry, for the tarball, and it matches;
+  - every tarball entry is confined to `snip-vX.Y.Z-linux-x86_64/`,
+    with no `..` component and no link or special file;
+  - the layout is exactly `bin/sum-node`, `bin/e2e-helper`,
+    `README.md`, `CHANGELOG.md`, `LICENSE-MIT` and `LICENSE-APACHE`,
+    with both binaries executable;
+  - the bundled `CHANGELOG.md` has a `## [X.Y.Z]` section;
+  - `bin/sum-node --version` prints exactly `sum-node X.Y.Z` on that
+    runner;
+  - the `install.sh` asset is byte-identical to the tag's
+    `scripts/install.sh`.
 
-      sha256sum --check --ignore-missing SHA256SUMS
-      tar xzf snip-vX.Y.Z-linux-x86_64.tar.gz
-      ./snip-vX.Y.Z-linux-x86_64/bin/sum-node --version
-      ```
+`make release-check` self-tests the verifier against a synthetic good
+release and 16 broken ones
+([`scripts/test-verify-release-assets.sh`](../../scripts/test-verify-release-assets.sh)).
 
-      Confirms tarball integrity, layout, and that the binary
-      runs on a clean host. After publishing the release, the
-      curl-pipe install line from the README/INSTALL becomes
-      reachable; that is the next gate.
+- [ ] Wait for the `release` workflow on the tag to finish green,
+      including both `verify draft assets` jobs. Keep the run URL as
+      evidence.
+- [ ] Open the draft release in the GitHub UI and confirm the asset
+      list is the one the job checked.
+
+**Fallback: a clean host.** If the GitHub-hosted job cannot run, or
+as an additional check, verify by hand on a clean Linux x86_64 host
+(or an Ubuntu 22.04 VM / container). From a checkout of the tag:
+
+```bash
+# Authenticated download from the draft release.
+# Draft assets are NOT reachable via the unauthenticated
+# releases URL; use `gh release download` from a logged-in
+# gh CLI for the preflight.
+mkdir assets
+gh release download vX.Y.Z \
+    --repo SUM-INNOVATION/Storage-Node-Interface-Protocol \
+    --dir assets
+scripts/verify-release-assets.sh assets vX.Y.Z scripts/install.sh
+```
+
+Without a checkout, the minimal manual steps are:
+
+```bash
+gh release download vX.Y.Z \
+    --repo SUM-INNOVATION/Storage-Node-Interface-Protocol \
+    --pattern 'snip-*-linux-x86_64.tar.gz' \
+    --pattern 'SHA256SUMS'
+
+sha256sum --check --ignore-missing SHA256SUMS
+tar xzf snip-vX.Y.Z-linux-x86_64.tar.gz
+./snip-vX.Y.Z-linux-x86_64/bin/sum-node --version
+```
+
+Either way this confirms tarball integrity, layout, and that the
+binary runs on a clean host. After publishing the release, the
+curl-pipe install line from the README/INSTALL becomes reachable;
+that is the next gate.
+
 - [ ] Replace the auto-generated draft body with the matching
       `CHANGELOG.md` section + the install command.
 - [ ] Manually publish the draft. For rc tags, keep the
       "pre-release" flag checked.
-- [ ] After publishing, re-run the documented curl-pipe install
-      line on a clean host as a final smoke:
+- [ ] After publishing, run the post-publish install smoke.
+      **First path:** dispatch
+      [`.github/workflows/release-install-smoke.yml`](../../.github/workflows/release-install-smoke.yml)
+      with the tag. It runs the line below on fresh `ubuntu-22.04`
+      and `ubuntu-24.04` runners and checks `sum-node --version`.
+      It runs only on manual dispatch and reads only the public
+      release URLs. **Fallback:** run the line on a clean host:
 
       ```bash
       curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/vX.Y.Z/install.sh \
