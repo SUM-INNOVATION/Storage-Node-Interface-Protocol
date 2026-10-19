@@ -85,6 +85,12 @@ struct Cli {
     #[arg(long, env = "SUM_GC_GRACE", default_value = "3600")]
     gc_grace_secs: u64,
 
+    /// Assignment-epoch watch interval in seconds (listen mode). After a
+    /// `ReassignChunksV2`, held chunks are attested again against the new
+    /// epoch at the first poll. `0` disables the watcher.
+    #[arg(long, env = "SUM_EPOCH_WATCH_INTERVAL", default_value = "60")]
+    epoch_watch_secs: u64,
+
     /// SUM Chain V2 chain ID. Used by V2 tx builders (`AcceptAssignmentV2`,
     /// etc.) when signing on-chain transactions.
     #[arg(long, env = "SUM_CHAIN_ID", default_value = "1337")]
@@ -782,7 +788,7 @@ async fn run_listen(
         let acl_for_v2: Arc<dyn sum_node::inbound_v2::AccessChecker> = acl.clone();
         let dispatcher = Arc::new(V2Dispatcher::new(
             validator,
-            attestor,
+            attestor.clone(),
             rpc.clone(),
             store.clone(),
             acl_for_v2,
@@ -792,6 +798,21 @@ async fn run_listen(
         // so a restart does not forget what this archive holds.
         let rebuilt = dispatcher.seed_held_from_disk().await;
         info!(chunks = rebuilt, "V2 held set rebuilt from disk");
+
+        // Attest again when a file's assignment epoch changes (and once at
+        // startup for epochs this node missed). Shares the attestor, so
+        // its runs are serialized with ManifestPush-triggered ones.
+        let held: Arc<dyn sum_node::epoch_watcher::HeldSource> = dispatcher.clone();
+        let watcher = sum_node::epoch_watcher::EpochWatcher::new(
+            attestor,
+            rpc.clone(),
+            held,
+            l1_addr,
+            v2_params,
+        );
+        let watch_interval = Duration::from_secs(cli.epoch_watch_secs);
+        let watcher_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move { watcher.run(watch_interval, watcher_shutdown).await });
         v2_dispatcher = Some(dispatcher);
         info!("V2 dispatcher initialized — accepting V2 ingest");
     } else {

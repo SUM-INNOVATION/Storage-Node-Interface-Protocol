@@ -183,6 +183,9 @@ pub struct FileShape {
     /// ManifestPush handler to choose between Public CBOR validation
     /// (existing behavior) and Private opaque-bytes storage.
     pub visibility: sum_types::rpc_types::VisibilityV2,
+    /// File lifecycle from chain. The epoch watcher skips Abandoned files:
+    /// the chain refuses attestations for them.
+    pub lifecycle: sum_types::rpc_types::LifecycleV2,
 }
 
 /// Build a placeholder `DataManifest` for the Private ManifestPush
@@ -285,6 +288,7 @@ impl AttestTriggerRpc for L1RpcClient {
             chunk_count: info.chunk_count,
             assignment_height: info.assignment_height,
             visibility: info.visibility,
+            lifecycle: info.lifecycle,
         })
     }
 
@@ -1399,6 +1403,7 @@ mod tests {
                 chunk_count: info.chunk_count,
                 assignment_height: info.assignment_height,
                 visibility: info.visibility,
+                lifecycle: info.lifecycle,
             })
         }
         async fn fetch_snapshot(&self, height: u64) -> anyhow::Result<Vec<[u8; 20]>> {
