@@ -420,6 +420,20 @@ pub struct ArchiveCoverageSummaryV2 {
     pub currently_active: bool,
 }
 
+/// One row of `storage_getPushableFilesV2`: a V2 file in a pushable
+/// lifecycle (Pending or Active; Abandoned files are excluded). The chain
+/// returns rows in `merkle_root` order, paginated by offset/limit (default
+/// 256, hard cap 1024).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PushableFileInfoV2 {
+    /// Hex merkle root.
+    pub merkle_root: String,
+    pub chunk_count: u32,
+    /// `0` = Pending, `1` = Active.
+    pub lifecycle: u8,
+    pub created_at: u64,
+}
+
 /// Response from `storage_getAssignmentCoverageV2` (chain plan v3.2 §4).
 ///
 /// Owner polls until `can_activate_now == true`, then submits
