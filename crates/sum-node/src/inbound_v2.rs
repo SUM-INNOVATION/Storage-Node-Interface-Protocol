@@ -3545,7 +3545,7 @@ mod tests {
         assert!(d.held_for(&root).is_empty());
         assert!(!stores.read().await.local.has(&cid), "not stored");
         assert!(
-            held_from_disk(&*stores.read().await).get(&root).is_none(),
+            !held_from_disk(&*stores.read().await).contains_key(&root),
             "not recorded"
         );
         // The same chunk pushed by its owner is accepted.
