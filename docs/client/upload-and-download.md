@@ -179,9 +179,10 @@ file's owner can submit; the chain enforces that too.
   and attest against the file's latest assignment epoch, and attest their
   held chunks again when it changes. But `ingest`/`resume` still push to,
   and downloads still route to, the archives of the file's original
-  assignment snapshot, and a newly assigned archive does not fetch chunks
-  from other archives. So a reassignment does not by itself restore
-  coverage under the new epoch.
+  assignment snapshot. A newly assigned archive fetches its new chunks of a
+  Public file from other archives only if its operator enabled re-fetch
+  (`--refetch-secs`, off by default), and never for a Private file. So a
+  reassignment does not by itself restore coverage under the new epoch.
 - How a newly assigned archive is protected from storage-proof challenges
   before it has fetched its chunks is a separate, unratified protocol
   decision.

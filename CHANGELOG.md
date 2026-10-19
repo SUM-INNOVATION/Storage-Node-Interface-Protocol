@@ -14,9 +14,10 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ### Added
 - **Epoch watcher** (`--epoch-watch-secs`, `SUM_EPOCH_WATCH_INTERVAL`, default 60, `0` disables): attests held chunks again when a held file's assignment epoch changes, and once at startup for epochs the node missed. See `docs/operator/monitoring.md` "Assignment epochs and re-attestation".
+- **Re-fetch of newly assigned Public chunks** (`--refetch-secs`, `SUM_REFETCH_INTERVAL`, **default 0: off**). After a reassignment, an archive pulls the Public chunks the latest epoch newly assigns to it from other archives over the existing V2 `Pull`/`ManifestPull`, refuses bytes that do not match the file's manifest, and accepts the rest through push validation; the epoch watcher then attests them. Bounded per run; never deletes. **Private files are never re-fetched** (nothing is requested, stored or attested for them) pending an authorization policy. See `docs/operator/monitoring.md` "Re-fetch of newly assigned Public chunks".
 
 ### Not changed
-- Owner-side push routing (`ingest`, `resume`) and download routing still use the original assignment snapshot, and newly assigned archives do not re-fetch chunks, so a reassignment alone does not restore coverage. No wire, chain or consensus change.
+- Owner-side push routing (`ingest`, `resume`) and download routing still use the original assignment snapshot, so without re-fetch a reassignment alone does not restore coverage, and Private files are not re-fetched at all. No latency is promised for a newly assigned archive. No wire, chain or consensus change.
 
 ## [0.4.0-rc4] - 2026-10-20
 
