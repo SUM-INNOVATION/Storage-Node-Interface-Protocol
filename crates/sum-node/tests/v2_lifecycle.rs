@@ -42,7 +42,7 @@ use sum_store::manifest_index::ManifestIndex;
 use sum_store::merkle::MerkleTree;
 use sum_types::config::StoreConfig;
 use sum_types::rpc_types::{
-    LifecycleV2, NodeRecordInfo, StorageFileInfoV2, TxStatusV2, VisibilityV2,
+    AssignmentCoverageV2, LifecycleV2, NodeRecordInfo, StorageFileInfoV2, TxStatusV2, VisibilityV2,
 };
 use sum_types::storage::{ChunkDescriptor, DataManifest};
 use tokio::sync::RwLock;
@@ -196,6 +196,29 @@ impl AttestTriggerRpc for MockRpc {
             .copied()
             .ok_or_else(|| anyhow::anyhow!("trigger: no nonce for {address_base58}"))
     }
+    /// A registered file's coverage row with no epoch list: this chain has
+    /// no reassignment epochs, so `assignment_height` is the only epoch.
+    async fn fetch_coverage(&self, merkle_root: &[u8; 32]) -> Result<Option<AssignmentCoverageV2>> {
+        let key = format!("0x{}", hex::encode(merkle_root));
+        Ok(self
+            .files
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|info| AssignmentCoverageV2 {
+                chunk_count: info.chunk_count,
+                covered_count: 0,
+                can_activate_now: false,
+                missing_total: info.chunk_count,
+                missing_offset: 0,
+                missing_indices: vec![],
+                per_archive: vec![],
+                assignment_epochs: vec![],
+                latest_assignment_epoch: 0,
+                reassignment_needed: false,
+                per_epoch: vec![],
+            }))
+    }
 }
 
 /// Newtype around `Arc<MockRpc>` so we can implement V2RpcClient,
@@ -243,6 +266,9 @@ impl AttestTriggerRpc for ArcRpcTrigger {
     }
     async fn fetch_nonce(&self, address_base58: &str) -> Result<u64> {
         self.0.fetch_nonce(address_base58).await
+    }
+    async fn fetch_coverage(&self, merkle_root: &[u8; 32]) -> Result<Option<AssignmentCoverageV2>> {
+        self.0.fetch_coverage(merkle_root).await
     }
 }
 
