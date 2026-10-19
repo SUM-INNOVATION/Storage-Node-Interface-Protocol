@@ -23,10 +23,13 @@
 //! ## Held-set tracker
 //!
 //! In-memory `HashMap<[u8; 32], BTreeSet<u32>>` keyed by file
-//! `merkle_root`. Updated only on successful V2 `Push`. Read by the
-//! `ManifestPush` handler when spawning attestation. Lost on node
-//! restart — Phase 0b accepts that; W10/W11 reconstruct from chain
-//! state via `storage_getAssignmentCoverageV2 + scan-on-disk`.
+//! `merkle_root`. Updated only on successful V2 `Push`, after the chunk
+//! index is recorded durably in the store's `<hex_root>.v2_held` sidecar
+//! (a push whose record fails is not acknowledged). Read by the
+//! `ManifestPush` handler when spawning attestation and by the epoch
+//! watcher. After a restart [`V2Dispatcher::seed_held_from_disk`]
+//! rebuilds it from those records and from Public manifests, keeping only
+//! chunks still on disk; see [`held_from_disk`].
 //!
 //! ## Why ManifestPush triggers attestation, not Push
 //!
@@ -429,6 +432,56 @@ where
         self
     }
 
+    /// Record a stored, validated V2 chunk durably (the store's
+    /// `<hex_root>.v2_held` sidecar), then in the held tracker. The caller
+    /// holds the store write lock and refuses the ACK on `Err`: a chunk
+    /// acknowledged without its record would be forgotten by a restart.
+    fn record_held(
+        &self,
+        manifest_idx: &mut ManifestIndex,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        cid: &str,
+    ) -> std::result::Result<(), String> {
+        manifest_idx
+            .record_v2_held_index(merkle_root, chunk_index, cid)
+            .map_err(|e| format!("held-index persistence failed: {e}"))?;
+        self.held
+            .lock()
+            .expect("held mutex poisoned")
+            .entry(merkle_root)
+            .or_default()
+            .insert(chunk_index);
+        Ok(())
+    }
+
+    /// Rebuild the held tracker from disk after a restart (see
+    /// [`held_from_disk`]) and merge it into the current one. Returns the
+    /// number of chunk indices found.
+    pub async fn seed_held_from_disk(&self) -> usize {
+        let rebuilt = {
+            let stores = self.store.read().await;
+            held_from_disk(&stores)
+        };
+        let found = rebuilt.values().map(BTreeSet::len).sum();
+        let mut held = self.held.lock().expect("held mutex poisoned");
+        for (root, indices) in rebuilt {
+            held.entry(root).or_default().extend(indices);
+        }
+        found
+    }
+
+    /// Every root the held tracker has at least one chunk for.
+    pub fn held_roots(&self) -> Vec<[u8; 32]> {
+        self.held
+            .lock()
+            .expect("held mutex poisoned")
+            .iter()
+            .filter(|(_, indices)| !indices.is_empty())
+            .map(|(root, _)| *root)
+            .collect()
+    }
+
     /// Snapshot of the held tracker for `merkle_root`. Used by the
     /// attestation trigger and by tests asserting receive-side state.
     pub fn held_for(&self, merkle_root: &[u8; 32]) -> BTreeSet<u32> {
@@ -633,13 +686,22 @@ where
                             chunk_index,
                             error: Some(format!("private chunk mapping persistence failed: {e}")),
                         }
+                    } else if let Err(e) =
+                        self.record_held(&mut stores.manifest_idx, merkle_root, chunk_index, &cid)
+                    {
+                        warn!(
+                            %peer_id,
+                            root = %hex::encode(merkle_root),
+                            chunk_index,
+                            %e,
+                            "V2 Push (Private): held-index record FAILED — refusing ACK"
+                        );
+                        ShardResponseV2::PushAck {
+                            merkle_root,
+                            chunk_index,
+                            error: Some(e),
+                        }
                     } else {
-                        self.held
-                            .lock()
-                            .expect("held mutex poisoned")
-                            .entry(merkle_root)
-                            .or_default()
-                            .insert(chunk_index);
                         debug!(
                             %peer_id,
                             root = %hex::encode(merkle_root),
@@ -654,23 +716,36 @@ where
                         }
                     }
                 } else {
-                    self.held
-                        .lock()
-                        .expect("held mutex poisoned")
-                        .entry(merkle_root)
-                        .or_default()
-                        .insert(chunk_index);
-                    debug!(
-                        %peer_id,
-                        root = %hex::encode(merkle_root),
-                        chunk_index,
-                        cid = %cid,
-                        "V2 Push (Public): chunk validated and stored"
-                    );
-                    ShardResponseV2::PushAck {
-                        merkle_root,
-                        chunk_index,
-                        error: None,
+                    let recorded = {
+                        let mut stores = self.store.write().await;
+                        self.record_held(&mut stores.manifest_idx, merkle_root, chunk_index, &cid)
+                    };
+                    if let Err(e) = recorded {
+                        warn!(
+                            %peer_id,
+                            root = %hex::encode(merkle_root),
+                            chunk_index,
+                            %e,
+                            "V2 Push (Public): held-index record FAILED — refusing ACK"
+                        );
+                        ShardResponseV2::PushAck {
+                            merkle_root,
+                            chunk_index,
+                            error: Some(e),
+                        }
+                    } else {
+                        debug!(
+                            %peer_id,
+                            root = %hex::encode(merkle_root),
+                            chunk_index,
+                            cid = %cid,
+                            "V2 Push (Public): chunk validated and stored"
+                        );
+                        ShardResponseV2::PushAck {
+                            merkle_root,
+                            chunk_index,
+                            error: None,
+                        }
                     }
                 }
             }
@@ -1042,6 +1117,50 @@ where
         );
     }
     Some(summary)
+}
+
+/// The chunk indices this archive holds, per file, rebuilt from disk:
+///
+/// - every index recorded in a `<hex_root>.v2_held` sidecar (V2 Push,
+///   Public or Private) whose chunk is still in the store;
+/// - for each Public manifest, every index whose chunk CID is in the
+///   store. This covers Public chunks pushed before the sidecar existed.
+///   A Public manifest is validated against its root, so a chunk on disk
+///   under the manifest's CID for index `i` is that file's chunk `i`. V1
+///   files appear here too; attestation and the epoch watcher act only on
+///   roots the chain reports as V2 files.
+///
+/// Private chunks pushed before the sidecar existed cannot be indexed (the
+/// encrypted manifest cannot be read here); they are attested again only
+/// after they are pushed again.
+pub fn held_from_disk(store: &SumStore) -> HashMap<[u8; 32], BTreeSet<u32>> {
+    let mut held: HashMap<[u8; 32], BTreeSet<u32>> = HashMap::new();
+    for root in store.manifest_idx.v2_held_roots() {
+        if let Some(records) = store.manifest_idx.v2_held_records(&root) {
+            let present: BTreeSet<u32> = records
+                .iter()
+                .filter(|(_, cid)| store.local.has(cid))
+                .map(|(index, _)| *index)
+                .collect();
+            if !present.is_empty() {
+                held.entry(root).or_default().extend(present);
+            }
+        }
+    }
+    for root in store.manifest_idx.all_merkle_roots() {
+        if let Some(manifest) = store.manifest_idx.get_by_merkle_root(&root) {
+            let present: BTreeSet<u32> = manifest
+                .chunks
+                .iter()
+                .filter(|c| store.local.has(&c.cid))
+                .map(|c| c.chunk_index)
+                .collect();
+            if !present.is_empty() {
+                held.entry(root).or_default().extend(present);
+            }
+        }
+    }
+    held
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -3149,5 +3268,176 @@ mod tests {
         let mut nonces = f.rpc.sent_nonces();
         nonces.sort();
         assert_eq!(nonces, vec![40, 41]);
+    }
+
+    // ── Held set across a restart (sum-chain #129, P4) ──
+
+    fn store_at(dir: &std::path::Path) -> Arc<RwLock<SumStore>> {
+        let cfg = sum_types::config::StoreConfig {
+            store_dir: dir.to_path_buf(),
+            max_chunk_msg_bytes: sum_types::config::DEFAULT_MAX_CHUNK_MSG_BYTES,
+        };
+        Arc::new(RwLock::new(SumStore::new(cfg).expect("SumStore::new")))
+    }
+
+    /// A chain with one file of `n` chunks (`private` or Public) assigned
+    /// over `five_archives()` at h=500, and the indices it assigns to
+    /// archive 0 under the validator's R.
+    fn held_fixture(
+        n: u32,
+        salt: u8,
+        private: bool,
+    ) -> (AllMockRpc, DataManifest, Vec<Vec<u8>>, MerkleTree, Vec<u32>) {
+        let snapshot = five_archives();
+        let (manifest, chunks, tree) = make_manifest(n, salt);
+        let root = manifest.merkle_root;
+        let rpc = AllMockRpc::new();
+        let info = if private {
+            file_info_active_private(&root, n, 500)
+        } else {
+            file_info_active(&root, n, 500)
+        };
+        rpc.add_file(&format!("0x{}", hex::encode(root)), info);
+        rpc.add_snapshot(
+            500,
+            snapshot.iter().map(node_record).collect(),
+            snapshot.clone(),
+        );
+        let r = crate::push_validator::V2Params::DEFAULTS.assignment_replication_factor;
+        let mine: Vec<u32> = (0..n)
+            .filter(|&i| {
+                sum_store::assignment_v2::assigned_archives(&root, &snapshot, i, r)
+                    .contains(&snapshot[0])
+            })
+            .collect();
+        assert!(
+            mine.len() >= 2,
+            "fixture needs two chunks assigned to archive 0"
+        );
+        (rpc, manifest, chunks, tree, mine)
+    }
+
+    async fn push(
+        d: &V2Dispatcher<ArcRpc, ArcRpc, ArcRpcTrigger>,
+        net: &RecorderNet,
+        root: [u8; 32],
+        index: u32,
+        chunks: &[Vec<u8>],
+        tree: &MerkleTree,
+    ) -> Option<String> {
+        let req = ShardRequestV2::Push {
+            data: chunks[index as usize].clone(),
+            merkle_root: root,
+            chunk_index: index,
+            merkle_path: tree.proof_bytes(index),
+        };
+        d.handle(net, PeerId::random(), req, u64::from(index)).await;
+        match net.last().expect("every push is answered").1 {
+            ShardResponseV2::PushAck { error, .. } => error,
+            other => panic!("expected PushAck, got {other:?}"),
+        }
+    }
+
+    async fn pushes_survive_a_restart(private: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (rpc, manifest, chunks, tree, mine) =
+            held_fixture(16, if private { 0x61 } else { 0x62 }, private);
+        let root = manifest.merkle_root;
+        let pushed = &mine[..2];
+        let me = five_archives()[0];
+        {
+            let stores = store_at(dir.path());
+            let d = build_dispatcher(rpc, vec![], me, stores);
+            let net = RecorderNet::new();
+            for &i in pushed {
+                assert_eq!(push(&d, &net, root, i, &chunks, &tree).await, None);
+            }
+            assert_eq!(d.held_for(&root), pushed.iter().copied().collect());
+        }
+
+        // Restart: a fresh store and dispatcher over the same directory.
+        let (rpc2, ..) = held_fixture(16, if private { 0x61 } else { 0x62 }, private);
+        let stores = store_at(dir.path());
+        let d = build_dispatcher(rpc2, vec![], me, stores.clone());
+        assert!(d.held_for(&root).is_empty());
+        assert_eq!(d.seed_held_from_disk().await, 2);
+        assert_eq!(d.held_for(&root), pushed.iter().copied().collect());
+        assert_eq!(d.held_roots(), vec![root]);
+
+        // A chunk no longer on disk is not held after the next rebuild.
+        let gone = cid_from_blake3_hash(&blake3::hash(&chunks[pushed[0] as usize]));
+        stores.read().await.local.delete(&gone).unwrap();
+        let rebuilt = held_from_disk(&*stores.read().await);
+        assert_eq!(rebuilt.get(&root), Some(&[pushed[1]].into_iter().collect()));
+    }
+
+    #[tokio::test]
+    async fn public_pushes_are_held_again_after_a_restart() {
+        pushes_survive_a_restart(false).await;
+    }
+
+    #[tokio::test]
+    async fn private_pushes_are_held_again_after_a_restart() {
+        pushes_survive_a_restart(true).await;
+    }
+
+    /// Public chunks stored before the sidecar existed are indexed from
+    /// the file's manifest; Private ones cannot be, and are not guessed.
+    #[tokio::test]
+    async fn rebuild_indexes_older_public_chunks_from_the_manifest_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = store_at(dir.path());
+        let (public, public_chunks, _) = make_manifest(4, 0x63);
+        let (private, private_chunks, _) = make_manifest(4, 0x64);
+        {
+            let mut s = stores.write().await;
+            s.manifest_idx.insert(&public).unwrap();
+            s.manifest_idx
+                .insert_private(private.merkle_root, b"opaque".to_vec())
+                .unwrap();
+            for i in [0usize, 2] {
+                s.local
+                    .put(&public.chunks[i].cid, &public_chunks[i])
+                    .unwrap();
+                s.local
+                    .put(&private.chunks[i].cid, &private_chunks[i])
+                    .unwrap();
+                s.manifest_idx
+                    .record_private_chunk_cid(private.merkle_root, &private.chunks[i].cid)
+                    .unwrap();
+            }
+        }
+        let held = held_from_disk(&*stores.read().await);
+        assert_eq!(
+            held.get(&public.merkle_root),
+            Some(&[0u32, 2].into_iter().collect())
+        );
+        assert_eq!(held.get(&private.merkle_root), None);
+    }
+
+    /// A push whose index cannot be recorded is not acknowledged and not
+    /// held: after a restart it would otherwise be forgotten.
+    #[tokio::test]
+    async fn a_push_whose_index_record_fails_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rpc, manifest, chunks, tree, mine) = held_fixture(16, 0x65, false);
+        let root = manifest.merkle_root;
+        let stores = store_at(dir.path());
+        stores
+            .write()
+            .await
+            .manifest_idx
+            .record_v2_held_index(root, mine[0], "some-other-cid")
+            .unwrap();
+        let d = build_dispatcher(rpc, vec![], five_archives()[0], stores);
+        let net = RecorderNet::new();
+        let err = push(&d, &net, root, mine[0], &chunks, &tree)
+            .await
+            .expect("refused");
+        assert!(err.contains("held-index persistence failed"), "{err}");
+        assert!(d.held_for(&root).is_empty());
+        // Another index of the same file is unaffected.
+        assert_eq!(push(&d, &net, root, mine[1], &chunks, &tree).await, None);
+        assert_eq!(d.held_for(&root), [mine[1]].into_iter().collect());
     }
 }
