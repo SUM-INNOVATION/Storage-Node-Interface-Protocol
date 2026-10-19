@@ -80,8 +80,9 @@ for observability only via `AssignmentCoverageV2` and
 `AssignmentEpochCoverageV2` at
 [`crates/sum-types/src/rpc_types.rs`](../../crates/sum-types/src/rpc_types.rs).
 `sum-node reassign` submits an owner-triggered `ReassignChunksV2`
-when the chain reports `reassignment_needed`. It uses the chain's no-key
-builder and the owner's existing key; see
+when the chain reports `reassignment_needed` and an archive that has left
+the active set holds a chunk of the file under the latest epoch. It uses
+the chain's no-key builder and the owner's existing key; see
 [`../client/upload-and-download.md`](../client/upload-and-download.md#reassignment).
 SNIP does not yet push, attest or route downloads under a later epoch, so
 abandon remains the only complete recovery from a pinned empty assignment

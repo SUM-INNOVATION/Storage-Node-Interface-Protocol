@@ -142,6 +142,42 @@ pub fn chunks_for_archive_v2(
     chunks
 }
 
+/// The first chunk index in `[0, chunk_count)` that is assigned to any of
+/// `targets`, with the target it is assigned to. `None` if no target holds a
+/// chunk of the file.
+///
+/// Scans chunks in ascending order and stops at the first hit, so a file that
+/// does have such an assignee usually costs a handful of chunk computations;
+/// only the `None` answer sweeps every chunk. When several targets share the
+/// first chunk, the one returned is the first of them in the assignment's
+/// `(score, address)` order. Targets outside the snapshot hold nothing.
+pub fn first_chunk_assigned_to_any(
+    merkle_root: &[u8; 32],
+    chunk_count: u32,
+    snapshot: &[[u8; 20]],
+    replication_factor: u32,
+    targets: &[[u8; 20]],
+) -> Option<(u32, [u8; 20])> {
+    let root = Hash::new(*merkle_root);
+    let presorted = presorted_addresses(snapshot);
+    let wanted: Vec<Address> = targets
+        .iter()
+        .map(|a| Address::new(*a))
+        .filter(|a| presorted.binary_search(a).is_ok())
+        .collect();
+    if wanted.is_empty() {
+        return None;
+    }
+    for chunk_index in 0..chunk_count {
+        let assigned =
+            wire_assigned_archives_presorted(&root, &presorted, chunk_index, replication_factor);
+        if let Some(hit) = assigned.iter().find(|a| wanted.contains(a)) {
+            return Some((chunk_index, *hit.as_bytes()));
+        }
+    }
+    None
+}
+
 // ── Inline unit tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -253,5 +289,47 @@ mod tests {
         let a0 = assigned_archives(&root, &snapshot, 0, 5);
         let a1 = assigned_archives(&root, &snapshot, 1, 5);
         assert_ne!(a0, a1, "chunk_index must influence the score");
+    }
+
+    /// `first_chunk_assigned_to_any` agrees with a full per-archive sweep: it
+    /// finds the lowest chunk any target holds, and `None` exactly when no
+    /// target holds a chunk.
+    #[test]
+    fn first_chunk_assigned_to_any_matches_a_full_sweep() {
+        let root = [7u8; 32];
+        let snapshot: Vec<[u8; 20]> = (0..6).map(|i| [0x40 + i; 20]).collect();
+        let chunk_count = 50;
+        for target in &snapshot {
+            let expected = chunks_for_archive_v2(&root, chunk_count, &snapshot, 3, target)
+                .into_iter()
+                .next();
+            let got = first_chunk_assigned_to_any(&root, chunk_count, &snapshot, 3, &[*target]);
+            assert_eq!(got.map(|(c, _)| c), expected);
+            if let Some((_, who)) = got {
+                assert_eq!(&who, target);
+            }
+        }
+
+        // One chunk, R = 1: only one archive holds anything.
+        let holder = assigned_archives(&root, &snapshot, 0, 1)[0];
+        let others: Vec<[u8; 20]> = snapshot.iter().copied().filter(|a| *a != holder).collect();
+        assert_eq!(
+            first_chunk_assigned_to_any(&root, 1, &snapshot, 1, &others),
+            None
+        );
+        assert_eq!(
+            first_chunk_assigned_to_any(&root, 1, &snapshot, 1, &[holder]),
+            Some((0, holder))
+        );
+
+        // A target outside the snapshot holds nothing; no targets, nothing.
+        assert_eq!(
+            first_chunk_assigned_to_any(&root, chunk_count, &snapshot, 3, &[[0xEE; 20]]),
+            None
+        );
+        assert_eq!(
+            first_chunk_assigned_to_any(&root, chunk_count, &snapshot, 3, &[]),
+            None
+        );
     }
 }
