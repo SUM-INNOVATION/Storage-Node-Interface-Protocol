@@ -86,7 +86,7 @@ Effective replication is `min(configured_r, eligible_snapshot.len())` — the sa
 - **Fewer eligible archives than `R`, or an assigned archive unreachable, before registration** — S2 needs `R` distinct `PushAck`s per chunk, so a file registered in either state could only end `Pending`. `IngestPipeline::run` and `run_private` check the current snapshot first and return `IngestOutcome::Failed { stage: Register }` without submitting `RegisterFilePendingV2`. In `resume`, an assignee that never appears leaves its chunks under-replicated; the outcome is `PendingNeedsAction { suggested: Resume }` and its source names the missing archives.
 - **Pinned assignment snapshot empty after `filter_active_archives`** — S1 has already finalized, but `storage_getActiveNodesAtHeight(assignment_height)` returns zero eligible archives. The pipeline returns `IngestOutcome::PendingNeedsAction { suggested: Abandon }` with the manifest preserved. The pinned assignment height is historical and immutable: subsequent `resume` calls will observe the same empty snapshot. `ReassignChunksV2` (post-#62 chain call) is the only chain-side recovery. `sum-node reassign` submits it when the chain reports `reassignment_needed`, but SNIP does not yet push or attest under a later epoch, so the complete operator recourse is still `abandon`.
 
-### Post-#62 `AssignmentCoverageV2` fields (observability)
+### Post-#62 `AssignmentCoverageV2` fields
 
 `AssignmentCoverageV2` carries four fields introduced by upstream `sum-chain` issue #62:
 
@@ -94,6 +94,8 @@ Effective replication is `min(configured_r, eligible_snapshot.len())` — the sa
 - `latest_assignment_epoch: u64` — the epoch whose targets the chain considers current for admission.
 - `reassignment_needed: bool` — the chain would accept `ReassignChunksV2`: an archive in the latest epoch's snapshot has left the active set. The rule is snapshot-wide; that archive need not hold a chunk of this file. `sum-node reassign` additionally requires a departed archive that holds one.
 - `per_epoch: Vec<AssignmentEpochCoverageV2>` — per-epoch shape of covered/missing indices.
+
+Archives read `assignment_epochs` / `latest_assignment_epoch` to validate pushes and attest against the latest epoch, and `per_epoch` in the epoch watcher (see [`../operator/monitoring.md`](../operator/monitoring.md#assignment-epochs-and-re-attestation)); the owner-side pipeline reads them for observability only.
 
 All four decode with `#[serde(default)]` so legacy chain responses that omit them continue to work. `AssignmentCoverageV2::resolved_latest_epoch()` returns `Some(latest_assignment_epoch)` when at least one epoch is populated, `None` otherwise — this lets callers distinguish a legacy response from a post-#62 response with a real epoch-0 result. Aggregate `can_activate_now` semantics are unchanged post-#62 (see upstream `storage_metadata.rs:2181-2200`). SNIP reads `reassignment_needed` to gate `sum-node reassign`, which submits an owner-triggered `ReassignChunksV2`; the remaining epoch-aware push and attestation work is tracked in the roadmap.
 

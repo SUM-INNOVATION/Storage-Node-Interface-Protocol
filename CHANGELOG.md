@@ -7,6 +7,17 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ## [Unreleased]
 
+### Fixed
+- **Attestation and push validation after a reassignment.** Archives validated pushes and attested against a file's original assignment snapshot (`assignment_height`), but after a `ReassignChunksV2` the chain accepts `AcceptAssignmentV2` only against the latest epoch's snapshot. A replacement archive refused its newly assigned chunks and attested nothing; a surviving archive attested indices the chain refuses. Both now use the latest assignment epoch from `storage_getAssignmentCoverageV2` (sum-chain #129).
+- **Held set after a restart.** The set of chunk indices an archive holds was in memory only. Each V2 push now records its index in `manifests/<root>.v2_held` before it is acknowledged, and the held set is rebuilt from these records and Public manifests at startup. Private chunks pushed by earlier versions are attested again only after a re-push.
+- Attestation runs are serialized per account, so two runs never start from the same nonce.
+
+### Added
+- **Epoch watcher** (`--epoch-watch-secs`, `SUM_EPOCH_WATCH_INTERVAL`, default 60, `0` disables): attests held chunks again when a held file's assignment epoch changes, and once at startup for epochs the node missed. See `docs/operator/monitoring.md` "Assignment epochs and re-attestation".
+
+### Not changed
+- Owner-side push routing (`ingest`, `resume`) and download routing still use the original assignment snapshot, and newly assigned archives do not re-fetch chunks, so a reassignment alone does not restore coverage. No wire, chain or consensus change.
+
 ## [0.4.0-rc4] - 2026-10-20
 
 First release candidate since `v0.4.0-rc3` (2026-05-08). It carries

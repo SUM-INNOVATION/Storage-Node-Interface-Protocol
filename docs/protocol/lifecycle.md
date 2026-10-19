@@ -236,7 +236,7 @@ After Alice's pushes complete, she also sends the `DataManifest` to each distinc
 
 Each storage node independently runs the **V2 deterministic assignment algorithm** that Alice already ran in Step 3 to choose her push targets. The goal: for each of the `C` = 10 chunks, determine which `R` = 3 of the `N` = 10 nodes should store a copy. No central coordinator decides this — every participant (Alice, every archive, the L1 validators) computes the same answer independently because they all use the same public on-chain inputs.
 
-Each archive queries the L1 for the snapshot pinned at the file's `assignment_height` and reads chain params for `R`:
+Each archive queries the L1 for the snapshot pinned at the file's `assignment_height` and reads chain params for `R`. (That is the file's only assignment epoch until a `ReassignChunksV2` adds one; archives always validate pushes and attest against the latest epoch, read from `storage_getAssignmentCoverageV2`.)
 
 1. `storage_getActiveNodesAtHeight(assignment_height)` ([crates/sum-node/src/rpc_client.rs:228-234](../../crates/sum-node/src/rpc_client.rs#L228-L234)) -> "What storage nodes were active when this file was registered?" -> Returns 10 addresses: `[N1_addr, ..., N10_addr]`, canonicalized via `BTreeSet` (deduped + sorted by address bytes — every participant sorts identically).
 2. `chain_getChainParams()` ([crates/sum-types/src/rpc_types.rs:213-258](../../crates/sum-types/src/rpc_types.rs#L213-L258)) -> reads `assignment_replication_factor` (default 3).

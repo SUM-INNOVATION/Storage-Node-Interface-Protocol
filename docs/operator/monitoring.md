@@ -139,6 +139,27 @@ Each is logged at `error` level. A torn final line left by a crash in the middle
 - This does not recover chunks that earlier versions already deleted. They must be pushed again by the file's owner or another replica, and re-attested.
 - `SUM_GC_GRACE` delays deletion of collectable chunks only. A restart starts the grace clock again.
 
+## Assignment epochs and re-attestation
+
+A file's owner can submit `ReassignChunksV2` after an archive assigned to the file leaves the active set. The chain then adds an assignment epoch: from that height it accepts this archive's `AcceptAssignmentV2` only for chunks assigned to it over the new epoch's snapshot.
+
+**What the archive does.**
+- **Push validation and attestation use the file's latest assignment epoch**, read from `storage_getAssignmentCoverageV2`. A chunk the latest epoch no longer assigns here is refused; a chunk it newly assigns here is accepted.
+- **The epoch watcher** checks every V2 file this archive holds chunks of, every `--epoch-watch-secs` (default 60). When a file's latest epoch has changed, it attests the held chunks the new epoch assigns here. At startup it also attests any file whose latest epoch shows fewer attested chunks from this archive than it holds and is assigned. It retries a failed run at most 3 times per epoch.
+- It attests only chunks already on disk. An archive newly assigned chunks it does not hold attests nothing for them until they are pushed to it; this release has no archive-to-archive re-fetch.
+
+**Log lines.**
+- `V2 held set rebuilt from disk` (startup, with the number of chunk indices found);
+- `epoch watcher: assignment epoch changed; attesting again`;
+- `epoch watcher: attestation did not finish; waiting for the next epoch change or a restart` (`warn`, after 3 failed runs for one epoch).
+
+**The held-index records.**
+- `<store_dir>/manifests/<root>.v2_held` records the chunk index of each chunk accepted by V2 push, one `<index> <cid>` line per push, synced before the push is acknowledged. If the write fails the push is refused.
+- At startup the archive rebuilds its held set from these records and from Public manifests, keeping only chunks still on disk.
+- **Private chunks pushed by a version without these records** cannot be indexed after a restart. They stay stored and are served, but are attested again only after the owner pushes them again.
+- A lost or damaged record file means the affected chunks are not attested until they are pushed again; it never makes the archive attest a chunk it does not hold. Unusable lines are dropped (and the file rewritten) at startup with a `warn`.
+- **Do not edit or delete these files while the archive is running.**
+
 ## Log guards
 
 Sensitive material (Ed25519 seed, X25519 secret, `K_file`, wrapped
