@@ -38,14 +38,18 @@ sum-node --client \
 The client:
 
 1. Chunks the file locally into 1 MB pieces.
-2. Signs and submits `RegisterFilePendingV2`, waits for finality.
-3. Reads the active-node snapshot at `assignment_height`.
-4. Pushes each chunk to its `R = 3` assigned archives in parallel,
+2. Waits until every archive the file would be assigned to is
+   identified on the network. If the chain lists fewer eligible
+   archives than `R`, or one of them is not reachable within 30 s,
+   it stops here: nothing is registered and no fee is spent.
+3. Signs and submits `RegisterFilePendingV2`, waits for finality.
+4. Reads the active-node snapshot at `assignment_height`.
+5. Pushes each chunk to its `R = 3` assigned archives in parallel,
    each push carrying an inline Merkle proof.
-5. Pushes the CBOR manifest to each distinct assigned archive.
-6. Polls `storage_getAssignmentCoverageV2` until
+6. Pushes the CBOR manifest to each distinct assigned archive.
+7. Polls `storage_getAssignmentCoverageV2` until
    `can_activate_now == true`.
-7. Signs and submits `ActivateFileV2`, waits for finality.
+8. Signs and submits `ActivateFileV2`, waits for finality.
 
 Stable stdout on success:
 

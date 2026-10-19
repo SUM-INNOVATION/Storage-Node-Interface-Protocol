@@ -12,6 +12,7 @@ pub mod ingest_v2;
 pub mod manifest_ingress;
 pub mod market_sync;
 pub mod metrics;
+pub mod peer_discovery;
 pub mod peer_state;
 pub mod por_worker;
 pub mod profile;
