@@ -134,6 +134,10 @@ impl V2RpcClient for MockRpc {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no snapshot at height {height}"))
     }
+    /// This mock's chain has no reassignment epochs.
+    async fn latest_assignment_epoch(&self, _merkle_root_hex: &str) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -236,6 +240,9 @@ impl V2RpcClient for ArcRpc {
     }
     async fn storage_get_active_nodes_at_height(&self, height: u64) -> Result<Vec<NodeRecordInfo>> {
         self.0.storage_get_active_nodes_at_height(height).await
+    }
+    async fn latest_assignment_epoch(&self, merkle_root_hex: &str) -> Result<Option<u64>> {
+        self.0.latest_assignment_epoch(merkle_root_hex).await
     }
 }
 

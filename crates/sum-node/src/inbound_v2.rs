@@ -255,6 +255,17 @@ impl V2RpcClient for L1RpcClient {
     ) -> Result<Vec<sum_types::rpc_types::NodeRecordInfo>> {
         L1RpcClient::storage_get_active_nodes_at_height(self, height).await
     }
+
+    async fn latest_assignment_epoch(&self, merkle_root_hex: &str) -> Result<Option<u64>> {
+        // Only the epoch fields are read: ask for an empty missing-index window.
+        let coverage =
+            L1RpcClient::storage_get_assignment_coverage_v2(self, merkle_root_hex, None, Some(0))
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no coverage row for registered root {merkle_root_hex}")
+                })?;
+        Ok(coverage.resolved_latest_epoch())
+    }
 }
 
 #[async_trait::async_trait]
@@ -1213,6 +1224,18 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("no snapshot at height {height}"))
         }
+        async fn latest_assignment_epoch(
+            &self,
+            merkle_root_hex: &str,
+        ) -> anyhow::Result<Option<u64>> {
+            let root: [u8; 32] = hex::decode(merkle_root_hex.trim_start_matches("0x"))?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("bad root hex {merkle_root_hex}"))?;
+            let coverage = AttestTriggerRpc::fetch_coverage(self, &root)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no coverage row for {merkle_root_hex}"))?;
+            Ok(coverage.resolved_latest_epoch())
+        }
     }
 
     #[async_trait::async_trait]
@@ -1501,6 +1524,12 @@ mod tests {
             height: u64,
         ) -> anyhow::Result<Vec<NodeRecordInfo>> {
             self.0.storage_get_active_nodes_at_height(height).await
+        }
+        async fn latest_assignment_epoch(
+            &self,
+            merkle_root_hex: &str,
+        ) -> anyhow::Result<Option<u64>> {
+            self.0.latest_assignment_epoch(merkle_root_hex).await
         }
     }
     #[async_trait::async_trait]

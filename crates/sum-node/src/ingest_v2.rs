@@ -2873,6 +2873,11 @@ mod tests {
                 .map(|(_, nodes)| nodes.clone())
                 .ok_or_else(|| anyhow::anyhow!("no snapshot at height {height}"))
         }
+        /// The owner-side pipeline never validates a push; this mock's
+        /// chain has no reassignment epochs.
+        async fn latest_assignment_epoch(&self, _merkle_root_hex: &str) -> Result<Option<u64>> {
+            Ok(None)
+        }
     }
 
     #[async_trait]
@@ -6143,6 +6148,9 @@ mod tests {
             ) -> Result<Vec<NodeRecordInfo>> {
                 self.snapshot_heights.lock().unwrap().push(height);
                 self.inner.storage_get_active_nodes_at_height(height).await
+            }
+            async fn latest_assignment_epoch(&self, merkle_root_hex: &str) -> Result<Option<u64>> {
+                self.inner.latest_assignment_epoch(merkle_root_hex).await
             }
         }
         #[async_trait]
