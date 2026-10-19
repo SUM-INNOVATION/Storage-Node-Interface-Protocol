@@ -708,6 +708,35 @@ where
         chunk_index: u32,
         merkle_path: Vec<[u8; 32]>,
     ) -> Option<String> {
+        self.accept_validated(source, data, merkle_root, chunk_index, merkle_path, true)
+            .await
+    }
+
+    /// [`Self::accept_chunk`] for a chunk a re-fetch pulled from another
+    /// archive. A Private file's chunk is refused after validation and
+    /// before anything is stored or recorded: re-fetch of Private data
+    /// awaits an authorization policy.
+    pub async fn accept_refetched_chunk(
+        &self,
+        source: &(dyn std::fmt::Display + Sync),
+        data: Vec<u8>,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        merkle_path: Vec<[u8; 32]>,
+    ) -> Option<String> {
+        self.accept_validated(source, data, merkle_root, chunk_index, merkle_path, false)
+            .await
+    }
+
+    async fn accept_validated(
+        &self,
+        source: &(dyn std::fmt::Display + Sync),
+        data: Vec<u8>,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        merkle_path: Vec<[u8; 32]>,
+        allow_private: bool,
+    ) -> Option<String> {
         let peer_id = source;
         let validate = self
             .validator
@@ -719,6 +748,10 @@ where
                 visibility,
             }) => {
                 let cid = cid_from_blake3_hash(&blake3::Hash::from(leaf_hash));
+                if visibility.is_private() && !allow_private {
+                    warn!(%peer_id, %cid, "re-fetched chunk of a Private file — refused, not stored");
+                    return Some("re-fetch of Private data is not authorized".into());
+                }
                 if let Err(e) = store_v2_pushed_chunk(&self.store, merkle_root, &cid, &data).await {
                     warn!(%peer_id, %cid, error = %e, "V2 Push: chunk not stored — refusing ACK");
                     Some(e)
@@ -3486,6 +3519,49 @@ mod tests {
         assert_eq!(d.held_for(&root), [mine[1]].into_iter().collect());
     }
 
+    /// The re-fetch acceptance path refuses a Private file's chunk after
+    /// validation and before anything is stored or recorded, although the
+    /// same chunk is assigned to this archive and a push of it is accepted.
+    #[tokio::test]
+    async fn a_refetched_private_chunk_is_refused_and_nothing_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rpc, manifest, chunks, tree, mine) = held_fixture(16, 0x6A, true);
+        let root = manifest.merkle_root;
+        let stores = store_at(dir.path());
+        let d = build_dispatcher(rpc, vec![], five_archives()[0], stores.clone());
+        let i = mine[0];
+        let cid = manifest.chunks[i as usize].cid.clone();
+        let refusal = d
+            .accept_refetched_chunk(
+                &"test",
+                chunks[i as usize].clone(),
+                root,
+                i,
+                tree.proof_bytes(i),
+            )
+            .await
+            .expect("refused");
+        assert!(refusal.contains("Private"), "{refusal}");
+        assert!(d.held_for(&root).is_empty());
+        assert!(!stores.read().await.local.has(&cid), "not stored");
+        assert!(
+            held_from_disk(&*stores.read().await).get(&root).is_none(),
+            "not recorded"
+        );
+        // The same chunk pushed by its owner is accepted.
+        assert_eq!(
+            d.accept_chunk(
+                &"owner",
+                chunks[i as usize].clone(),
+                root,
+                i,
+                tree.proof_bytes(i)
+            )
+            .await,
+            None
+        );
+    }
+
     // ── Re-fetch hand-over (G3 P3) ──────────────────────────────────────
 
     /// The chain side of a re-fetch: one Public file reassigned from
@@ -3542,7 +3618,12 @@ mod tests {
         async fn pull_manifest(&self, _from: [u8; 20], _root: [u8; 32]) -> anyhow::Result<Vec<u8>> {
             Ok(self.manifest.clone())
         }
-        async fn pull_chunk(&self, from: [u8; 20], cid: &str) -> anyhow::Result<Vec<u8>> {
+        async fn pull_chunk(
+            &self,
+            from: [u8; 20],
+            cid: &str,
+            _size: u64,
+        ) -> anyhow::Result<Vec<u8>> {
             let mut data = self
                 .chunks
                 .get(cid)

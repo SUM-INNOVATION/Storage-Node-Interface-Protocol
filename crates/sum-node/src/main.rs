@@ -91,6 +91,14 @@ struct Cli {
     #[arg(long, env = "SUM_EPOCH_WATCH_INTERVAL", default_value = "60")]
     epoch_watch_secs: u64,
 
+    /// V2 re-fetch interval in seconds (listen mode). After a
+    /// `ReassignChunksV2`, pulls the Public chunks the latest epoch newly
+    /// assigns to this archive from other archives, verifies them, and
+    /// stores them like pushes. Private files are never re-fetched. `0`
+    /// (the default) disables re-fetch.
+    #[arg(long, env = "SUM_REFETCH_INTERVAL", default_value = "0")]
+    refetch_secs: u64,
+
     /// SUM Chain V2 chain ID. Used by V2 tx builders (`AcceptAssignmentV2`,
     /// etc.) when signing on-chain transactions.
     #[arg(long, env = "SUM_CHAIN_ID", default_value = "1337")]
@@ -685,6 +693,11 @@ async fn run_listen(
     // nodes skip V2 inbound entirely. ShardRequestedV2 events will surface
     // but be logged-only.
     let mut v2_dispatcher: Option<Arc<V2Dispatcher<L1RpcClient, L1RpcClient, L1RpcClient>>> = None;
+    // Re-fetch's outbound pulls, settled from this loop's events. `None`
+    // unless `--refetch-secs` is set.
+    let mut refetch_transport: Option<
+        Arc<sum_node::refetch_net::ListenRefetchTransport<Arc<SumNet>>>,
+    > = None;
 
     // Spawn PoR worker if we have an L1 keypair.
     // Shutdown signal for background workers.
@@ -813,6 +826,32 @@ async fn run_listen(
         let watch_interval = Duration::from_secs(cli.epoch_watch_secs);
         let watcher_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move { watcher.run(watch_interval, watcher_shutdown).await });
+
+        // Re-fetch of newly assigned Public chunks (off unless configured).
+        // Pulls go out through `net` and are answered from this loop's
+        // events; verified chunks enter through the push path and the epoch
+        // watcher attests them.
+        if cli.refetch_secs > 0 {
+            let transport = Arc::new(sum_node::refetch_net::ListenRefetchTransport::new(
+                net.clone(),
+                peer_addresses.clone(),
+                sum_node::refetch_net::DEFAULT_PULL_TIMEOUT,
+            ));
+            let refetcher = sum_node::refetch_v2::Refetcher::new(
+                rpc.clone(),
+                transport.clone(),
+                dispatcher.clone(),
+                l1_addr,
+                v2_params.assignment_replication_factor,
+                sum_node::refetch_v2::RefetchLimits::default(),
+            );
+            let refetch_interval = Duration::from_secs(cli.refetch_secs);
+            let refetch_shutdown = shutdown_tx.subscribe();
+            tokio::spawn(async move { refetcher.run(refetch_interval, refetch_shutdown).await });
+            refetch_transport = Some(transport);
+        } else {
+            info!("V2 re-fetch disabled (--refetch-secs 0)");
+        }
         v2_dispatcher = Some(dispatcher);
         info!("V2 dispatcher initialized — accepting V2 ingest");
     } else {
@@ -843,10 +882,16 @@ async fn run_listen(
                     SumNetEvent::ShardRequested { .. } | SumNetEvent::ShardRequestedV2 { .. } => {
                         shard_dispatch.on_event(net.as_ref(), &event).await;
                     }
-                    SumNetEvent::ShardReceivedV2 { .. } => {
-                        // Phase 0b listen-mode doesn't initiate V2 outbound
-                        // requests (W10 will wire that). Just trace.
-                        print_event(&event);
+                    // Answers to re-fetch pulls settle their waiters; any
+                    // other V2 answer or request failure is only traced, as
+                    // before.
+                    SumNetEvent::ShardReceivedV2 { .. } | SumNetEvent::ShardRequestFailed { .. } => {
+                        let settled = refetch_transport
+                            .as_ref()
+                            .is_some_and(|t| t.on_event(&event));
+                        if !settled {
+                            print_event(&event);
+                        }
                     }
                     SumNetEvent::PeerIdentified { .. } | SumNetEvent::PeerDisconnected { .. } => {
                         let mut map = peer_addresses.write().await;

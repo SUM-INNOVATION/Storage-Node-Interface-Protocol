@@ -36,8 +36,9 @@
 //! pull-gated by the file's access list, and whether a newly assigned archive
 //! may pull them is an open protocol decision.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -73,8 +74,19 @@ impl PushableFilesRpc for L1RpcClient {
 pub trait RefetchTransport: Send + Sync {
     /// The raw manifest bytes `from` serves for `merkle_root`.
     async fn pull_manifest(&self, from: [u8; 20], merkle_root: [u8; 32]) -> Result<Vec<u8>>;
-    /// The bytes `from` serves for `cid`.
-    async fn pull_chunk(&self, from: [u8; 20], cid: &str) -> Result<Vec<u8>>;
+    /// The bytes `from` serves for `cid`, which the manifest says are `size`
+    /// bytes long.
+    async fn pull_chunk(&self, from: [u8; 20], cid: &str, size: u64) -> Result<Vec<u8>>;
+}
+
+#[async_trait]
+impl<T: RefetchTransport + ?Sized> RefetchTransport for Arc<T> {
+    async fn pull_manifest(&self, from: [u8; 20], merkle_root: [u8; 32]) -> Result<Vec<u8>> {
+        (**self).pull_manifest(from, merkle_root).await
+    }
+    async fn pull_chunk(&self, from: [u8; 20], cid: &str, size: u64) -> Result<Vec<u8>> {
+        (**self).pull_chunk(from, cid, size).await
+    }
 }
 
 /// Where verified results go: the archive's own push-acceptance path.
@@ -91,8 +103,8 @@ pub trait RefetchSink: Send + Sync {
         chain_chunk_count: u32,
         manifest_bytes: &[u8],
     ) -> std::result::Result<DataManifest, String>;
-    /// Validate, store and record a chunk as a V2 Push would be. `None` on
-    /// success, else the refusal reason.
+    /// Validate, store and record a chunk as a V2 Push would be, refusing a
+    /// Private file's chunk. `None` on success, else the refusal reason.
     async fn accept_chunk(
         &self,
         from: [u8; 20],
@@ -134,15 +146,8 @@ where
         merkle_path: Vec<[u8; 32]>,
     ) -> Option<String> {
         let source = format!("re-fetch from 0x{}", hex::encode(from));
-        crate::inbound_v2::V2Dispatcher::accept_chunk(
-            self,
-            &source,
-            data,
-            merkle_root,
-            chunk_index,
-            merkle_path,
-        )
-        .await
+        self.accept_refetched_chunk(&source, data, merkle_root, chunk_index, merkle_path)
+            .await
     }
 }
 
@@ -242,7 +247,15 @@ pub struct Refetcher<C, N, S> {
     me: [u8; 20],
     replication_factor: u32,
     limits: RefetchLimits,
+    /// Private roots whose skip has been logged, so the reason is logged
+    /// once per file rather than every run.
+    private_noted: StdMutex<HashSet<[u8; 32]>>,
 }
+
+/// The one reason a Private file is not re-fetched.
+pub const PRIVATE_SKIP_REASON: &str = "Private file not re-fetched: its manifest and ciphertext \
+     are served only to the file's access list, and re-fetch of Private data awaits an \
+     authorization policy";
 
 impl<C, N, S> Refetcher<C, N, S>
 where
@@ -265,6 +278,33 @@ where
             me,
             replication_factor,
             limits,
+            private_noted: StdMutex::new(HashSet::new()),
+        }
+    }
+
+    /// Run [`Self::run_once`] every `interval` until `shutdown` changes. A
+    /// zero interval disables re-fetch.
+    pub async fn run(self, interval: Duration, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        if interval.is_zero() {
+            info!("V2 re-fetch disabled (interval 0)");
+            return;
+        }
+        info!(
+            interval_secs = interval.as_secs(),
+            "V2 re-fetch started (Public files only)"
+        );
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    self.run_once().await;
+                }
+                _ = shutdown.changed() => {
+                    info!("V2 re-fetch stopping");
+                    return;
+                }
+            }
         }
     }
 
@@ -327,7 +367,17 @@ where
             return;
         }
         if shape.visibility.is_private() {
+            // Fail closed: nothing is requested, stored or attested for a
+            // Private file through re-fetch.
             report.private_skipped += 1;
+            if self
+                .private_noted
+                .lock()
+                .expect("mutex poisoned")
+                .insert(root)
+            {
+                info!(root = %root_hex, "{PRIVATE_SKIP_REASON}");
+            }
             return;
         }
         let coverage = match self.chain.fetch_coverage(&root).await {
@@ -403,7 +453,7 @@ where
             };
             let mut accepted = false;
             for &from in cp.sources.iter().take(self.limits.sources_per_chunk) {
-                let data = match self.net.pull_chunk(from, &desc.cid).await {
+                let data = match self.net.pull_chunk(from, &desc.cid, desc.size).await {
                     Ok(d) => d,
                     Err(e) => {
                         debug!(root = %root_hex, index = cp.chunk_index, %e, "re-fetch: pull failed");
@@ -670,17 +720,19 @@ mod tests {
         chunks: HashMap<([u8; 20], String), Vec<u8>>,
         manifests: HashMap<[u8; 20], Vec<u8>>,
         pulls: StdMutex<Vec<([u8; 20], String)>>,
+        manifest_pulls: StdMutex<Vec<[u8; 20]>>,
     }
 
     #[async_trait]
     impl RefetchTransport for Net {
         async fn pull_manifest(&self, from: [u8; 20], _root: [u8; 32]) -> Result<Vec<u8>> {
+            self.manifest_pulls.lock().unwrap().push(from);
             self.manifests
                 .get(&from)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("no manifest"))
         }
-        async fn pull_chunk(&self, from: [u8; 20], cid: &str) -> Result<Vec<u8>> {
+        async fn pull_chunk(&self, from: [u8; 20], cid: &str, _size: u64) -> Result<Vec<u8>> {
             self.pulls.lock().unwrap().push((from, cid.to_string()));
             self.chunks
                 .get(&(from, cid.to_string()))
@@ -1061,6 +1113,78 @@ mod tests {
         assert_eq!(report.planned, 0);
         assert!(r.net.pulls.lock().unwrap().is_empty());
         assert!(sink.accepted.lock().unwrap().is_empty());
+    }
+
+    /// Fail closed: a Private file the latest epoch newly assigns to this
+    /// archive is never requested (no manifest pull, no chunk pull), stored
+    /// or handed over, run after run, and the skip is noted once.
+    #[tokio::test]
+    async fn a_private_file_is_never_fetched_even_when_newly_assigned() {
+        let (manifest, chunks, cbor) = file(0x3C);
+        let root = manifest.merkle_root;
+        let epochs = [(500, archives()), (900, epoch1())];
+        assert!(
+            !plan_refetch(&root, CHUNKS, &epochs, R, &joiner(), &BTreeSet::new()).is_empty(),
+            "fixture: the latest epoch newly assigns this archive chunks"
+        );
+        let mut chain = Chain::new();
+        chain.add(root, true, &[500, 900]);
+        let net = Net::honest(&manifest, &chunks, &cbor);
+        let (r, sink) = refetcher(chain, net, Sink::default(), RefetchLimits::default());
+        for _ in 0..3 {
+            let report = r.run_once().await;
+            assert_eq!(report.private_skipped, 1);
+            assert_eq!(report.planned, 0);
+        }
+        assert!(r.net.pulls.lock().unwrap().is_empty(), "no chunk requested");
+        assert!(
+            r.net.manifest_pulls.lock().unwrap().is_empty(),
+            "no manifest requested"
+        );
+        assert!(
+            sink.accepted.lock().unwrap().is_empty(),
+            "nothing handed over"
+        );
+        assert!(sink.manifest.lock().unwrap().is_none(), "nothing indexed");
+        assert_eq!(r.private_noted.lock().unwrap().len(), 1, "skip noted once");
+    }
+
+    #[tokio::test]
+    async fn run_is_off_at_zero_and_stops_on_shutdown() {
+        let (manifest, chunks, cbor) = file(0x3D);
+        let mut chain = Chain::new();
+        chain.add(manifest.merkle_root, false, &[500, 900]);
+        let net = Net::honest(&manifest, &chunks, &cbor);
+        let (r, sink) = refetcher(chain, net, Sink::default(), RefetchLimits::default());
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        // Interval 0: returns at once and fetches nothing.
+        tokio::time::timeout(Duration::from_secs(1), r.run(Duration::ZERO, rx.clone()))
+            .await
+            .expect("disabled run returns");
+        assert!(sink.accepted.lock().unwrap().is_empty());
+
+        let (manifest, chunks, cbor) = file(0x3E);
+        let mut chain = Chain::new();
+        chain.add(manifest.merkle_root, false, &[500, 900]);
+        let net = Net::honest(&manifest, &chunks, &cbor);
+        let (r, sink) = refetcher(chain, net, Sink::default(), RefetchLimits::default());
+        let task = tokio::spawn(r.run(Duration::from_secs(3600), rx));
+        // The first tick fires at once; then shutdown stops the loop.
+        for _ in 0..200 {
+            if !sink.accepted.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !sink.accepted.lock().unwrap().is_empty(),
+            "first run happened"
+        );
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("stops on shutdown")
+            .unwrap();
     }
 
     #[tokio::test]
