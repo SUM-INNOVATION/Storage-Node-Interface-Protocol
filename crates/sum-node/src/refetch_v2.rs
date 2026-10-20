@@ -113,6 +113,11 @@ pub trait RefetchSink: Send + Sync {
         data: Vec<u8>,
         merkle_path: Vec<[u8; 32]>,
     ) -> Option<String>;
+    /// Attest `held ∩ assigned(latest epoch)` for `merkle_root` after a run
+    /// stored new chunks of it, through the same attestor a ManifestPush
+    /// uses. Re-fetched chunks can arrive after the epoch watcher has already
+    /// handled the file's latest epoch, so nothing else would attest them.
+    fn attest_refetched(&self, merkle_root: [u8; 32]);
 }
 
 #[async_trait]
@@ -148,6 +153,9 @@ where
         let source = format!("re-fetch from 0x{}", hex::encode(from));
         self.accept_refetched_chunk(&source, data, merkle_root, chunk_index, merkle_path)
             .await
+    }
+    fn attest_refetched(&self, merkle_root: [u8; 32]) {
+        self.spawn_refetch_attestation(merkle_root);
     }
 }
 
@@ -443,9 +451,10 @@ where
             .collect();
         let tree = MerkleTree::build(&leaves);
 
+        let fetched_before = report.fetched.len();
         for cp in plan {
             if report.fetched.len() + report.failed.len() >= self.limits.chunks_per_run {
-                return;
+                break;
             }
             let Some(desc) = manifest.chunks.get(cp.chunk_index as usize) else {
                 report.failed.push((root, cp.chunk_index));
@@ -497,6 +506,9 @@ where
             } else {
                 report.failed.push((root, cp.chunk_index));
             }
+        }
+        if report.fetched.len() > fetched_before {
+            self.sink.attest_refetched(root);
         }
     }
 
@@ -766,6 +778,7 @@ mod tests {
         accepted: StdMutex<Vec<(u32, Vec<u8>, Vec<[u8; 32]>)>>,
         held: BTreeSet<u32>,
         refuse: bool,
+        attest_triggers: StdMutex<Vec<[u8; 32]>>,
     }
 
     #[async_trait]
@@ -802,6 +815,9 @@ mod tests {
             }
             self.accepted.lock().unwrap().push((index, data, path));
             None
+        }
+        fn attest_refetched(&self, root: [u8; 32]) {
+            self.attest_triggers.lock().unwrap().push(root);
         }
     }
 
@@ -1197,6 +1213,74 @@ mod tests {
         let report = r.run_once().await;
         assert_eq!(report.errors, 1);
         assert_eq!(report.planned, 0);
+    }
+
+    #[tokio::test]
+    async fn stored_chunks_are_attested_once_per_file_per_run() {
+        let (manifest, chunks, cbor) = file(0x3C);
+        let root = manifest.merkle_root;
+        let mut chain = Chain::new();
+        chain.add(root, false, &[500, 900]);
+        let net = Net::honest(&manifest, &chunks, &cbor);
+        let (r, sink) = refetcher(chain, net, Sink::default(), RefetchLimits::default());
+        let report = r.run_once().await;
+        assert!(report.fetched.len() > 1);
+        assert_eq!(
+            *sink.attest_triggers.lock().unwrap(),
+            vec![root],
+            "one attestation for the file, after its chunks are stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_stored_means_no_attestation() {
+        let (manifest, chunks, cbor) = file(0x3D);
+        let root = manifest.merkle_root;
+        let mut chain = Chain::new();
+        chain.add(root, false, &[500, 900]);
+        let mut net = Net::honest(&manifest, &chunks, &cbor);
+        for (k, v) in net.chunks.iter_mut() {
+            if k.0 != joiner() {
+                v[0] ^= 0x01;
+            }
+        }
+        let (r, sink) = refetcher(chain, net, Sink::default(), RefetchLimits::default());
+        let report = r.run_once().await;
+        assert!(report.fetched.is_empty());
+        assert!(sink.attest_triggers.lock().unwrap().is_empty());
+
+        // Refused by the push validator: nothing stored, nothing attested.
+        let (manifest, chunks, cbor) = file(0x3E);
+        let root = manifest.merkle_root;
+        let mut chain = Chain::new();
+        chain.add(root, false, &[500, 900]);
+        let net = Net::honest(&manifest, &chunks, &cbor);
+        let sink = Sink {
+            refuse: true,
+            ..Sink::default()
+        };
+        let (r, sink) = refetcher(chain, net, sink, RefetchLimits::default());
+        let report = r.run_once().await;
+        assert!(report.fetched.is_empty());
+        assert!(sink.attest_triggers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_run_cut_short_by_the_budget_still_attests_what_it_stored() {
+        let (manifest, chunks, cbor) = file(0x3F);
+        let root = manifest.merkle_root;
+        let mut chain = Chain::new();
+        chain.add(root, false, &[500, 900]);
+        let net = Net::honest(&manifest, &chunks, &cbor);
+        let limits = RefetchLimits {
+            chunks_per_run: 1,
+            ..RefetchLimits::default()
+        };
+        let (r, sink) = refetcher(chain, net, Sink::default(), limits);
+        let report = r.run_once().await;
+        assert!(report.planned > 1);
+        assert_eq!(report.fetched.len(), 1);
+        assert_eq!(*sink.attest_triggers.lock().unwrap(), vec![root]);
     }
 
     #[tokio::test]
