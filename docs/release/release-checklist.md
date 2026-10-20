@@ -218,6 +218,13 @@ next source used, a restart while one chunk is missing, latest-epoch
 attestation with `reassignment_needed` cleared, and a Private file that is
 never fetched.
 
+The `reassignment re-fetch E2E` workflow
+(`.github/workflows/reassignment-refetch-e2e.yml`) runs exactly this, with
+`SNIP_E2E_REASSIGNMENT=1`, on any pull request to `main` that changes the
+re-fetch, epoch-watcher, push-validation, attestation or reassignment code,
+the E2E suite or this harness. Its paths filter is the trigger; the branch
+name does not matter. It is not a required check.
+
 `SUMCHAIN_COMMIT` is the chain commit the end-to-end run uses. It is
 not the compatibility pin in
 [`chain-compat.md`](../reference/chain-compat.md): at that pin the
