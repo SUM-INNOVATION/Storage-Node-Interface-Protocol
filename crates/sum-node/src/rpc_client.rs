@@ -317,6 +317,19 @@ impl L1RpcClient {
         .await
     }
 
+    /// `storage_getPushableFilesV2` — one page of V2 files in a pushable
+    /// lifecycle (Pending or Active), in `merkle_root` order. The chain
+    /// defaults `limit` to 256 and caps it at 1024; callers paginate with
+    /// `offset += returned.len()`.
+    pub async fn storage_get_pushable_files_v2(
+        &self,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<Vec<sum_types::rpc_types::PushableFileInfoV2>> {
+        self.call("storage_getPushableFilesV2", json!([offset, limit]))
+            .await
+    }
+
     /// `storage_buildReassignChunksV2` — the chain's no-key builder for an
     /// owner-triggered `ReassignChunksV2`. Returns the unsigned
     /// `TransactionV2` and its signing hash; it signs nothing and checks no

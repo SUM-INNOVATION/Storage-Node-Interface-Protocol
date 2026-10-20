@@ -31,6 +31,7 @@ Applies to every subcommand.
 | `--market-sync-secs` | `SUM_MARKET_SYNC_INTERVAL` | `30` | Market-sync polling interval. |
 | `--gc-grace-secs` | `SUM_GC_GRACE` | `3600` | Grace period before garbage-collecting unassigned chunks. |
 | `--epoch-watch-secs` | `SUM_EPOCH_WATCH_INTERVAL` | `60` | Listen mode: how often to check held V2 files for a new assignment epoch and attest held chunks again under it. `0` disables. See [assignment epochs](../operator/monitoring.md#assignment-epochs-and-re-attestation). |
+| `--refetch-secs` | `SUM_REFETCH_INTERVAL` | `0` | Listen mode: how often to re-fetch Public chunks a reassignment newly assigned to this archive from other archives. `0` (default) disables. Private files are never re-fetched. See [re-fetch](../operator/monitoring.md#re-fetch-of-newly-assigned-public-chunks). |
 | `--chain-id` | `SUM_CHAIN_ID` | `1337` | See [`config-flags.md`](config-flags.md) "Chain ID safety." |
 | `--attest-fee` | `SUM_ATTEST_FEE` | `1000000` | Per-tx fee for V2 attestation. Must be ≥ chain `min_fee`. |
 | `--client` | `SUM_CLIENT_MODE` | `false` | Client mode: upload / download only. `listen` refused. |
@@ -79,6 +80,10 @@ chunks → push manifest → poll coverage → `ActivateFileV2`.
 | `--visibility` | `public` | `public` or `private`. `private` generates a fresh `K_file`, encrypts chunks + manifest, wraps `K_file` for each recipient. |
 | `--recipient` | — | Recipient for a Private file: `<base58 L1 addr>` or `<addr>:<expires_at_height>`. Repeatable. Rejected with `--visibility public`. |
 
+Exit status and the `lifecycle:` line: see
+[`sum-node resume`](#sum-node-resume) ("Outcome and exit status"); the
+same contract applies here.
+
 ### sum-node resume
 
 V2 resume: replay only the residual portion of the pipeline for a
@@ -91,6 +96,23 @@ V2 resume: replay only the residual portion of the pipeline for a
 | `--push-wait-secs` | `120` | S2 partial push wall-clock timeout. |
 | `--manifest-push-wait-secs` | `60` | S3 manifest re-push wall-clock timeout. |
 | `--activation-wait-secs` | `300` | S4 coverage-poll wall-clock timeout. |
+
+**Outcome and exit status.** The command exits 0 whenever it reaches an
+outcome, including a file left `Pending`. The outcome is the last
+`lifecycle:` line on stdout:
+
+- `lifecycle: Active`: `ActivateFileV2` was submitted **and finalized**
+  (or the chain already showed the file `Active`). Activation is
+  complete, not merely submitted.
+- `lifecycle: Pending`: the file is registered but still `Pending`;
+  run `resume` again or `abandon`.
+- `lifecycle: Abandoned` (`resume` only): the file was abandoned.
+- No `lifecycle:` line: a root mismatch (`resume`) or an error; only a
+  warning is logged.
+
+A non-zero exit status means a setup or argument error (for example an
+unsupported `--visibility`). Scripts must read the `lifecycle:` line,
+not the exit status alone.
 
 ### sum-node abandon
 

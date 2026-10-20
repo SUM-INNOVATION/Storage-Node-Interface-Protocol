@@ -146,7 +146,7 @@ A file's owner can submit `ReassignChunksV2` after an archive assigned to the fi
 **What the archive does.**
 - **Push validation and attestation use the file's latest assignment epoch**, read from `storage_getAssignmentCoverageV2`. A chunk the latest epoch no longer assigns here is refused; a chunk it newly assigns here is accepted.
 - **The epoch watcher** checks every V2 file this archive holds chunks of, every `--epoch-watch-secs` (default 60). When a file's latest epoch has changed, it attests the held chunks the new epoch assigns here. At startup it also attests any file whose latest epoch shows fewer attested chunks from this archive than it holds and is assigned. It retries a failed run at most 3 times per epoch.
-- It attests only chunks already on disk. An archive newly assigned chunks it does not hold attests nothing for them until they are pushed to it; this release has no archive-to-archive re-fetch.
+- It attests only chunks already on disk. An archive newly assigned chunks it does not hold attests nothing for them until they are pushed to it, or until re-fetch (below, off by default) has pulled them.
 
 **Log lines.**
 - `V2 held set rebuilt from disk` (startup, with the number of chunk indices found);
@@ -159,6 +159,32 @@ A file's owner can submit `ReassignChunksV2` after an archive assigned to the fi
 - **Private chunks pushed by a version without these records** cannot be indexed after a restart. They stay stored and are served, but are attested again only after the owner pushes them again.
 - A lost or damaged record file means the affected chunks are not attested until they are pushed again; it never makes the archive attest a chunk it does not hold. Unusable lines are dropped (and the file rewritten) at startup with a `warn`.
 - **Do not edit or delete these files while the archive is running.**
+
+## Re-fetch of newly assigned Public chunks
+
+**Off by default.** Set `--refetch-secs` (`SUM_REFETCH_INTERVAL`) to a number of seconds to enable it, for example `300`. `0` disables it.
+
+After a `ReassignChunksV2`, the latest epoch can assign this archive chunks of a file that nobody will push to it: the owner's `ingest`/`resume` still route to the file's original archives. With re-fetch enabled, every interval the archive:
+
+1. reads the chain's list of Pending and Active V2 files (`storage_getPushableFilesV2`) and, for each file with more than one assignment epoch, finds the chunks the latest epoch assigns here that the previous epoch did not and that are not held;
+2. pulls the file's manifest from another archive if it has none, and accepts it only if it validates exactly as a ManifestPush would;
+3. pulls each chunk from the other archives assigned it (latest epoch first, then earlier epochs), refuses bytes that do not match the manifest, and stores accepted chunks through the same validation as a push: chain registration, latest-epoch assignment to this archive, Merkle proof;
+4. attests the chunks it stored, once per file per run, through the same attestation a ManifestPush starts. The epoch watcher alone would miss chunks that arrive after it has already handled the file's latest epoch.
+
+**Bounds per run:** 256 files, 1,024 chunks, 3 sources per chunk (and per manifest), 4 epochs, 30 s per pull. A source is used only if it is connected and has identified itself (`peer L1 identity mapped`); otherwise the next source is tried. Nothing is ever deleted.
+
+**Private files are never re-fetched.** Their manifests and ciphertext are served only to the file's access list, and re-fetch of Private data awaits an authorization policy. Nothing is requested, stored or attested for them, and a re-fetched chunk that turns out to belong to a Private file is refused before it is stored. The skip is logged once per file per run of the node: `Private file not re-fetched: …`.
+
+**What it does not do.**
+- No promise about how soon a newly assigned archive holds or attests its chunks, or about storage-proof challenges before it does; that protocol decision is open.
+- It does not complete an original placement: chunks this archive was already assigned before the reassignment are not re-fetched.
+- Owner-side push routing and download routing still use the file's first epoch.
+
+**Log lines.**
+- `V2 re-fetch started (Public files only)` / `V2 re-fetch disabled (--refetch-secs 0)` at startup;
+- `re-fetch: run complete` (when a run planned anything), with files checked, chunks planned, fetched and failed, and corrupt answers refused;
+- `re-fetch: bytes do not match the manifest; refused` and `re-fetch: manifest refused` (`warn`, with the source);
+- `re-fetch: inconsistent assignment epochs; skipped` (`warn`).
 
 ## Log guards
 

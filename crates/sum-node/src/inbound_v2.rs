@@ -497,6 +497,49 @@ where
             .unwrap_or_default()
     }
 
+    /// The locally indexed Public manifest for `merkle_root`, if any.
+    pub async fn local_manifest(&self, merkle_root: &[u8; 32]) -> Option<DataManifest> {
+        self.store
+            .read()
+            .await
+            .manifest_idx
+            .get_by_merkle_root(merkle_root)
+            .cloned()
+    }
+
+    /// A Public manifest pulled from another archive by a re-fetch.
+    /// Validated exactly as a Public ManifestPush (the recomputed Merkle
+    /// root equals `merkle_root`, CIDs bind to their blake3 hashes, indices
+    /// are ordered), its chunk count checked against the chain's, then
+    /// indexed unless it already is. No attestation is spawned: the epoch
+    /// watcher attests once chunks are held.
+    pub async fn accept_refetched_manifest(
+        &self,
+        merkle_root: [u8; 32],
+        chain_chunk_count: u32,
+        manifest_bytes: &[u8],
+    ) -> std::result::Result<DataManifest, String> {
+        let manifest = validate_manifest_push(&hex::encode(merkle_root), manifest_bytes)?;
+        if manifest.chunk_count != chain_chunk_count {
+            return Err(format!(
+                "manifest declares {} chunks, the chain registered {chain_chunk_count}",
+                manifest.chunk_count
+            ));
+        }
+        let mut stores = self.store.write().await;
+        if stores
+            .manifest_idx
+            .get_by_merkle_root(&merkle_root)
+            .is_none()
+        {
+            stores
+                .manifest_idx
+                .insert(&manifest)
+                .map_err(|e| format!("manifest persistence failed: {e}"))?;
+        }
+        Ok(manifest)
+    }
+
     /// Top-level dispatcher. Replies via `net.respond_shard_v2` exactly
     /// once per inbound request.
     pub async fn handle(
@@ -638,23 +681,80 @@ where
         chunk_index: u32,
         merkle_path: Vec<[u8; 32]>,
     ) {
+        let error = self
+            .accept_chunk(&peer_id, data, merkle_root, chunk_index, merkle_path)
+            .await;
+        let resp = ShardResponseV2::PushAck {
+            merkle_root,
+            chunk_index,
+            error,
+        };
+        if let Err(e) = net.respond_shard_v2(channel_id, resp).await {
+            warn!(channel_id, %e, "V2 Push: failed to send PushAck");
+        }
+    }
+
+    /// Validate one chunk exactly as a V2 Push is validated (chain
+    /// registration, latest-epoch assignment to this archive, strict
+    /// Merkle proof), store it, and record it durably as held. `None` on
+    /// success, otherwise the refusal reason a PushAck would carry.
+    /// `source` names where the chunk came from, for logs only: the peer
+    /// that pushed it, or the archive a re-fetch pulled it from.
+    pub async fn accept_chunk(
+        &self,
+        source: &(dyn std::fmt::Display + Sync),
+        data: Vec<u8>,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        merkle_path: Vec<[u8; 32]>,
+    ) -> Option<String> {
+        self.accept_validated(source, data, merkle_root, chunk_index, merkle_path, true)
+            .await
+    }
+
+    /// [`Self::accept_chunk`] for a chunk a re-fetch pulled from another
+    /// archive. A Private file's chunk is refused after validation and
+    /// before anything is stored or recorded: re-fetch of Private data
+    /// awaits an authorization policy.
+    pub async fn accept_refetched_chunk(
+        &self,
+        source: &(dyn std::fmt::Display + Sync),
+        data: Vec<u8>,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        merkle_path: Vec<[u8; 32]>,
+    ) -> Option<String> {
+        self.accept_validated(source, data, merkle_root, chunk_index, merkle_path, false)
+            .await
+    }
+
+    async fn accept_validated(
+        &self,
+        source: &(dyn std::fmt::Display + Sync),
+        data: Vec<u8>,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        merkle_path: Vec<[u8; 32]>,
+        allow_private: bool,
+    ) -> Option<String> {
+        let peer_id = source;
         let validate = self
             .validator
             .validate_push(merkle_root, chunk_index, &data, &merkle_path)
             .await;
-        let resp = match validate {
+        match validate {
             Ok(crate::push_validator::ValidatedPush {
                 leaf_hash,
                 visibility,
             }) => {
                 let cid = cid_from_blake3_hash(&blake3::Hash::from(leaf_hash));
+                if visibility.is_private() && !allow_private {
+                    warn!(%peer_id, %cid, "re-fetched chunk of a Private file — refused, not stored");
+                    return Some("re-fetch of Private data is not authorized".into());
+                }
                 if let Err(e) = store_v2_pushed_chunk(&self.store, merkle_root, &cid, &data).await {
                     warn!(%peer_id, %cid, error = %e, "V2 Push: chunk not stored — refusing ACK");
-                    ShardResponseV2::PushAck {
-                        merkle_root,
-                        chunk_index,
-                        error: Some(e),
-                    }
+                    Some(e)
                 } else if visibility.is_private() {
                     // Phase 4b: for Private files, the serving-side
                     // ACL gate (`merkle_root_for_cid`) needs the
@@ -685,11 +785,7 @@ where
                             %e,
                             "V2 Push (Private): cid->root mapping write FAILED — refusing ACK"
                         );
-                        ShardResponseV2::PushAck {
-                            merkle_root,
-                            chunk_index,
-                            error: Some(format!("private chunk mapping persistence failed: {e}")),
-                        }
+                        Some(format!("private chunk mapping persistence failed: {e}"))
                     } else if let Err(e) =
                         self.record_held(&mut stores.manifest_idx, merkle_root, chunk_index, &cid)
                     {
@@ -700,11 +796,7 @@ where
                             %e,
                             "V2 Push (Private): held-index record FAILED — refusing ACK"
                         );
-                        ShardResponseV2::PushAck {
-                            merkle_root,
-                            chunk_index,
-                            error: Some(e),
-                        }
+                        Some(e)
                     } else {
                         debug!(
                             %peer_id,
@@ -713,11 +805,7 @@ where
                             cid = %cid,
                             "V2 Push (Private): chunk validated, stored, and cid->root recorded"
                         );
-                        ShardResponseV2::PushAck {
-                            merkle_root,
-                            chunk_index,
-                            error: None,
-                        }
+                        None
                     }
                 } else {
                     let recorded = {
@@ -732,11 +820,7 @@ where
                             %e,
                             "V2 Push (Public): held-index record FAILED — refusing ACK"
                         );
-                        ShardResponseV2::PushAck {
-                            merkle_root,
-                            chunk_index,
-                            error: Some(e),
-                        }
+                        Some(e)
                     } else {
                         debug!(
                             %peer_id,
@@ -745,11 +829,7 @@ where
                             cid = %cid,
                             "V2 Push (Public): chunk validated and stored"
                         );
-                        ShardResponseV2::PushAck {
-                            merkle_root,
-                            chunk_index,
-                            error: None,
-                        }
+                        None
                     }
                 }
             }
@@ -762,15 +842,8 @@ where
                     reason = %msg,
                     "V2 Push: rejected"
                 );
-                ShardResponseV2::PushAck {
-                    merkle_root,
-                    chunk_index,
-                    error: Some(msg),
-                }
+                Some(msg)
             }
-        };
-        if let Err(e) = net.respond_shard_v2(channel_id, resp).await {
-            warn!(channel_id, %e, "V2 Push: failed to send PushAck");
         }
     }
 
@@ -998,6 +1071,13 @@ where
                 hex::encode(merkle_root)
             )),
         }
+    }
+
+    /// Attest what this archive holds of `merkle_root` after a re-fetch
+    /// stored new chunks of it. `run_attestation` ignores the manifest, so
+    /// the same empty stub the Private ManifestPush path passes is used.
+    pub(crate) fn spawn_refetch_attestation(&self, merkle_root: [u8; 32]) {
+        self.spawn_attestation(merkle_root, private_manifest_stub(merkle_root));
     }
 
     /// Build an `AttestRequest` and spawn the attestor as a background
@@ -3444,5 +3524,247 @@ mod tests {
         // Another index of the same file is unaffected.
         assert_eq!(push(&d, &net, root, mine[1], &chunks, &tree).await, None);
         assert_eq!(d.held_for(&root), [mine[1]].into_iter().collect());
+    }
+
+    /// The re-fetch acceptance path refuses a Private file's chunk after
+    /// validation and before anything is stored or recorded, although the
+    /// same chunk is assigned to this archive and a push of it is accepted.
+    #[tokio::test]
+    async fn a_refetched_private_chunk_is_refused_and_nothing_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rpc, manifest, chunks, tree, mine) = held_fixture(16, 0x6A, true);
+        let root = manifest.merkle_root;
+        let stores = store_at(dir.path());
+        let d = build_dispatcher(rpc, vec![], five_archives()[0], stores.clone());
+        let i = mine[0];
+        let cid = manifest.chunks[i as usize].cid.clone();
+        let refusal = d
+            .accept_refetched_chunk(
+                &"test",
+                chunks[i as usize].clone(),
+                root,
+                i,
+                tree.proof_bytes(i),
+            )
+            .await
+            .expect("refused");
+        assert!(refusal.contains("Private"), "{refusal}");
+        assert!(d.held_for(&root).is_empty());
+        assert!(!stores.read().await.local.has(&cid), "not stored");
+        assert!(
+            !held_from_disk(&*stores.read().await).contains_key(&root),
+            "not recorded"
+        );
+        // The same chunk pushed by its owner is accepted.
+        assert_eq!(
+            d.accept_chunk(
+                &"owner",
+                chunks[i as usize].clone(),
+                root,
+                i,
+                tree.proof_bytes(i)
+            )
+            .await,
+            None
+        );
+    }
+
+    // ── Re-fetch hand-over (G3 P3) ──────────────────────────────────────
+
+    /// The chain side of a re-fetch: one Public file reassigned from
+    /// `five_archives()` (epoch 500) to a snapshot where `0xF0…` replaced
+    /// archive 4 (epoch 900).
+    struct RefetchChain {
+        trigger: ArcRpcTrigger,
+        rows: Vec<sum_types::rpc_types::PushableFileInfoV2>,
+    }
+    #[async_trait::async_trait]
+    impl AttestTriggerRpc for RefetchChain {
+        async fn fetch_file_shape(&self, root: &[u8; 32]) -> anyhow::Result<FileShape> {
+            self.trigger.fetch_file_shape(root).await
+        }
+        async fn fetch_snapshot(&self, height: u64) -> anyhow::Result<Vec<[u8; 20]>> {
+            self.trigger.fetch_snapshot(height).await
+        }
+        async fn fetch_nonce(&self, a: &str) -> anyhow::Result<u64> {
+            self.trigger.fetch_nonce(a).await
+        }
+        async fn fetch_coverage(
+            &self,
+            root: &[u8; 32],
+        ) -> anyhow::Result<Option<AssignmentCoverageV2>> {
+            self.trigger.fetch_coverage(root).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::refetch_v2::PushableFilesRpc for RefetchChain {
+        async fn pushable_files(
+            &self,
+            offset: u32,
+            limit: u32,
+        ) -> anyhow::Result<Vec<sum_types::rpc_types::PushableFileInfoV2>> {
+            Ok(self
+                .rows
+                .iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .cloned()
+                .collect())
+        }
+    }
+
+    /// Surviving archives serving the file's manifest and chunks; `corrupt`
+    /// lists sources that serve flipped bytes.
+    struct Peers {
+        manifest: Vec<u8>,
+        chunks: HashMap<String, Vec<u8>>,
+        corrupt: Vec<[u8; 20]>,
+    }
+    #[async_trait::async_trait]
+    impl crate::refetch_v2::RefetchTransport for Peers {
+        async fn pull_manifest(&self, _from: [u8; 20], _root: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+            Ok(self.manifest.clone())
+        }
+        async fn pull_chunk(
+            &self,
+            from: [u8; 20],
+            cid: &str,
+            _size: u64,
+        ) -> anyhow::Result<Vec<u8>> {
+            let mut data = self
+                .chunks
+                .get(cid)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("not found"))?;
+            if self.corrupt.contains(&from) {
+                data[0] ^= 0xFF;
+            }
+            Ok(data)
+        }
+    }
+
+    /// End to end through the real dispatcher: the replacement archive
+    /// pulls and validates the manifest, fetches exactly its latest-epoch
+    /// chunks (skipping a corrupt source), accepts each through the push
+    /// validator, and records them as held on disk, so a restart and the
+    /// epoch watcher see them. The validator still refuses a chunk the
+    /// latest epoch does not assign to it, and a manifest whose chunk count
+    /// differs from the chain's.
+    #[tokio::test]
+    async fn refetched_chunks_are_accepted_through_the_push_path_and_held() {
+        use crate::refetch_v2::{RefetchLimits, Refetcher};
+        let dir = tempfile::tempdir().unwrap();
+        let epoch0 = five_archives();
+        let replacement = [0xF0u8; 20];
+        let mut epoch1 = epoch0.clone();
+        epoch1[4] = replacement;
+        epoch1.sort();
+        let (manifest, chunks, tree) = make_manifest(32, 0x2B);
+        let root = manifest.merkle_root;
+        let root_hex = format!("0x{}", hex::encode(root));
+        // Two identical chains: one behind the dispatcher, one for the
+        // re-fetch's listing and epoch reads.
+        let chain_state = || {
+            let rpc = AllMockRpc::new();
+            rpc.add_file(&root_hex, file_info_active(&root, 32, 500));
+            rpc.set_epochs(&root_hex, 32, &[500, 900], vec![]);
+            rpc.add_snapshot(
+                500,
+                epoch0.iter().map(node_record).collect(),
+                epoch0.clone(),
+            );
+            rpc.add_snapshot(
+                900,
+                epoch1.iter().map(node_record).collect(),
+                epoch1.clone(),
+            );
+            rpc
+        };
+        let rpc = Arc::new(chain_state());
+        let stores = store_at(dir.path());
+        let d = Arc::new(build_dispatcher_with_acl(
+            chain_state(),
+            replacement,
+            stores.clone(),
+            true,
+        ));
+        let r = crate::push_validator::V2Params::DEFAULTS.assignment_replication_factor;
+        let expected =
+            sum_store::assignment_v2::chunks_for_archive_v2(&root, 32, &epoch1, r, &replacement);
+        assert!(
+            !expected.is_empty(),
+            "fixture: the replacement is assigned chunks"
+        );
+
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(&manifest, &mut cbor).unwrap();
+        assert!(d.accept_refetched_manifest(root, 31, &cbor).await.is_err());
+
+        let first_source = sum_store::assignment_v2::assigned_archives(
+            &root,
+            &epoch1,
+            *expected.iter().next().unwrap(),
+            r,
+        )
+        .into_iter()
+        .find(|a| *a != replacement)
+        .unwrap();
+        let peers = Peers {
+            manifest: cbor,
+            chunks: manifest
+                .chunks
+                .iter()
+                .map(|c| (c.cid.clone(), chunks[c.chunk_index as usize].clone()))
+                .collect(),
+            corrupt: vec![first_source],
+        };
+        let chain = Arc::new(RefetchChain {
+            trigger: ArcRpcTrigger(rpc.clone()),
+            rows: vec![sum_types::rpc_types::PushableFileInfoV2 {
+                merkle_root: root_hex.clone(),
+                chunk_count: 32,
+                lifecycle: 1,
+                created_at: 1,
+            }],
+        });
+        let refetcher = Refetcher::new(
+            chain,
+            peers,
+            d.clone(),
+            replacement,
+            r,
+            RefetchLimits::default(),
+        );
+        let report = refetcher.run_once().await;
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert!(report.corrupt_refused >= 1);
+        let fetched: BTreeSet<u32> = report.fetched.iter().map(|(_, i)| *i).collect();
+        assert_eq!(fetched, expected);
+        assert_eq!(d.held_for(&root), expected);
+        assert!(d.local_manifest(&root).await.is_some());
+
+        // A chunk the latest epoch does not assign to this archive is
+        // refused even with valid bytes and proof.
+        let other = (0..32).find(|i| !expected.contains(i)).unwrap();
+        let refusal = d
+            .accept_chunk(
+                &"test",
+                chunks[other as usize].clone(),
+                root,
+                other,
+                tree.proof_bytes(other),
+            )
+            .await;
+        assert!(refusal.is_some());
+        assert!(!d.held_for(&root).contains(&other));
+
+        // Durable: once this archive's store is released, a fresh store at
+        // the same path rebuilds the same held set.
+        drop(refetcher);
+        drop(d);
+        drop(stores);
+        let reopened = store_at(dir.path());
+        let rebuilt = held_from_disk(&*reopened.read().await);
+        assert_eq!(rebuilt.get(&root), Some(&expected));
     }
 }

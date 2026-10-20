@@ -87,9 +87,11 @@ the chain's no-key builder and the owner's existing key; see
 Archives validate pushes and attest against the latest epoch, rebuild
 their held set from disk after a restart, and attest again when a held
 file's epoch changes. The owner-side push (`ingest`/`resume`) and download
-routing still use the original snapshot, and newly assigned archives do
-not re-fetch, so abandon remains the only complete recovery from a pinned
-empty assignment snapshot.
+routing still use the original snapshot. Newly assigned archives
+re-fetch Public chunks from other archives only when re-fetch is enabled
+(`--refetch-secs`, off by default), and a pinned empty snapshot leaves
+nothing to re-fetch from, so abandon remains the only complete recovery
+from a pinned empty assignment snapshot.
 
 **Acceptance criteria** (remaining):
 - ~~New CLI subcommand that submits `ReassignChunksV2`~~ (done:
@@ -98,8 +100,11 @@ empty assignment snapshot.
 - ~~Archive-side push validation and attestation against the latest
   assignment epoch; re-attestation when it changes; held set rebuilt
   after a restart~~ (done).
+- ~~Re-fetch of newly assigned Public chunks by the new assignee~~ (done,
+  off by default: `--refetch-secs`). Private re-fetch awaits an
+  authorization policy.
 - Owner-side push routing and download routing against the latest
-  assignment epoch, and re-fetch of newly assigned chunks.
+  assignment epoch.
 - End-to-end mirror scenario that lands a file with epoch-0
   empty-snapshot, calls the new path, and confirms the file
   activates against a fresh epoch snapshot.

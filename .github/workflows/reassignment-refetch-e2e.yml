@@ -1,0 +1,88 @@
+# Reassignment and V2 re-fetch E2E (scenario 13 of the local-mirror suite)
+# on a fresh GitHub-hosted runner, for pull requests that change the code or
+# harness it exercises.
+#
+# It runs the same scripts/local-mirror-e2e.sh as the release workflow, on
+# the same synthetic sum-chain devnet (chain id 1337 at SUMCHAIN_COMMIT;
+# throwaway keys generated on the runner, never committed, printed or
+# uploaded), with SNIP_E2E_REASSIGNMENT=1. With that set, and only in this
+# run's throwaway devnet genesis, the script opens two existing gates from
+# genesis: archive unbonding and archive reassignment. It refuses to run if
+# the chain id is not 1337 or if PoR assignment targeting or the PoR
+# scheduler gate is set. It runs the shared local-mirror suite with the
+# opt-in unset, then scenario 13 alone. The devnet is torn down at the end.
+# Read-only token, no secrets, no production endpoint or peer.
+#
+# The paths filter is the trigger: any pull request to main touching the
+# listed files runs it, whatever its branch name. It is not a required check.
+# The release workflow (release/ branches) is unchanged and does not opt in.
+#
+# All third-party actions are pinned to the full commit SHAs the other
+# workflows already use.
+
+name: reassignment re-fetch E2E
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/sum-node/src/refetch_v2.rs'
+      - 'crates/sum-node/src/refetch_net.rs'
+      - 'crates/sum-node/src/epoch_watcher.rs'
+      - 'crates/sum-node/src/inbound_v2.rs'
+      - 'crates/sum-node/src/push_validator.rs'
+      - 'crates/sum-node/src/assignment_attestor.rs'
+      - 'crates/sum-node/src/reassign_v2.rs'
+      - 'crates/sum-node/tests/e2e_mirror.rs'
+      - 'scripts/local-mirror-e2e.sh'
+      - '.github/workflows/reassignment-refetch-e2e.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reassignment-refetch-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SUMCHAIN_COMMIT: d8130ead3b77f38eff6eeb82b4e68bb1aca8e3b2
+
+jobs:
+  reassignment-refetch-e2e:
+    name: reassignment + re-fetch E2E (synthetic sum-chain devnet)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Checkout SNIP
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout sum-chain at SUMCHAIN_COMMIT
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          repository: SUM-INNOVATION/sum-chain
+          ref: ${{ env.SUMCHAIN_COMMIT }}
+          path: sum-chain
+          persist-credentials: false
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9  # v1
+        with:
+          toolchain: stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: Toolchain versions
+        run: |
+          docker version
+          docker compose version
+          cargo --version
+          python3 --version
+
+      - name: Local-mirror suite, then scenario 13 (reassignment and re-fetch)
+        env:
+          SUMCHAIN_DIR: ${{ github.workspace }}/sum-chain
+          SNIP_E2E_REASSIGNMENT: "1"
+        run: scripts/local-mirror-e2e.sh

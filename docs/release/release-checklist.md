@@ -203,6 +203,28 @@ It uses a read-only token and no secrets, and it is not a required
 check. A failure is a hard release blocker. Record the run URL and
 the chain commit with the release evidence.
 
+The reassignment and re-fetch scenario
+(`reassignment_refetch_restores_public_coverage`) does not run in the
+release workflow: the synthetic devnet keeps
+`archive_reassignment_enabled_from_height` and
+`archive_unbonding_enabled_from_height` unset, so it skips unless
+`SNIP_E2E_REASSIGNMENT=1` is set. With that set, `scripts/local-mirror-e2e.sh`
+opens exactly those two gates from genesis in this run's throwaway devnet
+genesis (PoR assignment targeting and the PoR scheduler stay unset), runs the
+shared suite with the opt-in unset, and then runs this scenario alone. It
+covers: an archive leaving by its own BeginUnstake, the owner's reassignment,
+re-fetch by a fourth throwaway archive with corrupt copies refused and the
+next source used, a restart while one chunk is missing, latest-epoch
+attestation with `reassignment_needed` cleared, and a Private file that is
+never fetched.
+
+The `reassignment re-fetch E2E` workflow
+(`.github/workflows/reassignment-refetch-e2e.yml`) runs exactly this, with
+`SNIP_E2E_REASSIGNMENT=1`, on any pull request to `main` that changes the
+re-fetch, epoch-watcher, push-validation, attestation or reassignment code,
+the E2E suite or this harness. Its paths filter is the trigger; the branch
+name does not matter. It is not a required check.
+
 `SUMCHAIN_COMMIT` is the chain commit the end-to-end run uses. It is
 not the compatibility pin in
 [`chain-compat.md`](../reference/chain-compat.md): at that pin the

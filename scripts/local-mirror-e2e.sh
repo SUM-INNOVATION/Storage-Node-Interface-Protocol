@@ -80,6 +80,40 @@ echo "== 1. provision the synthetic devnet at chain commit $SUMCHAIN_COMMIT"
 # readable inside the 0700 devnet/ directory when this host's uid differs.
 chmod 0644 "$SUMCHAIN_DIR"/devnet/keys/validator*.json
 
+# Opt-in, devnet only: scenario 13 (reassignment and V2 re-fetch) needs an
+# archive to leave the active set by its own BeginUnstake and the owner to
+# reassign, so this throwaway genesis opens exactly two existing gates from
+# genesis: archive unbonding and archive reassignment. PoR assignment
+# targeting and the assignment-aware PoR scheduler stay unset, and this
+# refuses to run if the provisioner ever set them. Only the generated
+# devnet/genesis.json of this run is edited; nothing in either repository.
+if [ "${SNIP_E2E_REASSIGNMENT:-0}" = 1 ]; then
+    echo "== 1b. devnet-only opt-in: archive unbonding + reassignment gates at genesis"
+    python3 - "$SUMCHAIN_DIR/devnet/genesis.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    genesis = json.load(f)
+if genesis.get("chain_id") != 1337:
+    sys.exit(f"refusing: chain id {genesis.get('chain_id')!r} is not the synthetic devnet's 1337")
+params = genesis["params"]
+for gate in (
+    "por_assignment_targeting_enabled_from_height",
+    "assignment_aware_por_scheduler_enabled_from_height",
+):
+    if params.get(gate) is not None:
+        sys.exit(f"refusing: {gate} is set in the devnet genesis")
+params["archive_unbonding_enabled_from_height"] = 0
+params["archive_reassignment_enabled_from_height"] = 0
+with open(path, "w") as f:
+    json.dump(genesis, f, indent=2)
+print("devnet genesis: archive_unbonding_enabled_from_height=0, "
+      "archive_reassignment_enabled_from_height=0; PoR targeting and scheduler unset")
+PY
+fi
+
 echo "== 2. build and start the five validators"
 started=1
 GIT_HASH="$SUMCHAIN_COMMIT" "${COMPOSE[@]}" up -d --build --wait --wait-timeout "$READY_TIMEOUT"
@@ -129,7 +163,24 @@ make smoke RPC="$RPC" SMOKE_ARGS=--require-v2
 
 echo "== 5. local-mirror E2E suite"
 suite=0
-SNIP_E2E_RPC_URL="$RPC" SNIP_E2E_KEYS_DIR="$KEYS_DIR" make e2e-mirror || suite=$?
+# Scenario 13 removes an archive from the active set, so it never runs inside
+# the shared suite: the suite runs with the opt-in unset, then scenario 13
+# runs alone, last, with its own time limit.
+env -u SNIP_E2E_REASSIGNMENT SNIP_E2E_RPC_URL="$RPC" SNIP_E2E_KEYS_DIR="$KEYS_DIR" \
+    make e2e-mirror || suite=$?
+if [ "${SNIP_E2E_REASSIGNMENT:-0}" = 1 ]; then
+    # Runs whatever the shared suite's result, so its own evidence is always
+    # produced; the job still fails if either part failed.
+    echo "== 5b. scenario 13 alone: reassignment, public re-fetch, restart, corruption, Private"
+    scenario=0
+    SNIP_E2E_REASSIGNMENT=1 SNIP_E2E_RPC_URL="$RPC" SNIP_E2E_KEYS_DIR="$KEYS_DIR" \
+        timeout 1500 cargo test -p sum-node --test e2e_mirror -- --ignored --exact \
+        reassignment_refetch_restores_public_coverage --nocapture || scenario=$?
+    echo "shared suite exit: $suite; scenario 13 exit: $scenario"
+    if [ "$suite" -eq 0 ]; then
+        suite=$scenario
+    fi
+fi
 if [ "$suite" -eq 0 ]; then
     echo "local-mirror E2E: ok (chain commit $SUMCHAIN_COMMIT)"
     exit 0
