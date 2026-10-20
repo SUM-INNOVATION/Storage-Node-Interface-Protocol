@@ -73,4 +73,7 @@ jobs:
       - name: Local-mirror E2E
         env:
           SUMCHAIN_DIR: ${{ github.workspace }}/sum-chain
+          # CI verification branch only, not for merge: opt in to scenario 13
+          # (devnet-only unbonding + reassignment gates; PoR targeting unset).
+          SNIP_E2E_REASSIGNMENT: "1"
         run: scripts/local-mirror-e2e.sh
