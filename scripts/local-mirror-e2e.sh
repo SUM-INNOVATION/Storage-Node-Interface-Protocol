@@ -168,11 +168,18 @@ suite=0
 # runs alone, last, with its own time limit.
 env -u SNIP_E2E_REASSIGNMENT SNIP_E2E_RPC_URL="$RPC" SNIP_E2E_KEYS_DIR="$KEYS_DIR" \
     make e2e-mirror || suite=$?
-if [ "$suite" -eq 0 ] && [ "${SNIP_E2E_REASSIGNMENT:-0}" = 1 ]; then
+if [ "${SNIP_E2E_REASSIGNMENT:-0}" = 1 ]; then
+    # Runs whatever the shared suite's result, so its own evidence is always
+    # produced; the job still fails if either part failed.
     echo "== 5b. scenario 13 alone: reassignment, public re-fetch, restart, corruption, Private"
+    scenario=0
     SNIP_E2E_REASSIGNMENT=1 SNIP_E2E_RPC_URL="$RPC" SNIP_E2E_KEYS_DIR="$KEYS_DIR" \
         timeout 1500 cargo test -p sum-node --test e2e_mirror -- --ignored --exact \
-        reassignment_refetch_restores_public_coverage --nocapture || suite=$?
+        reassignment_refetch_restores_public_coverage --nocapture || scenario=$?
+    echo "shared suite exit: $suite; scenario 13 exit: $scenario"
+    if [ "$suite" -eq 0 ]; then
+        suite=$scenario
+    fi
 fi
 if [ "$suite" -eq 0 ]; then
     echo "local-mirror E2E: ok (chain commit $SUMCHAIN_COMMIT)"
