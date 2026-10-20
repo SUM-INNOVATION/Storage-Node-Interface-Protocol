@@ -98,11 +98,11 @@ status is 0 either way, so read the `lifecycle:` line:
 - **`sum-node resume <merkle-root-hex> <path>`** — replay only the
   residual portion of the pipeline. Re-chunks `<path>` locally,
   asserts its computed root matches `<merkle-root-hex>`, then
-  fills only what's missing. It prints `lifecycle: Active` only after
-  `ActivateFileV2` has finalized (or when the file is already Active),
-  and `lifecycle: Pending` if the file is still Pending. It exits 0 in
-  both cases, and also on a root mismatch or an error, which print no
-  `lifecycle:` line ([CLI reference](../reference/cli.md#sum-node-resume)).
+  fills only what's missing. It exits 0 and prints `lifecycle: Active`
+  only after `ActivateFileV2` has finalized (or when the file is already
+  Active). A file still Pending exits 3 (`lifecycle: Pending`), an
+  Abandoned file 4, a root mismatch 5 and any error 1
+  ([CLI reference](../reference/cli.md#sum-node-resume)).
 - **`sum-node abandon <merkle-root-hex>`** — after
   `activation_grace_blocks` blocks past `created_at`, submit
   `AbandonFileV2` to release the deposit (minus the
