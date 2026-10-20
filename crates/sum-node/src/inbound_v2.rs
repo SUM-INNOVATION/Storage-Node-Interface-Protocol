@@ -1073,6 +1073,13 @@ where
         }
     }
 
+    /// Attest what this archive holds of `merkle_root` after a re-fetch
+    /// stored new chunks of it. `run_attestation` ignores the manifest, so
+    /// the same empty stub the Private ManifestPush path passes is used.
+    pub(crate) fn spawn_refetch_attestation(&self, merkle_root: [u8; 32]) {
+        self.spawn_attestation(merkle_root, private_manifest_stub(merkle_root));
+    }
+
     /// Build an `AttestRequest` and spawn the attestor as a background
     /// task. We don't `await` here — the inbound dispatch path returns
     /// immediately after sending `ManifestPushAck`. Attestation outcomes
@@ -1086,13 +1093,6 @@ where
     /// updated by the V2 push handler. This keeps the Private path
     /// (where no decoded manifest exists) source-compatible with the
     /// Public path.
-    /// Attest what this archive holds of `merkle_root` after a re-fetch
-    /// stored new chunks of it. `run_attestation` ignores the manifest, so
-    /// the same empty stub the Private ManifestPush path passes is used.
-    pub(crate) fn spawn_refetch_attestation(&self, merkle_root: [u8; 32]) {
-        self.spawn_attestation(merkle_root, private_manifest_stub(merkle_root));
-    }
-
     fn spawn_attestation(&self, merkle_root: [u8; 32], _manifest: DataManifest) {
         let attestor = self.attestor.clone();
         let trigger_rpc = self.trigger_rpc.clone();
