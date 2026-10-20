@@ -1241,18 +1241,21 @@ async fn resume_pending_completes_to_active() {
         ],
         &[],
     );
+    // Exit 0 means the file is Active (ActivateFileV2 finalized, or already
+    // Active); 3 still Pending, 4 Abandoned, 5 root mismatch, 1 error.
     assert!(
         resume_out.status.success(),
-        "resume failed: stderr={}\nstdout={}",
+        "resume did not complete activation (exit {:?}: 3 Pending, 4 Abandoned, \
+         5 root mismatch, 1 error): stderr={}\nstdout={}",
+        resume_out.status.code(),
         String::from_utf8_lossy(&resume_out.stderr),
         String::from_utf8_lossy(&resume_out.stdout),
     );
 
-    // `resume` exits 0 on every outcome; its result is the `lifecycle:`
-    // line on stdout. `lifecycle: Active` is printed only after
-    // `ActivateFileV2` has finalized (or when the chain already shows the
-    // file Active), so the chain row is Active by the time it returns. Any
-    // other result is final for this run: waiting cannot activate the file.
+    // With exit 0, resume also prints `lifecycle: Active`, which it does
+    // only after `ActivateFileV2` has finalized (or when the chain already
+    // shows the file Active), so the chain row is Active by the time it
+    // returns. Both are required.
     let resume_stdout = String::from_utf8_lossy(&resume_out.stdout).to_string();
     let resume_stderr = String::from_utf8_lossy(&resume_out.stderr).to_string();
     assert!(

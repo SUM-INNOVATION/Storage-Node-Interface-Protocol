@@ -348,9 +348,10 @@ abandon path. The chain row stays `Pending` until either:
 
   On success this prints `merkle_root: 0x<hex>` + `lifecycle:
   Active` and the file is fully activated: `ActivateFileV2` has
-  finalized. `resume` exits 0 whatever the outcome, so check the
-  `lifecycle:` line: `Pending` means run it again or abandon, and no
-  line at all means a root mismatch or an error (see the warning).
+  finalized, and the exit status is 0. Any other outcome exits
+  non-zero: 3 means the file is still Pending (run it again or abandon),
+  4 Abandoned, 5 a root mismatch and 1 an error (see the warning and the
+  [CLI reference](../reference/cli.md#sum-node-resume)).
   Continue to § 6.3.
 
 - **Abandon** (only if the file is the wrong content / wrong

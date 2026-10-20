@@ -80,9 +80,15 @@ chunks → push manifest → poll coverage → `ActivateFileV2`.
 | `--visibility` | `public` | `public` or `private`. `private` generates a fresh `K_file`, encrypts chunks + manifest, wraps `K_file` for each recipient. |
 | `--recipient` | — | Recipient for a Private file: `<base58 L1 addr>` or `<addr>:<expires_at_height>`. Repeatable. Rejected with `--visibility public`. |
 
-Exit status and the `lifecycle:` line: see
-[`sum-node resume`](#sum-node-resume) ("Outcome and exit status"); the
-same contract applies here.
+**Outcome and exit status.** `ingest-v2` exits 0 whenever it reaches an
+outcome, including a file left `Pending`; read the last `lifecycle:` line
+on stdout. `lifecycle: Active` means `ActivateFileV2` was submitted and
+finalized; `lifecycle: Pending` means the file is registered but still
+`Pending` (run `resume` or `abandon`). An error before registration prints
+no `lifecycle:` line, only a warning. A non-zero exit status means a setup
+or argument error (for example an unsupported `--visibility`). Unlike
+`resume` (below), `ingest-v2` does not encode the outcome in its exit
+status.
 
 ### sum-node resume
 
@@ -97,22 +103,23 @@ V2 resume: replay only the residual portion of the pipeline for a
 | `--manifest-push-wait-secs` | `60` | S3 manifest re-push wall-clock timeout. |
 | `--activation-wait-secs` | `300` | S4 coverage-poll wall-clock timeout. |
 
-**Outcome and exit status.** The command exits 0 whenever it reaches an
-outcome, including a file left `Pending`. The outcome is the last
-`lifecycle:` line on stdout:
+**Outcome and exit status.** `resume` exits 0 only when activation is
+complete. Every other outcome exits non-zero with its own code, and the
+`lifecycle:` line on stdout is printed as before:
 
-- `lifecycle: Active`: `ActivateFileV2` was submitted **and finalized**
-  (or the chain already showed the file `Active`). Activation is
-  complete, not merely submitted.
-- `lifecycle: Pending`: the file is registered but still `Pending`;
-  run `resume` again or `abandon`.
-- `lifecycle: Abandoned` (`resume` only): the file was abandoned.
-- No `lifecycle:` line: a root mismatch (`resume`) or an error; only a
-  warning is logged.
+| Exit | Outcome | stdout |
+|---|---|---|
+| `0` | The file is `Active`: `ActivateFileV2` was submitted **and finalized** in this run, or the chain already showed the file `Active` | `lifecycle: Active` |
+| `3` | The file is still `Pending`; run `resume` again or `abandon` | `lifecycle: Pending` |
+| `4` | The chain shows the file `Abandoned`; resume cannot activate it | `lifecycle: Abandoned` |
+| `5` | Root mismatch: the file at `<path>` does not produce `<merkle_root>` | none (a warning is logged) |
+| `1` | An error: a failure during the run, or before an outcome (arguments, RPC, chain parameters, missing `--key-file`) | none (the error is logged) |
 
-A non-zero exit status means a setup or argument error (for example an
-unsupported `--visibility`). Scripts must read the `lifecycle:` line,
-not the exit status alone.
+`1` is the code every `sum-node` error already exits with, and `2` is
+the argument parser's usage-error code, so outcome codes start at `3`.
+Before this change `resume` exited 0 on every outcome; scripts that
+treated exit 0 as "resume ran" must now check for `0` (Active) or `3`
+(still Pending).
 
 ### sum-node abandon
 

@@ -387,10 +387,11 @@ recovery options:
   cargo run --release -p sum-node -- abandon <merkle-root-hex>
   ```
 
-`resume` exits 0 whatever the outcome; read its `lifecycle:` line.
-`lifecycle: Active` means `ActivateFileV2` finalized, `lifecycle: Pending`
-means the file is still Pending, and no line means a root mismatch or an
-error (see the warning).
+`resume` exits 0 only when the file is Active (`ActivateFileV2`
+finalized, or already Active). It exits 3 if the file is still Pending,
+4 if it is Abandoned, 5 on a root mismatch and 1 on any error; the
+`lifecycle:` line is printed as before. See the
+[CLI reference](../reference/cli.md#sum-node-resume).
 
 Choose `resume` when the failure was transient (push timeout, peer
 churn). Choose `abandon` when the file or recipients are wrong and

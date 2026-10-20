@@ -202,6 +202,44 @@ pub enum IngestOutcome {
     },
 }
 
+/// Exit status of `sum-node resume`, by outcome.
+///
+/// `0` only when the file is `Active`: `ActivateFileV2` finalized during
+/// this run, or the chain already showed the file `Active`. Every other
+/// outcome exits non-zero, with its own code. `1` is the code any error from
+/// `main` already exits with, and `2` is the argument parser's usage-error
+/// code, so outcome codes start at `3`.
+pub mod resume_exit {
+    /// Activation complete (finalized now, or already `Active` on chain).
+    pub const ACTIVE: i32 = 0;
+    /// An error: a failure during the run, or before an outcome (arguments,
+    /// RPC, chain parameters).
+    pub const ERROR: i32 = 1;
+    /// The file is still `Pending`: run `resume` again, or `abandon`.
+    pub const PENDING: i32 = 3;
+    /// The chain shows the file `Abandoned`; resume cannot activate it.
+    pub const ABANDONED: i32 = 4;
+    /// The file does not match the given merkle root.
+    pub const ROOT_MISMATCH: i32 = 5;
+}
+
+impl IngestOutcome {
+    /// The `sum-node resume` exit status for this outcome
+    /// ([`resume_exit`]). Exhaustive on purpose: a new outcome needs an
+    /// explicit code.
+    pub fn resume_exit_code(&self) -> i32 {
+        match self {
+            IngestOutcome::Activated { .. }
+            | IngestOutcome::ResumedActivated { .. }
+            | IngestOutcome::ActivatedOnChain { .. } => resume_exit::ACTIVE,
+            IngestOutcome::PendingNeedsAction { .. } => resume_exit::PENDING,
+            IngestOutcome::AbandonedOnChain { .. } => resume_exit::ABANDONED,
+            IngestOutcome::RootMismatch { .. } => resume_exit::ROOT_MISMATCH,
+            IngestOutcome::Failed { .. } => resume_exit::ERROR,
+        }
+    }
+}
+
 /// Terminal outcome of [`IngestPipeline::abandon`].
 #[derive(Debug)]
 pub enum AbandonOutcome {
@@ -2786,6 +2824,101 @@ fn chunks_replicated_in(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod resume_exit_tests {
+    use super::*;
+
+    fn manifest() -> DataManifest {
+        DataManifest {
+            file_name: String::new(),
+            file_hash: [0u8; 32],
+            total_size_bytes: 0,
+            chunk_count: 0,
+            merkle_root: [7u8; 32],
+            chunks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_an_active_file_exits_zero() {
+        let activated = IngestOutcome::Activated {
+            merkle_root: [7u8; 32],
+            manifest: manifest(),
+            register_tx_hash: String::new(),
+            register_height: 1,
+            activate_tx_hash: String::new(),
+            activate_height: 2,
+        };
+        let resumed = IngestOutcome::ResumedActivated {
+            merkle_root: [7u8; 32],
+            manifest: manifest(),
+            register_height: 1,
+            activate_tx_hash: String::new(),
+            activate_height: 2,
+        };
+        let already = IngestOutcome::ActivatedOnChain {
+            merkle_root: [7u8; 32],
+            manifest: manifest(),
+            register_height: 1,
+            activate_height: 2,
+        };
+        for outcome in [activated, resumed, already] {
+            assert_eq!(outcome.resume_exit_code(), 0, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn every_other_outcome_exits_non_zero_with_its_own_code() {
+        let pending = IngestOutcome::PendingNeedsAction {
+            merkle_root: [7u8; 32],
+            manifest: manifest(),
+            failed_stage: IngestStage::Coverage,
+            last_coverage: None,
+            under_replicated_chunks: None,
+            suggested: SuggestedAction::Resume,
+            source: None,
+        };
+        let abandoned = IngestOutcome::AbandonedOnChain {
+            merkle_root: [7u8; 32],
+            manifest: manifest(),
+            abandoned_at_height: Some(9),
+        };
+        let mismatch = IngestOutcome::RootMismatch {
+            expected: [7u8; 32],
+            actual: [8u8; 32],
+            manifest: manifest(),
+        };
+        let failed = IngestOutcome::Failed {
+            stage: IngestStage::Activate,
+            manifest: None,
+            source: anyhow::anyhow!("synthetic failure"),
+        };
+        assert_eq!(pending.resume_exit_code(), resume_exit::PENDING);
+        assert_eq!(abandoned.resume_exit_code(), resume_exit::ABANDONED);
+        assert_eq!(mismatch.resume_exit_code(), resume_exit::ROOT_MISMATCH);
+        assert_eq!(failed.resume_exit_code(), resume_exit::ERROR);
+    }
+
+    #[test]
+    fn the_codes_are_distinct_and_avoid_the_usage_error_code() {
+        let codes = [
+            resume_exit::ACTIVE,
+            resume_exit::ERROR,
+            resume_exit::PENDING,
+            resume_exit::ABANDONED,
+            resume_exit::ROOT_MISMATCH,
+        ];
+        let unique: std::collections::BTreeSet<i32> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), codes.len(), "codes must be distinct");
+        assert!(
+            !codes.contains(&2),
+            "2 is the argument parser's usage-error code"
+        );
+        assert_eq!(resume_exit::ACTIVE, 0);
+        assert_eq!(resume_exit::ERROR, 1);
+    }
+}
 
 #[cfg(test)]
 mod tests {
