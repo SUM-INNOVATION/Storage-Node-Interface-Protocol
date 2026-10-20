@@ -244,6 +244,12 @@ enum Command {
     /// both the explicit `merkle_root` (recorded from the prior
     /// `IngestV2` outcome) AND the original file path. Mismatch
     /// surfaces as a typed `RootMismatch` outcome.
+    ///
+    /// Exits 0 whenever it reaches an outcome; the outcome is the
+    /// `lifecycle:` line on stdout. `lifecycle: Active` is printed only
+    /// after `ActivateFileV2` has finalized (or when the file is already
+    /// Active on chain); `lifecycle: Pending` means it is still Pending. A
+    /// root mismatch or an error prints no `lifecycle:` line, only a warning.
     Resume {
         /// Hex-encoded 32-byte merkle root of the pending file.
         merkle_root: String,

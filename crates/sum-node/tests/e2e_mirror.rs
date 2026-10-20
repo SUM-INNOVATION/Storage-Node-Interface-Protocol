@@ -1248,20 +1248,44 @@ async fn resume_pending_completes_to_active() {
         String::from_utf8_lossy(&resume_out.stdout),
     );
 
-    // Confirm chain row is Active.
-    tokio::time::sleep(Duration::from_secs(8)).await;
-    let info = rpc
-        .storage_get_file_info_v2(&prefixed, None, None)
-        .await
-        .expect("storage_getFileInfoV2 after resume")
-        .expect("V2 row must be present after resume");
+    // `resume` exits 0 on every outcome; its result is the `lifecycle:`
+    // line on stdout. `lifecycle: Active` is printed only after
+    // `ActivateFileV2` has finalized (or when the chain already shows the
+    // file Active), so the chain row is Active by the time it returns. Any
+    // other result is final for this run: waiting cannot activate the file.
+    let resume_stdout = String::from_utf8_lossy(&resume_out.stdout).to_string();
+    let resume_stderr = String::from_utf8_lossy(&resume_out.stderr).to_string();
     assert!(
-        info.lifecycle.is_active(),
-        "file lifecycle after resume must be Active, got {:?}\nresume stdout={}\nresume stderr={}",
-        info.lifecycle,
-        String::from_utf8_lossy(&resume_out.stdout),
-        String::from_utf8_lossy(&resume_out.stderr),
+        resume_stdout
+            .lines()
+            .any(|l| l.trim() == "lifecycle: Active"),
+        "resume did not report an activated file: stdout={resume_stdout}\nstderr={resume_stderr}"
     );
+
+    // Confirm on chain state: poll until Active, bounded; Abandoned is
+    // terminal.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let info = rpc
+            .storage_get_file_info_v2(&prefixed, None, None)
+            .await
+            .expect("storage_getFileInfoV2 after resume")
+            .expect("V2 row must be present after resume");
+        if info.lifecycle.is_active() {
+            break;
+        }
+        assert!(
+            !info.lifecycle.is_abandoned(),
+            "the file is Abandoned after resume reported Active: stdout={resume_stdout}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "chain row not Active 30s after resume reported Active (got {:?}): \
+             stdout={resume_stdout}\nstderr={resume_stderr}",
+            info.lifecycle
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 // ── 13. reassignment_refetch_restores_public_coverage ───────────────────────

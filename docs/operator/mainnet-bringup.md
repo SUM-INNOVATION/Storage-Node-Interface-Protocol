@@ -347,7 +347,11 @@ abandon path. The chain row stays `Pending` until either:
   ```
 
   On success this prints `merkle_root: 0x<hex>` + `lifecycle:
-  Active` and the file is fully activated. Continue to § 6.3.
+  Active` and the file is fully activated: `ActivateFileV2` has
+  finalized. `resume` exits 0 whatever the outcome, so check the
+  `lifecycle:` line: `Pending` means run it again or abandon, and no
+  line at all means a root mismatch or an error (see the warning).
+  Continue to § 6.3.
 
 - **Abandon** (only if the file is the wrong content / wrong
   recipients and you want the deposit back). Subject to the

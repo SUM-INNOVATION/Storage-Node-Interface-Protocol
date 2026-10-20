@@ -91,13 +91,18 @@ chain, the command aborts before any state is written.
 
 ### Recovery
 
-If `ingest-v2` exits with `lifecycle: Pending` — chunks pushed but
-coverage or activation stalled — the file is recoverable:
+If `ingest-v2` prints `lifecycle: Pending` (chunks pushed but
+coverage or activation stalled), the file is recoverable. The exit
+status is 0 either way, so read the `lifecycle:` line:
 
 - **`sum-node resume <merkle-root-hex> <path>`** — replay only the
   residual portion of the pipeline. Re-chunks `<path>` locally,
   asserts its computed root matches `<merkle-root-hex>`, then
-  fills only what's missing.
+  fills only what's missing. It prints `lifecycle: Active` only after
+  `ActivateFileV2` has finalized (or when the file is already Active),
+  and `lifecycle: Pending` if the file is still Pending. It exits 0 in
+  both cases, and also on a root mismatch or an error, which print no
+  `lifecycle:` line ([CLI reference](../reference/cli.md#sum-node-resume)).
 - **`sum-node abandon <merkle-root-hex>`** — after
   `activation_grace_blocks` blocks past `created_at`, submit
   `AbandonFileV2` to release the deposit (minus the
