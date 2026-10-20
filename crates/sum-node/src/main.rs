@@ -245,11 +245,10 @@ enum Command {
     /// `IngestV2` outcome) AND the original file path. Mismatch
     /// surfaces as a typed `RootMismatch` outcome.
     ///
-    /// Exits 0 whenever it reaches an outcome; the outcome is the
-    /// `lifecycle:` line on stdout. `lifecycle: Active` is printed only
-    /// after `ActivateFileV2` has finalized (or when the file is already
-    /// Active on chain); `lifecycle: Pending` means it is still Pending. A
-    /// root mismatch or an error prints no `lifecycle:` line, only a warning.
+    /// Exit status: 0 only when the file is Active (`lifecycle: Active`:
+    /// `ActivateFileV2` finalized, or already Active on chain); 3 still
+    /// Pending (`lifecycle: Pending`); 4 Abandoned on chain
+    /// (`lifecycle: Abandoned`); 5 root mismatch; 1 any error.
     Resume {
         /// Hex-encoded 32-byte merkle root of the pending file.
         merkle_root: String,
@@ -487,7 +486,7 @@ async fn main() -> Result<()> {
                     "resume requires --key-file (V2 ActivateFileV2 needs a signing key)"
                 )
             })?;
-            run_resume_v2(
+            let code = run_resume_v2(
                 keypair,
                 seed,
                 cli.rpc_url.clone(),
@@ -501,7 +500,15 @@ async fn main() -> Result<()> {
                 manifest_push_wait_secs,
                 activation_wait_secs,
             )
-            .await
+            .await?;
+            if code != sum_node::ingest_v2::resume_exit::ACTIVE {
+                // The `lifecycle:` line is already printed; make sure it
+                // reaches a pipe before the process ends.
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
+            }
+            Ok(())
         }
         Command::Abandon { merkle_root } => {
             let seed = seed.ok_or_else(|| {
@@ -1397,7 +1404,7 @@ async fn run_resume_v2(
     push_wait_secs: u64,
     manifest_push_wait_secs: u64,
     activation_wait_secs: u64,
-) -> Result<()> {
+) -> Result<i32> {
     let merkle_root = parse_merkle_root_hex(&merkle_root_hex)?;
     let l1_addr = identity::l1_address_from_keypair(&keypair);
     let rpc_early = Arc::new(L1RpcClient::new(rpc_url.clone()));
@@ -1535,7 +1542,7 @@ async fn run_resume_v2(
         }
     }
     net.shutdown().await?;
-    Ok(())
+    Ok(outcome.resume_exit_code())
 }
 
 /// Owner-triggered `ReassignChunksV2` (see `sum_node::reassign_v2`).
