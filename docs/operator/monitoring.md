@@ -169,7 +169,7 @@ After a `ReassignChunksV2`, the latest epoch can assign this archive chunks of a
 1. reads the chain's list of Pending and Active V2 files (`storage_getPushableFilesV2`) and, for each file with more than one assignment epoch, finds the chunks the latest epoch assigns here that the previous epoch did not and that are not held;
 2. pulls the file's manifest from another archive if it has none, and accepts it only if it validates exactly as a ManifestPush would;
 3. pulls each chunk from the other archives assigned it (latest epoch first, then earlier epochs), refuses bytes that do not match the manifest, and stores accepted chunks through the same validation as a push: chain registration, latest-epoch assignment to this archive, Merkle proof;
-4. leaves attestation to the epoch watcher, which attests the new chunks at its next check.
+4. attests the chunks it stored, once per file per run, through the same attestation a ManifestPush starts. The epoch watcher alone would miss chunks that arrive after it has already handled the file's latest epoch.
 
 **Bounds per run:** 256 files, 1,024 chunks, 3 sources per chunk (and per manifest), 4 epochs, 30 s per pull. A source is used only if it is connected and has identified itself (`peer L1 identity mapped`); otherwise the next source is tried. Nothing is ever deleted.
 
