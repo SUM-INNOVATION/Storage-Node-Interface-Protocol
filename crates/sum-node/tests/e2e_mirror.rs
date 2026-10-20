@@ -1257,8 +1257,10 @@ async fn resume_pending_completes_to_active() {
         .expect("V2 row must be present after resume");
     assert!(
         info.lifecycle.is_active(),
-        "file lifecycle after resume must be Active, got {:?}",
-        info.lifecycle
+        "file lifecycle after resume must be Active, got {:?}\nresume stdout={}\nresume stderr={}",
+        info.lifecycle,
+        String::from_utf8_lossy(&resume_out.stdout),
+        String::from_utf8_lossy(&resume_out.stderr),
     );
 }
 
