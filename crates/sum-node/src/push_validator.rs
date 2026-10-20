@@ -8,10 +8,13 @@
 //!   1. **File exists and is not Abandoned.** Look up
 //!      `storage_getFileInfoV2(root)`; require lifecycle ∈ {Pending, Active}.
 //!   2. **Our archive is assigned this chunk.** Read the immutable
-//!      snapshot at `info.assignment_height` via
+//!      snapshot at the file's LATEST assignment epoch via
 //!      `storage_getActiveNodesAtHeight`; the V2 rendezvous-hash
 //!      (`assignment_v2`) must place us in the top-R for this
-//!      `chunk_index`.
+//!      `chunk_index`. The epoch list comes from
+//!      `storage_getAssignmentCoverageV2`: `info.assignment_height` is
+//!      only the first epoch, and after a `ReassignChunksV2` the chain
+//!      judges this archive's attestations against the latest one.
 //!   3. **Merkle proof verifies.** Use the strict
 //!      [`verify_merkle_proof_bytes_for_tree`] variant against the
 //!      chain-registered `chunk_count` so a peer can't lie about both
@@ -40,7 +43,14 @@
 //! serialize on each other.
 //!
 //! Snapshots are immutable per height (chain plan §5.3 Ask 15 Option A),
-//! so the snapshot cache never goes stale. File info CAN go stale — a
+//! so the snapshot cache never goes stale.
+//!
+//! A third cache holds each file's latest assignment epoch for
+//! [`DEFAULT_EPOCH_TTL`]. A reassignment can make it stale: a push the
+//! cached epoch would refuse first re-reads the epoch (at most once per
+//! [`DEFAULT_EPOCH_RECHECK_MIN`] per file), so a newly assigned archive
+//! is not refused for long; a push the stale epoch still accepts stores a
+//! chunk the archive will not attest (attestation re-reads the epoch). File info CAN go stale — a
 //! Pending file may be activated or abandoned while we hold the cache —
 //! which has two consequences:
 //!   * **Abandoned-while-cached-Active**: we accept the chunk and store
@@ -74,6 +84,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use lru::LruCache;
@@ -148,6 +159,13 @@ pub trait V2RpcClient: Send + Sync {
         &self,
         height: u64,
     ) -> anyhow::Result<Vec<NodeRecordInfo>>;
+
+    /// The file's latest assignment epoch, from
+    /// `storage_getAssignmentCoverageV2`. `Ok(Some(h))` when the chain
+    /// reports an epoch list; `Ok(None)` when it reports none (no
+    /// reassignment epochs, so `assignment_height` is the only epoch).
+    /// `Err` on transport failure or a missing coverage row.
+    async fn latest_assignment_epoch(&self, merkle_root_hex: &str) -> anyhow::Result<Option<u64>>;
 }
 
 /// Reasons a push gets rejected. Each variant maps to a distinct
@@ -197,6 +215,12 @@ pub enum PushReject {
     #[error("chunk_index {chunk_index} >= chunk_count {chunk_count}")]
     OutOfRange { chunk_index: u32, chunk_count: u32 },
 
+    /// The file's latest assignment epoch could not be read. The chunk
+    /// is not stored: which archives the chain now assigns it to is
+    /// unknown. Caller may retry with backoff.
+    #[error("assignment-epoch lookup failed: {0}")]
+    EpochLookup(#[source] anyhow::Error),
+
     /// `storage_getActiveNodesAtHeight(h)` returned an RPC error.
     #[error("snapshot lookup failed at height {height}: {source}")]
     SnapshotLookup {
@@ -205,10 +229,10 @@ pub enum PushReject {
         source: anyhow::Error,
     },
 
-    /// Snapshot at the file's assignment_height does not contain our
-    /// archive's address. Either we registered after this snapshot, or
-    /// the chain returned a snapshot we shouldn't be participating in.
-    /// Reject — we're not a valid storage target for this file.
+    /// The snapshot at the file's latest assignment epoch does not contain
+    /// our archive's address. Either we registered after this snapshot,
+    /// or a reassignment epoch no longer includes us. Reject — we're not a
+    /// valid storage target for this file.
     #[error("our archive (addr={my_addr_hex}) is not in the snapshot at height {height}")]
     NotInSnapshot { height: u64, my_addr_hex: String },
 
@@ -240,12 +264,25 @@ pub enum PushReject {
 pub const DEFAULT_FILE_INFO_CAP: usize = 256;
 pub const DEFAULT_SNAPSHOT_CAP: usize = 64;
 
+/// How long a file's latest assignment epoch is reused before it is read
+/// again. A reassignment is seen by a push this long after it at most.
+pub const DEFAULT_EPOCH_TTL: Duration = Duration::from_secs(30);
+
+/// Minimum age of a cached epoch before a push it would refuse triggers a
+/// re-read. Bounds the coverage reads a peer can cause by pushing chunks
+/// this archive is not assigned.
+pub const DEFAULT_EPOCH_RECHECK_MIN: Duration = Duration::from_secs(2);
+
 pub struct PushValidator<C: V2RpcClient> {
     rpc: C,
     my_addr: [u8; 20],
     params: V2Params,
     file_info: Mutex<LruCache<[u8; 32], StorageFileInfoV2>>,
     snapshot: Mutex<LruCache<u64, Vec<[u8; 20]>>>,
+    /// merkle_root → (latest assignment epoch, when it was read).
+    epochs: Mutex<LruCache<[u8; 32], (u64, Instant)>>,
+    epoch_ttl: Duration,
+    epoch_recheck_min: Duration,
 }
 
 impl<C: V2RpcClient> PushValidator<C> {
@@ -272,7 +309,17 @@ impl<C: V2RpcClient> PushValidator<C> {
             params,
             file_info: Mutex::new(LruCache::new(file_info_cap)),
             snapshot: Mutex::new(LruCache::new(snapshot_cap)),
+            epochs: Mutex::new(LruCache::new(file_info_cap)),
+            epoch_ttl: DEFAULT_EPOCH_TTL,
+            epoch_recheck_min: DEFAULT_EPOCH_RECHECK_MIN,
         }
+    }
+
+    /// Override [`DEFAULT_EPOCH_TTL`] and [`DEFAULT_EPOCH_RECHECK_MIN`].
+    pub fn with_epoch_timing(mut self, ttl: Duration, recheck_min: Duration) -> Self {
+        self.epoch_ttl = ttl;
+        self.epoch_recheck_min = recheck_min;
+        self
     }
 
     /// Validate one inbound push. Returns the BLAKE3 leaf hash of
@@ -318,23 +365,26 @@ impl<C: V2RpcClient> PushValidator<C> {
             });
         }
 
-        let snapshot = self.fetch_snapshot(info.assignment_height).await?;
-
-        if snapshot.binary_search(&self.my_addr).is_err() {
-            return Err(PushReject::NotInSnapshot {
-                height: info.assignment_height,
-                my_addr_hex: hex::encode(self.my_addr),
-            });
-        }
-
-        let assigned = assigned_archives(
-            &merkle_root,
-            &snapshot,
-            chunk_index,
-            self.params.assignment_replication_factor,
-        );
-        if !assigned.iter().any(|a| a == &self.my_addr) {
-            return Err(PushReject::NotAssigned { chunk_index });
+        let (epoch, read_now) = self
+            .assignment_epoch(&merkle_root, &info, self.epoch_ttl)
+            .await?;
+        match self.check_assigned(&merkle_root, epoch, chunk_index).await {
+            Ok(()) => {}
+            Err(refused @ (PushReject::NotInSnapshot { .. } | PushReject::NotAssigned { .. }))
+                if !read_now =>
+            {
+                // The cached epoch may predate a reassignment that assigns
+                // this chunk here: re-read it before refusing.
+                let (fresh, _) = self
+                    .assignment_epoch(&merkle_root, &info, self.epoch_recheck_min)
+                    .await?;
+                if fresh == epoch {
+                    return Err(refused);
+                }
+                self.check_assigned(&merkle_root, fresh, chunk_index)
+                    .await?;
+            }
+            Err(e) => return Err(e),
         }
 
         // Strict Merkle gate. `total_leaves` must come from chain state,
@@ -357,6 +407,75 @@ impl<C: V2RpcClient> PushValidator<C> {
             leaf_hash,
             visibility: info.visibility,
         })
+    }
+
+    /// Whether the assignment over the snapshot at `epoch` places this
+    /// archive among `chunk_index`'s R archives.
+    async fn check_assigned(
+        &self,
+        merkle_root: &[u8; 32],
+        epoch: u64,
+        chunk_index: u32,
+    ) -> Result<(), PushReject> {
+        let snapshot = self.fetch_snapshot(epoch).await?;
+        if snapshot.binary_search(&self.my_addr).is_err() {
+            return Err(PushReject::NotInSnapshot {
+                height: epoch,
+                my_addr_hex: hex::encode(self.my_addr),
+            });
+        }
+        let assigned = assigned_archives(
+            merkle_root,
+            &snapshot,
+            chunk_index,
+            self.params.assignment_replication_factor,
+        );
+        if !assigned.iter().any(|a| a == &self.my_addr) {
+            return Err(PushReject::NotAssigned { chunk_index });
+        }
+        Ok(())
+    }
+
+    /// The file's latest assignment epoch, from the cache when that entry
+    /// is younger than `max_age`. The flag is true when it was read from
+    /// the chain by this call.
+    async fn assignment_epoch(
+        &self,
+        merkle_root: &[u8; 32],
+        info: &StorageFileInfoV2,
+        max_age: Duration,
+    ) -> Result<(u64, bool), PushReject> {
+        if let Some((epoch, read_at)) = self
+            .epochs
+            .lock()
+            .expect("epochs mutex poisoned")
+            .get(merkle_root)
+            .copied()
+            && read_at.elapsed() < max_age
+        {
+            return Ok((epoch, false));
+        }
+        let root_hex = format!("0x{}", hex::encode(merkle_root));
+        let epoch = match self
+            .rpc
+            .latest_assignment_epoch(&root_hex)
+            .await
+            .map_err(PushReject::EpochLookup)?
+        {
+            None => info.assignment_height,
+            Some(latest) if latest < info.assignment_height => {
+                return Err(PushReject::BadChainShape(format!(
+                    "latest assignment epoch {latest} below assignment_height {} for root {root_hex}",
+                    info.assignment_height
+                )));
+            }
+            Some(latest) => latest,
+        };
+        self.epochs
+            .lock()
+            .expect("epochs mutex poisoned")
+            .put(*merkle_root, (epoch, Instant::now()));
+        Ok((epoch, true))
     }
 
     /// Cache-fronted wrapper around `storage_getFileInfoV2`. On miss,
@@ -489,6 +608,10 @@ mod tests {
         error_roots: StdMutex<std::collections::HashSet<String>>,
         file_info_calls: StdMutex<Vec<String>>,
         snapshot_calls: StdMutex<Vec<u64>>,
+        /// Latest assignment epoch by root hex: `Ok(None)` (the default
+        /// for an unlisted root) is a chain without reassignment epochs.
+        epochs: StdMutex<HashMap<String, Result<Option<u64>, String>>>,
+        epoch_calls: StdMutex<usize>,
     }
 
     impl MockRpc {
@@ -514,6 +637,21 @@ mod tests {
         }
         fn snapshot_call_count(&self) -> usize {
             self.snapshot_calls.lock().unwrap().len()
+        }
+        fn set_latest_epoch(&self, root_hex: &str, epoch: u64) {
+            self.epochs
+                .lock()
+                .unwrap()
+                .insert(root_hex.to_string(), Ok(Some(epoch)));
+        }
+        fn fail_epoch(&self, root_hex: &str) {
+            self.epochs.lock().unwrap().insert(
+                root_hex.to_string(),
+                Err("coverage transport failure".into()),
+            );
+        }
+        fn epoch_call_count(&self) -> usize {
+            *self.epoch_calls.lock().unwrap()
         }
     }
 
@@ -550,6 +688,18 @@ mod tests {
                 .get(&height)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("no snapshot at height {height}"))
+        }
+
+        async fn latest_assignment_epoch(
+            &self,
+            merkle_root_hex: &str,
+        ) -> anyhow::Result<Option<u64>> {
+            *self.epoch_calls.lock().unwrap() += 1;
+            match self.epochs.lock().unwrap().get(merkle_root_hex) {
+                None => Ok(None),
+                Some(Ok(e)) => Ok(*e),
+                Some(Err(msg)) => Err(anyhow::anyhow!(msg.clone())),
+            }
         }
     }
 
@@ -1379,5 +1529,248 @@ mod tests {
             .await
             .expect_err("mismatched response root must reject");
         assert!(matches!(err, PushReject::BadChainShape(_)), "got {err:?}");
+    }
+
+    // ── Pushes after a reassignment epoch (sum-chain #129, P2) ──
+    //
+    // The chain records a reassignment epoch in a separate list; the
+    // `storage_getFileInfoV2` row keeps the original `assignment_height`.
+    // The validator reads the latest epoch from the coverage RPC and judges
+    // every push against that epoch's snapshot.
+
+    /// The epoch-0 snapshot (archive 0xAA has since left) and the latest
+    /// epoch's snapshot (0xAA gone, replacement 0xC0 added), both sorted.
+    fn reassignment_snapshots() -> (Vec<[u8; 20]>, Vec<[u8; 20]>) {
+        let epoch0 = five_archives();
+        let mut latest: Vec<[u8; 20]> = epoch0[1..].to_vec();
+        latest.push([0xC0; 20]);
+        latest.sort();
+        (epoch0, latest)
+    }
+
+    const H0: u64 = 700;
+    const H_LATEST: u64 = 900;
+
+    /// A mock chain for `tree` with epoch 0 at `H0` and, when `reassigned`,
+    /// a reassignment epoch at `H_LATEST`.
+    fn reassigned_rpc(tree: &TreeFixture, reassigned: bool) -> MockRpc {
+        let (epoch0, latest) = reassignment_snapshots();
+        let root_hex = format!("0x{}", hex::encode(tree.root));
+        let rpc = MockRpc::default();
+        rpc.add_file(
+            &root_hex,
+            file_info(&tree.root, tree.chunk_count, LifecycleV2::ACTIVE, H0),
+        );
+        rpc.add_snapshot(H0, epoch0.iter().map(node_record).collect());
+        rpc.add_snapshot(H_LATEST, latest.iter().map(node_record).collect());
+        if reassigned {
+            rpc.set_latest_epoch(&root_hex, H_LATEST);
+        }
+        rpc
+    }
+
+    /// A surviving archive and a chunk the latest epoch assigns to it but
+    /// epoch 0 did not (`newly == true`), or the reverse.
+    fn survivor_chunk(tree: &TreeFixture, newly: bool) -> ([u8; 20], u32) {
+        let (epoch0, latest) = reassignment_snapshots();
+        let r = V2Params::DEFAULTS.assignment_replication_factor;
+        latest
+            .iter()
+            .filter(|a| epoch0.contains(a))
+            .find_map(|a| {
+                (0..tree.chunk_count)
+                    .find(|&i| {
+                        let in_latest = assigned_archives(&tree.root, &latest, i, r).contains(a);
+                        let in_epoch0 = assigned_archives(&tree.root, &epoch0, i, r).contains(a);
+                        if newly {
+                            in_latest && !in_epoch0
+                        } else {
+                            in_epoch0 && !in_latest
+                        }
+                    })
+                    .map(|i| (*a, i))
+            })
+            .expect("fixture has a survivor whose assignment moved")
+    }
+
+    #[tokio::test]
+    async fn reassignment_replacement_archive_accepts_its_latest_epoch_chunk() {
+        let (_, latest) = reassignment_snapshots();
+        let replacement = [0xC0; 20];
+        let tree = TreeFixture::new(32, 0x66);
+        let r = V2Params::DEFAULTS.assignment_replication_factor;
+        let idx = first_chunk_assigned_to(&tree.root, &latest, tree.chunk_count, &replacement, r);
+        let validator =
+            PushValidator::new(reassigned_rpc(&tree, true), replacement, V2Params::DEFAULTS);
+
+        validator
+            .validate_push(tree.root, idx, tree.data(idx), &tree.proof(idx))
+            .await
+            .expect("the latest epoch assigns this chunk to the replacement");
+        assert_eq!(
+            *validator.rpc.snapshot_calls.lock().unwrap(),
+            vec![H_LATEST]
+        );
+    }
+
+    #[tokio::test]
+    async fn reassignment_survivor_accepts_a_newly_assigned_chunk() {
+        let tree = TreeFixture::new(64, 0x77);
+        let (survivor, idx) = survivor_chunk(&tree, true);
+        let validator =
+            PushValidator::new(reassigned_rpc(&tree, true), survivor, V2Params::DEFAULTS);
+        validator
+            .validate_push(tree.root, idx, tree.data(idx), &tree.proof(idx))
+            .await
+            .expect("a chunk the latest epoch newly assigns is accepted");
+    }
+
+    #[tokio::test]
+    async fn reassignment_survivor_refuses_a_chunk_no_longer_assigned_to_it() {
+        let tree = TreeFixture::new(64, 0x77);
+        let (survivor, idx) = survivor_chunk(&tree, false);
+        let validator =
+            PushValidator::new(reassigned_rpc(&tree, true), survivor, V2Params::DEFAULTS);
+        let err = validator
+            .validate_push(tree.root, idx, tree.data(idx), &tree.proof(idx))
+            .await
+            .expect_err("only epoch 0 assigned this chunk here");
+        assert!(
+            matches!(err, PushReject::NotAssigned { chunk_index } if chunk_index == idx),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reassignment_departed_archive_refuses_every_push() {
+        let (epoch0, _) = reassignment_snapshots();
+        let departed = epoch0[0];
+        let tree = TreeFixture::new(32, 0x55);
+        let r = V2Params::DEFAULTS.assignment_replication_factor;
+        let idx = first_chunk_assigned_to(&tree.root, &epoch0, tree.chunk_count, &departed, r);
+        let validator =
+            PushValidator::new(reassigned_rpc(&tree, true), departed, V2Params::DEFAULTS);
+        let err = validator
+            .validate_push(tree.root, idx, tree.data(idx), &tree.proof(idx))
+            .await
+            .expect_err("the latest epoch's snapshot no longer contains it");
+        match err {
+            PushReject::NotInSnapshot { height, .. } => assert_eq!(height, H_LATEST),
+            other => panic!("expected NotInSnapshot at the latest epoch, got {other:?}"),
+        }
+    }
+
+    /// Without an epoch list the file's `assignment_height` is the only
+    /// epoch: pushes are judged against it, as before reassignment existed.
+    #[tokio::test]
+    async fn no_epoch_list_judges_pushes_against_assignment_height() {
+        let (epoch0, _) = reassignment_snapshots();
+        let tree = TreeFixture::new(32, 0x44);
+        let me = epoch0[0];
+        let r = V2Params::DEFAULTS.assignment_replication_factor;
+        let idx = first_chunk_assigned_to(&tree.root, &epoch0, tree.chunk_count, &me, r);
+        let validator = PushValidator::new(reassigned_rpc(&tree, false), me, V2Params::DEFAULTS);
+        validator
+            .validate_push(tree.root, idx, tree.data(idx), &tree.proof(idx))
+            .await
+            .expect("epoch 0 assigns it");
+        assert_eq!(*validator.rpc.snapshot_calls.lock().unwrap(), vec![H0]);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_epoch_refuses_the_push() {
+        let (_, latest) = reassignment_snapshots();
+        let tree = TreeFixture::new(32, 0x33);
+        let me = latest[0];
+        let r = V2Params::DEFAULTS.assignment_replication_factor;
+        let idx = first_chunk_assigned_to(&tree.root, &latest, tree.chunk_count, &me, r);
+        let rpc = reassigned_rpc(&tree, true);
+        rpc.fail_epoch(&format!("0x{}", hex::encode(tree.root)));
+        let validator = PushValidator::new(rpc, me, V2Params::DEFAULTS);
+        let err = validator
+            .validate_push(tree.root, idx, tree.data(idx), &tree.proof(idx))
+            .await
+            .expect_err("unknown epoch");
+        assert!(matches!(err, PushReject::EpochLookup(_)), "{err:?}");
+        assert_eq!(validator.rpc.snapshot_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_latest_epoch_below_assignment_height_is_a_bad_chain_shape() {
+        let tree = TreeFixture::new(32, 0x22);
+        let rpc = reassigned_rpc(&tree, false);
+        rpc.set_latest_epoch(&format!("0x{}", hex::encode(tree.root)), H0 - 1);
+        let validator = PushValidator::new(rpc, [0xC0; 20], V2Params::DEFAULTS);
+        let err = validator
+            .validate_push(tree.root, 0, tree.data(0), &tree.proof(0))
+            .await
+            .expect_err("malformed epoch list");
+        assert!(matches!(err, PushReject::BadChainShape(_)), "{err:?}");
+    }
+
+    /// A cached epoch that predates a reassignment is re-read before a
+    /// push it would refuse is refused, so the replacement is not turned
+    /// away until the cache expires.
+    #[tokio::test]
+    async fn a_stale_cached_epoch_is_re_read_before_refusing() {
+        let (epoch0, latest) = reassignment_snapshots();
+        let replacement = [0xC0; 20];
+        let tree = TreeFixture::new(32, 0x66);
+        let r = V2Params::DEFAULTS.assignment_replication_factor;
+        let idx = first_chunk_assigned_to(&tree.root, &latest, tree.chunk_count, &replacement, r);
+        let root_hex = format!("0x{}", hex::encode(tree.root));
+        // Before the reassignment: no epoch list, epoch 0 cached by a push
+        // to a member of epoch 0.
+        let validator = PushValidator::new(
+            reassigned_rpc(&tree, false),
+            replacement,
+            V2Params::DEFAULTS,
+        )
+        .with_epoch_timing(Duration::from_secs(3600), Duration::ZERO);
+        let err = validator
+            .validate_push(tree.root, idx, tree.data(idx), &tree.proof(idx))
+            .await
+            .expect_err("not in epoch 0");
+        assert!(matches!(err, PushReject::NotInSnapshot { height, .. } if height == H0));
+        assert!(!epoch0.contains(&replacement));
+
+        // The reassignment lands; the cache still says epoch 0.
+        validator.rpc.set_latest_epoch(&root_hex, H_LATEST);
+        validator
+            .validate_push(tree.root, idx, tree.data(idx), &tree.proof(idx))
+            .await
+            .expect("the re-read epoch assigns it");
+        // One read for the first push; the second push's cached refusal
+        // triggers exactly one re-read.
+        assert_eq!(validator.rpc.epoch_call_count(), 2);
+    }
+
+    /// The re-read is rate-limited: a cached epoch younger than the
+    /// minimum is trusted, so a stream of pushes for chunks this archive
+    /// is not assigned does not turn into a stream of coverage reads.
+    #[tokio::test]
+    async fn refusals_do_not_re_read_a_recently_read_epoch() {
+        let (_, latest) = reassignment_snapshots();
+        let tree = TreeFixture::new(32, 0x66);
+        let me = latest[1];
+        let r = V2Params::DEFAULTS.assignment_replication_factor;
+        let not_mine = (0..tree.chunk_count)
+            .find(|&i| !assigned_archives(&tree.root, &latest, i, r).contains(&me))
+            .expect("some chunk is not assigned here");
+        let validator = PushValidator::new(reassigned_rpc(&tree, true), me, V2Params::DEFAULTS)
+            .with_epoch_timing(Duration::from_secs(3600), Duration::from_secs(3600));
+        for _ in 0..5 {
+            let err = validator
+                .validate_push(
+                    tree.root,
+                    not_mine,
+                    tree.data(not_mine),
+                    &tree.proof(not_mine),
+                )
+                .await
+                .expect_err("not assigned here");
+            assert!(matches!(err, PushReject::NotAssigned { .. }));
+        }
+        assert_eq!(validator.rpc.epoch_call_count(), 1);
     }
 }

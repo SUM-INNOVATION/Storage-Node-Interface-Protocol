@@ -42,7 +42,7 @@ use sum_store::manifest_index::ManifestIndex;
 use sum_store::merkle::MerkleTree;
 use sum_types::config::StoreConfig;
 use sum_types::rpc_types::{
-    LifecycleV2, NodeRecordInfo, StorageFileInfoV2, TxStatusV2, VisibilityV2,
+    AssignmentCoverageV2, LifecycleV2, NodeRecordInfo, StorageFileInfoV2, TxStatusV2, VisibilityV2,
 };
 use sum_types::storage::{ChunkDescriptor, DataManifest};
 use tokio::sync::RwLock;
@@ -134,6 +134,10 @@ impl V2RpcClient for MockRpc {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no snapshot at height {height}"))
     }
+    /// This mock's chain has no reassignment epochs.
+    async fn latest_assignment_epoch(&self, _merkle_root_hex: &str) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -178,6 +182,7 @@ impl AttestTriggerRpc for MockRpc {
             chunk_count: info.chunk_count,
             assignment_height: info.assignment_height,
             visibility: info.visibility,
+            lifecycle: info.lifecycle,
         })
     }
     async fn fetch_snapshot(&self, height: u64) -> Result<Vec<[u8; 20]>> {
@@ -196,6 +201,29 @@ impl AttestTriggerRpc for MockRpc {
             .copied()
             .ok_or_else(|| anyhow::anyhow!("trigger: no nonce for {address_base58}"))
     }
+    /// A registered file's coverage row with no epoch list: this chain has
+    /// no reassignment epochs, so `assignment_height` is the only epoch.
+    async fn fetch_coverage(&self, merkle_root: &[u8; 32]) -> Result<Option<AssignmentCoverageV2>> {
+        let key = format!("0x{}", hex::encode(merkle_root));
+        Ok(self
+            .files
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|info| AssignmentCoverageV2 {
+                chunk_count: info.chunk_count,
+                covered_count: 0,
+                can_activate_now: false,
+                missing_total: info.chunk_count,
+                missing_offset: 0,
+                missing_indices: vec![],
+                per_archive: vec![],
+                assignment_epochs: vec![],
+                latest_assignment_epoch: 0,
+                reassignment_needed: false,
+                per_epoch: vec![],
+            }))
+    }
 }
 
 /// Newtype around `Arc<MockRpc>` so we can implement V2RpcClient,
@@ -213,6 +241,9 @@ impl V2RpcClient for ArcRpc {
     }
     async fn storage_get_active_nodes_at_height(&self, height: u64) -> Result<Vec<NodeRecordInfo>> {
         self.0.storage_get_active_nodes_at_height(height).await
+    }
+    async fn latest_assignment_epoch(&self, merkle_root_hex: &str) -> Result<Option<u64>> {
+        self.0.latest_assignment_epoch(merkle_root_hex).await
     }
 }
 
@@ -243,6 +274,9 @@ impl AttestTriggerRpc for ArcRpcTrigger {
     }
     async fn fetch_nonce(&self, address_base58: &str) -> Result<u64> {
         self.0.fetch_nonce(address_base58).await
+    }
+    async fn fetch_coverage(&self, merkle_root: &[u8; 32]) -> Result<Option<AssignmentCoverageV2>> {
+        self.0.fetch_coverage(merkle_root).await
     }
 }
 
@@ -754,4 +788,93 @@ async fn v2_manifest_push_acks_before_attestation_completes() {
     // eventually time out at the dispatcher's `batch_timeout = 2s`
     // — but our handle() already returned. Don't .await it; tokio
     // drops the spawned task at test teardown.
+}
+
+/// Runs the epoch-less scenario: pushes every chunk assigned to this archive,
+/// then a ManifestPush, and returns the attestation transactions it sends.
+async fn never_reassigned_attestation_txs() -> Vec<String> {
+    let arch = build_archive(true);
+    let (manifest, chunks, tree) = make_manifest(16, 0xE5);
+    let root = manifest.merkle_root;
+    let assignment_height = 700;
+    arch.rpc.add_file(
+        &format!("0x{}", hex::encode(root)),
+        StorageFileInfoV2 {
+            chunk_count: manifest.chunk_count,
+            assignment_height,
+            lifecycle: LifecycleV2::PENDING,
+            ..file_info_active(&root, manifest.chunk_count, assignment_height)
+        },
+    );
+    arch.rpc.add_snapshot(
+        assignment_height,
+        arch.snapshot.iter().map(node_record).collect(),
+        arch.snapshot.clone(),
+    );
+    arch.rpc.set_nonce(&l1_address_base58(&arch.my_addr), 7);
+
+    let r = V2Params::DEFAULTS.assignment_replication_factor;
+    let net = CapturingNet::new();
+    let mut channel = 100u64;
+    let mut pushed = 0;
+    for i in 0..manifest.chunk_count {
+        let assigned = sum_store::assignment_v2::assigned_archives(&root, &arch.snapshot, i, r);
+        if !assigned.contains(&arch.my_addr) {
+            continue;
+        }
+        let req = ShardRequestV2::Push {
+            data: chunks[i as usize].clone(),
+            merkle_root: root,
+            chunk_index: i,
+            merkle_path: tree.proof_bytes(i),
+        };
+        arch.dispatcher
+            .handle(&net, fake_peer(), req, channel)
+            .await;
+        match net.take(channel) {
+            Some(ShardResponseV2::PushAck { error: None, .. }) => pushed += 1,
+            other => panic!("push of chunk {i}: {other:?}"),
+        }
+        channel += 1;
+    }
+    assert!(pushed > 0, "this archive holds at least one chunk");
+    arch.rpc.enqueue_send("0xtx-attest");
+    arch.rpc
+        .enqueue_status(TxStatusV2::Finalized { block_height: 701 });
+
+    let mut manifest_bytes = Vec::new();
+    ciborium::ser::into_writer(&manifest, &mut manifest_bytes).unwrap();
+    let req = ShardRequestV2::ManifestPush {
+        merkle_root: root,
+        manifest_bytes,
+    };
+    arch.dispatcher
+        .handle(&net, fake_peer(), req, channel)
+        .await;
+    match net.take(channel) {
+        Some(ShardResponseV2::ManifestPushAck { error: None, .. }) => (),
+        other => panic!("ManifestPush: {other:?}"),
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let sent = arch.rpc.sent_txs.lock().unwrap().clone();
+        if !sent.is_empty() || tokio::time::Instant::now() >= deadline {
+            return sent;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The attestation SNIP main `36fa8eeb` (before latest-epoch attestation)
+/// sends in [`never_reassigned_attestation_txs`]'s scenario, captured by
+/// running that scenario there.
+const NEVER_REASSIGNED_ATTESTATION_TX: &str = "010000003905000000000000e2c4667dc8b07e139ac03ed15c56090624b88f6040420f0000000000000000000000000007000000000000001400000003000000996519ebda7e3dd4fa35456b83c811c9dfc05a98d14d572f7bbd26a4ca76b0850a0000000000000000000000020000000300000004000000050000000600000008000000090000000b0000000d0000004a916f4774f14b35a83b0504d34e8bf7c18eb2cdb653be04c9ca50b0955a241f941d2451b885c0e3d1ec687d69f36ba46b1e38fe59cd1c288465f04932332a04197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61";
+
+/// Compatibility: on a chain without reassignment epochs, the attestation an
+/// archive sends after a ManifestPush is byte-for-byte the previous release's.
+#[tokio::test]
+async fn never_reassigned_attestation_is_byte_for_byte_unchanged() {
+    let sent = never_reassigned_attestation_txs().await;
+    assert_eq!(sent, vec![NEVER_REASSIGNED_ATTESTATION_TX.to_string()]);
 }

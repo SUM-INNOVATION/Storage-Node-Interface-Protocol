@@ -23,10 +23,13 @@
 //! ## Held-set tracker
 //!
 //! In-memory `HashMap<[u8; 32], BTreeSet<u32>>` keyed by file
-//! `merkle_root`. Updated only on successful V2 `Push`. Read by the
-//! `ManifestPush` handler when spawning attestation. Lost on node
-//! restart — Phase 0b accepts that; W10/W11 reconstruct from chain
-//! state via `storage_getAssignmentCoverageV2 + scan-on-disk`.
+//! `merkle_root`. Updated only on successful V2 `Push`, after the chunk
+//! index is recorded durably in the store's `<hex_root>.v2_held` sidecar
+//! (a push whose record fails is not acknowledged). Read by the
+//! `ManifestPush` handler when spawning attestation and by the epoch
+//! watcher. After a restart [`V2Dispatcher::seed_held_from_disk`]
+//! rebuilds it from those records and from Public manifests, keeping only
+//! chunks still on disk; see [`held_from_disk`].
 //!
 //! ## Why ManifestPush triggers attestation, not Push
 //!
@@ -84,6 +87,7 @@ impl<T: RespondNet + ?Sized> RespondNet for Arc<T> {
 use sum_store::SumStore;
 use sum_store::content_id::cid_from_blake3_hash;
 use sum_store::serve::validate_manifest_push;
+use sum_types::rpc_types::AssignmentCoverageV2;
 use sum_types::storage::DataManifest;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -111,7 +115,9 @@ pub const DEFAULT_ATTEST_BATCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// can be tested without hitting a real RPC.
 #[async_trait::async_trait]
 pub trait AttestTriggerRpc: Send + Sync {
-    /// Get `(chunk_count, assignment_height)` for the file at `merkle_root`.
+    /// Get `(chunk_count, assignment_height, visibility)` for the file at
+    /// `merkle_root`. `assignment_height` is the file's FIRST assignment
+    /// epoch; attestation uses [`latest_assignment_epoch`].
     async fn fetch_file_shape(&self, merkle_root: &[u8; 32]) -> Result<FileShape>;
 
     /// Get the canonical (decoded, sorted, deduped) active-node
@@ -120,6 +126,53 @@ pub trait AttestTriggerRpc: Send + Sync {
 
     /// Get the next nonce slot for `address_base58`.
     async fn fetch_nonce(&self, address_base58: &str) -> Result<u64>;
+
+    /// `storage_getAssignmentCoverageV2` for the file, read for its
+    /// assignment epochs and per-epoch attestation counts. `Ok(None)` when
+    /// the chain has no coverage row for the root. Implementations may
+    /// request an empty missing-index window.
+    async fn fetch_coverage(&self, merkle_root: &[u8; 32]) -> Result<Option<AssignmentCoverageV2>>;
+}
+
+/// The snapshot height an attestation for this file is judged against
+/// now: the file's latest assignment epoch.
+///
+/// The chain validates every `AcceptAssignmentV2` index against the
+/// assignment over the latest epoch's snapshot (the original
+/// `assignment_height` until a `ReassignChunksV2` adds an epoch) and
+/// rejects the whole transaction for any index not assigned to the signer
+/// there. `getFileInfoV2.assignment_height` stays at the first epoch, so
+/// it is used only when the chain reports no epoch list at all (a chain
+/// without reassignment epochs, where it is the only epoch).
+///
+/// Errors when the epoch cannot be read, the chain has no coverage row
+/// for a registered file, or the reported latest epoch precedes the
+/// file's first one: attesting against a guessed epoch can only produce
+/// a transaction the chain refuses.
+pub async fn latest_assignment_epoch<T: AttestTriggerRpc + ?Sized>(
+    rpc: &T,
+    merkle_root: &[u8; 32],
+    shape: &FileShape,
+) -> Result<u64> {
+    let coverage = rpc.fetch_coverage(merkle_root).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no coverage row for registered root 0x{}",
+            hex::encode(merkle_root)
+        )
+    })?;
+    epoch_from_coverage(&coverage, shape.assignment_height)
+}
+
+/// [`latest_assignment_epoch`] for a coverage row already read.
+pub fn epoch_from_coverage(coverage: &AssignmentCoverageV2, assignment_height: u64) -> Result<u64> {
+    match coverage.resolved_latest_epoch() {
+        None => Ok(assignment_height),
+        Some(latest) if latest < assignment_height => Err(anyhow::anyhow!(
+            "chain reports latest assignment epoch {latest} below the file's \
+             assignment_height {assignment_height}"
+        )),
+        Some(latest) => Ok(latest),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -130,6 +183,9 @@ pub struct FileShape {
     /// ManifestPush handler to choose between Public CBOR validation
     /// (existing behavior) and Private opaque-bytes storage.
     pub visibility: sum_types::rpc_types::VisibilityV2,
+    /// File lifecycle from chain. The epoch watcher skips Abandoned files:
+    /// the chain refuses attestations for them.
+    pub lifecycle: sum_types::rpc_types::LifecycleV2,
 }
 
 /// Build a placeholder `DataManifest` for the Private ManifestPush
@@ -205,6 +261,17 @@ impl V2RpcClient for L1RpcClient {
     ) -> Result<Vec<sum_types::rpc_types::NodeRecordInfo>> {
         L1RpcClient::storage_get_active_nodes_at_height(self, height).await
     }
+
+    async fn latest_assignment_epoch(&self, merkle_root_hex: &str) -> Result<Option<u64>> {
+        // Only the epoch fields are read: ask for an empty missing-index window.
+        let coverage =
+            L1RpcClient::storage_get_assignment_coverage_v2(self, merkle_root_hex, None, Some(0))
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no coverage row for registered root {merkle_root_hex}")
+                })?;
+        Ok(coverage.resolved_latest_epoch())
+    }
 }
 
 #[async_trait::async_trait]
@@ -221,6 +288,7 @@ impl AttestTriggerRpc for L1RpcClient {
             chunk_count: info.chunk_count,
             assignment_height: info.assignment_height,
             visibility: info.visibility,
+            lifecycle: info.lifecycle,
         })
     }
 
@@ -242,6 +310,13 @@ impl AttestTriggerRpc for L1RpcClient {
 
     async fn fetch_nonce(&self, address_base58: &str) -> Result<u64> {
         L1RpcClient::get_nonce(self, address_base58).await
+    }
+
+    async fn fetch_coverage(&self, merkle_root: &[u8; 32]) -> Result<Option<AssignmentCoverageV2>> {
+        let key = format!("0x{}", hex::encode(merkle_root));
+        // Only the epoch fields and per-epoch counts are read: ask for an
+        // empty missing-index window.
+        L1RpcClient::storage_get_assignment_coverage_v2(self, &key, None, Some(0)).await
     }
 }
 
@@ -359,6 +434,56 @@ where
         self.attest_poll_interval = poll_interval;
         self.attest_batch_timeout = batch_timeout;
         self
+    }
+
+    /// Record a stored, validated V2 chunk durably (the store's
+    /// `<hex_root>.v2_held` sidecar), then in the held tracker. The caller
+    /// holds the store write lock and refuses the ACK on `Err`: a chunk
+    /// acknowledged without its record would be forgotten by a restart.
+    fn record_held(
+        &self,
+        manifest_idx: &mut ManifestIndex,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        cid: &str,
+    ) -> std::result::Result<(), String> {
+        manifest_idx
+            .record_v2_held_index(merkle_root, chunk_index, cid)
+            .map_err(|e| format!("held-index persistence failed: {e}"))?;
+        self.held
+            .lock()
+            .expect("held mutex poisoned")
+            .entry(merkle_root)
+            .or_default()
+            .insert(chunk_index);
+        Ok(())
+    }
+
+    /// Rebuild the held tracker from disk after a restart (see
+    /// [`held_from_disk`]) and merge it into the current one. Returns the
+    /// number of chunk indices found.
+    pub async fn seed_held_from_disk(&self) -> usize {
+        let rebuilt = {
+            let stores = self.store.read().await;
+            held_from_disk(&stores)
+        };
+        let found = rebuilt.values().map(BTreeSet::len).sum();
+        let mut held = self.held.lock().expect("held mutex poisoned");
+        for (root, indices) in rebuilt {
+            held.entry(root).or_default().extend(indices);
+        }
+        found
+    }
+
+    /// Every root the held tracker has at least one chunk for.
+    pub fn held_roots(&self) -> Vec<[u8; 32]> {
+        self.held
+            .lock()
+            .expect("held mutex poisoned")
+            .iter()
+            .filter(|(_, indices)| !indices.is_empty())
+            .map(|(root, _)| *root)
+            .collect()
     }
 
     /// Snapshot of the held tracker for `merkle_root`. Used by the
@@ -565,13 +690,22 @@ where
                             chunk_index,
                             error: Some(format!("private chunk mapping persistence failed: {e}")),
                         }
+                    } else if let Err(e) =
+                        self.record_held(&mut stores.manifest_idx, merkle_root, chunk_index, &cid)
+                    {
+                        warn!(
+                            %peer_id,
+                            root = %hex::encode(merkle_root),
+                            chunk_index,
+                            %e,
+                            "V2 Push (Private): held-index record FAILED — refusing ACK"
+                        );
+                        ShardResponseV2::PushAck {
+                            merkle_root,
+                            chunk_index,
+                            error: Some(e),
+                        }
                     } else {
-                        self.held
-                            .lock()
-                            .expect("held mutex poisoned")
-                            .entry(merkle_root)
-                            .or_default()
-                            .insert(chunk_index);
                         debug!(
                             %peer_id,
                             root = %hex::encode(merkle_root),
@@ -586,23 +720,36 @@ where
                         }
                     }
                 } else {
-                    self.held
-                        .lock()
-                        .expect("held mutex poisoned")
-                        .entry(merkle_root)
-                        .or_default()
-                        .insert(chunk_index);
-                    debug!(
-                        %peer_id,
-                        root = %hex::encode(merkle_root),
-                        chunk_index,
-                        cid = %cid,
-                        "V2 Push (Public): chunk validated and stored"
-                    );
-                    ShardResponseV2::PushAck {
-                        merkle_root,
-                        chunk_index,
-                        error: None,
+                    let recorded = {
+                        let mut stores = self.store.write().await;
+                        self.record_held(&mut stores.manifest_idx, merkle_root, chunk_index, &cid)
+                    };
+                    if let Err(e) = recorded {
+                        warn!(
+                            %peer_id,
+                            root = %hex::encode(merkle_root),
+                            chunk_index,
+                            %e,
+                            "V2 Push (Public): held-index record FAILED — refusing ACK"
+                        );
+                        ShardResponseV2::PushAck {
+                            merkle_root,
+                            chunk_index,
+                            error: Some(e),
+                        }
+                    } else {
+                        debug!(
+                            %peer_id,
+                            root = %hex::encode(merkle_root),
+                            chunk_index,
+                            cid = %cid,
+                            "V2 Push (Public): chunk validated and stored"
+                        );
+                        ShardResponseV2::PushAck {
+                            merkle_root,
+                            chunk_index,
+                            error: None,
+                        }
                     }
                 }
             }
@@ -698,8 +845,8 @@ where
             }
             // ACK and spawn attestation. Attestation does NOT consult
             // the manifest contents — it batches `held ∩ assignment`
-            // from the in-memory tracker and `chunk_count /
-            // assignment_height` from chain. Pass an empty stub
+            // from the in-memory tracker, with `chunk_count` and the
+            // latest assignment epoch from chain. Pass an empty stub
             // DataManifest only because the existing helper signature
             // takes one; the underlying `run_attestation` ignores it.
             let resp = ShardResponseV2::ManifestPushAck {
@@ -860,8 +1007,9 @@ where
     /// `storage_getAssignmentCoverageV2` in W10/W11 resume flows.
     ///
     /// The `_manifest` argument is intentionally unused — attestation
-    /// reads `chunk_count` and `assignment_height` from chain via
-    /// `fetch_file_shape` and the `held` set from the in-memory tracker
+    /// reads `chunk_count` from chain via `fetch_file_shape`, the latest
+    /// assignment epoch via [`latest_assignment_epoch`], and the `held`
+    /// set from the in-memory tracker
     /// updated by the V2 push handler. This keeps the Private path
     /// (where no decoded manifest exists) source-compatible with the
     /// Public path.
@@ -909,6 +1057,11 @@ where
         return None;
     }
 
+    // One run at a time per account, taken before the epoch and nonce are
+    // read: the nonce is only a safe starting point while no other run is
+    // submitting, and the epoch is read as close to submission as possible.
+    let _run = attestor.exclusive_run().await;
+
     let shape = match trigger_rpc.fetch_file_shape(&merkle_root).await {
         Ok(s) => s,
         Err(e) => {
@@ -916,10 +1069,17 @@ where
             return None;
         }
     };
-    let snapshot = match trigger_rpc.fetch_snapshot(shape.assignment_height).await {
+    let epoch = match latest_assignment_epoch(trigger_rpc.as_ref(), &merkle_root, &shape).await {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(root = %root_hex, %e, "attestation trigger: latest assignment epoch unavailable — not attesting");
+            return None;
+        }
+    };
+    let snapshot = match trigger_rpc.fetch_snapshot(epoch).await {
         Ok(s) => s,
         Err(e) => {
-            warn!(root = %root_hex, %e, "attestation trigger: fetch_snapshot failed");
+            warn!(root = %root_hex, epoch, %e, "attestation trigger: fetch_snapshot failed");
             return None;
         }
     };
@@ -945,6 +1105,7 @@ where
     if summary.fully_attested() {
         info!(
             root = %root_hex,
+            epoch,
             batches = summary.batches.len(),
             attested_count = summary.attested_count(),
             "attestation: every AcceptAssignmentV2 batch finalized"
@@ -952,6 +1113,7 @@ where
     } else {
         warn!(
             root = %root_hex,
+            epoch,
             finalized_batches = summary.batches.len(),
             attested_count = summary.attested_count(),
             error = ?summary.error,
@@ -959,6 +1121,50 @@ where
         );
     }
     Some(summary)
+}
+
+/// The chunk indices this archive holds, per file, rebuilt from disk:
+///
+/// - every index recorded in a `<hex_root>.v2_held` sidecar (V2 Push,
+///   Public or Private) whose chunk is still in the store;
+/// - for each Public manifest, every index whose chunk CID is in the
+///   store. This covers Public chunks pushed before the sidecar existed.
+///   A Public manifest is validated against its root, so a chunk on disk
+///   under the manifest's CID for index `i` is that file's chunk `i`. V1
+///   files appear here too; attestation and the epoch watcher act only on
+///   roots the chain reports as V2 files.
+///
+/// Private chunks pushed before the sidecar existed cannot be indexed (the
+/// encrypted manifest cannot be read here); they are attested again only
+/// after they are pushed again.
+pub fn held_from_disk(store: &SumStore) -> HashMap<[u8; 32], BTreeSet<u32>> {
+    let mut held: HashMap<[u8; 32], BTreeSet<u32>> = HashMap::new();
+    for root in store.manifest_idx.v2_held_roots() {
+        if let Some(records) = store.manifest_idx.v2_held_records(&root) {
+            let present: BTreeSet<u32> = records
+                .iter()
+                .filter(|(_, cid)| store.local.has(cid))
+                .map(|(index, _)| *index)
+                .collect();
+            if !present.is_empty() {
+                held.entry(root).or_default().extend(present);
+            }
+        }
+    }
+    for root in store.manifest_idx.all_merkle_roots() {
+        if let Some(manifest) = store.manifest_idx.get_by_merkle_root(&root) {
+            let present: BTreeSet<u32> = manifest
+                .chunks
+                .iter()
+                .filter(|c| store.local.has(&c.cid))
+                .map(|c| c.chunk_index)
+                .collect();
+            if !present.is_empty() {
+                held.entry(root).or_default().extend(present);
+            }
+        }
+    }
+    held
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -998,7 +1204,8 @@ mod tests {
     use sum_net::l1_address_base58;
     use sum_store::merkle::MerkleTree;
     use sum_types::rpc_types::{
-        LifecycleV2, NodeRecordInfo, StorageFileInfoV2, TxStatusV2, VisibilityV2,
+        AssignmentEpochCoverageV2, LifecycleV2, NodeRecordInfo, StorageFileInfoV2, TxStatusV2,
+        VisibilityV2,
     };
     use sum_types::storage::{ChunkDescriptor, DataManifest};
 
@@ -1014,6 +1221,14 @@ mod tests {
         status_responses: StdMutex<VecDeque<Result<TxStatusV2, String>>>,
         nonce_responses: StdMutex<HashMap<String, u64>>,
         sent_txs: StdMutex<Vec<String>>,
+        /// Coverage rows by root hex. A root with no entry here but a
+        /// registered file reports a coverage row without an epoch list
+        /// (a chain without reassignment epochs).
+        coverages: StdMutex<HashMap<String, Result<AssignmentCoverageV2, String>>>,
+        /// When set, `fetch_nonce` returns this base plus the number of
+        /// transactions sent so far (a chain whose nonce advances with each
+        /// accepted transaction), yielding once before it answers.
+        nonce_advances_from: StdMutex<Option<u64>>,
     }
 
     impl AllMockRpc {
@@ -1051,6 +1266,65 @@ mod tests {
         fn sent_count(&self) -> usize {
             self.sent_txs.lock().unwrap().len()
         }
+        /// Report `epochs` (ascending heights, epoch 0 first) as the
+        /// file's assignment epochs, with `per_epoch` attestation detail.
+        fn set_epochs(
+            &self,
+            root_hex: &str,
+            chunk_count: u32,
+            epochs: &[u64],
+            per_epoch: Vec<AssignmentEpochCoverageV2>,
+        ) {
+            self.coverages.lock().unwrap().insert(
+                root_hex.to_string(),
+                Ok(coverage_with_epochs(chunk_count, epochs, per_epoch)),
+            );
+        }
+        fn fail_coverage(&self, root_hex: &str) {
+            self.coverages.lock().unwrap().insert(
+                root_hex.to_string(),
+                Err("coverage transport failure".into()),
+            );
+        }
+        fn advance_nonce_from(&self, base: u64) {
+            *self.nonce_advances_from.lock().unwrap() = Some(base);
+        }
+        fn sent_nonces(&self) -> Vec<u64> {
+            self.sent_txs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|hex_tx| {
+                    let signed = sumchain_wire::transaction::SignedTransaction::from_hex(hex_tx)
+                        .expect("our own transaction decodes");
+                    match signed.inner {
+                        sumchain_wire::transaction::TxInner::V2(tx) => tx.nonce,
+                        other => panic!("expected a V2 transaction, got {other:?}"),
+                    }
+                })
+                .collect()
+        }
+    }
+
+    /// A coverage row carrying `epochs` as the file's assignment epochs.
+    fn coverage_with_epochs(
+        chunk_count: u32,
+        epochs: &[u64],
+        per_epoch: Vec<AssignmentEpochCoverageV2>,
+    ) -> AssignmentCoverageV2 {
+        AssignmentCoverageV2 {
+            chunk_count,
+            covered_count: 0,
+            can_activate_now: false,
+            missing_total: chunk_count,
+            missing_offset: 0,
+            missing_indices: vec![],
+            per_archive: vec![],
+            assignment_epochs: epochs.to_vec(),
+            latest_assignment_epoch: epochs.last().copied().unwrap_or(0),
+            reassignment_needed: false,
+            per_epoch,
+        }
     }
 
     #[async_trait::async_trait]
@@ -1072,6 +1346,18 @@ mod tests {
                 .get(&height)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("no snapshot at height {height}"))
+        }
+        async fn latest_assignment_epoch(
+            &self,
+            merkle_root_hex: &str,
+        ) -> anyhow::Result<Option<u64>> {
+            let root: [u8; 32] = hex::decode(merkle_root_hex.trim_start_matches("0x"))?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("bad root hex {merkle_root_hex}"))?;
+            let coverage = AttestTriggerRpc::fetch_coverage(self, &root)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no coverage row for {merkle_root_hex}"))?;
+            Ok(coverage.resolved_latest_epoch())
         }
     }
 
@@ -1117,6 +1403,7 @@ mod tests {
                 chunk_count: info.chunk_count,
                 assignment_height: info.assignment_height,
                 visibility: info.visibility,
+                lifecycle: info.lifecycle,
             })
         }
         async fn fetch_snapshot(&self, height: u64) -> anyhow::Result<Vec<[u8; 20]>> {
@@ -1128,12 +1415,35 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("trigger: no snapshot"))
         }
         async fn fetch_nonce(&self, address_base58: &str) -> anyhow::Result<u64> {
+            let advancing = *self.nonce_advances_from.lock().unwrap();
+            if let Some(base) = advancing {
+                // Read, then yield before answering: two unserialized
+                // callers both read the same value, as on a real chain.
+                let nonce = base + self.sent_count() as u64;
+                tokio::task::yield_now().await;
+                return Ok(nonce);
+            }
             self.nonce_responses
                 .lock()
                 .unwrap()
                 .get(address_base58)
                 .copied()
                 .ok_or_else(|| anyhow::anyhow!("trigger: no nonce for {address_base58}"))
+        }
+        async fn fetch_coverage(
+            &self,
+            merkle_root: &[u8; 32],
+        ) -> anyhow::Result<Option<AssignmentCoverageV2>> {
+            let key = format!("0x{}", hex::encode(merkle_root));
+            if let Some(entry) = self.coverages.lock().unwrap().get(&key).cloned() {
+                return entry.map(Some).map_err(anyhow::Error::msg);
+            }
+            Ok(self
+                .files
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|info| coverage_with_epochs(info.chunk_count, &[], vec![])))
         }
     }
 
@@ -1339,6 +1649,12 @@ mod tests {
         ) -> anyhow::Result<Vec<NodeRecordInfo>> {
             self.0.storage_get_active_nodes_at_height(height).await
         }
+        async fn latest_assignment_epoch(
+            &self,
+            merkle_root_hex: &str,
+        ) -> anyhow::Result<Option<u64>> {
+            self.0.latest_assignment_epoch(merkle_root_hex).await
+        }
     }
     #[async_trait::async_trait]
     impl crate::tx_wait::TxStatusSource for ArcRpc {
@@ -1365,6 +1681,12 @@ mod tests {
         }
         async fn fetch_nonce(&self, address_base58: &str) -> anyhow::Result<u64> {
             self.0.fetch_nonce(address_base58).await
+        }
+        async fn fetch_coverage(
+            &self,
+            merkle_root: &[u8; 32],
+        ) -> anyhow::Result<Option<AssignmentCoverageV2>> {
+            self.0.fetch_coverage(merkle_root).await
         }
     }
 
@@ -2722,5 +3044,405 @@ mod tests {
         // And at offset 0 → the whole chunk.
         let got = v2_pull(&d, &net, &cid, 0, narrowing, 21).await;
         expect_ok(got, 21, &cid, 0, 4, b"abcd");
+    }
+
+    // ── Attestation after a reassignment epoch (sum-chain #129, P2/P4) ──
+    //
+    // The chain (sum-chain `execute_accept_assignment_v2`) validates every
+    // `AcceptAssignmentV2` index against the assignment over the LATEST
+    // reassignment epoch's snapshot, and rejects the whole transaction if
+    // any index is not assigned to the signer in that epoch.
+    // `getFileInfoV2.assignment_height` stays at epoch 0, so the archive
+    // reads the epoch list from `storage_getAssignmentCoverageV2`.
+
+    /// Epoch 0 at h=500 is `five_archives()`; a reassignment epoch at h=900
+    /// replaces the fifth archive with `replacement`, plus the attestor the
+    /// tests below share.
+    struct ReassignedFixture {
+        epoch0: Vec<[u8; 20]>,
+        epoch1: Vec<[u8; 20]>,
+        replacement: [u8; 20],
+        manifest: DataManifest,
+        rpc: Arc<AllMockRpc>,
+        r: u32,
+    }
+
+    impl ReassignedFixture {
+        fn new() -> Self {
+            let epoch0 = five_archives();
+            let mut epoch1 = epoch0.clone();
+            let replacement = [0xF0u8; 20];
+            epoch1[4] = replacement;
+            epoch1.sort();
+            let (manifest, _chunks, _tree) = make_manifest(64, 0x29);
+            let root_hex = format!("0x{}", hex::encode(manifest.merkle_root));
+            let rpc = AllMockRpc::new();
+            // getFileInfoV2 reports the file's ORIGINAL assignment_height;
+            // the coverage row carries both epochs.
+            rpc.add_file(
+                &root_hex,
+                file_info_active(&manifest.merkle_root, manifest.chunk_count, 500),
+            );
+            rpc.set_epochs(&root_hex, manifest.chunk_count, &[500, 900], vec![]);
+            rpc.add_snapshot(
+                500,
+                epoch0.iter().map(node_record).collect(),
+                epoch0.clone(),
+            );
+            rpc.add_snapshot(
+                900,
+                epoch1.iter().map(node_record).collect(),
+                epoch1.clone(),
+            );
+            Self {
+                epoch0,
+                epoch1,
+                replacement,
+                manifest,
+                rpc: Arc::new(rpc),
+                r: 3,
+            }
+        }
+        fn attestor(&self, me: [u8; 20]) -> Arc<AssignmentAttestor<ArcRpc>> {
+            Arc::new(AssignmentAttestor::new(
+                ArcRpc(self.rpc.clone()),
+                [42u8; 32],
+                me,
+                1337,
+                1_000_000,
+                crate::push_validator::V2Params {
+                    assignment_replication_factor: self.r,
+                    max_chunk_indices_per_tx: 1024,
+                },
+            ))
+        }
+        fn assigned(&self, snapshot: &[[u8; 20]], me: &[u8; 20]) -> BTreeSet<u32> {
+            sum_store::assignment_v2::chunks_for_archive_v2(
+                &self.manifest.merkle_root,
+                self.manifest.chunk_count,
+                snapshot,
+                self.r,
+                me,
+            )
+        }
+        async fn run(&self, me: [u8; 20], held: BTreeSet<u32>) -> Option<AttestSummary> {
+            run_attestation(
+                self.attestor(me),
+                Arc::new(ArcRpcTrigger(self.rpc.clone())),
+                self.manifest.merkle_root,
+                held,
+                l1_address_base58(&me),
+                Duration::from_millis(10),
+                Duration::from_secs(2),
+            )
+            .await
+        }
+    }
+
+    /// The replacement holds every chunk the latest epoch assigns it (an
+    /// owner re-pushed them) and attests exactly that set, although the
+    /// epoch-0 snapshot does not contain it.
+    #[tokio::test]
+    async fn reassignment_epoch_replacement_archive_attests_its_latest_epoch_set() {
+        let f = ReassignedFixture::new();
+        let latest_epoch_set = f.assigned(&f.epoch1, &f.replacement);
+        assert!(
+            !latest_epoch_set.is_empty(),
+            "fixture: the latest epoch must assign the replacement some chunks"
+        );
+        f.rpc.set_nonce(&l1_address_base58(&f.replacement), 0);
+        f.rpc.enqueue_send("0xtx-replacement");
+        f.rpc
+            .enqueue_status(TxStatusV2::Finalized { block_height: 1000 });
+
+        let summary = f
+            .run(f.replacement, latest_epoch_set.clone())
+            .await
+            .expect("trigger runs");
+        assert!(summary.fully_attested(), "{:?}", summary.error);
+        assert_eq!(summary.batches.len(), 1);
+        let submitted: BTreeSet<u32> = summary.batches[0].chunk_indices.iter().copied().collect();
+        assert_eq!(submitted, latest_epoch_set);
+        assert_eq!(f.rpc.sent_count(), 1);
+    }
+
+    /// A surviving archive holding the whole file attests exactly its
+    /// latest-epoch assignment: never an index only epoch 0 gave it (the
+    /// chain would refuse the whole transaction), always the indices the
+    /// latest epoch newly gives it.
+    #[tokio::test]
+    async fn reassignment_epoch_survivor_attests_only_its_latest_epoch_assignment() {
+        let f = ReassignedFixture::new();
+        let me = f.epoch0[0];
+        let s0 = f.assigned(&f.epoch0, &me);
+        let s1 = f.assigned(&f.epoch1, &me);
+        let only_epoch0: Vec<u32> = s0.difference(&s1).copied().collect();
+        let only_latest: Vec<u32> = s1.difference(&s0).copied().collect();
+        assert!(
+            !only_epoch0.is_empty() && !only_latest.is_empty(),
+            "fixture: the reassignment must move this archive's assignment both ways \
+             (only_epoch0={only_epoch0:?}, only_latest={only_latest:?})"
+        );
+        f.rpc.set_nonce(&l1_address_base58(&me), 7);
+        f.rpc.enqueue_send("0xtx-attest");
+        f.rpc
+            .enqueue_status(TxStatusV2::Finalized { block_height: 1000 });
+        let held: BTreeSet<u32> = (0..f.manifest.chunk_count).collect();
+
+        let summary = f.run(me, held).await.expect("trigger runs");
+        assert_eq!(summary.batches.len(), 1);
+        let submitted: BTreeSet<u32> = summary.batches[0].chunk_indices.iter().copied().collect();
+        assert_eq!(submitted, s1, "attests the latest epoch's assignment");
+        assert!(only_epoch0.iter().all(|i| !submitted.contains(i)));
+        assert!(only_latest.iter().all(|i| submitted.contains(i)));
+    }
+
+    /// An archive the reassignment removed attests nothing for this file,
+    /// although it still holds its epoch-0 chunks.
+    #[tokio::test]
+    async fn reassignment_epoch_departed_archive_attests_nothing() {
+        let f = ReassignedFixture::new();
+        let departed = f.epoch0[4];
+        assert!(!f.epoch1.contains(&departed));
+        f.rpc.set_nonce(&l1_address_base58(&departed), 0);
+        let held = f.assigned(&f.epoch0, &departed);
+        assert!(!held.is_empty());
+
+        let summary = f.run(departed, held).await.expect("trigger runs");
+        assert!(summary.batches.is_empty() && summary.error.is_none());
+        assert_eq!(f.rpc.sent_count(), 0);
+    }
+
+    /// When the epoch list cannot be read, nothing is submitted: a guess
+    /// (epoch 0) produces a transaction the chain refuses after a
+    /// reassignment.
+    #[tokio::test]
+    async fn attestation_is_not_submitted_when_the_epoch_cannot_be_read() {
+        let f = ReassignedFixture::new();
+        let me = f.epoch0[0];
+        f.rpc.set_nonce(&l1_address_base58(&me), 0);
+        f.rpc
+            .fail_coverage(&format!("0x{}", hex::encode(f.manifest.merkle_root)));
+        let held: BTreeSet<u32> = (0..f.manifest.chunk_count).collect();
+        assert!(f.run(me, held).await.is_none());
+        assert_eq!(f.rpc.sent_count(), 0);
+    }
+
+    /// A latest epoch below the file's first epoch is a malformed chain
+    /// answer: refuse rather than attest against it.
+    #[test]
+    fn epoch_from_coverage_refuses_a_latest_epoch_below_the_first() {
+        let cov = coverage_with_epochs(4, &[300], vec![]);
+        assert!(epoch_from_coverage(&cov, 500).is_err());
+        let cov = coverage_with_epochs(4, &[500, 900], vec![]);
+        assert_eq!(epoch_from_coverage(&cov, 500).unwrap(), 900);
+        // No epoch list: the file's assignment_height is the only epoch.
+        let cov = coverage_with_epochs(4, &[], vec![]);
+        assert_eq!(epoch_from_coverage(&cov, 500).unwrap(), 500);
+    }
+
+    /// Two attestation runs (a ManifestPush trigger and the epoch watcher,
+    /// or two files) never start from the same nonce: the second reads the
+    /// nonce only after the first run's transaction is final.
+    #[tokio::test]
+    async fn concurrent_attestation_runs_use_distinct_nonces() {
+        let f = ReassignedFixture::new();
+        let me = f.epoch0[0];
+        f.rpc.advance_nonce_from(40);
+        for tx in ["0xtx-a", "0xtx-b"] {
+            f.rpc.enqueue_send(tx);
+            f.rpc
+                .enqueue_status(TxStatusV2::Finalized { block_height: 1000 });
+        }
+        let held: BTreeSet<u32> = (0..f.manifest.chunk_count).collect();
+        let attestor = f.attestor(me);
+        let trigger = Arc::new(ArcRpcTrigger(f.rpc.clone()));
+        let run = |held: BTreeSet<u32>| {
+            run_attestation(
+                attestor.clone(),
+                trigger.clone(),
+                f.manifest.merkle_root,
+                held,
+                l1_address_base58(&me),
+                Duration::from_millis(10),
+                Duration::from_secs(2),
+            )
+        };
+        let (a, b) = tokio::join!(run(held.clone()), run(held));
+        assert!(a.unwrap().fully_attested() && b.unwrap().fully_attested());
+        let mut nonces = f.rpc.sent_nonces();
+        nonces.sort();
+        assert_eq!(nonces, vec![40, 41]);
+    }
+
+    // ── Held set across a restart (sum-chain #129, P4) ──
+
+    fn store_at(dir: &std::path::Path) -> Arc<RwLock<SumStore>> {
+        let cfg = sum_types::config::StoreConfig {
+            store_dir: dir.to_path_buf(),
+            max_chunk_msg_bytes: sum_types::config::DEFAULT_MAX_CHUNK_MSG_BYTES,
+        };
+        Arc::new(RwLock::new(SumStore::new(cfg).expect("SumStore::new")))
+    }
+
+    /// A chain with one file of `n` chunks (`private` or Public) assigned
+    /// over `five_archives()` at h=500, and the indices it assigns to
+    /// archive 0 under the validator's R.
+    fn held_fixture(
+        n: u32,
+        salt: u8,
+        private: bool,
+    ) -> (AllMockRpc, DataManifest, Vec<Vec<u8>>, MerkleTree, Vec<u32>) {
+        let snapshot = five_archives();
+        let (manifest, chunks, tree) = make_manifest(n, salt);
+        let root = manifest.merkle_root;
+        let rpc = AllMockRpc::new();
+        let info = if private {
+            file_info_active_private(&root, n, 500)
+        } else {
+            file_info_active(&root, n, 500)
+        };
+        rpc.add_file(&format!("0x{}", hex::encode(root)), info);
+        rpc.add_snapshot(
+            500,
+            snapshot.iter().map(node_record).collect(),
+            snapshot.clone(),
+        );
+        let r = crate::push_validator::V2Params::DEFAULTS.assignment_replication_factor;
+        let mine: Vec<u32> = (0..n)
+            .filter(|&i| {
+                sum_store::assignment_v2::assigned_archives(&root, &snapshot, i, r)
+                    .contains(&snapshot[0])
+            })
+            .collect();
+        assert!(
+            mine.len() >= 2,
+            "fixture needs two chunks assigned to archive 0"
+        );
+        (rpc, manifest, chunks, tree, mine)
+    }
+
+    async fn push(
+        d: &V2Dispatcher<ArcRpc, ArcRpc, ArcRpcTrigger>,
+        net: &RecorderNet,
+        root: [u8; 32],
+        index: u32,
+        chunks: &[Vec<u8>],
+        tree: &MerkleTree,
+    ) -> Option<String> {
+        let req = ShardRequestV2::Push {
+            data: chunks[index as usize].clone(),
+            merkle_root: root,
+            chunk_index: index,
+            merkle_path: tree.proof_bytes(index),
+        };
+        d.handle(net, PeerId::random(), req, u64::from(index)).await;
+        match net.last().expect("every push is answered").1 {
+            ShardResponseV2::PushAck { error, .. } => error,
+            other => panic!("expected PushAck, got {other:?}"),
+        }
+    }
+
+    async fn pushes_survive_a_restart(private: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let (rpc, manifest, chunks, tree, mine) =
+            held_fixture(16, if private { 0x61 } else { 0x62 }, private);
+        let root = manifest.merkle_root;
+        let pushed = &mine[..2];
+        let me = five_archives()[0];
+        {
+            let stores = store_at(dir.path());
+            let d = build_dispatcher(rpc, vec![], me, stores);
+            let net = RecorderNet::new();
+            for &i in pushed {
+                assert_eq!(push(&d, &net, root, i, &chunks, &tree).await, None);
+            }
+            assert_eq!(d.held_for(&root), pushed.iter().copied().collect());
+        }
+
+        // Restart: a fresh store and dispatcher over the same directory.
+        let (rpc2, ..) = held_fixture(16, if private { 0x61 } else { 0x62 }, private);
+        let stores = store_at(dir.path());
+        let d = build_dispatcher(rpc2, vec![], me, stores.clone());
+        assert!(d.held_for(&root).is_empty());
+        assert_eq!(d.seed_held_from_disk().await, 2);
+        assert_eq!(d.held_for(&root), pushed.iter().copied().collect());
+        assert_eq!(d.held_roots(), vec![root]);
+
+        // A chunk no longer on disk is not held after the next rebuild.
+        let gone = cid_from_blake3_hash(&blake3::hash(&chunks[pushed[0] as usize]));
+        stores.read().await.local.delete(&gone).unwrap();
+        let rebuilt = held_from_disk(&*stores.read().await);
+        assert_eq!(rebuilt.get(&root), Some(&[pushed[1]].into_iter().collect()));
+    }
+
+    #[tokio::test]
+    async fn public_pushes_are_held_again_after_a_restart() {
+        pushes_survive_a_restart(false).await;
+    }
+
+    #[tokio::test]
+    async fn private_pushes_are_held_again_after_a_restart() {
+        pushes_survive_a_restart(true).await;
+    }
+
+    /// Public chunks stored before the sidecar existed are indexed from
+    /// the file's manifest; Private ones cannot be, and are not guessed.
+    #[tokio::test]
+    async fn rebuild_indexes_older_public_chunks_from_the_manifest_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores = store_at(dir.path());
+        let (public, public_chunks, _) = make_manifest(4, 0x63);
+        let (private, private_chunks, _) = make_manifest(4, 0x64);
+        {
+            let mut s = stores.write().await;
+            s.manifest_idx.insert(&public).unwrap();
+            s.manifest_idx
+                .insert_private(private.merkle_root, b"opaque".to_vec())
+                .unwrap();
+            for i in [0usize, 2] {
+                s.local
+                    .put(&public.chunks[i].cid, &public_chunks[i])
+                    .unwrap();
+                s.local
+                    .put(&private.chunks[i].cid, &private_chunks[i])
+                    .unwrap();
+                s.manifest_idx
+                    .record_private_chunk_cid(private.merkle_root, &private.chunks[i].cid)
+                    .unwrap();
+            }
+        }
+        let held = held_from_disk(&*stores.read().await);
+        assert_eq!(
+            held.get(&public.merkle_root),
+            Some(&[0u32, 2].into_iter().collect())
+        );
+        assert_eq!(held.get(&private.merkle_root), None);
+    }
+
+    /// A push whose index cannot be recorded is not acknowledged and not
+    /// held: after a restart it would otherwise be forgotten.
+    #[tokio::test]
+    async fn a_push_whose_index_record_fails_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rpc, manifest, chunks, tree, mine) = held_fixture(16, 0x65, false);
+        let root = manifest.merkle_root;
+        let stores = store_at(dir.path());
+        stores
+            .write()
+            .await
+            .manifest_idx
+            .record_v2_held_index(root, mine[0], "some-other-cid")
+            .unwrap();
+        let d = build_dispatcher(rpc, vec![], five_archives()[0], stores);
+        let net = RecorderNet::new();
+        let err = push(&d, &net, root, mine[0], &chunks, &tree)
+            .await
+            .expect("refused");
+        assert!(err.contains("held-index persistence failed"), "{err}");
+        assert!(d.held_for(&root).is_empty());
+        // Another index of the same file is unaffected.
+        assert_eq!(push(&d, &net, root, mine[1], &chunks, &tree).await, None);
+        assert_eq!(d.held_for(&root), [mine[1]].into_iter().collect());
     }
 }

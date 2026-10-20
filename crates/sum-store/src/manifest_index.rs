@@ -17,9 +17,14 @@
 //!     Served back verbatim on ACL-gated `ManifestPull`; downstream
 //!     readers (recipients with `K_file`) decrypt and decode locally.
 //!
-//! On startup both shapes are scanned and loaded into memory.
+//! A third file, `<hex_root>.v2_held`, records the chunk index of every
+//! chunk this archive accepted by V2 Push for that file (one
+//! `<chunk_index> <cid>` line per push), so the archive's held set can be
+//! rebuilt after a restart for Public and Private files alike.
+//!
+//! On startup every shape is scanned and loaded into memory.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -63,6 +68,12 @@ pub struct ManifestIndex {
     /// that keeps this list (provenance unknown, so retained). Persisted
     /// in [`GC_PROTECTED_FILE`]; see [`Self::record_v2_held_chunk`].
     gc_protected: HashSet<String>,
+    /// Chunks accepted by V2 Push, per file: merkle root → chunk index →
+    /// CID. Persisted as `<hex_root>.v2_held` (see
+    /// [`Self::record_v2_held_index`]) so the held set survives a restart;
+    /// the chunk index is what `AcceptAssignmentV2` attests, and for a
+    /// Private file nothing else on disk records it.
+    v2_held: HashMap<[u8; 32], BTreeMap<u32, String>>,
     /// `Some(false)` when the protected list exists but could not be read:
     /// garbage collection must then delete nothing. `None` until the list
     /// has been created (first run of this version, before seeding).
@@ -182,6 +193,7 @@ impl ManifestIndex {
             private_bytes: HashMap::new(),
             private_cid_to_root: HashMap::new(),
             gc_protected: HashSet::new(),
+            v2_held: HashMap::new(),
             gc_protection_intact: None,
         };
 
@@ -238,6 +250,19 @@ impl ManifestIndex {
                         }
                     }
                 }
+                Some("v2_held") => {
+                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    let Some(root) = decode_hex_root(stem) else {
+                        tracing::warn!(path = %path.display(), "skipping V2 held-index sidecar with non-hex stem");
+                        continue;
+                    };
+                    match fs::read_to_string(&path) {
+                        Ok(content) => index.load_v2_held_lines(&path, root, &content),
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), %e, "skipping unreadable V2 held-index sidecar");
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -260,6 +285,7 @@ impl ManifestIndex {
             private_manifests = index.private_bytes.len(),
             public_indexed_chunks = index.cid_to_root.len(),
             private_indexed_chunks = index.private_cid_to_root.len(),
+            v2_held_files = index.v2_held.len(),
             "manifest index loaded"
         );
 
@@ -442,6 +468,52 @@ impl ManifestIndex {
         Ok(())
     }
 
+    /// Record, durably, that the chunk at `chunk_index` of `merkle_root`
+    /// was accepted by a V2 Push and stored under `cid`. Call it after the
+    /// chunk is written and before the push is acknowledged; the held set
+    /// is rebuilt from these records after a restart.
+    ///
+    /// Idempotent for a pair already recorded. A different CID for an index
+    /// already recorded is refused: a verified Merkle proof binds each index
+    /// of a root to one leaf, so the mismatch is corruption or a bug, and
+    /// rebinding would make the archive attest a chunk it does not hold.
+    pub fn record_v2_held_index(
+        &mut self,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        cid: &str,
+    ) -> Result<()> {
+        if let Some(existing) = self
+            .v2_held
+            .get(&merkle_root)
+            .and_then(|m| m.get(&chunk_index))
+        {
+            if existing == cid {
+                return Ok(());
+            }
+            return Err(crate::error::StoreError::Other(format!(
+                "chunk {chunk_index} of root 0x{} is recorded as {existing}; refusing to rebind it to {cid}",
+                hex::encode(merkle_root)
+            )));
+        }
+        self.append_v2_held_line(&merkle_root, chunk_index, cid)?;
+        self.v2_held
+            .entry(merkle_root)
+            .or_default()
+            .insert(chunk_index, cid.to_string());
+        Ok(())
+    }
+
+    /// The V2 Push records for `merkle_root`: chunk index → CID.
+    pub fn v2_held_records(&self, merkle_root: &[u8; 32]) -> Option<&BTreeMap<u32, String>> {
+        self.v2_held.get(merkle_root)
+    }
+
+    /// Every merkle root with at least one V2 Push record.
+    pub fn v2_held_roots(&self) -> Vec<[u8; 32]> {
+        self.v2_held.keys().copied().collect()
+    }
+
     /// Whether garbage collection must never delete `cid`.
     pub fn is_gc_protected(&self, cid: &str) -> bool {
         self.gc_protected.contains(cid)
@@ -614,6 +686,96 @@ impl ManifestIndex {
         Ok(())
     }
 
+    /// Parse a `<hex_root>.v2_held` sidecar. Only newline-terminated
+    /// lines count: a torn final line (crash mid-append) is dropped. A line
+    /// that does not parse is skipped, and conflicting records for one
+    /// index drop that index. These records only decide what the archive
+    /// attests, so a lost record means a chunk is not attested until it is
+    /// pushed again, never that one is attested without being held.
+    ///
+    /// When anything was dropped, the sidecar is rewritten (atomically)
+    /// with only the usable records, so a later push of a dropped index is
+    /// not refused, or dropped again, because of the bad line.
+    fn load_v2_held_lines(&mut self, path: &Path, root: [u8; 32], content: &str) {
+        let complete = match content.rfind('\n') {
+            Some(last) => &content[..=last],
+            None => "",
+        };
+        let torn = complete.len() != content.len();
+        let mut records: BTreeMap<u32, String> = BTreeMap::new();
+        let mut conflicted: HashSet<u32> = HashSet::new();
+        let mut skipped = 0usize;
+        for line in complete.lines() {
+            let Some((index, cid)) = parse_v2_held_line(line) else {
+                skipped += 1;
+                continue;
+            };
+            if conflicted.contains(&index) {
+                continue;
+            }
+            match records.get(&index) {
+                Some(existing) if existing != cid => {
+                    records.remove(&index);
+                    conflicted.insert(index);
+                }
+                Some(_) => {}
+                None => {
+                    records.insert(index, cid.to_string());
+                }
+            }
+        }
+        if torn || skipped > 0 || !conflicted.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                torn_tail = torn,
+                skipped,
+                conflicting_indices = conflicted.len(),
+                "V2 held-index sidecar had unusable records; those chunks are not attested until pushed again"
+            );
+            if let Err(e) = self.rewrite_v2_held(&root, &records) {
+                tracing::warn!(path = %path.display(), %e, "could not rewrite the V2 held-index sidecar");
+            }
+        }
+        if !records.is_empty() {
+            self.v2_held.entry(root).or_default().extend(records);
+        }
+    }
+
+    /// Replace `<hex_root>.v2_held` with exactly `records` (temp file,
+    /// fsync, rename, directory fsync).
+    fn rewrite_v2_held(&self, root: &[u8; 32], records: &BTreeMap<u32, String>) -> Result<()> {
+        use std::io::Write;
+        let name = format!("{}.v2_held", hex::encode(root));
+        let path = self.manifests_dir.join(&name);
+        let tmp = self.manifests_dir.join(format!("{name}.tmp"));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            for (index, cid) in records {
+                writeln!(f, "{index} {cid}")?;
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        sync_dir(&self.manifests_dir)
+    }
+
+    /// Append one `<chunk_index> <cid>` line to `<hex_root>.v2_held` and
+    /// sync it. Each line is independently complete, so a crash mid-write
+    /// loses at most the in-flight record.
+    fn append_v2_held_line(&self, root: &[u8; 32], chunk_index: u32, cid: &str) -> Result<()> {
+        use std::io::Write;
+        let path = self
+            .manifests_dir
+            .join(format!("{}.v2_held", hex::encode(root)));
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        f.write_all(format!("{chunk_index} {cid}\n").as_bytes())?;
+        f.sync_data()?;
+        Ok(())
+    }
+
     /// Append one CID line to `<hex_root>.private_chunks`. Each line
     /// is independently complete (`<cid>\n`), so a crash mid-write
     /// loses at most the in-flight line — the rest reloads cleanly.
@@ -648,6 +810,19 @@ fn decode_hex_root(s: &str) -> Option<[u8; 32]> {
         out[i] = u8::from_str_radix(s, 16).ok()?;
     }
     Some(out)
+}
+
+/// Parse one `<hex_root>.v2_held` line: `<chunk_index> <cid>`.
+fn parse_v2_held_line(line: &str) -> Option<(u32, &str)> {
+    let mut parts = line.split(' ');
+    let (index, cid) = (parts.next()?, parts.next()?);
+    if parts.next().is_some() || cid.is_empty() || cid.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((index.parse().ok()?, cid))
 }
 
 /// Parse one complete [`GC_PROTECTED_FILE`] line into its CID:
@@ -1400,5 +1575,101 @@ mod network_manifest_ingress_tests {
         let reloaded = idx(d.path());
         assert!(reloaded.get_by_merkle_root(&asked.merkle_root).is_none());
         assert_eq!(reloaded.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod v2_held_tests {
+    use super::*;
+
+    #[test]
+    fn v2_held_records_survive_reload_and_are_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = [0x5A; 32];
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            idx.record_v2_held_index(root, 3, "cid-3").unwrap();
+            idx.record_v2_held_index(root, 7, "cid-7").unwrap();
+            // Same pair again: no new line, no error.
+            idx.record_v2_held_index(root, 3, "cid-3").unwrap();
+        }
+        let path = dir
+            .path()
+            .join("manifests")
+            .join(format!("{}.v2_held", hex::encode(root)));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "3 cid-3\n7 cid-7\n"
+        );
+
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        let records = idx.v2_held_records(&root).expect("records reloaded");
+        assert_eq!(
+            records
+                .iter()
+                .map(|(i, c)| (*i, c.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "cid-3"), (7, "cid-7")]
+        );
+        assert_eq!(idx.v2_held_roots(), vec![root]);
+    }
+
+    #[test]
+    fn v2_held_record_refuses_a_different_cid_for_a_recorded_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        let root = [0x5B; 32];
+        idx.record_v2_held_index(root, 1, "cid-a").unwrap();
+        let err = idx
+            .record_v2_held_index(root, 1, "cid-b")
+            .expect_err("rebinding an index must be refused");
+        assert!(err.to_string().contains("refusing to rebind"), "{err}");
+        assert_eq!(idx.v2_held_records(&root).unwrap()[&1], "cid-a");
+    }
+
+    #[test]
+    fn v2_held_sidecar_drops_unusable_records_and_rewrites_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = [0x5C; 32];
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).unwrap();
+        let path = manifests.join(format!("{}.v2_held", hex::encode(root)));
+        std::fs::write(
+            &path,
+            // good, malformed (no cid), negative, extra field, conflicting
+            // pair, good, torn tail (no newline)
+            "0 cid-0\n1\n-2 cid-x\n4 cid-4 extra\n5 cid-5\n5 cid-5b\n6 cid-6\n9 ci",
+        )
+        .unwrap();
+        // A sidecar whose stem is not a root is ignored.
+        std::fs::write(manifests.join("not-a-root.v2_held"), "0 cid\n").unwrap();
+
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        let got: Vec<(u32, &str)> = idx
+            .v2_held_records(&root)
+            .unwrap()
+            .iter()
+            .map(|(i, c)| (*i, c.as_str()))
+            .collect();
+        assert_eq!(got, vec![(0, "cid-0"), (6, "cid-6")]);
+        assert_eq!(idx.v2_held_roots(), vec![root]);
+        // Rewritten with only the usable records.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "0 cid-0\n6 cid-6\n"
+        );
+
+        // The dropped indices can be recorded again, and survive a reload.
+        idx.record_v2_held_index(root, 5, "cid-5").unwrap();
+        idx.record_v2_held_index(root, 9, "cid-9").unwrap();
+        drop(idx);
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        let got: Vec<u32> = idx
+            .v2_held_records(&root)
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(got, vec![0, 5, 6, 9]);
     }
 }
