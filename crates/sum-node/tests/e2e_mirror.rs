@@ -45,11 +45,91 @@ use std::time::Duration;
 use sum_node::rpc_client::L1RpcClient;
 
 use common::{
-    await_tx_finality, e2e_rpc_url, funded_or_skip, mirror_running_or_skip, role_address,
-    role_seed_path, spawn_bin,
+    E2E_FINALITY_BUDGET_SECS, await_tx_finality, e2e_rpc_url, funded_or_skip,
+    mirror_running_or_skip, role_address, role_seed_path, spawn_bin,
 };
 
 // ── Shared per-test setup ───────────────────────────────────────────────────
+
+/// Poll `probe` once a second until it yields `Ok(v)`, for at most `budget`,
+/// then panic with `what` and the last observation. The deterministic
+/// replacement for "sleep a fixed time, then assert": it returns as soon as
+/// the chain shows the expected state, and fails loudly with what it saw.
+async fn wait_for<T, F, Fut>(what: &str, budget: Duration, mut probe: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match probe().await {
+            Ok(v) => return v,
+            Err(last) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "e2e: {what} not observed within {budget:?} (last: {last})"
+            ),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// How long a CLI command's chain effect may take to become visible when the
+/// command does not print a tx hash to wait on: twice the per-tx finality
+/// budget.
+fn chain_effect_budget() -> Duration {
+    Duration::from_secs(2 * E2E_FINALITY_BUDGET_SECS)
+}
+
+/// Wait until the chain height reaches `h`.
+async fn wait_height_at_least(rpc: &L1RpcClient, h: u64, what: &str) -> u64 {
+    // From any height the chain needs (h - now) blocks; budget generously
+    // per block, bounded.
+    let budget = Duration::from_secs(60) + chain_effect_budget();
+    wait_for(what, budget, move || async move {
+        match rpc.chain_get_block_height().await {
+            Ok(head) if head.height >= h => Ok(head.height),
+            Ok(head) => Err(format!("height {} < {h}", head.height)),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
+}
+
+/// What a test needs the chain's access list to show for one address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessShows {
+    /// An entry for the address exists.
+    Present,
+    /// No entry for the address.
+    Absent,
+    /// An entry with exactly this expiry (`None` = no expiry).
+    Expiry(Option<u64>),
+}
+
+/// Wait until `storage_getFileInfoV2` shows `want` for `addr` on `root_hex`.
+async fn wait_access(rpc: &L1RpcClient, root_hex: &str, addr: &str, want: AccessShows) {
+    let what = format!("access list of {root_hex} showing {want:?} for {addr}");
+    wait_for(&what, chain_effect_budget(), move || async move {
+        let info = rpc
+            .storage_get_file_info_v2(root_hex, None, None)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "file not found".to_string())?;
+        let entry = info.access_list.iter().find(|e| e.address == addr);
+        let ok = match (want, entry) {
+            (AccessShows::Present, Some(_)) => true,
+            (AccessShows::Absent, None) => true,
+            (AccessShows::Expiry(x), Some(e)) => e.expires_at == x,
+            _ => false,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("entry {entry:?}"))
+        }
+    })
+    .await
+}
 
 /// Standard prelude every scenario calls first. Establishes the
 /// connection, sanity-checks the mirror, returns the rpc client.
@@ -522,15 +602,22 @@ async fn register_encryption_key() {
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout),
     );
-    // The CLI doesn't always return the tx hash on stdout; just
-    // wait a few finality cycles and confirm chain state.
-    tokio::time::sleep(Duration::from_secs(8)).await;
-
+    // The CLI doesn't always return the tx hash on stdout, so wait on the
+    // chain state itself (bounded) rather than a fixed sleep.
     let addr = role_address("owner");
-    let pk = rpc
-        .account_get_encryption_public_key(&addr)
-        .await
-        .expect("account_getEncryptionPublicKey after register-encryption-key");
+    let (rpc_ref, addr_ref) = (&rpc, addr.as_str());
+    let pk = wait_for(
+        &format!("an encryption pubkey for owner ({addr})"),
+        chain_effect_budget(),
+        move || async move {
+            match rpc_ref.account_get_encryption_public_key(addr_ref).await {
+                Ok(Some(pk)) => Ok(Some(pk)),
+                Ok(None) => Err("account_getEncryptionPublicKey returned None".into()),
+                Err(e) => Err(format!("account_getEncryptionPublicKey: {e}")),
+            }
+        },
+    )
+    .await;
     assert!(
         pk.is_some(),
         "owner ({addr}) has no encryption pubkey after register-encryption-key"
@@ -775,7 +862,7 @@ async fn share_post_ingest_admits_new_recipient() {
         String::from_utf8_lossy(&share_out.stderr),
         String::from_utf8_lossy(&share_out.stdout),
     );
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    wait_access(&rpc, &root_hex, &third_party_addr, AccessShows::Present).await;
 
     // Third-party downloads.
     let download_dir = tempfile::tempdir().expect("download out dir");
@@ -880,7 +967,10 @@ async fn revoke_denies_recipient_after_finality() {
         "revoke failed: {}",
         String::from_utf8_lossy(&revoke_out.stderr),
     );
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // RemoveAccessV2 removes the entry: wait until the chain shows it gone
+    // (bounded), so the refusal below is tested against a finalized revoke
+    // rather than raced against a fixed sleep.
+    wait_access(&rpc, &root_hex, &recipient_addr, AccessShows::Absent).await;
 
     // Post-revoke: recipient download must fail.
     let dl_dir_after = tempfile::tempdir().unwrap();
@@ -955,8 +1045,14 @@ async fn update_access_extend_expiry_admits_past_original_cutoff() {
     );
     let root_hex = format!("0x{}", hex::encode(merkle_root));
 
-    // Wait until past the original expiry.
-    tokio::time::sleep(Duration::from_secs(14)).await;
+    // Wait until the chain is past the original expiry (by height, with a
+    // two-block margin), instead of a fixed sleep.
+    wait_height_at_least(
+        &rpc,
+        original_expires + 2,
+        "the chain past the original expiry",
+    )
+    .await;
 
     // Owner extends expiry.
     let new_expires = head.height + 10_000;
@@ -982,7 +1078,13 @@ async fn update_access_extend_expiry_admits_past_original_cutoff() {
         "update-access extend failed: {}",
         String::from_utf8_lossy(&upd_out.stderr),
     );
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    wait_access(
+        &rpc,
+        &root_hex,
+        &recipient_addr,
+        AccessShows::Expiry(Some(new_expires)),
+    )
+    .await;
 
     // Recipient downloads (should succeed now).
     let dl_dir = tempfile::tempdir().unwrap();
@@ -1065,8 +1167,15 @@ async fn update_access_clear_expiry_grants_indefinite_access() {
         "update-access clear failed: {}",
         String::from_utf8_lossy(&upd_out.stderr),
     );
-    // Wait past the ORIGINAL expiry to prove the clear took effect.
-    tokio::time::sleep(Duration::from_secs(14)).await;
+    // The clear is on chain, and the chain is past the ORIGINAL expiry (by
+    // height, two-block margin), which is what proves the clear took effect.
+    wait_access(&rpc, &root_hex, &recipient_addr, AccessShows::Expiry(None)).await;
+    wait_height_at_least(
+        &rpc,
+        original_expires + 2,
+        "the chain past the original expiry",
+    )
+    .await;
 
     let dl_dir = tempfile::tempdir().unwrap();
     let out_path = dl_dir.path().join("after-clear.bin");
@@ -1584,6 +1693,9 @@ async fn reassignment_refetch_restores_public_coverage() {
         dirs.push(dir);
     }
     wait_active_archives(&rpc, ARCHIVE_ROLES.len()).await;
+    // The chain side is waited on above; this short settle covers libp2p
+    // (mDNS) discoverability only, which has no observable state to wait on
+    // from here (as in `spawn_archive_fleet`).
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // 2. A four-chunk Public file and a one-chunk owner-only Private file,
@@ -1779,8 +1891,24 @@ async fn reassignment_refetch_restores_public_coverage() {
         );
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
-    // X stays missing while every reachable copy is corrupt.
+    // X stays missing while every reachable copy is corrupt. This is a
+    // negative check, so it is an explicit, bounded observation window, not a
+    // wait-until: 12 s covers at least two re-fetch runs at the 5 s interval
+    // (REFETCH_FLAGS), and the window only counts if the archive actually
+    // completed another run inside it (otherwise "still missing" would prove
+    // nothing).
+    let runs_before = read_log_plain(&run1)
+        .matches("re-fetch: run complete")
+        .count();
     tokio::time::sleep(Duration::from_secs(12)).await;
+    let runs_after = read_log_plain(&run1)
+        .matches("re-fetch: run complete")
+        .count();
+    assert!(
+        runs_after > runs_before,
+        "e2e: no re-fetch run completed during the 12 s observation window \
+         ({runs_before} before, {runs_after} after), so it observed nothing"
+    );
     let (_, fourth) = latest_epoch_of(&rpc, &root_hex, &addr4_b58).await;
     assert_eq!(
         fourth.as_ref().map(|a| a.attested_count),
