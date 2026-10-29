@@ -723,14 +723,18 @@ async fn an_allowed_peer_cannot_open_a_second_route_by_dialing_in() {
             .any(|(stage, addr)| *stage == RefusalStage::Inbound && starts_with(addr, &x_quic)),
         "the direct QUIC connection from {x_quic} must be refused as inbound: {inbound:?}"
     );
-    // C's connections, from its swarm's events: only the forwarded one.
+    // C's connections, from its swarm's events: only through the forwarder
+    // (a bootstrap dial and a Kademlia dial may race to open two there), and
+    // none over QUIC.
     let routes = c.established();
-    assert_eq!(routes.len(), 1, "{routes:?}");
-    assert_eq!(routes[0].0, x.peer);
-    assert!(
-        !routes.iter().any(|(_, remote)| is_quic(remote)),
-        "no QUIC route was established: {routes:?}"
-    );
+    assert!(!routes.is_empty());
+    for (peer, remote) in &routes {
+        assert_eq!(*peer, x.peer, "{routes:?}");
+        assert!(
+            starts_with(remote, &route) && !is_quic(remote),
+            "only the forwarded route may exist: {routes:?}"
+        );
+    }
     // The route through the endpoint is still up on X's side.
     while let Ok(ev) = x.events.try_recv() {
         assert!(
