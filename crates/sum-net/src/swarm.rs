@@ -1,16 +1,24 @@
 use std::collections::HashMap;
-
+use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, SwarmBuilder, dcutr, gossipsub, identify,
+    Multiaddr, PeerId, Transport,
+    core::{
+        muxing::StreamMuxerBox,
+        transport::{Boxed, timeout::TransportTimeout},
+        upgrade::Version,
+    },
+    dcutr, gossipsub, identify,
     identity::Keypair,
     kad, mdns,
     multiaddr::Protocol,
+    relay,
     request_response::{self, ResponseChannel},
-    swarm::SwarmEvent,
+    swarm::{SwarmEvent, behaviour::toggle::Toggle, dial_opts::DialOpts},
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -31,9 +39,18 @@ use crate::{
     },
     discovery,
     events::SumNetEvent,
+    gate::{Gated, PolicyBehaviour, PolicyTransport},
     gossip::GossipManager,
     nat,
+    policy::{ConnectionAudit, NetPolicy, PolicyRefusals, PolicySource},
 };
+
+/// Transport connection timeout. The value `SwarmBuilder` applies by default,
+/// kept so the hand-composed stack below behaves as the builder-made one did.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Idle-connection timeout, as before.
+const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long a pending response channel is kept before it is considered orphaned.
 /// Matches the request-response timeout (120s) so the requester has already
@@ -251,6 +268,14 @@ pub struct SumSwarm {
     /// redundant dials when we already have a usable direct path. Updated
     /// from `SwarmEvent::ConnectionEstablished` / `ConnectionClosed`.
     direct_connections: HashMap<PeerId, u32>,
+
+    /// Network policy (SNIP #79), shared with the transport gate and the
+    /// policy behaviours. Unrestricted unless `--outbound-allow` is set.
+    policy: Arc<NetPolicy>,
+
+    /// Refusal totals at the last periodic summary, so the summary is logged
+    /// only when something changed.
+    last_refusals: PolicyRefusals,
 }
 
 impl SumSwarm {
@@ -260,111 +285,29 @@ impl SumSwarm {
     /// via [`crate::identity::keypair_from_seed`].
     ///
     /// Transport:  QUIC always; TCP+Noise+Yamux added when `enable_wan` is true.
-    /// Behaviour:  mDNS + Gossipsub + Identify + chunk transfer + Kademlia DHT.
-    /// Listener:   `0.0.0.0:<listen_port>` (QUIC) + `0.0.0.0:<tcp_listen_port>` (TCP, if WAN).
+    /// Behaviour:  mDNS (unless disabled) + Gossipsub + Identify + chunk
+    ///             transfer + Kademlia DHT.
+    /// Listener:   `0.0.0.0:<listen_port>` (QUIC) + `0.0.0.0:<tcp_listen_port>`
+    ///             (TCP, if WAN); `0.0.0.0` is replaced by `config.listen_ip`
+    ///             when set.
+    ///
+    /// Fails if `config.outbound_allow` holds a malformed entry. The effective
+    /// network policy is logged once here.
     pub fn build(config: &NetConfig, keypair: Keypair) -> Result<Self> {
-        let gossip_cfg = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_secs(10))
-            .validation_mode(gossipsub::ValidationMode::Strict)
-            .history_length(10)
-            .history_gossip(3)
-            .build()
-            .map_err(|msg| anyhow::anyhow!("gossipsub config error: {msg}"))?;
+        let policy = Arc::new(NetPolicy::from_config(config)?);
+        policy.log_effective();
 
-        // Captured by the behaviour closure; drives whether the relay server
-        // accepts reservations (opt-in, only on publicly-reachable hosts).
-        let relay_server_enabled = config.relay_server;
+        let mut swarm = build_swarm(config, keypair, policy.clone())?;
 
-        // Unified transport chain: TCP/Noise/Yamux + QUIC + DNS + relay-client.
-        // Relay circuits (v2) run over TCP, so TCP is mandatory whenever
-        // relays are used. In LAN-only mode we still build all three
-        // transports but bind only the QUIC listener and never bootstrap
-        // the DHT, so the WAN transports stay idle.
-        //
-        // `with_dns()` wraps the underlying transports with a system DNS
-        // resolver so `/dns4/host/...` multiaddrs (used in our bootstrap
-        // peers) actually resolve. Without this, dials against any DNS
-        // multiaddr fail at the swarm with "Multiaddr is not supported"
-        // and the node can never reach the relay on a fresh startup.
-        let mut swarm = SwarmBuilder::with_existing_identity(keypair)
-            .with_tokio()
-            .with_tcp(
-                libp2p::tcp::Config::default(),
-                libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
-            )?
-            .with_quic()
-            .with_dns()?
-            .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
-            .with_behaviour(
-                |key,
-                 relay_client|
-                 -> std::result::Result<
-                    LocalMeshBehaviour,
-                    Box<dyn std::error::Error + Send + Sync>,
-                > {
-                    let local_peer_id = key.public().to_peer_id();
-
-                    let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
-
-                    let gossipsub_behaviour = gossipsub::Behaviour::new(
-                        gossipsub::MessageAuthenticity::Signed(key.clone()),
-                        gossip_cfg.clone(),
-                    )
-                    .map_err(|msg| -> Box<dyn std::error::Error + Send + Sync> { msg.into() })?;
-
-                    let identify = identify::Behaviour::new(identify::Config::new(
-                        "/sum-node/0.1.0".into(),
-                        key.public(),
-                    ));
-
-                    // Two behaviours, one protocol each. `send_request`
-                    // attaches every protocol its behaviour was registered
-                    // with to every request, so a single behaviour carrying
-                    // both protocols cannot be asked to speak one of them —
-                    // the version has to be a choice of behaviour. See
-                    // `crate::behaviour` for the full argument.
-                    let shard_xfer_v1 = build_shard_xfer_v1();
-                    let shard_xfer_v2 = build_shard_xfer_v2();
-
-                    let kademlia = discovery::build_kademlia(local_peer_id);
-                    let autonat = nat::build_autonat(local_peer_id);
-                    let relay = nat::build_relay_server(local_peer_id, relay_server_enabled);
-                    let dcutr = dcutr::Behaviour::new(local_peer_id);
-
-                    Ok(LocalMeshBehaviour {
-                        mdns,
-                        gossipsub: gossipsub_behaviour,
-                        identify,
-                        shard_xfer_v1,
-                        shard_xfer_v2,
-                        kademlia,
-                        autonat,
-                        relay,
-                        relay_client,
-                        dcutr,
-                    })
-                },
-            )?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-            .build();
-
-        // QUIC listener (always)
-        let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", config.udp_listen_port)
-            .parse()
-            .context("invalid QUIC listen multiaddr")?;
-        swarm
-            .listen_on(quic_addr)
-            .context("failed to bind QUIC listener")?;
-
-        // TCP listener (WAN mode only)
-        if config.enable_wan {
-            let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", config.tcp_listen_port)
-                .parse()
-                .context("invalid TCP listen multiaddr")?;
-            swarm
-                .listen_on(tcp_addr)
-                .context("failed to bind TCP listener")?;
+        // QUIC listener (always), TCP listener (WAN mode only). The network
+        // policy does not change listeners.
+        for addr in listen_addrs(config)? {
+            let what = if addr.iter().any(|p| matches!(p, Protocol::QuicV1)) {
+                "failed to bind QUIC listener"
+            } else {
+                "failed to bind TCP listener"
+            };
+            swarm.listen_on(addr).context(what)?;
         }
 
         Ok(Self {
@@ -378,14 +321,27 @@ impl SumSwarm {
             nat_status: nat::NatStatus::Unknown,
             active_relay_reservation: nat::RelayReservationState::None,
             direct_connections: HashMap::new(),
+            policy,
+            last_refusals: PolicyRefusals::default(),
         })
+    }
+
+    /// The network policy this swarm runs under.
+    pub fn policy(&self) -> Arc<NetPolicy> {
+        self.policy.clone()
     }
 
     /// Bootstrap Kademlia DHT with the provided peer multiaddrs.
     ///
     /// Each address must end with `/p2p/<peer_id>`. The node dials the
     /// bootstrap peers and initiates a Kademlia bootstrap query.
+    ///
+    /// Under an outbound allow-list a bootstrap address that is not allowed
+    /// is refused (logged and counted under `bootstrap`) and neither stored
+    /// nor dialed. If every bootstrap address is refused the Kademlia
+    /// bootstrap query is skipped with a warning instead of failing startup.
     pub fn bootstrap_kademlia(&mut self, bootstrap_peers: &[String]) -> Result<()> {
+        let mut admitted = 0usize;
         for addr_str in bootstrap_peers {
             let addr: Multiaddr = addr_str
                 .parse()
@@ -405,6 +361,14 @@ impl SumSwarm {
                     anyhow::anyhow!("bootstrap addr missing /p2p/ component: {addr_str}")
                 })?;
 
+            if !self
+                .policy
+                .admit(PolicySource::Bootstrap, &addr, Some(peer_id))
+            {
+                continue;
+            }
+            admitted += 1;
+
             self.inner
                 .behaviour_mut()
                 .kademlia
@@ -423,9 +387,21 @@ impl SumSwarm {
 
             info!(%peer_id, %addr, "added Kademlia bootstrap peer");
 
-            if let Err(e) = self.inner.dial(addr) {
+            let opts = DialOpts::from(addr);
+            self.policy
+                .label_dial(opts.connection_id(), PolicySource::Bootstrap);
+            if let Err(e) = self.inner.dial(opts) {
                 warn!(%peer_id, %e, "failed to dial bootstrap peer");
             }
+        }
+
+        if !bootstrap_peers.is_empty() && admitted == 0 {
+            warn!(
+                configured = bootstrap_peers.len(),
+                "network policy: no bootstrap peer is allowed by --outbound-allow — \
+                 Kademlia bootstrap skipped"
+            );
+            return Ok(());
         }
 
         if !bootstrap_peers.is_empty() {
@@ -564,6 +540,7 @@ impl SumSwarm {
                             }
                         }
                         Some(SwarmCommand::Shutdown) | None => {
+                            self.log_policy_summary();
                             info!("swarm event loop shutting down");
                             return Ok(());
                         }
@@ -572,6 +549,7 @@ impl SumSwarm {
 
                 _ = reaper_interval.tick() => {
                     self.reap_orphaned_channels();
+                    self.log_policy_summary();
                 }
             }
         }
@@ -602,6 +580,30 @@ impl SumSwarm {
                 "outbound request records expired without a terminal event"
             );
         }
+    }
+
+    /// Log the policy refusal totals if they changed since the last summary.
+    /// Silent without an allow-list and while nothing has been refused.
+    fn log_policy_summary(&mut self) {
+        if !self.policy.is_restricted() {
+            return;
+        }
+        let now = self.policy.refusals();
+        if now == self.last_refusals {
+            return;
+        }
+        self.last_refusals = now;
+        info!(
+            total = now.total(),
+            bootstrap = now.bootstrap,
+            mdns = now.mdns,
+            identify = now.identify,
+            kad = now.kad,
+            autodial = now.autodial,
+            inbound = now.inbound,
+            other = now.other,
+            "network policy: refusal totals"
+        );
     }
 
     /// Snapshot of the fixed-field refusal counters.
@@ -874,6 +876,7 @@ impl SumSwarm {
                 discovery::handle_mdns_event(
                     e,
                     &mut self.inner.behaviour_mut().gossipsub,
+                    &self.policy,
                     event_tx,
                 );
             }
@@ -928,6 +931,14 @@ impl SumSwarm {
                 // hole-punch coordination.
                 self.inner.add_external_address(info.observed_addr.clone());
 
+                // The peer's advertised listen addresses, minus any the
+                // network policy refuses (counted under `identify`). Without
+                // an allow-list this is every advertised address, in order.
+                // Everything below — relay candidates, Kademlia, the
+                // direct-dial shortcut — works from this list only, so an
+                // allowed peer cannot slip an alternative address in here.
+                let advertised = admitted_listen_addrs(&self.policy, peer_id, &info.listen_addrs);
+
                 // Detect relay-capable peers so we can request a reservation
                 // when AutoNAT determines we are Private. The relay hop
                 // protocol string contains "relay" — matching works across
@@ -942,7 +953,7 @@ impl SumSwarm {
                     let entry = self.relay_peers.entry(peer_id).or_default();
                     entry.confirmed = true;
                     let mut added = 0usize;
-                    for addr in &info.listen_addrs {
+                    for addr in &advertised {
                         if is_dialable_over_wan(addr) && !entry.addrs.contains(addr) {
                             entry.addrs.push(addr.clone());
                             added += 1;
@@ -959,7 +970,7 @@ impl SumSwarm {
 
                 // Feed identified peer's listen addresses into Kademlia
                 // so the DHT routing table populates beyond bootstrap nodes.
-                for addr in &info.listen_addrs {
+                for addr in &advertised {
                     self.inner
                         .behaviour_mut()
                         .kademlia
@@ -981,10 +992,13 @@ impl SumSwarm {
                 // so it's safe to call this on every identify event for
                 // peers we don't already have a direct connection to.
                 if !self.direct_connections.contains_key(&peer_id)
-                    && let Some(addr) = pick_direct_dial_candidate(&info.listen_addrs, peer_id)
+                    && let Some(addr) = pick_direct_dial_candidate(&advertised, peer_id)
                 {
                     debug!(%peer_id, %addr, "attempting direct dial (no direct connection yet)");
-                    if let Err(e) = self.inner.dial(addr) {
+                    let opts = DialOpts::from(addr);
+                    self.policy
+                        .label_dial(opts.connection_id(), PolicySource::Autodial);
+                    if let Err(e) = self.inner.dial(opts) {
                         debug!(%peer_id, %e, "direct-dial attempt rejected by swarm");
                     }
                 }
@@ -999,12 +1013,24 @@ impl SumSwarm {
                     peer, addresses, ..
                 },
             )) => {
+                // Under an allow-list, drop the addresses it refuses (counted
+                // under `kad`). Kademlia's table is fed only through filtered
+                // paths, so this is a backstop; a peer left with no allowed
+                // address is not wired into gossipsub or reported.
+                let addrs: Vec<Multiaddr> = addresses
+                    .iter()
+                    .filter(|a| self.policy.admit(PolicySource::Kad, a, Some(peer)))
+                    .cloned()
+                    .collect();
+                if self.policy.is_restricted() && addrs.is_empty() {
+                    debug!(%peer, "Kademlia peer has no address the network policy allows — ignored");
+                    return;
+                }
                 // Wire Kademlia-discovered peers into gossipsub (same as mDNS).
                 self.inner
                     .behaviour_mut()
                     .gossipsub
                     .add_explicit_peer(&peer);
-                let addrs: Vec<Multiaddr> = addresses.iter().cloned().collect();
                 info!(%peer, addr_count = addrs.len(), "Kademlia peer discovered");
                 if let Err(e) = event_tx.try_send(SumNetEvent::PeerDiscovered {
                     peer_id: peer,
@@ -1103,6 +1129,18 @@ impl SumSwarm {
                     *self.direct_connections.entry(peer_id).or_insert(0) += 1;
                 }
                 info!(%peer_id, relayed, "connection established");
+                debug!(
+                    %peer_id,
+                    remote = %endpoint.get_remote_address(),
+                    outbound = endpoint.is_dialer(),
+                    "connection route"
+                );
+                self.policy.audit(ConnectionAudit::Established {
+                    peer_id,
+                    remote_addr: endpoint.get_remote_address().clone(),
+                    outbound: endpoint.is_dialer(),
+                    relayed,
+                });
                 if let Err(e) = event_tx.try_send(SumNetEvent::PeerConnected { peer_id }) {
                     warn!(%e, "event channel full — dropping PeerConnected");
                 }
@@ -1127,6 +1165,12 @@ impl SumSwarm {
                     }
                 }
                 debug!(%peer_id, relayed, ?cause, num_established, "connection closed");
+                self.policy.audit(ConnectionAudit::Closed {
+                    peer_id,
+                    remote_addr: endpoint.get_remote_address().clone(),
+                    outbound: endpoint.is_dialer(),
+                    relayed,
+                });
                 if let Some(event) = disconnect_event(peer_id, num_established)
                     && let Err(e) = event_tx.try_send(event)
                 {
@@ -1145,6 +1189,164 @@ impl SumSwarm {
             _ => {}
         }
     }
+}
+
+/// The listen addresses for `config`: QUIC always, TCP in WAN mode, on
+/// `0.0.0.0` unless `config.listen_ip` says otherwise.
+pub(crate) fn listen_addrs(config: &NetConfig) -> Result<Vec<Multiaddr>> {
+    let ip = config.listen_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
+    let mut addrs = vec![
+        format!("/ip4/{ip}/udp/{}/quic-v1", config.udp_listen_port)
+            .parse()
+            .context("invalid QUIC listen multiaddr")?,
+    ];
+    if config.enable_wan {
+        addrs.push(
+            format!("/ip4/{ip}/tcp/{}", config.tcp_listen_port)
+                .parse()
+                .context("invalid TCP listen multiaddr")?,
+        );
+    }
+    Ok(addrs)
+}
+
+/// The listen addresses a peer advertised through Identify that the network
+/// policy admits, in the order advertised. Refused ones are logged and counted
+/// under `identify`. Without an allow-list this is `advertised` unchanged.
+pub(crate) fn admitted_listen_addrs(
+    policy: &NetPolicy,
+    peer_id: PeerId,
+    advertised: &[Multiaddr],
+) -> Vec<Multiaddr> {
+    advertised
+        .iter()
+        .filter(|a| policy.admit(PolicySource::Identify, a, Some(peer_id)))
+        .cloned()
+        .collect()
+}
+
+/// Build the libp2p swarm the way [`SumSwarm`] runs it, without listeners.
+///
+/// Public so tests can drive the production stack directly. The transport is
+/// the stack `SwarmBuilder` produced before SNIP #79 — relay client, then
+/// DNS over TCP (Noise, Yamux) and QUIC, behind a 10 s connection timeout —
+/// composed by hand so that [`PolicyTransport`] can sit outside all of it.
+/// Without an allow-list the gate passes every call straight through.
+pub fn build_swarm(
+    config: &NetConfig,
+    keypair: Keypair,
+    policy: Arc<NetPolicy>,
+) -> Result<libp2p::Swarm<LocalMeshBehaviour>> {
+    let local_peer_id = keypair.public().to_peer_id();
+
+    let gossip_cfg = gossipsub::ConfigBuilder::default()
+        .heartbeat_interval(Duration::from_secs(10))
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        .history_length(10)
+        .history_gossip(3)
+        .build()
+        .map_err(|msg| anyhow::anyhow!("gossipsub config error: {msg}"))?;
+
+    // Unified transport chain: TCP/Noise/Yamux + QUIC + DNS + relay-client.
+    // Relay circuits (v2) run over TCP, so TCP is mandatory whenever
+    // relays are used. In LAN-only mode we still build all three
+    // transports but bind only the QUIC listener and never bootstrap
+    // the DHT, so the WAN transports stay idle.
+    //
+    // DNS wraps TCP and QUIC so `/dns4/host/...` multiaddrs (used in our
+    // bootstrap peers) actually resolve. Without it, dials against any DNS
+    // multiaddr fail at the swarm with "Multiaddr is not supported" and the
+    // node can never reach the relay on a fresh startup.
+    let (transport, relay_client) = build_transport(&keypair, policy.clone())?;
+
+    // Disabled mDNS is not constructed at all: no socket, no announcement.
+    let mdns = if policy.mdns_enabled() {
+        Some(mdns::tokio::Behaviour::new(
+            mdns::Config::default(),
+            local_peer_id,
+        )?)
+    } else {
+        None
+    };
+
+    let gossipsub_behaviour = gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+        gossip_cfg,
+    )
+    .map_err(|msg| anyhow::anyhow!("gossipsub behaviour error: {msg}"))?;
+
+    let identify = identify::Behaviour::new(identify::Config::new(
+        "/sum-node/0.1.0".into(),
+        keypair.public(),
+    ));
+
+    // Two behaviours, one protocol each. `send_request` attaches every
+    // protocol its behaviour was registered with to every request, so a
+    // single behaviour carrying both protocols cannot be asked to speak one
+    // of them — the version has to be a choice of behaviour. See
+    // `crate::behaviour` for the full argument.
+    let shard_xfer_v1 = build_shard_xfer_v1();
+    let shard_xfer_v2 = build_shard_xfer_v2();
+
+    let kademlia = discovery::build_kademlia(local_peer_id);
+    let autonat = nat::build_autonat(local_peer_id);
+    // Drives whether the relay server accepts reservations (opt-in, only on
+    // publicly-reachable hosts).
+    let relay = nat::build_relay_server(local_peer_id, config.relay_server);
+    let dcutr = dcutr::Behaviour::new(local_peer_id);
+
+    let behaviour = LocalMeshBehaviour {
+        net_policy: PolicyBehaviour::new(policy.clone()),
+        mdns: Gated::new(Toggle::from(mdns), PolicySource::Mdns, policy.clone()),
+        gossipsub: gossipsub_behaviour,
+        identify: Gated::new(identify, PolicySource::Identify, policy.clone()),
+        shard_xfer_v1,
+        shard_xfer_v2,
+        kademlia: Gated::new(kademlia, PolicySource::Kad, policy.clone()),
+        autonat: Gated::new(autonat, PolicySource::Autodial, policy.clone()),
+        relay,
+        relay_client: Gated::new(relay_client, PolicySource::Autodial, policy.clone()),
+        dcutr: Gated::new(dcutr, PolicySource::Autodial, policy),
+    };
+
+    Ok(libp2p::Swarm::new(
+        transport,
+        behaviour,
+        local_peer_id,
+        libp2p::swarm::Config::with_tokio_executor()
+            .with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT),
+    ))
+}
+
+/// The transport stack, with the policy gate outermost, plus the relay-client
+/// behaviour that pairs with the relay transport.
+fn build_transport(
+    keypair: &Keypair,
+    policy: Arc<NetPolicy>,
+) -> Result<(Boxed<(PeerId, StreamMuxerBox)>, relay::client::Behaviour)> {
+    let tcp = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default())
+        .upgrade(Version::V1Lazy)
+        .authenticate(libp2p::noise::Config::new(keypair)?)
+        .multiplex(libp2p::yamux::Config::default())
+        .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
+    let quic = libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(keypair))
+        .map(|(p, m), _| (p, StreamMuxerBox::new(m)));
+    let tcp_quic = tcp.or_transport(quic).map(|either, _| either.into_inner());
+    let dns = libp2p::dns::tokio::Transport::system(tcp_quic)?;
+
+    let (relay_transport, relay_client) = relay::client::new(keypair.public().to_peer_id());
+    let relay_transport = relay_transport
+        .upgrade(Version::V1Lazy)
+        .authenticate(libp2p::noise::Config::new(keypair)?)
+        .multiplex(libp2p::yamux::Config::default())
+        .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
+
+    let stack = relay_transport
+        .or_transport(dns)
+        .map(|either, _| either.into_inner());
+    let stack = TransportTimeout::new(stack, CONNECTION_TIMEOUT).boxed();
+
+    Ok((PolicyTransport::new(stack, policy).boxed(), relay_client))
 }
 
 /// Return `true` if `addr` is a WAN-dialable multiaddr.
@@ -1677,6 +1879,89 @@ mod tests {
             picked.to_string(),
             format!("/ip4/8.8.8.8/udp/4001/quic-v1/p2p/{peer}")
         );
+    }
+
+    // ── Network policy (SNIP #79) ────────────────────────────────────────
+
+    fn restricted(entries: &[&str]) -> NetPolicy {
+        NetPolicy::new(true, crate::policy::AddrPolicy::parse(entries).unwrap())
+    }
+
+    /// Listeners are what they were before #79: QUIC on 0.0.0.0 always, TCP
+    /// only in WAN mode. The policy fields do not touch them.
+    #[test]
+    fn listen_addrs_are_unchanged_by_default_and_by_the_policy() {
+        let mut cfg = NetConfig::default();
+        assert_eq!(
+            listen_addrs(&cfg).unwrap(),
+            vec![ma("/ip4/0.0.0.0/udp/0/quic-v1")]
+        );
+        cfg.enable_wan = true;
+        cfg.udp_listen_port = 4001;
+        cfg.tcp_listen_port = 4002;
+        assert_eq!(
+            listen_addrs(&cfg).unwrap(),
+            vec![
+                ma("/ip4/0.0.0.0/udp/4001/quic-v1"),
+                ma("/ip4/0.0.0.0/tcp/4002")
+            ]
+        );
+        cfg.mdns = false;
+        cfg.outbound_allow = vec!["/ip4/127.0.0.1/tcp/9".into()];
+        assert_eq!(
+            listen_addrs(&cfg).unwrap(),
+            vec![
+                ma("/ip4/0.0.0.0/udp/4001/quic-v1"),
+                ma("/ip4/0.0.0.0/tcp/4002")
+            ],
+            "the policy restricts dials, not listeners"
+        );
+        cfg.listen_ip = Some(Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            listen_addrs(&cfg).unwrap(),
+            vec![
+                ma("/ip4/127.0.0.1/udp/4001/quic-v1"),
+                ma("/ip4/127.0.0.1/tcp/4002")
+            ]
+        );
+    }
+
+    #[test]
+    fn identify_addresses_pass_unchanged_without_a_policy() {
+        let peer = rand_peer();
+        let advertised = vec![
+            ma("/ip4/203.0.113.10/tcp/4001"),
+            ma("/ip4/127.0.0.1/udp/4001/quic-v1"),
+        ];
+        let open = NetPolicy::new(true, None);
+        assert_eq!(admitted_listen_addrs(&open, peer, &advertised), advertised);
+        assert_eq!(open.refusals().total(), 0);
+    }
+
+    /// An allowed peer advertising an alternative public address through
+    /// Identify: the alternative is refused, so the direct-dial shortcut
+    /// (autodial) never sees it, and an allowed address is still picked.
+    #[test]
+    fn identify_alternatives_are_refused_before_the_direct_dial_shortcut() {
+        let peer = rand_peer();
+        let policy = restricted(&["/ip4/203.0.113.10/tcp/4001"]);
+        let advertised = vec![
+            ma("/ip4/198.51.100.7/tcp/4001"),
+            ma("/ip4/198.51.100.7/udp/4001/quic-v1"),
+            ma("/ip4/203.0.113.10/tcp/4001"),
+        ];
+        let admitted = admitted_listen_addrs(&policy, peer, &advertised);
+        assert_eq!(admitted, vec![ma("/ip4/203.0.113.10/tcp/4001")]);
+        assert_eq!(
+            pick_direct_dial_candidate(&admitted, peer).unwrap(),
+            ma(&format!("/ip4/203.0.113.10/tcp/4001/p2p/{peer}"))
+        );
+        assert_eq!(policy.refusals().identify, 2);
+
+        // Only alternatives advertised: nothing to dial.
+        let none = admitted_listen_addrs(&policy, peer, &advertised[..2]);
+        assert!(pick_direct_dial_candidate(&none, peer).is_none());
+        assert_eq!(policy.refusals().identify, 4);
     }
 
     /// Closing one of several connections to a peer leaves it connected (and

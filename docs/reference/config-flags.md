@@ -29,6 +29,8 @@ gates that the binary reads at runtime are listed in
 | `--tcp-port` | `SUM_TCP_PORT` | `0` (OS-assigned) | TCP listen port for WAN. |
 | `--udp-port` | `SUM_UDP_PORT` | `0` (OS-assigned) | QUIC listen port. Pin for a reliably dialable node. |
 | `--relay-server` | `SUM_RELAY_SERVER` | `false` | Advertise this node as a Circuit Relay v2 server. Requires `--enable-wan`. |
+| `--mdns` | `SUM_MDNS` | `on` | mDNS LAN discovery. `off` (also `false`, `0`, `no`) builds no mDNS behaviour. See "Controlled networks" below. |
+| `--outbound-allow` | `SUM_OUTBOUND_ALLOW` | (unset) | Outbound address allow-list; repeatable or comma-separated. Unset means no restriction. See "Controlled networks" below. |
 | `--profile` | `SUM_PROFILE` | `production` | `production` fails closed on uncertain ACL paths; `dev` relaxes them. **`dev` MUST NEVER touch mainnet.** |
 
 ## Chain ID safety
@@ -87,6 +89,41 @@ The `register-node` and production-profile `ingest-v2` paths are
 safe against the default because they read `chain_id` from
 `chain_getChainParams` at runtime. The other paths listed above
 have not been migrated to that pattern yet.
+
+## Controlled networks
+
+`--mdns off` and `--outbound-allow` make a node keep to configured
+endpoints in a cooperative, controlled network (SNIP #79). Both are
+**application-level routing controls, not an OS security boundary**:
+a modified client can ignore them.
+
+- `--mdns off` / `SUM_MDNS=off`: no mDNS announcement or discovery.
+  Without `--enable-wan` too, the node discovers no peers (a warning
+  says so).
+- `--outbound-allow <entry>` / `SUM_OUTBOUND_ALLOW=<entry>,<entry>`:
+  every dial — bootstrap, mDNS, Identify, Kademlia and automatic dials
+  (AutoNAT, DCUtR, relay), over TCP and QUIC — must match an entry, and
+  a direct inbound connection is kept only from an allowed address
+  (relayed ones only through an allowed relay). Entries are IPs/CIDRs
+  (`127.0.0.1`, `10.0.0.0/8`, `::1`) or multiaddr prefixes
+  (`/ip4/127.0.0.1/tcp/4001`, `/ip4/127.0.0.1/udp/4001/quic-v1`,
+  `/dns4/relay.example.com/tcp/4001`, optionally ending in
+  `/p2p/<peer-id>`). A malformed entry is a usage error (exit 2).
+
+The environment variables apply to every subcommand that networks, so
+a `sum-node` child launched by OmniNode is configured with, for
+example:
+
+```bash
+SUM_MDNS=off
+SUM_ENABLE_WAN=true
+SUM_OUTBOUND_ALLOW=/ip4/127.0.0.1/tcp/4101
+SUM_BOOTSTRAP_PEERS=/ip4/127.0.0.1/tcp/4101/p2p/<archive-peer-id>
+```
+
+The matching rules, what exactly is enforced, the log lines and the
+limits are in
+[`../architecture/networking.md`](../architecture/networking.md#controlled-networks).
 
 ## Profile
 

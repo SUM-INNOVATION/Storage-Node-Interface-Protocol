@@ -40,6 +40,8 @@ Applies to every subcommand.
 | `--tcp-port` | `SUM_TCP_PORT` | `0` | TCP listen port (0 = OS-assigned). |
 | `--udp-port` | `SUM_UDP_PORT` | `0` | QUIC UDP port. Pin for reliable dialability. |
 | `--relay-server` | `SUM_RELAY_SERVER` | `false` | Advertise as Circuit Relay v2 server. Requires `--enable-wan`. |
+| `--mdns` | `SUM_MDNS` | `on` | mDNS LAN discovery, `on` or `off` (`true`/`false`, `1`/`0`, `yes`/`no` also accepted). `off` builds no mDNS: no announcement, no discovery. See [controlled networks](../architecture/networking.md#controlled-networks). |
+| `--outbound-allow` | `SUM_OUTBOUND_ALLOW` | (unset: no restriction) | Outbound address allow-list; repeatable or comma-separated. Entries are IPs/CIDRs (`127.0.0.1`, `10.0.0.0/8`, `::1`) or multiaddr prefixes (`/ip4/127.0.0.1/tcp/4001`, `/ip4/127.0.0.1/udp/4001/quic-v1`, optionally ending in `/p2p/<peer-id>`). When set, every dial must match and direct inbound connections are kept only from allowed addresses; refusals are logged and counted. Malformed entries are a usage error (exit 2). An application-level routing control, not an OS security boundary. See [controlled networks](../architecture/networking.md#controlled-networks). |
 | `--profile` | `SUM_PROFILE` | `production` | `production` fails closed on uncertain ACL paths; `dev` relaxes them. |
 
 ### sum-node listen

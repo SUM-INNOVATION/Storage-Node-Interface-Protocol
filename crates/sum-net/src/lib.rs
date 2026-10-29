@@ -6,9 +6,11 @@ pub mod codec;
 pub mod correlation;
 pub mod discovery;
 pub mod events;
+pub mod gate;
 pub mod gossip;
 pub mod identity;
 pub mod nat; // deferred — AutoNAT / DCUtR / relay
+pub mod policy;
 pub mod swarm;
 pub mod transport; // deferred — TCP/Noise fallback transport
 
@@ -35,11 +37,17 @@ pub use identity::{
 };
 pub use libp2p::PeerId;
 pub use libp2p::identity::Keypair;
+pub use policy::{
+    AddrPolicy, AllowEntry, ConnectionAudit, NetPolicy, PolicyParseError, PolicyRefusals,
+    PolicySource, RefusalStage,
+};
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use sum_types::config::NetConfig;
 
@@ -57,6 +65,11 @@ const CHANNEL_CAPACITY: usize = 256;
 pub struct SumNet {
     cmd_tx: mpsc::Sender<SwarmCommand>,
     event_rx: tokio::sync::Mutex<mpsc::Receiver<SumNetEvent>>,
+    policy: Arc<NetPolicy>,
+    /// The audit receiver opened before the swarm started, so the first
+    /// [`SumNet::connection_audit`] caller sees every event from the start
+    /// (bootstrap refusals happen inside [`SumNet::new`]).
+    first_audit_rx: Mutex<Option<broadcast::Receiver<ConnectionAudit>>>,
 }
 
 impl SumNet {
@@ -67,6 +80,8 @@ impl SumNet {
     /// [`identity::keypair_from_seed`].
     pub async fn new(config: NetConfig, keypair: Keypair) -> Result<Self> {
         let mut sum_swarm = SumSwarm::build(&config, keypair)?;
+        let policy = sum_swarm.policy();
+        let first_audit_rx = Mutex::new(Some(policy.subscribe()));
         sum_swarm.subscribe_all_topics()?;
 
         // Bootstrap Kademlia DHT when WAN mode is enabled.
@@ -86,7 +101,36 @@ impl SumNet {
         Ok(Self {
             cmd_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
+            policy,
+            first_audit_rx,
         })
+    }
+
+    // ── Network policy (SNIP #79) ───────────────────────────────────────
+
+    /// The network policy this node runs under (mDNS setting and outbound
+    /// allow-list).
+    pub fn net_policy(&self) -> &NetPolicy {
+        &self.policy
+    }
+
+    /// Refusal counts so far, by source. All zero without an allow-list.
+    pub fn net_policy_refusals(&self) -> PolicyRefusals {
+        self.policy.refusals()
+    }
+
+    /// A receiver of connection events (established / closed, with the
+    /// remote address) and policy refusals.
+    ///
+    /// The first call returns a receiver that has buffered events since the
+    /// node was built; later calls receive events from the moment of the
+    /// call. A receiver that falls behind loses the oldest events.
+    pub fn connection_audit(&self) -> broadcast::Receiver<ConnectionAudit> {
+        let mut first = self
+            .first_audit_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        first.take().unwrap_or_else(|| self.policy.subscribe())
     }
 
     // ── Gossipsub ──────────────────────────────────────────────────────

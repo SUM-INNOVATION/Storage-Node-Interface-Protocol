@@ -62,7 +62,14 @@ Key entry points:
 - `codec::VersionedShardCodec` — per-stream dispatch on the
   negotiated protocol name (`/sum/storage/v1` vs `v2`).
 - `swarm::SumSwarm` — the event loop, WAN bootstrap
-  (`bootstrap_kademlia`), and behaviour composition.
+  (`bootstrap_kademlia`), and behaviour composition;
+  `swarm::build_swarm` builds the transport stack and behaviours.
+- `policy` / `gate` — the network policy (SNIP #79): `--mdns` and the
+  `--outbound-allow` matching rules, refusal counters and the
+  connection audit stream (`policy`), and their enforcement at the
+  transport, on connections and on address-supplying behaviours
+  (`gate`). See
+  [`networking.md`](networking.md#controlled-networks).
 
 ## sum-store
 
