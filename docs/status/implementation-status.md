@@ -33,7 +33,8 @@ wins.
 
 | Feature | Status | Location | Notes |
 |---|---|---|---|
-| mDNS (LAN discovery) | Shipped | [`crates/sum-net/src/discovery.rs`](../../crates/sum-net/src/discovery.rs) | Default. |
+| mDNS (LAN discovery) | Shipped | [`crates/sum-net/src/discovery.rs`](../../crates/sum-net/src/discovery.rs) | Default. `--mdns off` disables it (SNIP #79). |
+| Controlled networks: `--mdns`, `--outbound-allow` (SNIP #79) | Unreleased | [`crates/sum-net/src/policy.rs`](../../crates/sum-net/src/policy.rs); [`crates/sum-net/src/gate.rs`](../../crates/sum-net/src/gate.rs); [`../architecture/networking.md`](../architecture/networking.md#controlled-networks) | Off by default. Outbound allow-list enforced at the transport on every dial path (TCP and QUIC), refused addresses kept out of Kademlia and peer stores, direct inbound connections from refused addresses dropped; refusals logged and counted. Application-level routing control, not an OS security boundary. |
 | Kademlia DHT + TCP fallback (WAN discovery) | Shipped | [`crates/sum-net/src/swarm.rs`](../../crates/sum-net/src/swarm.rs) | Gated by `--enable-wan`. |
 | Circuit Relay v2 server + client, DCUtR | Shipped | [`crates/sum-net/src/nat.rs`](../../crates/sum-net/src/nat.rs) | Server mode gated by `--relay-server` (requires `--enable-wan`). |
 | AutoNAT | Not implemented | — | Deferred with DCUtR-lite; may return if operator demand surfaces. |

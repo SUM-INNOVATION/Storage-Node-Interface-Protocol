@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -149,6 +149,34 @@ struct Cli {
     #[arg(long, env = "SUM_RELAY_SERVER")]
     relay_server: bool,
 
+    /// mDNS LAN discovery: `on` (default) or `off`.
+    ///
+    /// `off` builds no mDNS at all: the node neither announces itself nor
+    /// discovers LAN peers by multicast, so peers are found only through
+    /// --bootstrap-peer / Kademlia (--enable-wan).
+    #[arg(long, env = "SUM_MDNS", default_value = "on", value_enum)]
+    mdns: MdnsMode,
+
+    /// Outbound address allow-list (repeatable or comma-separated). Unset
+    /// (default): no restriction.
+    ///
+    /// When set, every dial this node makes — bootstrap, mDNS, Identify,
+    /// Kademlia, and automatic dials (AutoNAT, DCUtR hole-punching, relay) over
+    /// TCP and QUIC — must match an entry, and a direct inbound connection is
+    /// kept only from an allowed address (relayed ones only through an allowed
+    /// relay). Entries: an IP or CIDR (`127.0.0.1`, `10.0.0.0/8`, `::1`) or a
+    /// multiaddr prefix (`/ip4/127.0.0.1/tcp/4001`,
+    /// `/ip4/127.0.0.1/udp/4001/quic-v1`, optionally ending in
+    /// `/p2p/<peer-id>`). Refusals are logged and counted. An application-level
+    /// routing control, not an OS security boundary.
+    #[arg(
+        long = "outbound-allow",
+        env = "SUM_OUTBOUND_ALLOW",
+        value_delimiter = ',',
+        value_parser = parse_outbound_allow_entry
+    )]
+    outbound_allow: Vec<String>,
+
     /// Runtime profile. `production` fails closed on every uncertain ACL path
     /// (RPC errors, unregistered files, unknown CIDs all deny). `dev` relaxes
     /// those paths for local testing without an L1 chain — never use it for
@@ -158,6 +186,29 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+/// `--mdns` / `SUM_MDNS`. `true`/`false`, `1`/`0` and `yes`/`no` are accepted
+/// too, because the value usually arrives through the environment.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum MdnsMode {
+    #[value(alias = "true", alias = "1", alias = "yes")]
+    On,
+    #[value(alias = "false", alias = "0", alias = "no")]
+    Off,
+}
+
+/// Validate one `--outbound-allow` entry at parse time, so a malformed list
+/// is a usage error (exit 2) before anything networks. The string is kept as
+/// given; `sum-net` parses it again when it builds the swarm. A blank item
+/// (from a trailing comma) is kept and ignored there.
+fn parse_outbound_allow_entry(raw: &str) -> Result<String, String> {
+    if raw.trim().is_empty() {
+        return Ok(String::new());
+    }
+    raw.parse::<sum_net::AllowEntry>()
+        .map(|_| raw.trim().to_string())
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Subcommand)]
@@ -378,6 +429,23 @@ enum Command {
     },
 }
 
+/// The networking configuration every networking subcommand runs under. One
+/// place, so the `SUM_*` environment that OmniNode launches children with
+/// applies to `listen`, `ingest-v2`, `resume`, `download`, `fetch` and `send`
+/// alike.
+fn net_config_from_cli(cli: &Cli) -> NetConfig {
+    NetConfig {
+        udp_listen_port: cli.udp_port,
+        tcp_listen_port: cli.tcp_port,
+        enable_wan: cli.enable_wan,
+        bootstrap_peers: cli.bootstrap_peers.clone(),
+        relay_server: cli.relay_server,
+        mdns: cli.mdns == MdnsMode::On,
+        outbound_allow: cli.outbound_allow.clone(),
+        listen_ip: None,
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -417,14 +485,14 @@ async fn main() -> Result<()> {
         );
     }
 
+    if cli.mdns == MdnsMode::Off && !cli.enable_wan {
+        warn!(
+            "--mdns off without --enable-wan leaves no peer discovery: this node will find no peers"
+        );
+    }
+
     // Build network config from CLI args.
-    let net_config = NetConfig {
-        udp_listen_port: cli.udp_port,
-        tcp_listen_port: cli.tcp_port,
-        enable_wan: cli.enable_wan,
-        bootstrap_peers: cli.bootstrap_peers.clone(),
-        relay_server: cli.relay_server,
-    };
+    let net_config = net_config_from_cli(&cli);
 
     match cli.command {
         Command::Listen if cli.client => {
@@ -2389,5 +2457,196 @@ fn print_event(event: &SumNetEvent) {
         SumNetEvent::HolePunchFailed { peer_id, error } => {
             info!("HOLEPUNCH_NG peer={peer_id}  error={error}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every test that reads or writes the networking environment takes this:
+    /// the environment is process-wide and `Cli::try_parse_from` reads it.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const NET_ENV: [&str; 2] = ["SUM_MDNS", "SUM_OUTBOUND_ALLOW"];
+
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvGuard {
+        fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
+            let mut prior = Vec::new();
+            for (k, v) in pairs {
+                prior.push((*k, std::env::var_os(k)));
+                match v {
+                    Some(v) => unsafe { std::env::set_var(k, v) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+            EnvGuard(prior)
+        }
+
+        fn cleared() -> Self {
+            Self::set(&NET_ENV.map(|k| (k, None)))
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => unsafe { std::env::set_var(k, v) },
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+        }
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("sum-node").chain(args.iter().copied()))
+    }
+
+    /// The networking subcommands, with the positional arguments each needs.
+    fn networking_invocations() -> Vec<Vec<&'static str>> {
+        let root = "00".repeat(32);
+        let root: &'static str = Box::leak(root.into_boxed_str());
+        vec![
+            vec!["listen"],
+            vec!["ingest-v2", "file.bin"],
+            vec!["resume", root, "file.bin"],
+            vec!["download", root, "--output", "out.bin"],
+            vec!["fetch", "bafkexample"],
+            vec!["send", "hello"],
+        ]
+    }
+
+    /// With neither flag nor variable the config is exactly the pre-#79 one.
+    #[test]
+    fn defaults_are_unchanged_mdns_on_and_no_policy() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::cleared();
+        for args in networking_invocations() {
+            let cli = parse(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            assert_eq!(cli.mdns, MdnsMode::On);
+            let cfg = net_config_from_cli(&cli);
+            assert!(cfg.mdns, "{args:?}");
+            assert!(cfg.outbound_allow.is_empty(), "{args:?}");
+            assert_eq!(cfg.listen_ip, None);
+            let policy = sum_net::NetPolicy::from_config(&cfg).unwrap();
+            assert!(!policy.is_restricted());
+            assert!(policy.mdns_enabled());
+        }
+    }
+
+    #[test]
+    fn flags_set_mdns_and_the_allow_list() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::cleared();
+        let cli = parse(&[
+            "--mdns",
+            "off",
+            "--outbound-allow",
+            "/ip4/127.0.0.1/tcp/4001,10.0.0.0/8",
+            "--outbound-allow",
+            "/ip4/127.0.0.1/udp/4001/quic-v1",
+            "listen",
+        ])
+        .unwrap();
+        let cfg = net_config_from_cli(&cli);
+        assert!(!cfg.mdns);
+        assert_eq!(
+            cfg.outbound_allow,
+            [
+                "/ip4/127.0.0.1/tcp/4001",
+                "10.0.0.0/8",
+                "/ip4/127.0.0.1/udp/4001/quic-v1"
+            ]
+        );
+        let policy = sum_net::NetPolicy::from_config(&cfg).unwrap();
+        assert!(policy.is_restricted());
+        assert_eq!(policy.allow_list().unwrap().entries().len(), 3);
+    }
+
+    /// OmniNode launches `sum-node` children through the environment, so the
+    /// variables must reach every networking subcommand.
+    #[test]
+    fn env_vars_reach_every_networking_subcommand() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[
+            ("SUM_MDNS", Some("off")),
+            (
+                "SUM_OUTBOUND_ALLOW",
+                Some("/ip4/127.0.0.1/tcp/4101,/ip4/127.0.0.1/tcp/4102"),
+            ),
+        ]);
+        for args in networking_invocations() {
+            let cli = parse(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            let cfg = net_config_from_cli(&cli);
+            assert!(!cfg.mdns, "{args:?}");
+            assert_eq!(
+                cfg.outbound_allow,
+                ["/ip4/127.0.0.1/tcp/4101", "/ip4/127.0.0.1/tcp/4102"],
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mdns_accepts_boolean_spellings_from_the_environment() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (value, want) in [
+            ("off", MdnsMode::Off),
+            ("false", MdnsMode::Off),
+            ("0", MdnsMode::Off),
+            ("no", MdnsMode::Off),
+            ("on", MdnsMode::On),
+            ("true", MdnsMode::On),
+            ("1", MdnsMode::On),
+        ] {
+            let _env = EnvGuard::set(&[("SUM_MDNS", Some(value)), ("SUM_OUTBOUND_ALLOW", None)]);
+            assert_eq!(parse(&["listen"]).unwrap().mdns, want, "SUM_MDNS={value}");
+        }
+        let _env = EnvGuard::set(&[("SUM_MDNS", Some("sometimes"))]);
+        assert_eq!(
+            parse(&["listen"]).err().map(|e| e.exit_code()),
+            Some(2),
+            "an unknown SUM_MDNS value is a usage error"
+        );
+    }
+
+    /// A malformed entry is a usage error (exit 2) from the flag and from the
+    /// variable alike, before any networking starts.
+    #[test]
+    fn a_malformed_entry_is_a_usage_error() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::cleared();
+        let err = parse(&["--outbound-allow", "/ip4/127.0.0.1/tcp/0", "listen"])
+            .err()
+            .expect("port 0 must be refused");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("--outbound-allow"), "{err}");
+
+        let _env = EnvGuard::set(&[("SUM_OUTBOUND_ALLOW", Some("not-an-address"))]);
+        let err = parse(&["listen"]).err().expect("garbage must be refused");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn blank_items_are_ignored_and_an_empty_variable_is_no_policy() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[
+            ("SUM_MDNS", None),
+            ("SUM_OUTBOUND_ALLOW", Some("/ip4/127.0.0.1/tcp/4001,")),
+        ]);
+        let cfg = net_config_from_cli(&parse(&["listen"]).unwrap());
+        let policy = sum_net::NetPolicy::from_config(&cfg).unwrap();
+        assert_eq!(policy.allow_list().unwrap().entries().len(), 1);
+
+        let _env = EnvGuard::set(&[("SUM_OUTBOUND_ALLOW", Some(""))]);
+        let cfg = net_config_from_cli(&parse(&["listen"]).unwrap());
+        assert!(
+            !sum_net::NetPolicy::from_config(&cfg)
+                .unwrap()
+                .is_restricted()
+        );
     }
 }

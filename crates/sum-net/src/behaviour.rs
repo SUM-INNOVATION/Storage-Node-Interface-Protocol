@@ -3,10 +3,11 @@ use std::time::Duration;
 use libp2p::{
     autonat, dcutr, gossipsub, identify, kad, mdns, relay,
     request_response::{self, ProtocolSupport},
-    swarm::NetworkBehaviour,
+    swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
 };
 
 use crate::codec::{SHARD_XFER_PROTOCOL_V1, SHARD_XFER_PROTOCOL_V2, VersionedShardCodec};
+use crate::gate::{Gated, PolicyBehaviour};
 
 /// Request timeout applied to both shard-transfer behaviours.
 ///
@@ -60,6 +61,8 @@ pub fn build_shard_xfer_v2() -> request_response::Behaviour<VersionedShardCodec>
 ///
 /// The `#[derive(NetworkBehaviour)]` macro generates `LocalMeshBehaviourEvent`
 /// with variants matching each field name in PascalCase:
+/// - `NetPolicy(Infallible)` — never constructed; the policy behaviour emits
+///   no events
 /// - `Mdns(mdns::Event)`
 /// - `Gossipsub(gossipsub::Event)`
 /// - `Identify(identify::Event)`
@@ -91,22 +94,33 @@ pub fn build_shard_xfer_v2() -> request_response::Behaviour<VersionedShardCodec>
 /// record is keyed by [`crate::correlation::OutboundKey`] — the id paired with
 /// the [`crate::correlation::RequestDomain`] naming which of these two fields
 /// minted it — and never by the raw id.
+///
+/// ## Network policy (SNIP #79)
+///
+/// `net_policy` is first on purpose: the derived behaviour consults fields in
+/// declaration order, so a connection the policy refuses is refused before
+/// any other behaviour sets up state for it (see [`crate::gate`]). The
+/// address-supplying behaviours are wrapped in [`Gated`], which dereferences
+/// to the inner behaviour and keeps its event type, so the event variants
+/// below are unchanged. `mdns` is a [`Toggle`]: disabled, it is absent rather
+/// than idle — no socket, no announcement, no discovery.
 #[derive(NetworkBehaviour)]
 pub struct LocalMeshBehaviour {
-    pub mdns: mdns::tokio::Behaviour,
+    pub net_policy: PolicyBehaviour,
+    pub mdns: Gated<Toggle<mdns::tokio::Behaviour>>,
     pub gossipsub: gossipsub::Behaviour,
-    pub identify: identify::Behaviour,
+    pub identify: Gated<identify::Behaviour>,
     /// `/sum/storage/v1` only. Inbound V1 pulls are served; inbound V1 pushes
     /// are refused by `sum-node`'s inbound dispatcher. No outbound V1 push
     /// command exists any more.
     pub shard_xfer_v1: request_response::Behaviour<VersionedShardCodec>,
     /// `/sum/storage/v2` only. Every V2 operation is routed here explicitly.
     pub shard_xfer_v2: request_response::Behaviour<VersionedShardCodec>,
-    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
-    pub autonat: autonat::Behaviour,
+    pub kademlia: Gated<kad::Behaviour<kad::store::MemoryStore>>,
+    pub autonat: Gated<autonat::Behaviour>,
     pub relay: relay::Behaviour,
-    pub relay_client: relay::client::Behaviour,
-    pub dcutr: dcutr::Behaviour,
+    pub relay_client: Gated<relay::client::Behaviour>,
+    pub dcutr: Gated<dcutr::Behaviour>,
 }
 
 #[cfg(test)]

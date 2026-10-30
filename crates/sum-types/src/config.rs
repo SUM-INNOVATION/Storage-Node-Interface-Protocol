@@ -1,12 +1,18 @@
 // Global configuration structs for the SUM Storage Node.
 
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use crate::error::SumError;
 
 // ── Networking ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default)]
+/// Networking configuration for one `SumNet` instance.
+///
+/// `Default` is today's behaviour: mDNS on, no outbound address policy,
+/// listeners on every interface. It is implemented by hand rather than
+/// derived because a derived `Default` would turn mDNS **off**.
+#[derive(Debug, Clone)]
 pub struct NetConfig {
     /// UDP port for the QUIC listener. `0` = OS-assigned (ephemeral).
     ///
@@ -31,6 +37,38 @@ pub struct NetConfig {
     /// Only enable on publicly-reachable hosts (VPS, port-forwarded home
     /// server). Does nothing unless `enable_wan` is also true.
     pub relay_server: bool,
+    /// Run mDNS LAN discovery. `true` (the default) is the behaviour every
+    /// release before SNIP #79 had. `false` builds no mDNS behaviour at all:
+    /// the node neither announces itself nor discovers peers by multicast.
+    pub mdns: bool,
+    /// Outbound address allow-list (SNIP #79). Empty (the default) means no
+    /// restriction. Each entry is an IP address or CIDR (`127.0.0.1`,
+    /// `10.0.0.0/8`, `::1/128`) or a multiaddr prefix
+    /// (`/ip4/127.0.0.1/tcp/4001`, optionally ending in `/p2p/<peer-id>`).
+    ///
+    /// Parsed and enforced by `sum-net` (`sum_net::policy`). This is an
+    /// application-level routing control for cooperative networks, not an
+    /// OS security boundary: a modified client can ignore it.
+    pub outbound_allow: Vec<String>,
+    /// IPv4 address the QUIC and TCP listeners bind. `None` (the default and
+    /// the only value the CLI uses) binds `0.0.0.0`, as every earlier
+    /// release did. Tests set `127.0.0.1` to stay on loopback.
+    pub listen_ip: Option<Ipv4Addr>,
+}
+
+impl Default for NetConfig {
+    fn default() -> Self {
+        Self {
+            udp_listen_port: 0,
+            tcp_listen_port: 0,
+            enable_wan: false,
+            bootstrap_peers: Vec::new(),
+            relay_server: false,
+            mdns: true,
+            outbound_allow: Vec::new(),
+            listen_ip: None,
+        }
+    }
 }
 
 // ── Storage ──────────────────────────────────────────────────────────────────
@@ -137,6 +175,24 @@ mod tests {
     /// under `cargo test`'s default threading — the worst way for a test to be
     /// wrong, because it looks like flakiness rather than a missing invariant.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The default is the pre-#79 behaviour. A derived `Default` would have
+    /// made `mdns` false, silently turning LAN discovery off for every caller
+    /// that builds a config from `Default`.
+    #[test]
+    fn net_config_default_keeps_mdns_on_and_sets_no_policy() {
+        let cfg = NetConfig::default();
+        assert!(cfg.mdns, "mDNS stays on unless explicitly disabled");
+        assert!(
+            cfg.outbound_allow.is_empty(),
+            "no outbound policy by default"
+        );
+        assert_eq!(cfg.listen_ip, None, "listeners bind 0.0.0.0 by default");
+        assert!(!cfg.enable_wan);
+        assert!(!cfg.relay_server);
+        assert!(cfg.bootstrap_peers.is_empty());
+        assert_eq!((cfg.udp_listen_port, cfg.tcp_listen_port), (0, 0));
+    }
 
     #[test]
     fn store_config_carries_the_resolved_root_and_the_default_cap() {

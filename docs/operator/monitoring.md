@@ -186,6 +186,34 @@ After a `ReassignChunksV2`, the latest epoch can assign this archive chunks of a
 - `re-fetch: bytes do not match the manifest; refused` and `re-fetch: manifest refused` (`warn`, with the source);
 - `re-fetch: inconsistent assignment epochs; skipped` (`warn`).
 
+## Network policy refusals
+
+With `--outbound-allow` set (see
+[controlled networks](../architecture/networking.md#controlled-networks)),
+every address or connection the policy refuses is logged and counted.
+Lines to watch:
+
+- `network policy: mdns=... outbound_allow=...` (`info`, once at
+  startup) — the effective policy; logged with and without a policy.
+- `network policy: address not in --outbound-allow — refused` (`warn`
+  the first time a source offers an address, `debug` after), with
+  `source` (`bootstrap`, `mdns`, `identify`, `kad`, `autodial`,
+  `inbound`, `other`), `stage` (`admission`, `dial`, `inbound`) and
+  `addr`.
+- `network policy: refusal totals` (`info`, every 30 s when they
+  changed and at shutdown) — counts by source. They count refusals,
+  not distinct addresses.
+- `network policy: no bootstrap peer is allowed by --outbound-allow — Kademlia bootstrap skipped` (`warn`).
+
+Refusals are expected for an allowed peer's other addresses — a client
+restricted to a relay will refuse the archives' direct addresses that
+arrive through Identify and Kademlia. A transfer that fails while the
+totals grow, and no `connection established` follows, points at the
+allowed endpoint itself.
+
+There is no metrics endpoint for these counts; in process they are
+`SumNet::net_policy_refusals()`.
+
 ## Log guards
 
 Sensitive material (Ed25519 seed, X25519 secret, `K_file`, wrapped
