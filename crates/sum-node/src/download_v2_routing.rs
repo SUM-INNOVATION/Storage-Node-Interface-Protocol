@@ -7,10 +7,12 @@
 //! reusable helper rather than being duplicated inline.
 
 use std::collections::{BTreeSet, HashMap};
+use std::time::Duration;
 
 use anyhow::Result;
 use thiserror::Error;
 
+use sum_net::PeerId;
 use sum_store::manifest::deserialize_manifest_cbor;
 use sum_types::rpc_types::StorageFileInfoV2;
 use sum_types::storage::DataManifest;
@@ -152,6 +154,65 @@ pub async fn build_v2_assignment_view(
         distinct_assigned,
         per_chunk_assigned,
     })
+}
+
+// ── Per-chunk archive choice ────────────────────────────────────────────────
+
+/// How long a chunk fetch keeps strictly to the chain's ranking of a chunk's
+/// assigned archives (issue #78).
+///
+/// A chunk is asked of one assigned archive at a time, best-ranked first, and
+/// only once that archive's `PeerId` is known (`PeerIdentified`). An archive
+/// that is down is never identified, so before #78 a chunk whose top-ranked
+/// archive was down waited for it until the whole download timed out, while
+/// the other archives holding the chunk were never asked. For this long after
+/// the chunk phase starts, a chunk still waits for the archive next in line;
+/// after it, the chunk is asked of the next assigned archive that IS
+/// identified. The archives it passed over stay in line behind it.
+///
+/// It is a client-side retrieval choice: which assigned archive serves a
+/// chunk is not checked by the chain or by any archive, and every chunk is
+/// verified against the manifest whichever archive serves it.
+pub const UNRESOLVED_ARCHIVE_GRACE: Duration = Duration::from_secs(5);
+
+/// The assigned archive a pending chunk should be asked next: its position in
+/// `order` and its `PeerId`.
+///
+/// `order` is the chunk's assigned archives in the order they are asked, and
+/// `order[next..]` are those not asked yet (see [`mark_archive_asked`]). It
+/// starts as the chain's ranking. With `skip_unresolved == false` only
+/// `order[next]` may be chosen, and only once it is identified. With
+/// `skip_unresolved == true` (after [`UNRESOLVED_ARCHIVE_GRACE`]) the first
+/// identified archive in `order[next..]` is chosen.
+///
+/// `None`: nothing can be asked now (wait for a `PeerIdentified`), or every
+/// assigned archive has been asked (`next >= order.len()`).
+pub fn next_assigned_archive(
+    order: &[[u8; 20]],
+    next: usize,
+    addr_to_peer: &HashMap<[u8; 20], PeerId>,
+    skip_unresolved: bool,
+) -> Option<(usize, PeerId)> {
+    for (pos, addr) in order.iter().enumerate().skip(next) {
+        if let Some(&peer_id) = addr_to_peer.get(addr) {
+            return Some((pos, peer_id));
+        }
+        if !skip_unresolved {
+            return None;
+        }
+    }
+    None
+}
+
+/// Record that `order[pos]` (a position returned by
+/// [`next_assigned_archive`]) has been asked: it moves to position `*next`,
+/// ahead of any not-yet-identified archives it passed over, which keep their
+/// relative order, and `*next` advances past it. `order` keeps every assigned
+/// archive exactly once, so `*next >= order.len()` still means "all asked".
+pub fn mark_archive_asked(order: &mut [[u8; 20]], next: &mut usize, pos: usize) {
+    debug_assert!(pos >= *next && pos < order.len());
+    order[*next..=pos].rotate_right(1);
+    *next += 1;
 }
 
 // ── V2 manifest decode ──────────────────────────────────────────────────────

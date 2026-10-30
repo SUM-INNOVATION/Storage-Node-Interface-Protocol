@@ -46,6 +46,9 @@ use sum_store::merkle::MerkleTree;
 use sum_types::rpc_types::{AccessEntryV2, StorageFileInfoV2};
 use sum_types::storage::{ChunkDescriptor, DataManifest};
 
+use crate::download_v2_routing::{
+    UNRESOLVED_ARCHIVE_GRACE, mark_archive_asked, next_assigned_archive,
+};
 use crate::peer_state::apply_peer_event;
 use crate::rpc_client::L1RpcClient;
 
@@ -993,6 +996,7 @@ async fn fetch_all_ciphertext_chunks_v2(
         manifest: &DataManifest,
         state: &mut HashMap<u32, ChunkFetchState>,
         max_concurrent: usize,
+        skip_unresolved: bool,
     ) -> Result<(), (u32, anyhow::Error)> {
         // Snapshot the L1-addr → PeerId map ONCE per dispatch wave so
         // selection is deterministic for this wave.
@@ -1003,8 +1007,13 @@ async fn fetch_all_ciphertext_chunks_v2(
             .map(|(p, a)| (*a, *p))
             .collect();
 
-        let dispatches =
-            select_chunks_to_dispatch(state, &manifest.chunks, &addr_to_peer, max_concurrent);
+        let dispatches = select_chunks_to_dispatch(
+            state,
+            &manifest.chunks,
+            &addr_to_peer,
+            max_concurrent,
+            skip_unresolved,
+        );
 
         for d in dispatches {
             // Find the chunk descriptor — we already validated `idx`
@@ -1040,21 +1049,54 @@ async fn fetch_all_ciphertext_chunks_v2(
             let s = state
                 .get_mut(&d.chunk_index)
                 .expect("idx came from manifest");
+            if d.assigned_pos != s.next_attempt_idx {
+                info!(
+                    chunk_index = d.chunk_index,
+                    archive = %hex::encode(d.archive_addr),
+                    passed_over = d.assigned_pos - s.next_attempt_idx,
+                    "Private chunk fetch: asking the next identified assigned archive"
+                );
+            }
+            mark_archive_asked(&mut s.assigned, &mut s.next_attempt_idx, d.assigned_pos);
             s.in_flight_to = Some((d.peer_id, d.archive_addr));
-            s.next_attempt_idx += 1;
         }
         Ok(())
     }
 
+    // Issue #78: keep to the chain's ranking only for a bounded time.
+    let skip_unresolved_at = tokio::time::Instant::now() + UNRESOLVED_ARCHIVE_GRACE;
+    let mut skip_unresolved = false;
+
     // Initial dispatch attempt (peer_addresses may already have
     // entries from prior phases of `run_download_private`; usually
     // not, since the Private path hasn't done peer discovery yet).
-    try_dispatch_pending(net, peer_addresses, manifest, &mut state, max_concurrent).await?;
+    try_dispatch_pending(
+        net,
+        peer_addresses,
+        manifest,
+        &mut state,
+        max_concurrent,
+        skip_unresolved,
+    )
+    .await?;
 
     // Main event loop.
     while state.values().any(|s| s.received.is_none()) {
         let event = tokio::select! {
             ev = net.next_event() => ev,
+            _ = tokio::time::sleep_until(skip_unresolved_at), if !skip_unresolved => {
+                skip_unresolved = true;
+                try_dispatch_pending(
+                    net,
+                    peer_addresses,
+                    manifest,
+                    &mut state,
+                    max_concurrent,
+                    skip_unresolved,
+                )
+                .await?;
+                continue;
+            }
             _ = tokio::time::sleep_until(deadline) => {
                 let next_missing = manifest
                     .chunks
@@ -1091,8 +1133,15 @@ async fn fetch_all_ciphertext_chunks_v2(
                 // A new PeerIdentified may have unlocked archives we
                 // couldn't resolve before. Dispatch any newly-eligible
                 // chunks.
-                try_dispatch_pending(net, peer_addresses, manifest, &mut state, max_concurrent)
-                    .await?;
+                try_dispatch_pending(
+                    net,
+                    peer_addresses,
+                    manifest,
+                    &mut state,
+                    max_concurrent,
+                    skip_unresolved,
+                )
+                .await?;
             }
             Some(SumNetEvent::ShardReceivedV2 {
                 peer_id,
@@ -1190,8 +1239,15 @@ async fn fetch_all_ciphertext_chunks_v2(
                         ),
                     ));
                 }
-                try_dispatch_pending(net, peer_addresses, manifest, &mut state, max_concurrent)
-                    .await?;
+                try_dispatch_pending(
+                    net,
+                    peer_addresses,
+                    manifest,
+                    &mut state,
+                    max_concurrent,
+                    skip_unresolved,
+                )
+                .await?;
             }
             None => {
                 let next_missing = manifest
@@ -1215,10 +1271,13 @@ async fn fetch_all_ciphertext_chunks_v2(
 
 /// Per-chunk fetch bookkeeping for `fetch_all_ciphertext_chunks_v2`.
 struct ChunkFetchState {
-    /// V2-deterministic list of archives that hold this chunk, in
-    /// (score asc, address asc) order.
+    /// The archives that hold this chunk, in the order they are asked:
+    /// V2-deterministic (score asc, address asc), except that an archive
+    /// asked ahead of not-yet-identified ones moves ahead of them
+    /// ([`mark_archive_asked`], issue #78).
     assigned: Vec<[u8; 20]>,
-    /// Index of the next archive in `assigned` we'll try.
+    /// Number of archives in `assigned` already asked; `assigned[next_attempt_idx..]`
+    /// are the ones left.
     next_attempt_idx: usize,
     /// `(peer_id, archive_l1_addr)` of the in-flight request, if any.
     in_flight_to: Option<(PeerId, [u8; 20])>,
@@ -1236,6 +1295,8 @@ struct DispatchTarget {
     chunk_index: u32,
     peer_id: PeerId,
     archive_addr: [u8; 20],
+    /// The archive's position in the chunk's `assigned` order.
+    assigned_pos: usize,
 }
 
 /// **Pure** concurrency selector for the per-chunk fetch loop. Given
@@ -1252,9 +1313,11 @@ struct DispatchTarget {
 ///     outstanding `in_flight_to`. (Slow / stuck chunks therefore
 ///     do NOT block other pending chunks from progressing — they
 ///     simply hold one slot.)
-///   * For each pending chunk, walks `assigned[next_attempt_idx..]`
-///     and dispatches against the first archive resolvable to a
-///     known PeerId. Failed-archive retries are folded in here:
+///   * For each pending chunk, dispatches against
+///     [`next_assigned_archive`]: `assigned[next_attempt_idx]` once it
+///     resolves to a known PeerId, or, with `skip_unresolved` (after
+///     [`UNRESOLVED_ARCHIVE_GRACE`], issue #78), the first archive in
+///     `assigned[next_attempt_idx..]` that resolves. Failed-archive retries are folded in here:
 ///     the failure path elsewhere leaves `in_flight_to = None` and
 ///     `next_attempt_idx` advanced past the failed archive, so this
 ///     selector picks the next archive on the same chunk
@@ -1272,6 +1335,7 @@ fn select_chunks_to_dispatch(
     manifest_chunks: &[ChunkDescriptor],
     addr_to_peer: &HashMap<[u8; 20], PeerId>,
     max_concurrent: usize,
+    skip_unresolved: bool,
 ) -> Vec<DispatchTarget> {
     let cap = max_concurrent.max(1);
     let mut in_flight = state.values().filter(|s| s.in_flight_to.is_some()).count();
@@ -1286,23 +1350,27 @@ fn select_chunks_to_dispatch(
         if s.received.is_some() || s.in_flight_to.is_some() {
             continue;
         }
-        // Try only the next-untried archive. If its PeerId is not
+        // Try the next-untried archive. If its PeerId is not
         // resolvable yet, leave the chunk alone for this dispatch
         // wave — a future PeerIdentified event will let us pick it
-        // up. We deliberately don't skip ahead to a later archive:
-        // dispatching out of order would let a later archive serve
-        // before an earlier one is given a chance.
-        let probe_idx = s.next_attempt_idx;
-        if probe_idx < s.assigned.len() {
-            let target_addr = s.assigned[probe_idx];
-            if let Some(&peer_id) = addr_to_peer.get(&target_addr) {
-                out.push(DispatchTarget {
-                    chunk_index: cd.chunk_index,
-                    peer_id,
-                    archive_addr: target_addr,
-                });
-                in_flight += 1;
-            }
+        // up. Skipping ahead to a later archive would let it serve
+        // before an earlier one is given a chance, so that waits for
+        // `skip_unresolved`: an archive that is down is never
+        // identified, and without the bound its chunks would wait for
+        // it until the download times out (issue #78).
+        if let Some((assigned_pos, peer_id)) = next_assigned_archive(
+            &s.assigned,
+            s.next_attempt_idx,
+            addr_to_peer,
+            skip_unresolved,
+        ) {
+            out.push(DispatchTarget {
+                chunk_index: cd.chunk_index,
+                peer_id,
+                archive_addr: s.assigned[assigned_pos],
+                assigned_pos,
+            });
+            in_flight += 1;
         }
     }
     out
@@ -2013,7 +2081,8 @@ mod tests {
         let archives = vec![[0xA1u8; 20]];
         let (state, addr_to_peer) = synth_state(5, &archives);
 
-        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 1);
+        let dispatches =
+            select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 1, false);
         assert_eq!(dispatches.len(), 1);
         assert_eq!(dispatches[0].chunk_index, 0);
     }
@@ -2028,7 +2097,8 @@ mod tests {
         let (state, addr_to_peer) = synth_state(10, &archives);
 
         for n in [1usize, 2, 3, 5, 10] {
-            let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, n);
+            let dispatches =
+                select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, n, false);
             assert_eq!(dispatches.len(), n, "max_concurrent={n}");
             // Ascending chunk-index order.
             for (k, d) in dispatches.iter().enumerate() {
@@ -2055,7 +2125,8 @@ mod tests {
 
         // With max_concurrent=3, we already have 1 in-flight (chunk 0)
         // → selector should add 2 more (chunks 1 and 2).
-        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 3);
+        let dispatches =
+            select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 3, false);
         assert_eq!(dispatches.len(), 2);
         let indices: Vec<u32> = dispatches.iter().map(|d| d.chunk_index).collect();
         assert_eq!(indices, vec![1, 2]);
@@ -2082,7 +2153,8 @@ mod tests {
         // max_concurrent=3: 1 already in-flight → selector adds up
         // to 2 more. Chunk 0 should retry on archive[1]; chunk 2 on
         // archive[0].
-        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 3);
+        let dispatches =
+            select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 3, false);
         assert_eq!(dispatches.len(), 2);
 
         let chunk0 = dispatches
@@ -2128,7 +2200,8 @@ mod tests {
         // max_concurrent=4: 2 already in-flight → 2 more slots.
         // Chunk 0 retries on archive[1]; chunk 3 picks up archive[0].
         // Chunks 1 and 2 are NOT disturbed.
-        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 4);
+        let dispatches =
+            select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 4, false);
         assert_eq!(dispatches.len(), 2);
         let chunk0 = dispatches.iter().find(|d| d.chunk_index == 0).unwrap();
         assert_eq!(chunk0.archive_addr, [0xA2u8; 20]);
@@ -2151,7 +2224,8 @@ mod tests {
         // Chunk 0: tried the only archive; exhausted.
         state.get_mut(&0).unwrap().next_attempt_idx = 1;
 
-        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 4);
+        let dispatches =
+            select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 4, false);
         assert_eq!(dispatches.len(), 1);
         assert_eq!(dispatches[0].chunk_index, 1, "only chunk 1 dispatchable");
     }
@@ -2165,7 +2239,8 @@ mod tests {
         let archives = vec![[0xA1u8; 20]];
         let (state, addr_to_peer) = synth_state(3, &archives);
 
-        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 0);
+        let dispatches =
+            select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 0, false);
         assert_eq!(dispatches.len(), 1);
         assert_eq!(dispatches[0].chunk_index, 0);
     }
@@ -2195,7 +2270,8 @@ mod tests {
         // Empty addr_to_peer → the assigned archive isn't resolvable.
         let addr_to_peer: HashMap<[u8; 20], PeerId> = HashMap::new();
 
-        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 8);
+        let dispatches =
+            select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 8, false);
         assert!(
             dispatches.is_empty(),
             "no archives resolvable → no dispatches; got {dispatches:?}"
@@ -2209,6 +2285,30 @@ mod tests {
         }
     }
 
+    /// Issue #78: a chunk whose top-ranked archive never resolves (it
+    /// is down) is asked of its next resolvable assigned archive once
+    /// `skip_unresolved` is set (after `UNRESOLVED_ARCHIVE_GRACE`), and
+    /// not before. The passed-over archive is not counted as asked.
+    #[test]
+    fn select_chunks_to_dispatch_asks_the_next_identified_archive_after_the_grace_period() {
+        let manifest = synth_manifest(2);
+        let archives = vec![[0xD0u8; 20], [0xA1u8; 20], [0xA2u8; 20]];
+        let (state, mut addr_to_peer) = synth_state(2, &archives);
+        addr_to_peer.remove(&[0xD0u8; 20]);
+
+        let strict = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 8, false);
+        assert!(strict.is_empty(), "{strict:?}");
+
+        let after = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 8, true);
+        assert_eq!(after.len(), 2);
+        for d in &after {
+            assert_eq!(d.archive_addr, [0xA1u8; 20]);
+            assert_eq!(d.assigned_pos, 1);
+            assert_eq!(d.peer_id, addr_to_peer[&[0xA1u8; 20]]);
+        }
+        assert_eq!(state[&0].next_attempt_idx, 0);
+    }
+
     /// Already-received chunks don't get re-dispatched even when
     /// concurrency slots are open. The completion path is one-way.
     #[test]
@@ -2220,7 +2320,8 @@ mod tests {
         // Chunk 1 already received.
         state.get_mut(&1).unwrap().received = Some(vec![0xCC; 64]);
 
-        let dispatches = select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 8);
+        let dispatches =
+            select_chunks_to_dispatch(&state, &manifest.chunks, &addr_to_peer, 8, false);
         let indices: Vec<u32> = dispatches.iter().map(|d| d.chunk_index).collect();
         assert_eq!(
             indices,
