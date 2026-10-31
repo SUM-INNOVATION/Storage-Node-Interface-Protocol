@@ -19,11 +19,11 @@ use sum_store::{
     FetchManager, FetchOutcome, MerkleTree, compute_chunk_assignment, nodes_for_chunk,
 };
 use sum_types::rpc_types::{NodeRecordInfo, StorageFileInfoV2};
-use sum_types::storage::DataManifest;
+use sum_types::storage::{ChunkDescriptor, DataManifest};
 
 use crate::download_v2_routing::{
-    ManifestDecodeError, V2AssignmentError, V2AssignmentView, build_v2_assignment_view,
-    decode_v2_manifest_bytes,
+    ManifestDecodeError, UNRESOLVED_ARCHIVE_GRACE, V2AssignmentError, V2AssignmentView,
+    build_v2_assignment_view, decode_v2_manifest_bytes, mark_archive_asked, next_assigned_archive,
 };
 use crate::peer_state::apply_peer_event;
 use crate::rpc_client::L1RpcClient;
@@ -1217,6 +1217,93 @@ struct V2PublicFetchOutcome {
     peers_contacted: HashSet<PeerId>,
 }
 
+/// Per-chunk state of [`fetch_v2_public_chunks`]. `assigned` is the
+/// order the chunk's V2-assigned archives are asked in: the
+/// chain-deterministic ranking, except that an archive asked ahead of
+/// unidentified ones moves ahead of them ([`mark_archive_asked`]).
+/// `next_attempt_idx` counts the archives already asked; `in_flight_to`
+/// pins the (peer_id, archive) we're awaiting; `done` is set when the
+/// chunk is persisted to local disk.
+struct PublicChunkState {
+    assigned: Vec<[u8; 20]>,
+    next_attempt_idx: usize,
+    in_flight_to: Option<(PeerId, [u8; 20])>,
+    done: bool,
+}
+
+/// One chunk request [`select_public_chunk_dispatches`] schedules: the
+/// chunk, the peer to ask, and the archive's position in the chunk's
+/// `assigned` order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PublicDispatch {
+    chunk_index: u32,
+    peer_id: PeerId,
+    assigned_pos: usize,
+}
+
+/// **Pure** selection of the chunk requests to send now, in manifest
+/// order, up to `max_concurrent` in flight (clamped to at least 1). Each
+/// pending chunk is asked of [`next_assigned_archive`]: its next archive
+/// in line once identified, or, with `skip_unresolved` (after
+/// [`UNRESOLVED_ARCHIVE_GRACE`]), the first identified one not yet asked.
+fn select_public_chunk_dispatches(
+    state: &HashMap<u32, PublicChunkState>,
+    manifest_chunks: &[ChunkDescriptor],
+    addr_to_peer: &HashMap<[u8; 20], PeerId>,
+    max_concurrent: usize,
+    skip_unresolved: bool,
+) -> Vec<PublicDispatch> {
+    let cap = max_concurrent.max(1);
+    let mut in_flight = state.values().filter(|s| s.in_flight_to.is_some()).count();
+    let mut out = Vec::new();
+    for cd in manifest_chunks {
+        if in_flight >= cap {
+            break;
+        }
+        let Some(s) = state.get(&cd.chunk_index) else {
+            continue;
+        };
+        if s.done || s.in_flight_to.is_some() {
+            continue;
+        }
+        // `None`: wait for a PeerIdentified (or the grace period), or
+        // nothing left to ask — the caller's "all failed" path reports it.
+        if let Some((assigned_pos, peer_id)) = next_assigned_archive(
+            &s.assigned,
+            s.next_attempt_idx,
+            addr_to_peer,
+            skip_unresolved,
+        ) {
+            out.push(PublicDispatch {
+                chunk_index: cd.chunk_index,
+                peer_id,
+                assigned_pos,
+            });
+            in_flight += 1;
+        }
+    }
+    out
+}
+
+/// The archives that pending chunks are still waiting to see identified:
+/// for each chunk neither done nor in flight, its next archive in line,
+/// when that archive is not identified. Sorted, deduplicated.
+fn unresolved_next_archives(
+    state: &HashMap<u32, PublicChunkState>,
+    addr_to_peer: &HashMap<[u8; 20], PeerId>,
+) -> Vec<[u8; 20]> {
+    let mut out: Vec<[u8; 20]> = state
+        .values()
+        .filter(|s| !s.done && s.in_flight_to.is_none())
+        .filter_map(|s| s.assigned.get(s.next_attempt_idx))
+        .filter(|a| !addr_to_peer.contains_key(*a))
+        .copied()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// V2 per-chunk fetch with V2-assignment routing.
 ///
 /// For each chunk pending fetch, walks the chunk's V2-assigned
@@ -1230,6 +1317,11 @@ struct V2PublicFetchOutcome {
 /// On peer error or wrong bytes, advances to the next assigned
 /// archive. If every assigned archive fails for some chunk, the
 /// fetch fails — no "any connected peer" fallback.
+///
+/// An assigned archive that is never identified on the network (it is
+/// down, or unreachable from here) is passed over once
+/// [`UNRESOLVED_ARCHIVE_GRACE`] has elapsed since this phase started: the
+/// chunk is then asked of its next identified assigned archive (#78).
 async fn fetch_v2_public_chunks(
     net: &SumNet,
     store: &Arc<RwLock<sum_store::SumStore>>,
@@ -1239,20 +1331,9 @@ async fn fetch_v2_public_chunks(
     max_concurrent: usize,
     deadline: tokio::time::Instant,
 ) -> Result<V2PublicFetchOutcome> {
-    // Per-chunk state. `assigned` is the V2-deterministic order;
-    // `next_attempt_idx` walks it on each failure; `in_flight_to`
-    // pins the (peer_id, archive) we're awaiting; `received` is set
-    // when the chunk is persisted to local disk.
-    struct ChunkState {
-        assigned: Vec<[u8; 20]>,
-        next_attempt_idx: usize,
-        in_flight_to: Option<(PeerId, [u8; 20])>,
-        done: bool,
-    }
-
     // Skip-on-disk: if a chunk is already in the local store (from a
     // prior partial run), don't refetch. Initial `done` reflects this.
-    let mut state: HashMap<u32, ChunkState> = HashMap::with_capacity(manifest.chunks.len());
+    let mut state: HashMap<u32, PublicChunkState> = HashMap::with_capacity(manifest.chunks.len());
     let mut chunks_skipped: u32 = 0;
     {
         let store_read = store.read().await;
@@ -1268,7 +1349,7 @@ async fn fetch_v2_public_chunks(
             }
             state.insert(
                 cd.chunk_index,
-                ChunkState {
+                PublicChunkState {
                     assigned,
                     next_attempt_idx: 0,
                     in_flight_to: None,
@@ -1292,8 +1373,9 @@ async fn fetch_v2_public_chunks(
         net: &SumNet,
         peer_addresses: &RwLock<HashMap<PeerId, [u8; 20]>>,
         manifest: &DataManifest,
-        state: &mut HashMap<u32, ChunkState>,
+        state: &mut HashMap<u32, PublicChunkState>,
         max_concurrent: usize,
+        skip_unresolved: bool,
     ) -> Result<()> {
         let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
             .read()
@@ -1301,49 +1383,87 @@ async fn fetch_v2_public_chunks(
             .iter()
             .map(|(p, a)| (*a, *p))
             .collect();
-        let cap = max_concurrent.max(1);
-        let mut in_flight = state.values().filter(|s| s.in_flight_to.is_some()).count();
-        for cd in &manifest.chunks {
-            if in_flight >= cap {
-                break;
-            }
-            let Some(s) = state.get(&cd.chunk_index) else {
-                continue;
-            };
-            if s.done || s.in_flight_to.is_some() {
-                continue;
-            }
-            let probe_idx = s.next_attempt_idx;
-            if probe_idx >= s.assigned.len() {
-                // No more assigned archives to try for this chunk —
-                // surfaced by the caller's "all failed" path.
-                continue;
-            }
-            let target_addr = s.assigned[probe_idx];
-            let Some(&peer_id) = addr_to_peer.get(&target_addr) else {
-                // Not yet resolvable; wait for PeerIdentified.
-                continue;
-            };
+        let dispatches = select_public_chunk_dispatches(
+            state,
+            &manifest.chunks,
+            &addr_to_peer,
+            max_concurrent,
+            skip_unresolved,
+        );
+        for d in dispatches {
+            let cd = manifest
+                .chunks
+                .iter()
+                .find(|c| c.chunk_index == d.chunk_index)
+                .expect("idx came from manifest");
             // V2 single-shot pull. `max_bytes = cd.size` lets the
             // archive return the full chunk in one Data response.
-            if let Err(e) = net.pull_chunk_v2(peer_id, cd.cid.clone(), 0, cd.size).await {
+            if let Err(e) = net
+                .pull_chunk_v2(d.peer_id, cd.cid.clone(), 0, cd.size)
+                .await
+            {
                 bail!("pull_chunk_v2 (chunk {}): {e}", cd.chunk_index);
             }
             let s_mut = state
                 .get_mut(&cd.chunk_index)
                 .expect("idx came from manifest");
-            s_mut.in_flight_to = Some((peer_id, target_addr));
-            s_mut.next_attempt_idx += 1;
-            in_flight += 1;
+            let target_addr = s_mut.assigned[d.assigned_pos];
+            if d.assigned_pos != s_mut.next_attempt_idx {
+                info!(
+                    chunk_index = cd.chunk_index,
+                    archive = %hex::encode(target_addr),
+                    passed_over = d.assigned_pos - s_mut.next_attempt_idx,
+                    "V2Public chunk fetch: asking the next identified assigned archive"
+                );
+            }
+            mark_archive_asked(
+                &mut s_mut.assigned,
+                &mut s_mut.next_attempt_idx,
+                d.assigned_pos,
+            );
+            s_mut.in_flight_to = Some((d.peer_id, target_addr));
         }
         Ok(())
     }
 
-    try_dispatch(net, peer_addresses, manifest, &mut state, max_concurrent).await?;
+    // Issue #78: keep to the chain's ranking only for a bounded time.
+    let skip_unresolved_at = tokio::time::Instant::now() + UNRESOLVED_ARCHIVE_GRACE;
+    let mut skip_unresolved = false;
+
+    try_dispatch(
+        net,
+        peer_addresses,
+        manifest,
+        &mut state,
+        max_concurrent,
+        skip_unresolved,
+    )
+    .await?;
 
     while state.values().any(|s| !s.done) {
         let event = tokio::select! {
             ev = net.next_event() => ev,
+            _ = tokio::time::sleep_until(skip_unresolved_at), if !skip_unresolved => {
+                skip_unresolved = true;
+                let addr_to_peer: HashMap<[u8; 20], PeerId> = peer_addresses
+                    .read()
+                    .await
+                    .iter()
+                    .map(|(p, a)| (*a, *p))
+                    .collect();
+                let waiting = unresolved_next_archives(&state, &addr_to_peer);
+                if !waiting.is_empty() {
+                    warn!(
+                        archives = %waiting.iter().map(hex::encode).collect::<Vec<_>>().join(","),
+                        grace = ?UNRESOLVED_ARCHIVE_GRACE,
+                        "V2Public chunk fetch: assigned archive(s) not identified on the \
+                         network; their chunks are asked of the next identified assigned archive"
+                    );
+                }
+                try_dispatch(net, peer_addresses, manifest, &mut state, max_concurrent, skip_unresolved)
+                    .await?;
+                continue;
+            }
             _ = tokio::time::sleep_until(deadline) => {
                 let next_missing = manifest
                     .chunks
@@ -1361,7 +1481,15 @@ async fn fetch_v2_public_chunks(
             Some(ref e @ SumNetEvent::PeerIdentified { .. })
             | Some(ref e @ SumNetEvent::PeerDisconnected { .. }) => {
                 apply_peer_event(&mut *peer_addresses.write().await, e);
-                try_dispatch(net, peer_addresses, manifest, &mut state, max_concurrent).await?;
+                try_dispatch(
+                    net,
+                    peer_addresses,
+                    manifest,
+                    &mut state,
+                    max_concurrent,
+                    skip_unresolved,
+                )
+                .await?;
             }
             Some(SumNetEvent::ShardReceivedV2 {
                 peer_id,
@@ -1452,7 +1580,15 @@ async fn fetch_v2_public_chunks(
                         );
                     }
                 }
-                try_dispatch(net, peer_addresses, manifest, &mut state, max_concurrent).await?;
+                try_dispatch(
+                    net,
+                    peer_addresses,
+                    manifest,
+                    &mut state,
+                    max_concurrent,
+                    skip_unresolved,
+                )
+                .await?;
             }
             Some(SumNetEvent::ShardRequestFailed {
                 peer_id,
@@ -1492,7 +1628,15 @@ async fn fetch_v2_public_chunks(
                             s.assigned.len()
                         );
                     }
-                    try_dispatch(net, peer_addresses, manifest, &mut state, max_concurrent).await?;
+                    try_dispatch(
+                        net,
+                        peer_addresses,
+                        manifest,
+                        &mut state,
+                        max_concurrent,
+                        skip_unresolved,
+                    )
+                    .await?;
                 }
             }
             None => bail!("V2Public chunk fetch: network shut down mid-fetch"),
@@ -1616,6 +1760,310 @@ mod holder_map_tests {
         assert!(
             map.is_empty(),
             "at-height snapshot failure must fall back to gossipsub"
+        );
+    }
+}
+
+// ── Issue #78: a top-ranked archive that is down ──────────────────────────────
+
+#[cfg(test)]
+mod unresolved_archive_tests {
+    use super::*;
+
+    use std::collections::BTreeSet;
+    use std::net::Ipv4Addr;
+
+    use libp2p::Multiaddr;
+    use libp2p::multiaddr::Protocol;
+    use sum_net::{Keypair, ShardRequestV2, l1_address_from_keypair};
+    use sum_types::config::{NetConfig, StoreConfig};
+
+    const DOWN: [u8; 20] = [0xD0; 20];
+    const A: [u8; 20] = [0xA1; 20];
+    const B: [u8; 20] = [0xB2; 20];
+
+    fn chunks(n: u32) -> Vec<ChunkDescriptor> {
+        (0..n)
+            .map(|i| ChunkDescriptor {
+                chunk_index: i,
+                offset: 0,
+                size: 1,
+                blake3_hash: [i as u8; 32],
+                cid: format!("bafk-78-{i}"),
+                plaintext_blake3_hash: None,
+            })
+            .collect()
+    }
+
+    fn state_for(n: u32, order: &[[u8; 20]]) -> HashMap<u32, PublicChunkState> {
+        (0..n)
+            .map(|i| {
+                (
+                    i,
+                    PublicChunkState {
+                        assigned: order.to_vec(),
+                        next_attempt_idx: 0,
+                        in_flight_to: None,
+                        done: false,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn peers(addrs: &[[u8; 20]]) -> HashMap<[u8; 20], PeerId> {
+        addrs
+            .iter()
+            .map(|a| (*a, Keypair::generate_ed25519().public().to_peer_id()))
+            .collect()
+    }
+
+    /// Within the grace period a chunk waits for its top-ranked archive,
+    /// even though the next one is identified; after it, the next
+    /// identified assigned archive is asked.
+    #[test]
+    fn a_chunk_waits_for_its_top_archive_only_within_the_grace_period() {
+        let chunks = chunks(2);
+        let state = state_for(2, &[DOWN, A, B]);
+        let p = peers(&[A, B]);
+
+        let strict = select_public_chunk_dispatches(&state, &chunks, &p, 8, false);
+        assert!(strict.is_empty(), "{strict:?}");
+        assert_eq!(unresolved_next_archives(&state, &p), vec![DOWN]);
+
+        let after = select_public_chunk_dispatches(&state, &chunks, &p, 8, true);
+        assert_eq!(after.len(), 2);
+        for d in &after {
+            assert_eq!(d.assigned_pos, 1);
+            assert_eq!(d.peer_id, p[&A]);
+        }
+    }
+
+    /// In line, the top-ranked archive is asked first once identified, with
+    /// or without the grace period over.
+    #[test]
+    fn an_identified_top_archive_is_always_asked_first() {
+        let chunks = chunks(1);
+        let state = state_for(1, &[A, B]);
+        let p = peers(&[A, B]);
+        for skip in [false, true] {
+            let d = select_public_chunk_dispatches(&state, &chunks, &p, 8, skip);
+            assert_eq!(d.len(), 1);
+            assert_eq!((d[0].assigned_pos, d[0].peer_id), (0, p[&A]));
+        }
+    }
+
+    /// No assigned archive identified: nothing is asked, before or after the
+    /// grace period, and nothing is counted as asked.
+    #[test]
+    fn nothing_is_asked_while_no_assigned_archive_is_identified() {
+        let chunks = chunks(1);
+        let state = state_for(1, &[DOWN, A]);
+        for skip in [false, true] {
+            assert!(
+                select_public_chunk_dispatches(&state, &chunks, &HashMap::new(), 8, skip)
+                    .is_empty()
+            );
+        }
+        assert_eq!(state[&0].next_attempt_idx, 0);
+    }
+
+    /// Asking an archive out of turn keeps the passed-over one in line: if
+    /// the asked archive then fails, the passed-over one is next, and the
+    /// chunk counts as exhausted only after every assigned archive was asked.
+    #[test]
+    fn a_passed_over_archive_stays_in_line() {
+        let mut order = vec![DOWN, A, B];
+        let mut next = 0;
+        let p = peers(&[A, B]);
+        let (pos, _) = next_assigned_archive(&order, next, &p, true).unwrap();
+        assert_eq!(pos, 1);
+        mark_archive_asked(&mut order, &mut next, pos);
+        assert_eq!((order.clone(), next), (vec![A, DOWN, B], 1));
+
+        // A failed. DOWN is still unidentified: strictly, wait for it;
+        // after the grace period, ask B.
+        assert_eq!(next_assigned_archive(&order, next, &p, false), None);
+        let (pos, peer) = next_assigned_archive(&order, next, &p, true).unwrap();
+        assert_eq!((pos, peer), (2, p[&B]));
+        mark_archive_asked(&mut order, &mut next, pos);
+        assert_eq!((order.clone(), next), (vec![A, B, DOWN], 2));
+
+        // B failed too; DOWN comes back and is asked last.
+        let mut p2 = p.clone();
+        p2.insert(DOWN, Keypair::generate_ed25519().public().to_peer_id());
+        let (pos, _) = next_assigned_archive(&order, next, &p2, false).unwrap();
+        assert_eq!(pos, 2);
+        mark_archive_asked(&mut order, &mut next, pos);
+        assert_eq!(next, order.len(), "every assigned archive asked once");
+        assert_eq!(next_assigned_archive(&order, next, &p2, true), None);
+    }
+
+    /// The in-flight cap still holds when chunks are asked out of turn.
+    #[test]
+    fn the_in_flight_cap_holds_after_the_grace_period() {
+        let chunks = chunks(5);
+        let state = state_for(5, &[DOWN, A]);
+        let p = peers(&[A]);
+        let d = select_public_chunk_dispatches(&state, &chunks, &p, 2, true);
+        assert_eq!(
+            d.iter().map(|d| d.chunk_index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    // ── Over real swarms on loopback ──────────────────────────────────────
+
+    const PAYLOAD: &[u8] = b"snip-78 chunk served by a lower-ranked archive";
+
+    /// An archive: a `SumNet` node on loopback, mDNS off, that answers every
+    /// V2 Pull with `PAYLOAD`. Returns its dialable TCP address and L1
+    /// address.
+    async fn archive() -> (Multiaddr, [u8; 20], tokio::task::JoinHandle<()>) {
+        let kp = Keypair::generate_ed25519();
+        let l1 = l1_address_from_keypair(&kp);
+        let peer = kp.public().to_peer_id();
+        let net = Arc::new(SumNet::new(loopback(&[]), kp).await.expect("SumNet::new"));
+        let tcp = loop {
+            match net.next_event().await.expect("archive events") {
+                SumNetEvent::Listening { addr }
+                    if !addr.iter().any(|p| matches!(p, Protocol::QuicV1)) =>
+                {
+                    break addr;
+                }
+                _ => {}
+            }
+        };
+        let serve = net.clone();
+        let task = tokio::spawn(async move {
+            while let Some(ev) = serve.next_event().await {
+                if let SumNetEvent::ShardRequestedV2 {
+                    channel_id,
+                    request: ShardRequestV2::Pull { cid, .. },
+                    ..
+                } = ev
+                {
+                    let _ = serve
+                        .respond_shard_v2(
+                            channel_id,
+                            ShardResponseV2::Data {
+                                cid,
+                                offset: 0,
+                                total_bytes: PAYLOAD.len() as u64,
+                                data: PAYLOAD.to_vec(),
+                                error: None,
+                            },
+                        )
+                        .await;
+                }
+            }
+        });
+        (tcp.with(Protocol::P2p(peer)), l1, task)
+    }
+
+    fn loopback(bootstrap: &[String]) -> NetConfig {
+        NetConfig {
+            enable_wan: true,
+            mdns: false,
+            listen_ip: Some(Ipv4Addr::LOCALHOST),
+            bootstrap_peers: bootstrap.to_vec(),
+            ..NetConfig::default()
+        }
+    }
+
+    /// Issue #78 end to end: a chunk replicated to three archives whose
+    /// top-ranked archive is down. The two others are up and identified.
+    /// The download asks the next one once the grace period is over, instead
+    /// of waiting for the down archive until the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_chunk_is_fetched_from_the_next_archive_when_the_top_one_is_down() {
+        let (addr_a, l1_a, _serve_a) = archive().await;
+        let (addr_b, l1_b, _serve_b) = archive().await;
+        let down = l1_address_from_keypair(&Keypair::generate_ed25519());
+
+        let client = SumNet::new(
+            loopback(&[addr_a.to_string(), addr_b.to_string()]),
+            Keypair::generate_ed25519(),
+        )
+        .await
+        .expect("client SumNet::new");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RwLock::new(
+            sum_store::SumStore::new(StoreConfig {
+                store_dir: dir.path().join("store"),
+                max_chunk_msg_bytes: 2 * 1024 * 1024,
+            })
+            .unwrap(),
+        ));
+        let manifest = DataManifest {
+            file_name: "issue-78.bin".into(),
+            file_hash: *blake3::hash(PAYLOAD).as_bytes(),
+            total_size_bytes: PAYLOAD.len() as u64,
+            chunk_count: 1,
+            merkle_root: [0x78; 32],
+            chunks: vec![ChunkDescriptor {
+                chunk_index: 0,
+                offset: 0,
+                size: PAYLOAD.len() as u64,
+                blake3_hash: *blake3::hash(PAYLOAD).as_bytes(),
+                cid: sum_store::cid_from_data(PAYLOAD),
+                plaintext_blake3_hash: None,
+            }],
+        };
+        let ranked = vec![down, l1_a, l1_b];
+        let view = V2AssignmentView {
+            snapshot: {
+                let mut s = ranked.clone();
+                s.sort();
+                s
+            },
+            r: 3,
+            distinct_assigned: ranked.iter().copied().collect::<BTreeSet<_>>(),
+            per_chunk_assigned: HashMap::from([(0, ranked.clone())]),
+        };
+        let peer_addresses = RwLock::new(HashMap::new());
+
+        let started = tokio::time::Instant::now();
+        let outcome = fetch_v2_public_chunks(
+            &client,
+            &store,
+            &peer_addresses,
+            &view,
+            &manifest,
+            4,
+            started + Duration::from_secs(30),
+        )
+        .await
+        .expect("the chunk is fetched from an archive that is up");
+        let took = started.elapsed();
+
+        assert_eq!(outcome.chunks_fetched, 1);
+        let served_by: Vec<[u8; 20]> = {
+            let map = peer_addresses.read().await;
+            outcome
+                .chunk_peer_attribution
+                .keys()
+                .map(|p| map[p])
+                .collect()
+        };
+        assert_eq!(
+            served_by,
+            vec![l1_a],
+            "the next archive in rank order serves it"
+        );
+        assert_eq!(
+            store
+                .read()
+                .await
+                .local
+                .get(&manifest.chunks[0].cid)
+                .unwrap(),
+            PAYLOAD
+        );
+        assert!(
+            took >= UNRESOLVED_ARCHIVE_GRACE && took < Duration::from_secs(25),
+            "waited {took:?}: the top-ranked archive is waited for only during the grace period"
         );
     }
 }
