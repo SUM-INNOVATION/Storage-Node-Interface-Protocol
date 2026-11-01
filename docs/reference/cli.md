@@ -81,6 +81,7 @@ chunks → push manifest → poll coverage → `ActivateFileV2`.
 | `--activation-wait-secs` | `300` | S4 coverage-poll wall-clock timeout. |
 | `--visibility` | `public` | `public` or `private`. `private` generates a fresh `K_file`, encrypts chunks + manifest, wraps `K_file` for each recipient. |
 | `--recipient` | — | Recipient for a Private file: `<base58 L1 addr>` or `<addr>:<expires_at_height>`. Repeatable. Rejected with `--visibility public`. |
+| `--fee-deposit` (env `SUM_FEE_DEPOSIT`) | `0` | Koppa base units locked in the file's fee pool by `RegisterFilePendingV2`. With `0` the file has no fee pool: archives earn nothing for it and the chain never challenges it (only Active files with a positive pool are challenged). `abandon` refunds 90% of it. |
 
 **Outcome and exit status.** `ingest-v2` exits 0 whenever it reaches an
 outcome, including a file left `Pending`; read the last `lifecycle:` line
