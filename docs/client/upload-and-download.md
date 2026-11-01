@@ -7,7 +7,9 @@ actually runs.
 
 The archive operator's counterpart material is in
 [`../operator/runbook.md`](../operator/runbook.md). The full CLI
-reference is in [`../reference/cli.md`](../reference/cli.md).
+reference is in [`../reference/cli.md`](../reference/cli.md). To run
+the same ingest and download from Rust, see
+[`library.md`](library.md).
 
 ## Prerequisites
 
