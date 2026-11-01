@@ -267,6 +267,13 @@ enum Command {
         /// chain state is created.
         #[arg(long = "recipient")]
         recipients: Vec<String>,
+        /// Koppa base units to lock in the file's fee pool when it is
+        /// registered (`RegisterFilePendingV2.fee_deposit`). Default `0`:
+        /// no fee pool, so archives earn nothing for the file and the
+        /// chain never challenges it (only Active files with a positive
+        /// pool are challenged). `abandon` refunds 90% of it.
+        #[arg(long, env = "SUM_FEE_DEPOSIT", default_value = "0")]
+        fee_deposit: u64,
     },
 
     /// Fetch a chunk by CID from a LAN peer.
@@ -511,6 +518,7 @@ async fn main() -> Result<()> {
             activation_wait_secs,
             visibility,
             recipients,
+            fee_deposit,
         } => {
             let seed = seed.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -539,6 +547,7 @@ async fn main() -> Result<()> {
                 activation_wait_secs,
                 visibility,
                 recipients,
+                fee_deposit,
             )
             .await
         }
@@ -1154,6 +1163,7 @@ async fn run_ingest_v2(
     activation_wait_secs: u64,
     visibility: String,
     recipient_specs: Vec<String>,
+    fee_deposit: u64,
 ) -> Result<()> {
     let l1_addr = identity::l1_address_from_keypair(&keypair);
     let rpc_early = Arc::new(L1RpcClient::new(rpc_url.clone()));
@@ -1215,6 +1225,7 @@ async fn run_ingest_v2(
         push_wait_secs: Duration::from_secs(push_wait_secs),
         manifest_push_wait_secs: Duration::from_secs(manifest_push_wait_secs),
         discovery_timeout: INGEST_DISCOVERY_TIMEOUT,
+        fee_deposit,
     };
     let params = match rpc.chain_get_chain_params().await {
         Ok(cp) => {
@@ -1246,6 +1257,7 @@ async fn run_ingest_v2(
                     max_chunk_count_per_file: 1_048_576,
                     chain_id: chain_id_arg,
                     fee_per_tx,
+                    fee_deposit: defaults.fee_deposit,
                     poll_interval: defaults.poll_interval,
                     activation_wait_secs: defaults.activation_wait_secs,
                     finality_timeout: defaults.finality_timeout,
@@ -1443,6 +1455,7 @@ async fn build_v2_ingest_params(
                     max_chunk_count_per_file: 1_048_576,
                     chain_id: chain_id_arg,
                     fee_per_tx,
+                    fee_deposit: defaults.fee_deposit,
                     poll_interval: defaults.poll_interval,
                     activation_wait_secs: defaults.activation_wait_secs,
                     finality_timeout: defaults.finality_timeout,
@@ -1529,6 +1542,8 @@ async fn run_resume_v2(
         push_wait_secs: Duration::from_secs(push_wait_secs),
         manifest_push_wait_secs: Duration::from_secs(manifest_push_wait_secs),
         discovery_timeout: INGEST_DISCOVERY_TIMEOUT,
+        // Resume never registers, so it locks no deposit.
+        fee_deposit: 0,
     };
     let params = build_v2_ingest_params(&rpc, profile, chain_id_arg, fee_per_tx, defaults).await?;
     let resolver = Arc::new(sum_node::ingest_v2::MapPeerResolver::new());
