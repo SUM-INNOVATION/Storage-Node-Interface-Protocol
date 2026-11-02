@@ -24,6 +24,7 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 - **`sum-node resume` exits non-zero unless activation completed.** Exit `0` only when the file is `Active` (`ActivateFileV2` finalized in this run, or already `Active` on chain); `3` still `Pending`; `4` `Abandoned` on chain; `5` root mismatch; `1` any error. The `lifecycle:` stdout line is unchanged. **Scripts that relied on exit 0 for a still-Pending file must adapt:** check for `0` (Active) or `3` (Pending). `ingest-v2` is unchanged.
 
 ### Documentation
+- **Small files and packing (SNIP #57 item 3).** `docs/client/batching.md`: one registration per root is a chain rule, so a caller batches small files by packing them into one file. The page gives the per-file cost from `chain_getChainParams` (two transactions at `min_fee` each, plus the caller's `fee_deposit`; nothing per byte, and `storage_fee_per_byte` is not charged on them), why a file below one 1 MiB chunk costs as much as a full chunk, and what the members of a pack share: lifecycle, visibility and access, replication, challenges and whole-file retrieval. No code or chain change.
 - **`ingest-v2` exit status.** `ingest-v2` exits 0 whenever it reaches an outcome, including a file left `Pending`; the outcome is the `lifecycle:` line on stdout. `lifecycle: Active` means `ActivateFileV2` was submitted and finalized. An error before registration prints no `lifecycle:` line. Behaviour unchanged; documented in the CLI reference.
 
 ### Not changed
