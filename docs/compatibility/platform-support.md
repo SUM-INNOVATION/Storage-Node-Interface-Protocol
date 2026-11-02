@@ -91,6 +91,15 @@ to run a long-lived archive against mainnet for the documented
 validation window. A prebuilt aarch64 tarball is a candidate for
 `v0.4.1+` once that validation lands.
 
+A static `aarch64-unknown-linux-musl` build of `sum-node` runs in
+CI ([`aarch64-musl.yml`](../../.github/workflows/aarch64-musl.yml),
+[#58](https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/issues/58))
+on pull requests that change the code. It checks that the binaries
+link statically, runs `sum-node --version`, and runs the
+`e2e-helper` tests for that target. It is a build check only: no
+aarch64 binary is published, and the install script still accepts
+only x86_64.
+
 For the full mainnet archive bring-up flow see
 [`MAINNET-BRINGUP.md`](../operator/mainnet-bringup.md).
 
