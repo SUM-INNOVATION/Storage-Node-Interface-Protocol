@@ -310,6 +310,12 @@ pub struct IngestParams {
     pub chain_id: u64,
     /// Per-tx fee in Koppa base units. Must be ≥ chain `min_fee`.
     pub fee_per_tx: u128,
+    /// Koppa base units locked into the file's fee pool by
+    /// `RegisterFilePendingV2` (issue #56). `0` registers the file with no
+    /// fee pool: archives earn nothing for it, and the chain challenges
+    /// only Active files whose pool is positive. `AbandonFileV2` refunds
+    /// 90% of it. Caller policy, never read from the chain.
+    pub fee_deposit: u64,
     /// S4 coverage poll cadence. Default 2s.
     pub poll_interval: Duration,
     /// **S4 wall-clock timeout.** Pipeline returns
@@ -364,6 +370,7 @@ impl IngestParams {
             max_chunk_count_per_file: p.max_chunk_count_per_file,
             chain_id: p.chain_id,
             fee_per_tx: p.min_fee,
+            fee_deposit: defaults.fee_deposit,
             poll_interval: defaults.poll_interval,
             activation_wait_secs: defaults.activation_wait_secs,
             finality_timeout: defaults.finality_timeout,
@@ -396,6 +403,8 @@ pub struct IngestParamsDefaults {
     pub manifest_push_wait_secs: Duration,
     /// Upper bound on each peer-discovery wait. Default 30 s.
     pub discovery_timeout: Duration,
+    /// See [`IngestParams::fee_deposit`]. Default `0`.
+    pub fee_deposit: u64,
 }
 
 impl Default for IngestParamsDefaults {
@@ -408,6 +417,7 @@ impl Default for IngestParamsDefaults {
             push_wait_secs: Duration::from_secs(60),
             manifest_push_wait_secs: Duration::from_secs(30),
             discovery_timeout: Duration::from_secs(30),
+            fee_deposit: 0,
         }
     }
 }
@@ -1546,7 +1556,7 @@ where
             manifest.total_size_bytes,
             stored_size_bytes,
             manifest.chunk_count,
-            0, // fee_deposit; W10b CLI may parameterize
+            self.params.fee_deposit,
             visibility,
             initial_access,
         )?;
@@ -3271,6 +3281,7 @@ mod tests {
             push_wait_secs: Duration::from_millis(500),
             manifest_push_wait_secs: Duration::from_millis(500),
             discovery_timeout: Duration::from_millis(300),
+            fee_deposit: 0,
         }
     }
 
@@ -3281,6 +3292,7 @@ mod tests {
             max_chunk_count_per_file: 1_048_576,
             chain_id: 31337,
             fee_per_tx: 1_000,
+            fee_deposit: d.fee_deposit,
             poll_interval: d.poll_interval,
             activation_wait_secs: d.activation_wait_secs,
             finality_timeout: d.finality_timeout,
@@ -3493,6 +3505,65 @@ mod tests {
                 assert!(source.to_string().contains("visibility/bundle mismatch"));
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// Issue #56: the registration locks the caller's fee deposit, and the
+    /// default stays 0.
+    #[tokio::test]
+    async fn the_register_tx_carries_the_configured_fee_deposit() {
+        use sumchain_wire::storage_metadata::StorageMetadataOperationV2;
+        use sumchain_wire::transaction::{SignedTransaction, TxInner, TxPayload};
+
+        for (deposit, expected) in [(None, 0u64), (Some(777_000u64), 777_000)] {
+            let bytes = vec![0xAB; 1_048_576];
+            let (_dir, path) = write_test_file(&bytes);
+            let snapshot = five_archives();
+            let my_addr = snapshot[0];
+            let rpc = Arc::new(MockRpc::default());
+            rpc.set_nonce(&l1_address_base58(&my_addr), 5);
+            // Stop right after the registration is signed and sent.
+            rpc.enqueue_send_err("stop after the registration is captured");
+            rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+            let arch_to_peer: HashMap<_, _> = snapshot.iter().map(|a| (*a, fake_peer())).collect();
+            let mut defaults = defaults_for_tests();
+            if let Some(d) = deposit {
+                defaults.fee_deposit = d;
+            }
+            let pipeline = build_pipeline(
+                rpc.clone(),
+                Arc::new(MockNet::new()),
+                arch_to_peer,
+                my_addr,
+                params_for_test(defaults),
+            );
+            let outcome = pipeline.run(&path).await;
+            assert!(
+                matches!(
+                    outcome,
+                    IngestOutcome::Failed {
+                        stage: IngestStage::Register,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+
+            let sent = rpc.sent_txs.lock().unwrap().clone();
+            assert_eq!(sent.len(), 1, "only the registration was signed");
+            let signed = SignedTransaction::from_hex(&sent[0]).unwrap();
+            let TxInner::V2(tx) = &signed.inner else {
+                panic!("the builder emits V2");
+            };
+            match &tx.payload {
+                TxPayload::StorageMetadataV2(d) => match &d.operation {
+                    StorageMetadataOperationV2::RegisterFilePendingV2 { fee_deposit, .. } => {
+                        assert_eq!(*fee_deposit, expected, "deposit {deposit:?}")
+                    }
+                    other => panic!("expected RegisterFilePendingV2, got {other:?}"),
+                },
+                other => panic!("expected a StorageMetadataV2 payload, got {other:?}"),
+            }
         }
     }
 
