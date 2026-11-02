@@ -62,15 +62,34 @@ With `ingest_private`, that copy is the **plaintext**.
 
 The return value is the pipeline's `IngestOutcome`, unchanged:
 `Activated`, `PendingNeedsAction` (the file is registered and must be
-resumed or abandoned) or `Failed` (nothing was registered). The
-accessors read the manifest and root from any variant:
+resumed or abandoned) or `Failed`. The accessors read the manifest
+and root from any variant:
 
 - `manifest()` is the manifest built from the input. It is `None`
   only when the call failed before chunking (for example a bad
   `file_name`, `R = 0`, V2 not enabled on the chain).
 - `merkle_root()` is `manifest().merkle_root`: the root the file is,
   or would have been, registered under. It is present on a `Failed`
-  outcome after chunking, when nothing is on chain.
+  outcome after chunking.
+
+**`Failed` does not always mean nothing is on chain.** A `Register`
+failure before the registration is sent leaves nothing on chain. After
+it is sent, a finality timeout or a failed status query also returns
+`Failed { stage: Register, .. }`, yet the registration can still
+finalize later and leave the file `Pending`, with its fee deposit
+locked. Before retrying such an outcome, look up `merkle_root()` on
+chain (`storage_getFileInfoV2`). If the row exists, finish it with
+`resume` or `abandon` (below) instead of ingesting again.
+
+### Fee deposit
+
+`IngestParams::fee_deposit` is the Koppa, in base units, locked in the
+file's fee pool at registration: the CLI's `--fee-deposit`, or
+`SUM_FEE_DEPOSIT`. `IngestParamsDefaults::default()`, used in the
+example above, sets it to `0`. A file with no fee pool is never
+challenged, so archives earn nothing for it. To lock a deposit, pass
+`IngestParamsDefaults { fee_deposit, ..Default::default() }` to
+`IngestParams::from_chain_params`. The owner's balance must cover it.
 
 For a Private file the root is over the ciphertext under a fresh key,
 so it differs on every call and is known only after `ingest_private`
@@ -109,8 +128,11 @@ row", as in the CLI.
   CLI's `--max-concurrent` and `--download-timeout-secs`.
 - Public and legacy downloads go through the local chunk store
   (`store_dir`, resolved like `--store-dir`), hold its lease for the
-  call, and leave the fetched chunks in it. A running archive node
-  holds that lease, so use a separate store directory beside one.
+  call, and leave the fetched chunks in it. One holder at a time: while
+  a running archive node, or another Public or legacy download with the
+  same `store_dir` (the default included), holds the lease, the call
+  fails with `StoreRootBusy`. Give concurrent downloads, and downloads
+  beside an archive node, separate store directories.
 - `download_to_bytes` downloads into a temporary directory and reads
   the file back: the whole file is held in memory, and for a Private
   file the plaintext is on disk until the call returns.

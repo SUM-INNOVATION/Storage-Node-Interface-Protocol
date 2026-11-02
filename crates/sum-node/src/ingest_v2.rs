@@ -180,10 +180,15 @@ pub enum IngestOutcome {
         actual: [u8; 32],
         manifest: DataManifest,
     },
-    /// `RegisterFilePendingV2` itself never finalized. No chain state
-    /// was created — caller can rebuild a fresh tx (new nonce) and
-    /// retry. Manifest is included so the caller doesn't have to
-    /// re-chunk.
+    /// `RegisterFilePendingV2` was not seen to finalize (the pipeline
+    /// returns this only at [`IngestStage::Register`]). Manifest is
+    /// included so the caller doesn't have to re-chunk.
+    ///
+    /// This does not prove that nothing is on chain. If the registration
+    /// was broadcast and its finality wait timed out or a status query
+    /// failed, it can still finalize and leave the file `Pending`, with
+    /// its deposit locked. Look the root up on chain before retrying; if
+    /// it is registered, `resume` or `abandon` it.
     Failed {
         stage: IngestStage,
         manifest: Option<DataManifest>,
@@ -259,7 +264,8 @@ impl IngestOutcome {
     /// The merkle root of the input: `manifest().merkle_root`, the root the
     /// file is (or would be) registered under on chain. Present whenever
     /// [`Self::manifest`] is, including a [`IngestOutcome::Failed`] after
-    /// chunking, when nothing was registered.
+    /// chunking. After a `Failed` at [`IngestStage::Register`], check this
+    /// root on chain before retrying (see [`IngestOutcome::Failed`]).
     pub fn merkle_root(&self) -> Option<[u8; 32]> {
         self.manifest().map(|m| m.merkle_root)
     }
@@ -7422,6 +7428,59 @@ mod tests {
                 "root over the ciphertext chunk hashes"
             );
             assert_eq!(rpc.sent_txs.lock().unwrap().len(), 1);
+        }
+
+        /// `Failed { stage: Register }` after the registration was sent: its
+        /// finality wait times out, yet the tx may still finalize. This is
+        /// why the docs tell a caller to check `merkle_root()` on chain
+        /// before retrying a `Failed` outcome.
+        #[tokio::test]
+        async fn failed_at_register_can_follow_a_broadcast_registration() {
+            let snapshot = five_archives();
+            let my_addr = snapshot[0];
+            let rpc = Arc::new(MockRpc::default());
+            rpc.set_nonce(&l1_address_base58(&my_addr), 5);
+            rpc.enqueue_send("0xtx-register");
+            for _ in 0..2000 {
+                rpc.enqueue_status(TxStatusV2::Included { block_height: 100 });
+            }
+            rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+            let arch_to_peer: HashMap<_, _> = snapshot.iter().map(|a| (*a, fake_peer())).collect();
+            let mut d = defaults_for_tests();
+            d.finality_timeout = Duration::from_millis(100);
+            let pipeline = build_pipeline(
+                rpc.clone(),
+                Arc::new(MockNet::new()),
+                arch_to_peer,
+                my_addr,
+                params_for_test(d),
+            );
+            let bytes = vec![0xABu8; 1_048_576 + 1];
+
+            let outcome = pipeline
+                .ingest(IngestInput::Bytes {
+                    file_name: "pack.bin",
+                    data: &bytes,
+                })
+                .await;
+
+            assert!(
+                matches!(
+                    outcome,
+                    IngestOutcome::Failed {
+                        stage: IngestStage::Register,
+                        manifest: Some(_),
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert!(outcome.merkle_root().is_some());
+            assert_eq!(
+                rpc.sent_txs.lock().unwrap().len(),
+                1,
+                "the registration was broadcast"
+            );
         }
     }
 }

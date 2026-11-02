@@ -595,8 +595,31 @@ mod tests {
         })
     }
 
+    /// A network config whose listener cannot bind: TEST-NET-3 is never an
+    /// address of this host. A download that started its network node
+    /// with it would fail with the bind error.
+    fn unbindable_net() -> NetConfig {
+        NetConfig {
+            mdns: false,
+            listen_ip: Some(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+            ..NetConfig::default()
+        }
+    }
+
+    /// Control for the refusal tests below: [`unbindable_net`] really stops
+    /// `SumNet::new`, so reaching the network first would change their error.
+    #[tokio::test]
+    async fn an_unbindable_net_config_cannot_start_a_network_node() {
+        assert!(
+            SumNet::new(unbindable_net(), Keypair::generate_ed25519())
+                .await
+                .is_err()
+        );
+    }
+
     /// A Private file without a seed is refused after the one chain lookup,
-    /// before any network or store is touched.
+    /// before any network or store is touched: with [`unbindable_net`], a
+    /// network node started first would fail with its bind error instead.
     #[tokio::test]
     async fn download_private_file_without_seed_is_refused_before_networking() {
         let root = [0x22u8; 32];
@@ -605,10 +628,8 @@ mod tests {
             MockResponse::Result(file_row(root, 1)),
         )]))
         .await;
-        let config = DownloadConfig::ephemeral(
-            Arc::new(L1RpcClient::new(server.url())),
-            NetConfig::default(),
-        );
+        let config =
+            DownloadConfig::ephemeral(Arc::new(L1RpcClient::new(server.url())), unbindable_net());
         let out = tempfile::tempdir().unwrap();
         let output = out.path().join("out.bin");
 
@@ -632,15 +653,49 @@ mod tests {
             MockResponse::Result(file_row(root, 7)),
         )]))
         .await;
-        let config = DownloadConfig::ephemeral(
-            Arc::new(L1RpcClient::new(server.url())),
-            NetConfig::default(),
-        );
+        let config =
+            DownloadConfig::ephemeral(Arc::new(L1RpcClient::new(server.url())), unbindable_net());
         let out = tempfile::tempdir().unwrap();
         let err = download_to_path(&config, root, &out.path().join("out.bin"))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("visibility = 7"), "{err}");
         assert_eq!(server.requests().len(), 1, "only the V2 row lookup");
+    }
+
+    /// A failed V2-row lookup counts as "no V2 row" and takes the legacy
+    /// path, as in the CLI: the download gets past routing, the network
+    /// node and the store, and stops at the legacy path's first chain call
+    /// (`chain_getChainParams`, which this mock does not serve).
+    #[tokio::test]
+    async fn a_failed_v2_row_lookup_falls_back_to_the_legacy_path() {
+        for (label, response) in [
+            ("json-rpc error", MockResponse::error("boom")),
+            ("hangup", MockResponse::Hangup),
+        ] {
+            let root = [0x44u8; 32];
+            let server = start_mock_rpc(routes([("storage_getFileInfoV2", response)])).await;
+            let mut config = DownloadConfig::ephemeral(
+                Arc::new(L1RpcClient::new(server.url())),
+                NetConfig {
+                    mdns: false,
+                    listen_ip: Some(std::net::Ipv4Addr::LOCALHOST),
+                    ..NetConfig::default()
+                },
+            );
+            let store = tempfile::tempdir().unwrap();
+            config.store_dir = Some(store.path().to_path_buf());
+            let out = tempfile::tempdir().unwrap();
+
+            let err = download_to_path(&config, root, &out.path().join("out.bin"))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("chain_getChainParams failed"),
+                "{label}: {err:#}"
+            );
+            assert_eq!(server.method_count("storage_getFileInfoV2"), 1, "{label}");
+            assert_eq!(server.method_count("chain_getChainParams"), 1, "{label}");
+        }
     }
 }
