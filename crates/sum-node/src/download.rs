@@ -117,6 +117,19 @@ impl DownloadOrchestrator {
         store: Arc<RwLock<sum_store::SumStore>>,
         peer_addresses: Arc<RwLock<HashMap<PeerId, [u8; 20]>>>,
     ) -> Result<DownloadResult> {
+        self.run_with_manifest(net, store, peer_addresses)
+            .await
+            .map(|(result, _manifest)| result)
+    }
+
+    /// [`Self::run`], also returning the manifest the output was assembled
+    /// from. The library interface ([`crate::client`]) reports it.
+    pub(crate) async fn run_with_manifest(
+        self,
+        net: Arc<SumNet>,
+        store: Arc<RwLock<sum_store::SumStore>>,
+        peer_addresses: Arc<RwLock<HashMap<PeerId, [u8; 20]>>>,
+    ) -> Result<(DownloadResult, DataManifest)> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let started_at = SystemTime::now();
 
@@ -312,16 +325,19 @@ impl DownloadOrchestrator {
         if manifest.chunk_count == 0 {
             std::fs::File::create(&self.output_path)?;
             info!(output = %self.output_path.display(), "wrote empty file");
-            return Ok(DownloadResult {
-                chunks_fetched: 0,
-                chunks_skipped: 0,
-                total_bytes: 0,
-                merkle_verified: true,
-                chunk_peer_attribution: HashMap::new(),
-                peers_contacted: HashSet::new(),
-                started_at,
-                completed_at: SystemTime::now(),
-            });
+            return Ok((
+                DownloadResult {
+                    chunks_fetched: 0,
+                    chunks_skipped: 0,
+                    total_bytes: 0,
+                    merkle_verified: true,
+                    chunk_peer_attribution: HashMap::new(),
+                    peers_contacted: HashSet::new(),
+                    started_at,
+                    completed_at: SystemTime::now(),
+                },
+                manifest,
+            ));
         }
 
         // Store the manifest so we can read chunks back for assembly
@@ -363,19 +379,21 @@ impl DownloadOrchestrator {
         if total_to_fetch == 0 {
             // All chunks already on disk — skip to assembly. No network
             // fetches happened, so peer attribution is empty.
-            return self
-                .assemble(&store, &manifest)
-                .await
-                .map(|total_bytes| DownloadResult {
-                    chunks_fetched: 0,
-                    chunks_skipped,
-                    total_bytes,
-                    merkle_verified: true,
-                    chunk_peer_attribution: HashMap::new(),
-                    peers_contacted: HashSet::new(),
-                    started_at,
-                    completed_at: SystemTime::now(),
-                });
+            return self.assemble(&store, &manifest).await.map(|total_bytes| {
+                (
+                    DownloadResult {
+                        chunks_fetched: 0,
+                        chunks_skipped,
+                        total_bytes,
+                        merkle_verified: true,
+                        chunk_peer_attribution: HashMap::new(),
+                        peers_contacted: HashSet::new(),
+                        started_at,
+                        completed_at: SystemTime::now(),
+                    },
+                    manifest,
+                )
+            });
         }
 
         // Build a peer map for chunk routing: try to use assignment
@@ -538,16 +556,19 @@ impl DownloadOrchestrator {
         // ── Phase 4: Assemble ────────────────────────────────────────────
         let total_bytes = self.assemble(&store, &manifest).await?;
 
-        Ok(DownloadResult {
-            chunks_fetched,
-            chunks_skipped,
-            total_bytes,
-            merkle_verified: true,
-            chunk_peer_attribution,
-            peers_contacted,
-            started_at,
-            completed_at: SystemTime::now(),
-        })
+        Ok((
+            DownloadResult {
+                chunks_fetched,
+                chunks_skipped,
+                total_bytes,
+                merkle_verified: true,
+                chunk_peer_attribution,
+                peers_contacted,
+                started_at,
+                completed_at: SystemTime::now(),
+            },
+            manifest,
+        ))
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -723,6 +744,20 @@ impl DownloadOrchestrator {
         peer_addresses: Arc<RwLock<HashMap<PeerId, [u8; 20]>>>,
         info: StorageFileInfoV2,
     ) -> Result<DownloadResult> {
+        self.run_v2_public_with_manifest(net, store, peer_addresses, info)
+            .await
+            .map(|(result, _manifest)| result)
+    }
+
+    /// [`Self::run_v2_public`], also returning the manifest the output was
+    /// assembled from. The library interface ([`crate::client`]) reports it.
+    pub(crate) async fn run_v2_public_with_manifest(
+        self,
+        net: Arc<SumNet>,
+        store: Arc<RwLock<sum_store::SumStore>>,
+        peer_addresses: Arc<RwLock<HashMap<PeerId, [u8; 20]>>>,
+        info: StorageFileInfoV2,
+    ) -> Result<(DownloadResult, DataManifest)> {
         let started_at = SystemTime::now();
         let deadline = tokio::time::Instant::now() + self.timeout;
 
@@ -766,16 +801,19 @@ impl DownloadOrchestrator {
         if manifest.chunk_count == 0 {
             std::fs::File::create(&self.output_path)?;
             info!(output = %self.output_path.display(), "wrote empty file");
-            return Ok(DownloadResult {
-                chunks_fetched: 0,
-                chunks_skipped: 0,
-                total_bytes: 0,
-                merkle_verified: true,
-                chunk_peer_attribution: HashMap::new(),
-                peers_contacted: HashSet::new(),
-                started_at,
-                completed_at: SystemTime::now(),
-            });
+            return Ok((
+                DownloadResult {
+                    chunks_fetched: 0,
+                    chunks_skipped: 0,
+                    total_bytes: 0,
+                    merkle_verified: true,
+                    chunk_peer_attribution: HashMap::new(),
+                    peers_contacted: HashSet::new(),
+                    started_at,
+                    completed_at: SystemTime::now(),
+                },
+                manifest,
+            ));
         }
 
         // Persist the manifest in the local store so `assemble` can
@@ -807,16 +845,19 @@ impl DownloadOrchestrator {
         // ── Phase 4: assemble + verify ──────────────────────────────
         let total_bytes = self.assemble(&store, &manifest).await?;
 
-        Ok(DownloadResult {
-            chunks_fetched: fetch_outcome.chunks_fetched,
-            chunks_skipped: fetch_outcome.chunks_skipped,
-            total_bytes,
-            merkle_verified: true,
-            chunk_peer_attribution: fetch_outcome.chunk_peer_attribution,
-            peers_contacted: fetch_outcome.peers_contacted,
-            started_at,
-            completed_at: SystemTime::now(),
-        })
+        Ok((
+            DownloadResult {
+                chunks_fetched: fetch_outcome.chunks_fetched,
+                chunks_skipped: fetch_outcome.chunks_skipped,
+                total_bytes,
+                merkle_verified: true,
+                chunk_peer_attribution: fetch_outcome.chunk_peer_attribution,
+                peers_contacted: fetch_outcome.peers_contacted,
+                started_at,
+                completed_at: SystemTime::now(),
+            },
+            manifest,
+        ))
     }
 
     /// Read all chunks in order, concatenate, write to output file.

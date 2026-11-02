@@ -127,6 +127,9 @@ Key entry points:
   the `find_my_access_entry` helper used on the read path.
 - `download`, `download_private`, `download_v2_routing`,
   `download_route` — file retrieval, split by public/private + V1/V2.
+- `client` — the supported library interface over ingest and
+  download: a path or bytes in, the manifest and merkle root out. See
+  [`../client/library.md`](../client/library.md).
 - `upload::UploadOrchestrator` — V1 upload path (still used by V1
   `ingest`).
 - `assignment_attestor` — the `AcceptAssignmentV2` submitter run

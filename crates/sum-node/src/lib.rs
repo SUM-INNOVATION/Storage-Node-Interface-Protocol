@@ -1,8 +1,11 @@
 //! Shared library modules for the sum-node binary and e2e-helper.
+//!
+//! [`client`] is the supported library interface for ingest and download.
 
 pub mod access;
 pub mod acl;
 pub mod assignment_attestor;
+pub mod client;
 pub mod download;
 pub mod download_private;
 pub mod download_route;

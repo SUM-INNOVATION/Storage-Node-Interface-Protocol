@@ -180,10 +180,15 @@ pub enum IngestOutcome {
         actual: [u8; 32],
         manifest: DataManifest,
     },
-    /// `RegisterFilePendingV2` itself never finalized. No chain state
-    /// was created — caller can rebuild a fresh tx (new nonce) and
-    /// retry. Manifest is included so the caller doesn't have to
-    /// re-chunk.
+    /// `RegisterFilePendingV2` was not seen to finalize (the pipeline
+    /// returns this only at [`IngestStage::Register`]). Manifest is
+    /// included so the caller doesn't have to re-chunk.
+    ///
+    /// This does not prove that nothing is on chain. If the registration
+    /// was broadcast and its finality wait timed out or a status query
+    /// failed, it can still finalize and leave the file `Pending`, with
+    /// its deposit locked. Look the root up on chain before retrying; if
+    /// it is registered, `resume` or `abandon` it.
     Failed {
         stage: IngestStage,
         manifest: Option<DataManifest>,
@@ -237,6 +242,32 @@ impl IngestOutcome {
             IngestOutcome::RootMismatch { .. } => resume_exit::ROOT_MISMATCH,
             IngestOutcome::Failed { .. } => resume_exit::ERROR,
         }
+    }
+
+    /// The manifest of the input, built when the input was chunked (for a
+    /// Private file: over the ciphertext, with plaintext `file_hash` and
+    /// `total_size_bytes`). `None` only for a [`IngestOutcome::Failed`]
+    /// that stopped before chunking. For [`IngestOutcome::RootMismatch`] it
+    /// is the manifest of the file passed to `resume`.
+    pub fn manifest(&self) -> Option<&DataManifest> {
+        match self {
+            IngestOutcome::Activated { manifest, .. }
+            | IngestOutcome::ActivatedOnChain { manifest, .. }
+            | IngestOutcome::ResumedActivated { manifest, .. }
+            | IngestOutcome::AbandonedOnChain { manifest, .. }
+            | IngestOutcome::RootMismatch { manifest, .. }
+            | IngestOutcome::PendingNeedsAction { manifest, .. } => Some(manifest),
+            IngestOutcome::Failed { manifest, .. } => manifest.as_ref(),
+        }
+    }
+
+    /// The merkle root of the input: `manifest().merkle_root`, the root the
+    /// file is (or would be) registered under on chain. Present whenever
+    /// [`Self::manifest`] is, including a [`IngestOutcome::Failed`] after
+    /// chunking. After a `Failed` at [`IngestStage::Register`], check this
+    /// root on chain before retrying (see [`IngestOutcome::Failed`]).
+    pub fn merkle_root(&self) -> Option<[u8; 32]> {
+        self.manifest().map(|m| m.merkle_root)
     }
 }
 
@@ -361,14 +392,22 @@ impl IngestParams {
 
 /// Wall-clock + retry knobs supplied separately from chain params —
 /// these stay caller-tunable even when the rest comes from the chain.
+/// Each field fills the [`IngestParams`] field of the same name.
 #[derive(Debug, Clone, Copy)]
 pub struct IngestParamsDefaults {
+    /// Coverage and finality poll cadence. Default 2 s.
     pub poll_interval: Duration,
+    /// S4 coverage wait before the file is left `Pending`. Default 120 s.
     pub activation_wait_secs: Duration,
+    /// Finality wait per transaction (S1, S5). Default 60 s.
     pub finality_timeout: Duration,
+    /// Push retries per `(chunk, peer)`. Default 2.
     pub push_retries: u32,
+    /// S2 chunk-push wait. Default 60 s.
     pub push_wait_secs: Duration,
+    /// S3 manifest-push wait. Default 30 s.
     pub manifest_push_wait_secs: Duration,
+    /// Upper bound on each peer-discovery wait. Default 30 s.
     pub discovery_timeout: Duration,
     /// See [`IngestParams::fee_deposit`]. Default `0`.
     pub fee_deposit: u64,
@@ -549,6 +588,7 @@ pub struct MapPeerResolver {
 }
 
 impl MapPeerResolver {
+    /// An empty resolver; the pipeline fills it from identify events.
     pub fn new() -> Self {
         Self::default()
     }
@@ -879,6 +919,11 @@ fn eligible_archive_addresses(raw: Vec<NodeRecordInfo>) -> Result<Vec<[u8; 20]>>
 
 // ── Pipeline ────────────────────────────────────────────────────────────────
 
+/// The owner-side V2 ingest pipeline (S0–S6, see the module docs), plus
+/// `resume` and `abandon` for files it left `Pending`. Generic over the
+/// chain client, the network and the peer resolver; production uses
+/// `L1RpcClient`, `SumNet` and [`MapPeerResolver`]. The path / byte-slice
+/// entry points are in [`crate::client`].
 pub struct IngestPipeline<R, N, P>
 where
     R: V2IngestRpc + 'static,
@@ -903,6 +948,10 @@ where
     N: V2IngestNet + 'static,
     P: PeerResolver + 'static,
 {
+    /// Build a pipeline that signs with `signing_key_seed` as the account
+    /// `my_addr` (the L1 address of that seed's key). `params` usually come
+    /// from [`IngestParams::from_chain_params`]. Run one operation at a
+    /// time per pipeline: each reads the network's event stream.
     pub fn new(
         rpc: Arc<R>,
         net: Arc<N>,
@@ -7090,6 +7139,348 @@ mod tests {
                 "pushed to the reachable two"
             );
             assert_eq!(sent(&rpc), 0, "no activation");
+        }
+    }
+
+    // ── Library interface (`crate::client`, SNIP #57 item 1) ────────────
+    //
+    // `IngestPipeline::ingest` / `ingest_private` over the mocks above.
+    // Staging details and the download half are tested in `client.rs`.
+    mod library_interface {
+        use super::*;
+        use crate::client::IngestInput;
+
+        /// A pipeline scripted to register, push and activate a file with
+        /// `merkle_root` and `chunk_count` chunks (R = 5, five archives).
+        async fn activating_pipeline(
+            merkle_root: [u8; 32],
+            chunk_count: u32,
+        ) -> (IngestPipeline<MockRpc, MockNet, StaticPeers>, Arc<MockNet>) {
+            let snapshot = five_archives();
+            let my_addr = snapshot[0];
+            let peers: Vec<PeerId> = (0..5).map(|_| fake_peer()).collect();
+            let arch_to_peer: HashMap<_, _> = snapshot
+                .iter()
+                .copied()
+                .zip(peers.iter().copied())
+                .collect();
+            let rpc = Arc::new(MockRpc::default());
+            rpc.set_nonce(&l1_address_base58(&my_addr), 1);
+            rpc.enqueue_send("0xtx-register");
+            rpc.enqueue_status(TxStatusV2::Finalized { block_height: 100 });
+            rpc.enqueue_send("0xtx-activate");
+            rpc.enqueue_status(TxStatusV2::Finalized { block_height: 200 });
+            rpc.enqueue_coverage(coverage_active(chunk_count, true));
+            rpc.add_file(
+                &format!("0x{}", hex::encode(merkle_root)),
+                pending_file_info(&merkle_root, chunk_count, 50),
+            );
+            rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+            let net = Arc::new(MockNet::new());
+            ack_chunks_for_all(&net, merkle_root, chunk_count, &peers).await;
+            ack_manifest_for_all(&net, merkle_root, &peers).await;
+            let pipeline = build_pipeline(
+                rpc,
+                net.clone(),
+                arch_to_peer,
+                my_addr,
+                params_for_test(defaults_for_tests()),
+            );
+            (pipeline, net)
+        }
+
+        /// A pipeline whose `RegisterFilePendingV2` is rejected (S1a
+        /// passes). Returns the mock so tests can count transactions.
+        fn register_rejecting_pipeline(
+            reason: &str,
+        ) -> (IngestPipeline<MockRpc, MockNet, StaticPeers>, Arc<MockRpc>) {
+            let snapshot = five_archives();
+            let my_addr = snapshot[0];
+            let rpc = Arc::new(MockRpc::default());
+            rpc.set_nonce(&l1_address_base58(&my_addr), 5);
+            rpc.enqueue_send_err(reason);
+            rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+            let arch_to_peer: HashMap<_, _> = snapshot.iter().map(|a| (*a, fake_peer())).collect();
+            let pipeline = build_pipeline(
+                rpc.clone(),
+                Arc::new(MockNet::new()),
+                arch_to_peer,
+                my_addr,
+                params_for_test(defaults_for_tests()),
+            );
+            (pipeline, rpc)
+        }
+
+        fn activated_root(outcome: &IngestOutcome) -> [u8; 32] {
+            match outcome {
+                IngestOutcome::Activated {
+                    merkle_root,
+                    manifest,
+                    register_height,
+                    activate_height,
+                    ..
+                } => {
+                    assert_eq!(*register_height, 100);
+                    assert_eq!(*activate_height, 200);
+                    assert_eq!(manifest.merkle_root, *merkle_root);
+                    *merkle_root
+                }
+                other => panic!("expected Activated, got {other:?}"),
+            }
+        }
+
+        fn cbor(manifest: &DataManifest) -> Vec<u8> {
+            let mut out = Vec::new();
+            ciborium::ser::into_writer(manifest, &mut out).unwrap();
+            out
+        }
+
+        #[tokio::test]
+        async fn ingest_path_activates_and_reports_manifest_and_root() {
+            let bytes = vec![0xC3u8; 2 * 1_048_576 + 5]; // 3 chunks
+            let (_dir, path) = write_test_file(&bytes);
+            let (_mmap, expected) = BinaryChunker::chunk_file(&path).unwrap();
+            let (pipeline, net) =
+                activating_pipeline(expected.merkle_root, expected.chunk_count).await;
+
+            let outcome = pipeline.ingest(IngestInput::Path(&path)).await;
+
+            assert_eq!(activated_root(&outcome), expected.merkle_root);
+            assert_eq!(outcome.merkle_root(), Some(expected.merkle_root));
+            let manifest = outcome
+                .manifest()
+                .expect("an activated outcome has a manifest");
+            assert_eq!(manifest.file_name, "ingest.bin");
+            assert_eq!(manifest.chunk_count, 3);
+            assert_eq!(manifest.total_size_bytes, bytes.len() as u64);
+            assert_eq!(net.push_count(), 3 * 5, "3 chunks to 5 archives");
+            assert_eq!(net.manifest_push_count(), 5);
+        }
+
+        /// Bytes named like the file produce the same root and the same
+        /// manifest bytes (what S3 pushes) as ingesting the file.
+        #[tokio::test]
+        async fn ingest_bytes_matches_the_equivalent_file() {
+            let bytes: Vec<u8> = (0..(2 * 1_048_576 + 5)).map(|i| (i % 251) as u8).collect();
+            let (_dir, path) = write_test_file(&bytes);
+            let (_mmap, expected) = BinaryChunker::chunk_file(&path).unwrap();
+
+            let (from_path, _) =
+                activating_pipeline(expected.merkle_root, expected.chunk_count).await;
+            let path_outcome = from_path.ingest(IngestInput::Path(&path)).await;
+            let (from_bytes, net) =
+                activating_pipeline(expected.merkle_root, expected.chunk_count).await;
+            let bytes_outcome = from_bytes
+                .ingest(IngestInput::Bytes {
+                    file_name: "ingest.bin",
+                    data: &bytes,
+                })
+                .await;
+
+            assert_eq!(activated_root(&path_outcome), expected.merkle_root);
+            assert_eq!(activated_root(&bytes_outcome), expected.merkle_root);
+            assert_eq!(bytes_outcome.merkle_root(), path_outcome.merkle_root());
+            assert_eq!(
+                cbor(bytes_outcome.manifest().unwrap()),
+                cbor(path_outcome.manifest().unwrap()),
+                "identical manifests"
+            );
+            assert_eq!(net.push_count(), 3 * 5);
+        }
+
+        /// The root does not depend on the name; the manifest's
+        /// `file_name` is the name given.
+        #[tokio::test]
+        async fn ingest_bytes_root_is_independent_of_the_file_name() {
+            let bytes = vec![0x7Eu8; 1_048_576 + 1];
+            let (_dir, path) = write_test_file(&bytes);
+            let (_mmap, expected) = BinaryChunker::chunk_file(&path).unwrap();
+            let (pipeline, _) =
+                activating_pipeline(expected.merkle_root, expected.chunk_count).await;
+
+            let outcome = pipeline
+                .ingest(IngestInput::Bytes {
+                    file_name: "episode-0017.bin",
+                    data: &bytes,
+                })
+                .await;
+
+            assert_eq!(activated_root(&outcome), expected.merkle_root);
+            assert_eq!(outcome.manifest().unwrap().file_name, "episode-0017.bin");
+        }
+
+        /// Error path: input that cannot be staged fails before any RPC
+        /// that costs anything; no transaction, no manifest, no root.
+        #[tokio::test]
+        async fn ingest_bytes_with_unusable_file_name_fails_before_any_transaction() {
+            for bad in ["", "..", "a/b", "/etc/passwd"] {
+                let (pipeline, rpc) = register_rejecting_pipeline("must not be reached");
+                let outcome = pipeline
+                    .ingest(IngestInput::Bytes {
+                        file_name: bad,
+                        data: b"payload",
+                    })
+                    .await;
+                match &outcome {
+                    IngestOutcome::Failed {
+                        stage,
+                        manifest,
+                        source,
+                    } => {
+                        assert_eq!(*stage, IngestStage::Register);
+                        assert!(manifest.is_none());
+                        assert!(
+                            source.to_string().contains("not a plain file name"),
+                            "{bad:?}: {source}"
+                        );
+                    }
+                    other => panic!("{bad:?}: expected Failed, got {other:?}"),
+                }
+                assert!(outcome.manifest().is_none());
+                assert_eq!(outcome.merkle_root(), None);
+                assert!(rpc.sent_txs.lock().unwrap().is_empty(), "{bad:?}: no tx");
+            }
+        }
+
+        /// Error path: registration rejected. Nothing is on chain, but the
+        /// caller still gets the manifest and the root.
+        #[tokio::test]
+        async fn ingest_bytes_register_failure_still_reports_manifest_and_root() {
+            let bytes = vec![0xABu8; 1_048_576 + 1];
+            let (_dir, path) = write_test_file(&bytes);
+            let (_mmap, expected) = BinaryChunker::chunk_file(&path).unwrap();
+            let (pipeline, rpc) =
+                register_rejecting_pipeline("RegisterFilePendingV2 rejected: insufficient balance");
+
+            let outcome = pipeline
+                .ingest(IngestInput::Bytes {
+                    file_name: "episode.bin",
+                    data: &bytes,
+                })
+                .await;
+
+            match &outcome {
+                IngestOutcome::Failed { stage, source, .. } => {
+                    assert_eq!(*stage, IngestStage::Register);
+                    assert!(source.to_string().contains("insufficient balance"));
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+            assert_eq!(outcome.merkle_root(), Some(expected.merkle_root));
+            assert_eq!(outcome.manifest().unwrap().file_name, "episode.bin");
+            assert_eq!(
+                rpc.sent_txs.lock().unwrap().len(),
+                1,
+                "one register attempt"
+            );
+        }
+
+        /// Private bytes: the manifest carries the given name and the
+        /// plaintext size and hash; the root is the ciphertext's.
+        #[tokio::test]
+        async fn ingest_private_bytes_reports_the_encrypted_manifest() {
+            let my_addr = five_archives()[0];
+            // `build_pipeline` signs with seed [42; 32].
+            let (_sk, owner_pk) = x25519_keypair_from_ed25519_seed(&[42u8; 32]);
+            let spec = PrivateIngestSpec {
+                owner_l1_address: my_addr,
+                owner_x25519_pubkey: owner_pk,
+                recipients: vec![],
+            };
+            let plaintext = vec![0x11u8; PRIVATE_PLAINTEXT_CHUNK_SIZE + 3]; // 2 chunks
+            let (pipeline, rpc) =
+                register_rejecting_pipeline("RegisterFilePendingV2 rejected: test");
+
+            let outcome = pipeline
+                .ingest_private(
+                    IngestInput::Bytes {
+                        file_name: "diary.txt",
+                        data: &plaintext,
+                    },
+                    spec,
+                )
+                .await;
+
+            assert!(
+                matches!(
+                    outcome,
+                    IngestOutcome::Failed {
+                        stage: IngestStage::Register,
+                        manifest: Some(_),
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            let manifest = outcome.manifest().unwrap();
+            assert_eq!(manifest.file_name, "diary.txt");
+            assert_eq!(manifest.total_size_bytes, plaintext.len() as u64);
+            assert_eq!(manifest.file_hash, *blake3::hash(&plaintext).as_bytes());
+            assert_eq!(manifest.chunk_count, 2);
+            let leaves: Vec<blake3::Hash> = manifest
+                .chunks
+                .iter()
+                .map(|c| blake3::Hash::from(c.blake3_hash))
+                .collect();
+            assert_eq!(
+                outcome.merkle_root(),
+                Some(*MerkleTree::build(&leaves).root().as_bytes()),
+                "root over the ciphertext chunk hashes"
+            );
+            assert_eq!(rpc.sent_txs.lock().unwrap().len(), 1);
+        }
+
+        /// `Failed { stage: Register }` after the registration was sent: its
+        /// finality wait times out, yet the tx may still finalize. This is
+        /// why the docs tell a caller to check `merkle_root()` on chain
+        /// before retrying a `Failed` outcome.
+        #[tokio::test]
+        async fn failed_at_register_can_follow_a_broadcast_registration() {
+            let snapshot = five_archives();
+            let my_addr = snapshot[0];
+            let rpc = Arc::new(MockRpc::default());
+            rpc.set_nonce(&l1_address_base58(&my_addr), 5);
+            rpc.enqueue_send("0xtx-register");
+            for _ in 0..2000 {
+                rpc.enqueue_status(TxStatusV2::Included { block_height: 100 });
+            }
+            rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+            let arch_to_peer: HashMap<_, _> = snapshot.iter().map(|a| (*a, fake_peer())).collect();
+            let mut d = defaults_for_tests();
+            d.finality_timeout = Duration::from_millis(100);
+            let pipeline = build_pipeline(
+                rpc.clone(),
+                Arc::new(MockNet::new()),
+                arch_to_peer,
+                my_addr,
+                params_for_test(d),
+            );
+            let bytes = vec![0xABu8; 1_048_576 + 1];
+
+            let outcome = pipeline
+                .ingest(IngestInput::Bytes {
+                    file_name: "pack.bin",
+                    data: &bytes,
+                })
+                .await;
+
+            assert!(
+                matches!(
+                    outcome,
+                    IngestOutcome::Failed {
+                        stage: IngestStage::Register,
+                        manifest: Some(_),
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert!(outcome.merkle_root().is_some());
+            assert_eq!(
+                rpc.sent_txs.lock().unwrap().len(),
+                1,
+                "the registration was broadcast"
+            );
         }
     }
 }

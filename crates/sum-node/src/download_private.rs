@@ -384,6 +384,35 @@ pub async fn run_download_private(
     max_concurrent: usize,
     timeout: Duration,
 ) -> Result<()> {
+    download_private_with_manifest(
+        keypair,
+        seed,
+        rpc,
+        net,
+        info,
+        chain_root,
+        output,
+        max_concurrent,
+        timeout,
+    )
+    .await
+    .map(|_manifest| ())
+}
+
+/// [`run_download_private`], also returning the decrypted, verified
+/// manifest. The library interface ([`crate::client`]) reports it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn download_private_with_manifest(
+    keypair: Keypair,
+    seed: [u8; 32],
+    rpc: Arc<L1RpcClient>,
+    net: Arc<SumNet>,
+    info: StorageFileInfoV2,
+    chain_root: [u8; 32],
+    output: PathBuf,
+    max_concurrent: usize,
+    timeout: Duration,
+) -> Result<DataManifest> {
     let root_hex = format!("0x{}", hex::encode(chain_root));
     let my_addr = sum_net::identity::l1_address_from_keypair(&keypair);
     let my_addr_b58 = sum_net::identity::l1_address_base58(&my_addr);
@@ -498,7 +527,7 @@ pub async fn run_download_private(
         "Private download complete (file_hash verified)"
     );
     net.shutdown().await.ok();
-    Ok(())
+    Ok(manifest)
 }
 
 // ── Private network helpers ──────────────────────────────────────────────────
