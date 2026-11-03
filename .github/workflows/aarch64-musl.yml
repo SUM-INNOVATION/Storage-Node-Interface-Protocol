@@ -1,0 +1,146 @@
+# aarch64 musl build lane (SNIP #58): builds a static
+# aarch64-unknown-linux-musl `sum-node` from the locked sources and smoke-
+# tests it. It is a build check only. It publishes nothing: no release, no
+# workflow artifact, no change to release.yml or scripts/install.sh. Adding
+# the target to the release is a separate step that needs release
+# authorization.
+#
+# Not a merge gate: "release-check (linux)" in ci.yml is.
+#
+# Runner and userland. The job runs on the GitHub-hosted arm64 runner that
+# platform-validation.yml already uses for its debian:12 aarch64 stand-in
+# (ubuntu-24.04-arm). The build runs natively in an alpine:3.24 container,
+# a musl userland, so nothing is cross-compiled and no cross toolchain is
+# involved. The container is started with `docker run` instead of a job
+# `container:`, because GitHub Actions cannot run JavaScript actions such
+# as actions/checkout inside an Alpine container on an arm64 runner.
+# Rust comes from rustup, as in the stand-in cells (#24 § 1), and is the
+# official aarch64-unknown-linux-musl toolchain, which links statically
+# by default.
+#
+# C dependencies on this target (cargo tree --target
+# aarch64-unknown-linux-musl -e normal,build):
+#   openssl-sys  reqwest's default TLS (native-tls). Linked statically from
+#                Alpine's openssl-libs-static (OPENSSL_STATIC=1).
+#   aws-lc-sys   rustls / quinn for libp2p QUIC. Compiled from its crate
+#                sources by its cc builder; it ships pre-generated bindings
+#                for this target, so no bindgen, libclang or cmake.
+#   ring, blake3 compiled from their crate sources by the C compiler.
+# No zlib, no protoc. Cargo.toml and Cargo.lock are unchanged (no vendored
+# OpenSSL feature, no TLS backend change).
+#
+# Checks: the binaries are statically linked (no PT_INTERP, no DT_NEEDED);
+# `sum-node --version` prints "sum-node <workspace version>" in the build
+# container, on the runner's glibc Ubuntu, and in a container whose root
+# filesystem is empty; `e2e-helper --help` runs; and the #24 § 2.2 test
+# (`cargo test -p sum-node --bin e2e-helper`) passes for this target. The
+# live RPC smoke (§ 2.3) is not run: it needs a public endpoint, and the
+# other pull-request lanes avoid that dependency as well.
+#
+# Third-party actions are pinned to the same full commit SHAs as ci.yml.
+
+name: aarch64-musl
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/aarch64-musl.yml'
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/aarch64-musl.yml'
+
+concurrency:
+  group: aarch64-musl-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  TARGET: aarch64-unknown-linux-musl
+  ALPINE_IMAGE: alpine:3.24
+
+jobs:
+  build:
+    name: sum-node aarch64-unknown-linux-musl (static build + smoke, not published)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build and test in ${{ env.ALPINE_IMAGE }} (native musl, no cross)
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/lane"
+          cat > "$RUNNER_TEMP/lane/build.sh" <<'EOF'
+          set -eu
+          apk add --no-cache build-base linux-headers pkgconf \
+              openssl-dev openssl-libs-static curl
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+          . "$HOME/.cargo/env"
+          echo "alpine $(cat /etc/alpine-release)"
+          apk info -v 2>/dev/null | grep -E '^(musl|gcc|openssl-libs-static)-[0-9]' || true
+          rustc -vV
+          cargo -V
+
+          cargo build --release --locked -p sum-node --target "$TARGET"
+          cargo test --release --locked -p sum-node --bin e2e-helper --target "$TARGET"
+          EOF
+          docker run --rm \
+              -v "$GITHUB_WORKSPACE:/src" -w /src \
+              -v "$RUNNER_TEMP/lane:/lane:ro" \
+              -e TARGET -e CARGO_TERM_COLOR=never -e OPENSSL_STATIC=1 \
+              "$ALPINE_IMAGE" sh /lane/build.sh
+
+      - name: The binaries are statically linked
+        run: |
+          set -eu
+          OUT="target/$TARGET/release"
+          for b in sum-node e2e-helper; do
+              file "$OUT/$b"
+              if readelf -lW "$OUT/$b" | grep -q 'INTERP'; then
+                  echo "error: $b has a program interpreter (dynamically linked)" >&2
+                  exit 1
+              fi
+              if readelf -dW "$OUT/$b" | grep -q '(NEEDED)'; then
+                  readelf -dW "$OUT/$b" | grep '(NEEDED)' >&2
+                  echo "error: $b needs shared libraries" >&2
+                  exit 1
+              fi
+              ls -l "$OUT/$b"
+          done
+
+      - name: sum-node --version on Alpine, on glibc Ubuntu and on an empty root filesystem
+        run: |
+          set -eu
+          OUT="$GITHUB_WORKSPACE/target/$TARGET/release"
+          VERSION="$(sed -n 's/^version *= *"\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          test -n "$VERSION"
+          want="sum-node ${VERSION}"
+          check() {
+              echo "$1: $2"
+              test "$2" = "$want" || { echo "error: expected '$want'" >&2; exit 1; }
+          }
+
+          check "alpine" "$(docker run --rm --network none -v "$OUT:/x:ro" "$ALPINE_IMAGE" /x/sum-node --version)"
+          check "ubuntu (runner, glibc)" "$("$OUT/sum-node" --version)"
+
+          # An image with no files at all: no libc, no loader, no certificates.
+          tar -cf - --files-from /dev/null | docker import - snip-empty-rootfs >/dev/null
+          check "empty rootfs" "$(docker run --rm --network none -v "$OUT:/x:ro" snip-empty-rootfs /x/sum-node --version)"
+          docker run --rm --network none -v "$OUT:/x:ro" snip-empty-rootfs /x/e2e-helper --help >/dev/null
+          echo "empty rootfs: e2e-helper --help exits 0"
