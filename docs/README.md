@@ -36,7 +36,7 @@ directory is where the material lives once you want depth.
 | [`protocol/`](protocol/) | Protocol overview, lifecycle walkthrough, V2 state machine, Proof of Retrievability, diagrams |
 | [`architecture/`](architecture/) | Crate map, chain integration, networking |
 | [`operator/`](operator/) | Runbook, mainnet bring-up, monitoring |
-| [`client/`](client/) | End-user upload / download, library interface, key management |
+| [`client/`](client/) | End-user upload / download, library interface, small files and packing ([`client/batching.md`](client/batching.md)), key management |
 | [`reference/`](reference/) | Canonical CLI, chain compatibility, RPC methods, config flags |
 | [`security/`](security/) | Privacy audit, threat model |
 | [`compatibility/`](compatibility/) | Platform support matrix |

@@ -155,4 +155,6 @@ functions start their own node per call.
   network from registration to activation.
 - Several files in one registration (SNIP #57 item 3). Every file costs one
   `RegisterFilePendingV2` and one `ActivateFileV2`, each waiting for
-  finality.
+  finality. To batch small files, pack them into one file before the
+  upload: see [`batching.md`](batching.md) for the per-file cost and what
+  the files in a pack share.
