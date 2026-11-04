@@ -82,16 +82,62 @@ chunks → push manifest → poll coverage → `ActivateFileV2`.
 | `--visibility` | `public` | `public` or `private`. `private` generates a fresh `K_file`, encrypts chunks + manifest, wraps `K_file` for each recipient. |
 | `--recipient` | — | Recipient for a Private file: `<base58 L1 addr>` or `<addr>:<expires_at_height>`. Repeatable. Rejected with `--visibility public`. |
 | `--fee-deposit` (env `SUM_FEE_DEPOSIT`) | `0` | Koppa base units locked in the file's fee pool by `RegisterFilePendingV2`. With `0` the file has no fee pool: archives earn nothing for it and the chain never challenges it (only Active files with a positive pool are challenged). `abandon` refunds 90% of it. |
+| `--exit-status` | off | Exit with a code per outcome (table below) instead of 0 for every outcome. The contract lines on stdout are as without the flag, except that code `8` also prints `merkle_root:`. No environment variable. |
 
-**Outcome and exit status.** `ingest-v2` exits 0 whenever it reaches an
-outcome, including a file left `Pending`; read the last `lifecycle:` line
-on stdout. `lifecycle: Active` means `ActivateFileV2` was submitted and
-finalized; `lifecycle: Pending` means the file is registered but still
-`Pending` (run `resume` or `abandon`). An error before registration prints
-no `lifecycle:` line, only a warning. A non-zero exit status means a setup
-or argument error (for example an unsupported `--visibility`). Unlike
-`resume` (below), `ingest-v2` does not encode the outcome in its exit
-status.
+**Outcome and exit status.** Without `--exit-status`, `ingest-v2` exits 0
+whenever it reaches an outcome, including a file left `Pending`; read the
+last `lifecycle:` line on stdout. `lifecycle: Active` means
+`ActivateFileV2` was submitted and finalized; `lifecycle: Pending` means
+the file is registered but still `Pending` (run `resume` or `abandon`). A
+registration that did not finalize during the run prints no
+`merkle_root:` or `lifecycle:` line, only a warning. That is not always
+"nothing on chain": a refusal before the registration was sent left
+nothing, but a registration that was sent and not confirmed (a finality
+timeout, a failed status query, an error from the submission call) can
+still finalize and leave the file `Pending`. Codes `6`, `7` and `8` below
+tell these cases apart and say what to do. A non-zero exit status means a
+setup or argument error (for example an unsupported `--visibility`).
+Unlike `resume` (below), `ingest-v2` does not encode the outcome in its
+exit status unless `--exit-status` is given.
+
+**With `--exit-status`**, every outcome exits with its own code. The
+codes shared with `resume` have the same values and meanings.
+
+*Contract lines* are the stdout lines that begin with `merkle_root:` or
+`lifecycle:`. Log lines are also written to stdout and are not part of
+the contract; errors (code `1`) and usage errors (code `2`) go to stderr.
+With the flag the contract lines are those printed without it, except
+that code `8` also prints `merkle_root:`:
+
+| Exit | Outcome | Contract lines on stdout, with the flag | Without the flag |
+|---|---|---|---|
+| `0` | The file is `Active`: `ActivateFileV2` was submitted **and finalized** in this run | `merkle_root: 0x<root>`, then `lifecycle: Active` | the same; exit 0 |
+| `3` | The file is registered and still `Pending`; run `resume` or `abandon` | `merkle_root: 0x<root>`, then `lifecycle: Pending` | the same; exit 0 |
+| `6` | Refused before chain registration: the registration was not sent, or the chain reported it failed or dropped, and the root has neither a V1 nor a V2 row. This run registered nothing; retry once the cause is fixed. **It may still have paid a fee:** a registration the chain reported `Failed` was included in a block and paid its transaction fee; one never sent, or dropped, paid nothing | none (a warning is logged) | none; exit 0 |
+| `7` | The root is already registered on chain, as a V1 file (`storage_getAccessList`) or a V2 file (`storage_getFileInfoV2`), and not by this run (the chain refuses to register a root twice). The row may belong to another owner: read it before treating the file as stored. A rejected registration paid its fee, as for `6` | none (a warning is logged) | none; exit 0 |
+| `8` | The registration was sent, or may have been, and is not confirmed: the submission call failed, the finality wait timed out, or a status query failed. It can still finalize and leave the file `Pending`, with its deposit locked. Look the root up before retrying | `merkle_root: 0x<root>` only; no `lifecycle:` line (a warning is logged) | none; exit 0 |
+| `1` | An error before an outcome (arguments, missing `--key-file`, RPC, chain parameters, network start-up), or a root lookup that could not be done after a registration that was not sent or was rejected (see below) | none; the error is on stderr | the same for errors before an outcome; a failed lookup cannot occur (no lookup is made) |
+| `2` | Usage error from the argument parser | none; usage on stderr | the same |
+
+`4` keeps its `resume` meaning (`Abandoned`); `ingest-v2` does not produce
+that outcome. `5` (root mismatch) is not used: `ingest-v2` is given no
+root. `6` and `7` are told apart by read-only lookups of the root, made
+only with the flag and only after a registration that was not sent or was
+rejected: `storage_getFileInfoV2` (V2), then, if it finds no row,
+`storage_getAccessList` (V1). A row in either is `7`; no row in both is
+`6`. If a lookup fails (an RPC error or a malformed row) and the other
+found no row, the code is `1`, with the error on stderr: `6` is never
+reported without both lookups answering. `8` is reported without a
+lookup, because a row for the root may be this registration's.
+
+Codes `6` and `7` print no `merkle_root:` line, since this run did not
+register the root; the root, when one was computed, is in the warning.
+Code `8` prints `merkle_root:` because the registration may still
+finalize and the caller needs the root to find it (a Private file's root
+is that of a fresh ciphertext, which the caller cannot compute), and no
+`lifecycle:` line, because nothing is known to be registered. A Private
+file's root is that of a fresh ciphertext, so `7` does not occur for it
+in practice.
 
 ### sum-node resume
 
