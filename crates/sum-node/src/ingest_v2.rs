@@ -3269,6 +3269,16 @@ mod tests {
         nonces: StdMutex<HashMap<String, u64>>,
         sent_txs: StdMutex<Vec<String>>,
         coverage_polls: StdMutex<u32>,
+        /// `storage_getFileInfoV2` calls, by root.
+        file_info_reads: StdMutex<Vec<String>>,
+        /// When set, `storage_getFileInfoV2` fails with this message.
+        file_info_err: StdMutex<Option<String>>,
+        /// Roots with a V1 (`storage_getAccessList`) row.
+        v1_files: StdMutex<HashSet<String>>,
+        /// `storage_getAccessList` calls, by root.
+        v1_reads: StdMutex<Vec<String>>,
+        /// When set, `storage_getAccessList` fails with this message.
+        v1_err: StdMutex<Option<String>>,
     }
 
     impl MockRpc {
@@ -3314,6 +3324,13 @@ mod tests {
             &self,
             merkle_root_hex: &str,
         ) -> Result<Option<StorageFileInfoV2>> {
+            self.file_info_reads
+                .lock()
+                .unwrap()
+                .push(merkle_root_hex.to_string());
+            if let Some(msg) = self.file_info_err.lock().unwrap().clone() {
+                return Err(anyhow::anyhow!(msg));
+            }
             // Missing root → clean not-found (Ok(None)); present → Ok(Some).
             Ok(self.files.lock().unwrap().get(merkle_root_hex).cloned())
         }
@@ -3397,6 +3414,16 @@ mod tests {
                 .get(addr_base58)
                 .copied()
                 .ok_or_else(|| anyhow::anyhow!("no nonce for {addr_base58}"))
+        }
+        async fn v1_root_registered(&self, merkle_root_hex: &str) -> Result<bool> {
+            self.v1_reads
+                .lock()
+                .unwrap()
+                .push(merkle_root_hex.to_string());
+            if let Some(msg) = self.v1_err.lock().unwrap().clone() {
+                return Err(anyhow::anyhow!(msg));
+            }
+            Ok(self.v1_files.lock().unwrap().contains(merkle_root_hex))
         }
     }
 
@@ -3742,6 +3769,10 @@ mod tests {
         assert_eq!(net.manifest_push_count(), 5);
     }
 
+    /// The registration's submission call fails: the outcome is `Failed` at
+    /// `Register`, with the manifest. (The name predates `RegistrationTx`:
+    /// a failed submission is `Unconfirmed`, since the node may have
+    /// accepted the transaction; see `ingest_exit_status`.)
     #[tokio::test]
     async fn s1_register_failure_returns_failed_with_no_chain_state() {
         let bytes = vec![0xAB; 1_048_576];
@@ -7457,8 +7488,9 @@ mod tests {
             (pipeline, net)
         }
 
-        /// A pipeline whose `RegisterFilePendingV2` is rejected (S1a
-        /// passes). Returns the mock so tests can count transactions.
+        /// A pipeline whose `RegisterFilePendingV2` submission call fails
+        /// with `reason` (S1a passes). Returns the mock so tests can count
+        /// transactions.
         fn register_rejecting_pipeline(
             reason: &str,
         ) -> (IngestPipeline<MockRpc, MockNet, StaticPeers>, Arc<MockRpc>) {
@@ -7610,8 +7642,9 @@ mod tests {
             }
         }
 
-        /// Error path: registration rejected. Nothing is on chain, but the
-        /// caller still gets the manifest and the root.
+        /// Error path: the registration's submission call fails. The node
+        /// may have accepted it (`RegistrationTx::Unconfirmed`), and the
+        /// caller still gets the manifest and the root to look it up.
         #[tokio::test]
         async fn ingest_bytes_register_failure_still_reports_manifest_and_root() {
             let bytes = vec![0xABu8; 1_048_576 + 1];
@@ -7748,6 +7781,608 @@ mod tests {
                 rpc.sent_txs.lock().unwrap().len(),
                 1,
                 "the registration was broadcast"
+            );
+        }
+    }
+
+    /// `sum-node ingest-v2 --exit-status` (SNIP #77): one scripted chain
+    /// per outcome, run through [`IngestPipeline::run`] and then
+    /// [`IngestPipeline::ingest_exit_status`], the call the CLI makes.
+    mod ingest_exit_status {
+        use super::*;
+
+        const REJECTED: &str = "RegisterFilePendingV2 validity check failed";
+
+        /// A two-chunk file and five archives (R = 5), all resolvable, so
+        /// S1a passes at once unless a test shrinks the snapshot.
+        struct Chain {
+            _dir: tempfile::TempDir,
+            path: PathBuf,
+            root: [u8; 32],
+            chunk_count: u32,
+            rpc: Arc<MockRpc>,
+            net: Arc<MockNet>,
+            archives: Vec<[u8; 20]>,
+            peers: Vec<PeerId>,
+        }
+
+        impl Chain {
+            fn new(fill: u8) -> Self {
+                let (dir, path) = write_test_file(&vec![fill; 1_048_576 + 7]);
+                let (_mmap, manifest) = BinaryChunker::chunk_file(&path).unwrap();
+                let archives = five_archives();
+                let rpc = Arc::new(MockRpc::default());
+                rpc.set_nonce(&l1_address_base58(&archives[0]), 1);
+                rpc.add_snapshot(50, archives.iter().map(node_record).collect());
+                Self {
+                    _dir: dir,
+                    path,
+                    root: manifest.merkle_root,
+                    chunk_count: manifest.chunk_count,
+                    rpc,
+                    net: Arc::new(MockNet::new()),
+                    archives,
+                    peers: (0..5).map(|_| fake_peer()).collect(),
+                }
+            }
+
+            fn root_hex(&self) -> String {
+                format!("0x{}", hex::encode(self.root))
+            }
+
+            /// The chain holds a `Pending` row for the root, pinned at 50.
+            fn pending_row(&self) {
+                self.rpc.add_file(
+                    &self.root_hex(),
+                    pending_file_info(&self.root, self.chunk_count, 50),
+                );
+            }
+
+            /// The root is already registered and `Active`, by another owner.
+            fn registered_elsewhere(&self) {
+                let mut row = pending_file_info(&self.root, self.chunk_count, 50);
+                row.owner = l1_address_base58(&[0x77; 20]);
+                row.lifecycle = LifecycleV2::ACTIVE;
+                row.activated_at_height = Some(60);
+                self.rpc.add_file(&self.root_hex(), row);
+            }
+
+            /// The root is registered only as a V1 file: `storage_getAccessList`
+            /// has a row, `storage_getFileInfoV2` none.
+            fn registered_as_v1(&self) {
+                self.rpc.v1_files.lock().unwrap().insert(self.root_hex());
+            }
+
+            /// Four eligible archives for R = 5: S1a refuses before S1.
+            fn too_few_archives(&self) {
+                self.rpc
+                    .add_snapshot(50, self.archives[..4].iter().map(node_record).collect());
+            }
+
+            /// S1 is sent and finalizes, and the chain then holds our row.
+            fn registration_finalizes(&self) {
+                self.rpc.enqueue_send("0xtx-register");
+                self.rpc
+                    .enqueue_status(TxStatusV2::Finalized { block_height: 100 });
+                self.pending_row();
+            }
+
+            /// S1 is sent, included and refused by the executor.
+            fn registration_rejected(&self) {
+                self.rpc.enqueue_send("0xtx-register");
+                self.rpc.enqueue_status(TxStatusV2::Failed {
+                    block_height: Some(101),
+                    reason: REJECTED.into(),
+                });
+            }
+
+            async fn archives_ack(&self) {
+                ack_chunks_for_all(&self.net, self.root, self.chunk_count, &self.peers).await;
+                ack_manifest_for_all(&self.net, self.root, &self.peers).await;
+            }
+
+            async fn run_with(&self, params: IngestParams) -> (IngestOutcome, i32) {
+                let (outcome, status) = self.run_status_with(params).await;
+                (outcome, status.code)
+            }
+
+            async fn run(&self) -> (IngestOutcome, i32) {
+                self.run_with(params_for_test(defaults_for_tests())).await
+            }
+
+            async fn run_status(&self) -> (IngestOutcome, IngestExitStatus) {
+                self.run_status_with(params_for_test(defaults_for_tests()))
+                    .await
+            }
+
+            async fn run_status_with(
+                &self,
+                params: IngestParams,
+            ) -> (IngestOutcome, IngestExitStatus) {
+                let arch_to_peer: HashMap<_, _> = self
+                    .archives
+                    .iter()
+                    .copied()
+                    .zip(self.peers.iter().copied())
+                    .collect();
+                let pipeline = build_pipeline(
+                    self.rpc.clone(),
+                    self.net.clone(),
+                    arch_to_peer,
+                    self.archives[0],
+                    params,
+                );
+                let outcome = pipeline.run(&self.path).await;
+                let status = pipeline.ingest_exit_status(&outcome).await;
+                (outcome, status)
+            }
+
+            fn sent(&self) -> usize {
+                self.rpc.sent_txs.lock().unwrap().len()
+            }
+
+            /// `storage_getFileInfoV2` reads (S2's included).
+            fn lookups(&self) -> Vec<String> {
+                self.rpc.file_info_reads.lock().unwrap().clone()
+            }
+
+            /// `storage_getAccessList` (V1) reads.
+            fn v1_lookups(&self) -> Vec<String> {
+                self.rpc.v1_reads.lock().unwrap().clone()
+            }
+        }
+
+        #[tokio::test]
+        async fn an_activated_file_exits_0() {
+            let chain = Chain::new(0x61);
+            chain.registration_finalizes();
+            chain.archives_ack().await;
+            chain
+                .rpc
+                .enqueue_coverage(coverage_active(chain.chunk_count, true));
+            chain.rpc.enqueue_send("0xtx-activate");
+            chain
+                .rpc
+                .enqueue_status(TxStatusV2::Finalized { block_height: 200 });
+
+            let (outcome, code) = chain.run().await;
+
+            assert!(
+                matches!(outcome, IngestOutcome::Activated { .. }),
+                "{outcome:?}"
+            );
+            assert_eq!(code, ingest_exit::ACTIVE);
+            assert_eq!(code, 0);
+            assert_eq!(chain.lookups().len(), 1, "S2's read only; no exit lookup");
+        }
+
+        #[tokio::test]
+        async fn a_file_left_pending_exits_3() {
+            let chain = Chain::new(0x62);
+            chain.registration_finalizes();
+            chain.archives_ack().await;
+            // Coverage never completes within activation_wait_secs.
+            chain
+                .rpc
+                .enqueue_coverage(coverage_active(chain.chunk_count, false));
+
+            let (outcome, code) = chain.run().await;
+
+            assert!(
+                matches!(
+                    outcome,
+                    IngestOutcome::PendingNeedsAction {
+                        failed_stage: IngestStage::Coverage,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert_eq!(code, ingest_exit::PENDING);
+            assert_eq!(code, 3);
+        }
+
+        /// Issue #77, case 1: S1a refuses the archive set. Nothing is sent;
+        /// the read-only V2 and V1 lookups both find no row.
+        #[tokio::test]
+        async fn a_refusal_before_the_registration_is_sent_exits_6() {
+            let chain = Chain::new(0x63);
+            chain.too_few_archives();
+
+            let (outcome, status) = chain.run_status().await;
+
+            assert_eq!(outcome.registration_tx(), Some(RegistrationTx::NotSent));
+            assert_eq!(status.root_on_chain, RootOnChain::NotRegistered);
+            assert_eq!(status.code, ingest_exit::REFUSED);
+            assert_eq!(status.code, 6);
+            assert!(status.lookup_error.is_none());
+            assert_eq!(chain.sent(), 0);
+            assert_eq!(chain.lookups(), vec![chain.root_hex()]);
+            assert_eq!(chain.v1_lookups(), vec![chain.root_hex()]);
+        }
+
+        /// R = 0 stops before chunking: there is no root to look up.
+        #[tokio::test]
+        async fn a_refusal_before_chunking_exits_6_without_a_lookup() {
+            let chain = Chain::new(0x64);
+            let mut params = params_for_test(defaults_for_tests());
+            params.assignment_replication_factor = 0;
+
+            let (outcome, code) = chain.run_with(params).await;
+
+            assert_eq!(outcome.merkle_root(), None);
+            assert_eq!(outcome.registration_tx(), Some(RegistrationTx::NotSent));
+            assert_eq!(code, ingest_exit::REFUSED);
+            assert!(chain.lookups().is_empty());
+        }
+
+        /// The chain refused the registration (`Failed`) or dropped it, and
+        /// holds no row for the root: nothing was registered.
+        #[tokio::test]
+        async fn a_registration_the_chain_rejects_exits_6() {
+            for status in [
+                TxStatusV2::Failed {
+                    block_height: Some(101),
+                    reason: REJECTED.into(),
+                },
+                TxStatusV2::Dropped,
+            ] {
+                let chain = Chain::new(0x65);
+                chain.rpc.enqueue_send("0xtx-register");
+                chain.rpc.enqueue_status(status.clone());
+
+                let (outcome, code) = chain.run().await;
+
+                assert_eq!(
+                    outcome.registration_tx(),
+                    Some(RegistrationTx::Rejected),
+                    "{status:?}"
+                );
+                assert_eq!(code, ingest_exit::REFUSED, "{status:?}");
+                assert_eq!(chain.sent(), 1);
+            }
+        }
+
+        /// Issue #77, case 2: the root is already `Active` on chain under
+        /// another owner. The chain refuses the registration (receipt code
+        /// 30, the collision check) and the lookup finds the row. The
+        /// outcome is `Failed`, for which `ingest-v2` prints no
+        /// `merkle_root:` / `lifecycle:` line.
+        #[tokio::test]
+        async fn a_root_already_registered_exits_7() {
+            let chain = Chain::new(0x66);
+            chain.registered_elsewhere();
+            chain.registration_rejected();
+
+            let (outcome, code) = chain.run().await;
+
+            assert!(
+                matches!(
+                    outcome,
+                    IngestOutcome::Failed {
+                        stage: IngestStage::Register,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert_eq!(outcome.registration_tx(), Some(RegistrationTx::Rejected));
+            assert_eq!(code, ingest_exit::ALREADY_REGISTERED);
+            assert_eq!(code, 7);
+            assert!(chain.v1_lookups().is_empty(), "a V2 row is enough");
+        }
+
+        /// The root is registered only as a V1 file, which the chain also
+        /// refuses to register again as V2 ("already registered as V1
+        /// file", receipt code 30). The V2 lookup finds nothing, the V1
+        /// lookup finds the row: 7, whether the registration was rejected
+        /// or never sent.
+        #[tokio::test]
+        async fn a_root_registered_only_as_v1_exits_7() {
+            for sent in [true, false] {
+                let chain = Chain::new(0x6B);
+                chain.registered_as_v1();
+                if sent {
+                    chain.registration_rejected();
+                } else {
+                    chain.too_few_archives();
+                }
+
+                let (outcome, status) = chain.run_status().await;
+
+                let expected_tx = if sent {
+                    RegistrationTx::Rejected
+                } else {
+                    RegistrationTx::NotSent
+                };
+                assert_eq!(outcome.registration_tx(), Some(expected_tx));
+                assert_eq!(status.root_on_chain, RootOnChain::Registered, "sent={sent}");
+                assert_eq!(status.code, ingest_exit::ALREADY_REGISTERED, "sent={sent}");
+                assert_eq!(chain.lookups(), vec![chain.root_hex()], "V2 first");
+                assert_eq!(chain.v1_lookups(), vec![chain.root_hex()], "then V1");
+            }
+        }
+
+        /// Already registered, and S1a refuses as well: the lookup still
+        /// reports the row, and nothing is sent.
+        #[tokio::test]
+        async fn a_root_already_registered_exits_7_when_nothing_was_sent() {
+            let chain = Chain::new(0x67);
+            chain.registered_elsewhere();
+            chain.too_few_archives();
+
+            let (outcome, code) = chain.run().await;
+
+            assert_eq!(outcome.registration_tx(), Some(RegistrationTx::NotSent));
+            assert_eq!(code, ingest_exit::ALREADY_REGISTERED);
+            assert_eq!(chain.sent(), 0);
+        }
+
+        /// The registration was submitted and its outcome is unknown: the
+        /// submission call errored, finality timed out, or a status query
+        /// failed. Exit 8 although the chain holds a row for the root (it may
+        /// be this registration's); no lookup is made.
+        #[tokio::test]
+        async fn an_unconfirmed_registration_exits_8() {
+            for case in ["send error", "finality timeout", "status query error"] {
+                let chain = Chain::new(0x68);
+                chain.pending_row();
+                let mut params = params_for_test(defaults_for_tests());
+                match case {
+                    "send error" => chain.rpc.enqueue_send_err("connection reset by peer"),
+                    "finality timeout" => {
+                        chain.rpc.enqueue_send("0xtx-register");
+                        for _ in 0..2000 {
+                            chain
+                                .rpc
+                                .enqueue_status(TxStatusV2::Included { block_height: 100 });
+                        }
+                        params.finality_timeout = Duration::from_millis(100);
+                    }
+                    // No status queued: the first status query fails.
+                    _ => chain.rpc.enqueue_send("0xtx-register"),
+                }
+
+                let (outcome, code) = chain.run_with(params).await;
+
+                assert_eq!(
+                    outcome.registration_tx(),
+                    Some(RegistrationTx::Unconfirmed),
+                    "{case}"
+                );
+                assert_eq!(code, ingest_exit::REGISTRATION_UNCONFIRMED, "{case}");
+                assert_eq!(code, 8, "{case}");
+                assert_eq!(chain.sent(), 1, "{case}");
+                assert!(chain.lookups().is_empty(), "{case}");
+                assert!(chain.v1_lookups().is_empty(), "{case}");
+            }
+        }
+
+        /// A lookup that fails, with no row found by the other, is an
+        /// error (1) carrying the failure: never a refusal (6), which would
+        /// claim the root is not registered. A row found by the other
+        /// lookup still proves the root is registered (7).
+        #[tokio::test]
+        async fn a_failed_lookup_is_an_error_not_a_refusal() {
+            // (V2 error, V1 error, V1 row, V2 row) -> (code, error names)
+            let cases: [(bool, bool, bool, bool, i32, &[&str]); 5] = [
+                (
+                    true,
+                    false,
+                    false,
+                    false,
+                    ingest_exit::ERROR,
+                    &["storage_getFileInfoV2"],
+                ),
+                (
+                    false,
+                    true,
+                    false,
+                    false,
+                    ingest_exit::ERROR,
+                    &["storage_getAccessList"],
+                ),
+                (
+                    true,
+                    true,
+                    false,
+                    false,
+                    ingest_exit::ERROR,
+                    &["storage_getFileInfoV2", "storage_getAccessList"],
+                ),
+                (
+                    true,
+                    false,
+                    true,
+                    false,
+                    ingest_exit::ALREADY_REGISTERED,
+                    &[],
+                ),
+                (
+                    false,
+                    true,
+                    false,
+                    true,
+                    ingest_exit::ALREADY_REGISTERED,
+                    &[],
+                ),
+            ];
+            for (v2_err, v1_err, v1_row, v2_row, code, names) in cases {
+                for sent in [false, true] {
+                    let case = format!(
+                        "v2_err={v2_err} v1_err={v1_err} v1_row={v1_row} v2_row={v2_row} sent={sent}"
+                    );
+                    let chain = Chain::new(0x69);
+                    if v2_err {
+                        *chain.rpc.file_info_err.lock().unwrap() =
+                            Some("connection refused".into());
+                    }
+                    if v1_err {
+                        *chain.rpc.v1_err.lock().unwrap() =
+                            Some("failed to deserialize RPC result".into());
+                    }
+                    if v1_row {
+                        chain.registered_as_v1();
+                    }
+                    if v2_row {
+                        chain.registered_elsewhere();
+                    }
+                    if sent {
+                        chain.registration_rejected();
+                    } else {
+                        chain.too_few_archives();
+                    }
+
+                    let (_outcome, status) = chain.run_status().await;
+
+                    assert_eq!(status.code, code, "{case}");
+                    if code == ingest_exit::ERROR {
+                        assert_eq!(status.root_on_chain, RootOnChain::LookupFailed, "{case}");
+                        let msg = format!("{:#}", status.lookup_error.expect("the error"));
+                        for name in names {
+                            assert!(msg.contains(name), "{case}: {msg}");
+                        }
+                        assert!(msg.contains(&chain.root_hex()), "{case}: {msg}");
+                    } else {
+                        assert_eq!(status.root_on_chain, RootOnChain::Registered, "{case}");
+                        assert!(status.lookup_error.is_none(), "{case}");
+                    }
+                }
+            }
+        }
+
+        /// Recording `RegistrationTx` changes no message: the text and the
+        /// `{:#}` chain are those of the wrapped error.
+        #[tokio::test]
+        async fn registration_errors_read_as_before() {
+            let chain = Chain::new(0x6A);
+            chain.registration_rejected();
+            let (outcome, _) = chain.run().await;
+            let IngestOutcome::Failed { source, .. } = &outcome else {
+                panic!("expected Failed, got {outcome:?}");
+            };
+            let expected = format!("RegisterFilePendingV2 failed: {REJECTED}");
+            assert_eq!(source.to_string(), expected);
+            assert_eq!(format!("{source:#}"), expected);
+
+            let inner = anyhow::anyhow!("connection reset").context("RPC HTTP request failed");
+            let (text, chain_text) = (inner.to_string(), format!("{inner:#}"));
+            let wrapped = sent_registration_error(RegistrationTx::Unconfirmed, inner);
+            assert_eq!(wrapped.to_string(), text);
+            assert_eq!(format!("{wrapped:#}"), chain_text);
+            assert_eq!(chain_text, "RPC HTTP request failed: connection reset");
+        }
+
+        fn manifest() -> DataManifest {
+            DataManifest {
+                file_name: String::new(),
+                file_hash: [0u8; 32],
+                total_size_bytes: 0,
+                chunk_count: 0,
+                merkle_root: [7u8; 32],
+                chunks: Vec::new(),
+            }
+        }
+
+        /// Outcomes `run` does not produce still have explicit codes:
+        /// `Abandoned` as for `resume`; a root mismatch, and a `Failed`
+        /// past registration, as errors.
+        #[test]
+        fn outcomes_run_does_not_produce_keep_explicit_codes() {
+            let abandoned = IngestOutcome::AbandonedOnChain {
+                merkle_root: [7u8; 32],
+                manifest: manifest(),
+                abandoned_at_height: Some(9),
+            };
+            let mismatch = IngestOutcome::RootMismatch {
+                expected: [7u8; 32],
+                actual: [8u8; 32],
+                manifest: manifest(),
+            };
+            let past_register = IngestOutcome::Failed {
+                stage: IngestStage::Activate,
+                manifest: None,
+                source: anyhow::anyhow!("synthetic"),
+            };
+            for root in ALL_ROOT_STATES {
+                assert_eq!(abandoned.ingest_exit_code(root), ingest_exit::ABANDONED);
+                assert_eq!(mismatch.ingest_exit_code(root), ingest_exit::ERROR);
+                assert_eq!(past_register.ingest_exit_code(root), ingest_exit::ERROR);
+            }
+            assert_eq!(past_register.registration_tx(), None);
+            assert_eq!(abandoned.registration_tx(), None);
+        }
+
+        const ALL_ROOT_STATES: [RootOnChain; 4] = [
+            RootOnChain::Registered,
+            RootOnChain::NotRegistered,
+            RootOnChain::LookupFailed,
+            RootOnChain::NotLookedUp,
+        ];
+
+        /// The pure mapping for a registration that was not sent: 6 only on
+        /// an answered lookup with no row, or when no root was computed; a
+        /// root with a failed or missing lookup is an error, never 6.
+        #[test]
+        fn a_refusal_needs_an_answered_lookup_unless_there_is_no_root() {
+            let failed = |manifest: Option<DataManifest>| IngestOutcome::Failed {
+                stage: IngestStage::Register,
+                manifest,
+                source: anyhow::anyhow!("synthetic refusal"),
+            };
+            let with_root = failed(Some(manifest()));
+            let without_root = failed(None);
+            assert_eq!(
+                with_root.ingest_exit_code(RootOnChain::Registered),
+                ingest_exit::ALREADY_REGISTERED
+            );
+            assert_eq!(
+                with_root.ingest_exit_code(RootOnChain::NotRegistered),
+                ingest_exit::REFUSED
+            );
+            assert_eq!(
+                with_root.ingest_exit_code(RootOnChain::LookupFailed),
+                ingest_exit::ERROR
+            );
+            assert_eq!(
+                with_root.ingest_exit_code(RootOnChain::NotLookedUp),
+                ingest_exit::ERROR
+            );
+            assert_eq!(
+                without_root.ingest_exit_code(RootOnChain::NotLookedUp),
+                ingest_exit::REFUSED
+            );
+        }
+
+        #[test]
+        fn the_codes_reuse_resume_and_avoid_its_root_mismatch_and_usage_codes() {
+            assert_eq!(ingest_exit::ACTIVE, resume_exit::ACTIVE);
+            assert_eq!(ingest_exit::ERROR, resume_exit::ERROR);
+            assert_eq!(ingest_exit::PENDING, resume_exit::PENDING);
+            assert_eq!(ingest_exit::ABANDONED, resume_exit::ABANDONED);
+            let codes = [
+                ingest_exit::ACTIVE,
+                ingest_exit::ERROR,
+                ingest_exit::PENDING,
+                ingest_exit::ABANDONED,
+                ingest_exit::REFUSED,
+                ingest_exit::ALREADY_REGISTERED,
+                ingest_exit::REGISTRATION_UNCONFIRMED,
+            ];
+            let unique: BTreeSet<i32> = codes.iter().copied().collect();
+            assert_eq!(unique.len(), codes.len(), "codes must be distinct");
+            assert!(!codes.contains(&2), "2 is the usage-error code");
+            assert!(
+                !codes.contains(&resume_exit::ROOT_MISMATCH),
+                "5 stays resume's root mismatch"
+            );
+            assert_eq!(
+                [
+                    ingest_exit::REFUSED,
+                    ingest_exit::ALREADY_REGISTERED,
+                    ingest_exit::REGISTRATION_UNCONFIRMED
+                ],
+                [6, 7, 8]
             );
         }
     }
