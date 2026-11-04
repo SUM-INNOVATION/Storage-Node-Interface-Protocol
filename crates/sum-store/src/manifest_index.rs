@@ -22,6 +22,12 @@
 //! `<chunk_index> <cid>` line per push), so the archive's held set can be
 //! rebuilt after a restart for Public and Private files alike.
 //!
+//! A fourth file, `<hex_root>.v2_proofs`, records the Merkle leaf and path
+//! each accepted V2 Push carried (one `<chunk_index> <leaf> <path>` line per
+//! push; see [`ManifestIndex::record_v2_pushed_proof`]), so a PoR challenge
+//! on the chunk can be answered without the file's manifest, which an
+//! archive cannot read for a Private file.
+//!
 //! On startup every shape is scanned and loaded into memory.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -32,6 +38,21 @@ use sum_types::storage::DataManifest;
 
 use crate::error::Result;
 use crate::manifest;
+
+/// The Merkle leaf and path a validated V2 Push carried for one chunk, as
+/// recorded by [`ManifestIndex::record_v2_pushed_proof`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushedProof {
+    /// BLAKE3 hash of the chunk bytes: the Merkle leaf.
+    pub leaf: [u8; 32],
+    /// Sibling hashes, bottom-up, exactly as the push carried them: the
+    /// `merkle_path` of a `SubmitStorageProof` for this chunk.
+    pub path: Vec<[u8; 32]>,
+}
+
+/// Longest Merkle path a record may carry: a chunk index is a `u32`, so a
+/// tree has at most 32 levels below its root.
+const MAX_PUSHED_PROOF_DEPTH: usize = 32;
 
 /// In-memory index of all tracked file manifests.
 pub struct ManifestIndex {
@@ -74,6 +95,12 @@ pub struct ManifestIndex {
     /// the chunk index is what `AcceptAssignmentV2` attests, and for a
     /// Private file nothing else on disk records it.
     v2_held: HashMap<[u8; 32], BTreeMap<u32, String>>,
+    /// The leaf and Merkle path each V2 Push carried, per file: merkle root
+    /// → chunk index → proof. Persisted as `<hex_root>.v2_proofs` (see
+    /// [`Self::record_v2_pushed_proof`]). Every record verifies against its
+    /// root; the PoR responder answers from it when the file has no Public
+    /// manifest here.
+    v2_proofs: HashMap<[u8; 32], BTreeMap<u32, PushedProof>>,
     /// `Some(false)` when the protected list exists but could not be read:
     /// garbage collection must then delete nothing. `None` until the list
     /// has been created (first run of this version, before seeding).
@@ -194,6 +221,7 @@ impl ManifestIndex {
             private_cid_to_root: HashMap::new(),
             gc_protected: HashSet::new(),
             v2_held: HashMap::new(),
+            v2_proofs: HashMap::new(),
             gc_protection_intact: None,
         };
 
@@ -263,6 +291,19 @@ impl ManifestIndex {
                         }
                     }
                 }
+                Some("v2_proofs") => {
+                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    let Some(root) = decode_hex_root(stem) else {
+                        tracing::warn!(path = %path.display(), "skipping V2 push-proof sidecar with non-hex stem");
+                        continue;
+                    };
+                    match fs::read_to_string(&path) {
+                        Ok(content) => index.load_v2_proof_lines(&path, root, &content),
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), %e, "skipping unreadable V2 push-proof sidecar");
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -286,6 +327,7 @@ impl ManifestIndex {
             public_indexed_chunks = index.cid_to_root.len(),
             private_indexed_chunks = index.private_cid_to_root.len(),
             v2_held_files = index.v2_held.len(),
+            v2_proof_files = index.v2_proofs.len(),
             "manifest index loaded"
         );
 
@@ -512,6 +554,74 @@ impl ManifestIndex {
     /// Every merkle root with at least one V2 Push record.
     pub fn v2_held_roots(&self) -> Vec<[u8; 32]> {
         self.v2_held.keys().copied().collect()
+    }
+
+    /// Record, durably, the leaf and Merkle path a validated V2 Push carried
+    /// for the chunk at `chunk_index` of `merkle_root`, as one
+    /// `<chunk_index> <leaf hex> <path>` line appended to
+    /// `<hex_root>.v2_proofs` and synced (`<path>`: the sibling hashes in
+    /// hex, bottom-up, comma-separated; `-` for a one-chunk file). Call it
+    /// after the chunk is written and before its held index is recorded and
+    /// the push acknowledged. The PoR responder answers a challenge on the
+    /// chunk from this record when the file has no Public manifest here (a
+    /// Private file, whose manifest the archive cannot read).
+    ///
+    /// Idempotent for a record already held. A different record for an
+    /// index already recorded is refused, as for the held index: a verified
+    /// Merkle proof binds each index of a root to one leaf. A record whose
+    /// path does not lead from the leaf to `merkle_root` is refused, so
+    /// every record kept verifies against its root.
+    pub fn record_v2_pushed_proof(
+        &mut self,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        leaf: [u8; 32],
+        path: &[[u8; 32]],
+    ) -> Result<()> {
+        if let Some(existing) = self
+            .v2_proofs
+            .get(&merkle_root)
+            .and_then(|m| m.get(&chunk_index))
+        {
+            if existing.leaf == leaf && existing.path == path {
+                return Ok(());
+            }
+            return Err(crate::error::StoreError::Other(format!(
+                "chunk {chunk_index} of root 0x{} has a recorded push proof for leaf {}; refusing to rebind it to leaf {}",
+                hex::encode(merkle_root),
+                hex::encode(existing.leaf),
+                hex::encode(leaf)
+            )));
+        }
+        let proof = PushedProof {
+            leaf,
+            path: path.to_vec(),
+        };
+        if !pushed_proof_verifies(&merkle_root, chunk_index, &proof) {
+            return Err(crate::error::StoreError::Other(format!(
+                "push proof for chunk {chunk_index} does not lead to root 0x{}; not recorded",
+                hex::encode(merkle_root)
+            )));
+        }
+        self.append_v2_proof_line(&merkle_root, chunk_index, &proof)?;
+        self.v2_proofs
+            .entry(merkle_root)
+            .or_default()
+            .insert(chunk_index, proof);
+        Ok(())
+    }
+
+    /// The recorded V2 Push proof for the chunk at `chunk_index` of
+    /// `merkle_root`, if any. Chunks pushed before these records existed
+    /// have none.
+    pub fn v2_pushed_proof(
+        &self,
+        merkle_root: &[u8; 32],
+        chunk_index: u32,
+    ) -> Option<&PushedProof> {
+        self.v2_proofs
+            .get(merkle_root)
+            .and_then(|m| m.get(&chunk_index))
     }
 
     /// Whether garbage collection must never delete `cid`.
@@ -776,6 +886,123 @@ impl ManifestIndex {
         Ok(())
     }
 
+    /// Parse a `<hex_root>.v2_proofs` sidecar with the `.v2_held`
+    /// discipline: only newline-terminated lines count (a torn final line is
+    /// dropped); a line that does not parse, or whose path does not lead
+    /// from its leaf to `root`, is skipped; conflicting records for one index
+    /// drop that index. A dropped record means a challenge on that chunk of
+    /// a file without a Public manifest here goes unanswered until the chunk
+    /// is pushed again; it never yields an answer that does not verify.
+    ///
+    /// When anything was dropped, the sidecar is rewritten (atomically)
+    /// with only the usable records, so a later push of a dropped index is
+    /// not refused, or dropped again, because of the bad line.
+    fn load_v2_proof_lines(&mut self, path: &Path, root: [u8; 32], content: &str) {
+        let complete = match content.rfind('\n') {
+            Some(last) => &content[..=last],
+            None => "",
+        };
+        let torn = complete.len() != content.len();
+        let mut records: BTreeMap<u32, PushedProof> = BTreeMap::new();
+        let mut conflicted: HashSet<u32> = HashSet::new();
+        let mut skipped = 0usize;
+        for line in complete.lines() {
+            let Some((index, proof)) = parse_v2_proof_line(line) else {
+                skipped += 1;
+                continue;
+            };
+            if !pushed_proof_verifies(&root, index, &proof) {
+                skipped += 1;
+                continue;
+            }
+            if conflicted.contains(&index) {
+                continue;
+            }
+            match records.get(&index) {
+                Some(existing) if *existing != proof => {
+                    records.remove(&index);
+                    conflicted.insert(index);
+                }
+                Some(_) => {}
+                None => {
+                    records.insert(index, proof);
+                }
+            }
+        }
+        if torn || skipped > 0 || !conflicted.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                torn_tail = torn,
+                skipped,
+                conflicting_indices = conflicted.len(),
+                "V2 push-proof sidecar had unusable records; challenges on those chunks of files without a Public manifest are not answered until the chunks are pushed again"
+            );
+            if let Err(e) = self.rewrite_v2_proofs(&root, &records) {
+                tracing::warn!(path = %path.display(), %e, "could not rewrite the V2 push-proof sidecar");
+            }
+        }
+        if !records.is_empty() {
+            self.v2_proofs.entry(root).or_default().extend(records);
+        }
+    }
+
+    /// Replace `<hex_root>.v2_proofs` with exactly `records` (temp file,
+    /// fsync, rename, directory fsync).
+    fn rewrite_v2_proofs(
+        &self,
+        root: &[u8; 32],
+        records: &BTreeMap<u32, PushedProof>,
+    ) -> Result<()> {
+        use std::io::Write;
+        let name = format!("{}.v2_proofs", hex::encode(root));
+        let path = self.manifests_dir.join(&name);
+        let tmp = self.manifests_dir.join(format!("{name}.tmp"));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            for (index, proof) in records {
+                f.write_all(format_v2_proof_line(*index, proof).as_bytes())?;
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        sync_dir(&self.manifests_dir)
+    }
+
+    /// Append one line to `<hex_root>.v2_proofs` and sync it. Each line is
+    /// independently complete, so a crash mid-write loses at most the
+    /// in-flight record, whose push is then not acknowledged. If the file
+    /// does not end in a newline (an earlier append failed part-way in this
+    /// process), the record starts on a new line, so it is not joined to the
+    /// partial one and lost at the next load.
+    fn append_v2_proof_line(
+        &self,
+        root: &[u8; 32],
+        chunk_index: u32,
+        proof: &PushedProof,
+    ) -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let path = self
+            .manifests_dir
+            .join(format!("{}.v2_proofs", hex::encode(root)));
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        let mut line = format_v2_proof_line(chunk_index, proof);
+        if f.metadata()?.len() > 0 {
+            let mut last = [0u8; 1];
+            f.seek(SeekFrom::End(-1))?;
+            f.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                line.insert(0, '\n');
+            }
+        }
+        f.write_all(line.as_bytes())?;
+        f.sync_data()?;
+        Ok(())
+    }
+
     /// Append one CID line to `<hex_root>.private_chunks`. Each line
     /// is independently complete (`<cid>\n`), so a crash mid-write
     /// loses at most the in-flight line — the rest reloads cleanly.
@@ -823,6 +1050,61 @@ fn parse_v2_held_line(line: &str) -> Option<(u32, &str)> {
         return None;
     }
     Some((index.parse().ok()?, cid))
+}
+
+/// Whether `proof` is a Merkle path from its leaf at `chunk_index` to
+/// `root`, by the chain's verification algorithm. The index must fit in the
+/// path's depth: the strict push verifier requires exactly the tree's depth,
+/// and `chunk_index < chunk_count <= 2^depth`.
+fn pushed_proof_verifies(root: &[u8; 32], chunk_index: u32, proof: &PushedProof) -> bool {
+    let depth = proof.path.len();
+    depth <= MAX_PUSHED_PROOF_DEPTH
+        && chunk_index.checked_shr(depth as u32).unwrap_or(0) == 0
+        && crate::verify::verify_merkle_proof_bytes(&proof.leaf, chunk_index, &proof.path, root)
+}
+
+/// Format one `<hex_root>.v2_proofs` line: `<chunk_index> <leaf> <path>`,
+/// where `<leaf>` is 64 lowercase hex digits and `<path>` is the sibling
+/// hashes in the same form, bottom-up, comma-separated (`-` when empty).
+fn format_v2_proof_line(chunk_index: u32, proof: &PushedProof) -> String {
+    let path = if proof.path.is_empty() {
+        "-".to_string()
+    } else {
+        proof
+            .path
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!("{chunk_index} {} {path}\n", hex::encode(proof.leaf))
+}
+
+/// Parse one `<hex_root>.v2_proofs` line (see [`format_v2_proof_line`]).
+fn parse_v2_proof_line(line: &str) -> Option<(u32, PushedProof)> {
+    let mut parts = line.split(' ');
+    let (index, leaf, path) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let index: u32 = index.parse().ok()?;
+    let leaf = decode_hex_root(leaf)?;
+    let path = if path == "-" {
+        Vec::new()
+    } else {
+        let nodes = path
+            .split(',')
+            .map(decode_hex_root)
+            .collect::<Option<Vec<[u8; 32]>>>()?;
+        if nodes.len() > MAX_PUSHED_PROOF_DEPTH {
+            return None;
+        }
+        nodes
+    };
+    Some((index, PushedProof { leaf, path }))
 }
 
 /// Parse one complete [`GC_PROTECTED_FILE`] line into its CID:
@@ -1671,5 +1953,229 @@ mod v2_held_tests {
             .copied()
             .collect();
         assert_eq!(got, vec![0, 5, 6, 9]);
+    }
+}
+
+#[cfg(test)]
+mod v2_proof_tests {
+    use super::*;
+    use crate::merkle::MerkleTree;
+
+    /// A tree over `n` distinct leaves, its root, and the leaves.
+    fn tree(n: u32, salt: u8) -> (MerkleTree, [u8; 32], Vec<[u8; 32]>) {
+        let leaves: Vec<blake3::Hash> = (0..n)
+            .map(|i| {
+                let mut v = vec![salt; 16];
+                v.extend_from_slice(&i.to_le_bytes());
+                blake3::hash(&v)
+            })
+            .collect();
+        let t = MerkleTree::build(&leaves);
+        let root = *t.root().as_bytes();
+        (t, root, leaves.iter().map(|h| *h.as_bytes()).collect())
+    }
+
+    fn sidecar(dir: &Path, root: &[u8; 32]) -> PathBuf {
+        dir.join("manifests")
+            .join(format!("{}.v2_proofs", hex::encode(root)))
+    }
+
+    fn line(index: u32, leaf: &[u8; 32], path: &[[u8; 32]]) -> String {
+        let path = if path.is_empty() {
+            "-".to_string()
+        } else {
+            path.iter().map(hex::encode).collect::<Vec<_>>().join(",")
+        };
+        format!("{index} {} {path}\n", hex::encode(leaf))
+    }
+
+    #[test]
+    fn v2_pushed_proofs_survive_reload_and_are_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, root, leaves) = tree(5, 0x61);
+        let (_, single_root, single_leaves) = tree(1, 0x62);
+        assert_eq!(single_root, single_leaves[0], "one leaf: root = leaf");
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            for i in [0u32, 3, 4] {
+                idx.record_v2_pushed_proof(root, i, leaves[i as usize], &t.proof_bytes(i))
+                    .unwrap();
+            }
+            // The same record again: no new line, no error.
+            idx.record_v2_pushed_proof(root, 3, leaves[3], &t.proof_bytes(3))
+                .unwrap();
+            idx.record_v2_pushed_proof(single_root, 0, single_leaves[0], &[])
+                .unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(sidecar(dir.path(), &root)).unwrap(),
+            [0u32, 3, 4]
+                .iter()
+                .map(|&i| line(i, &leaves[i as usize], &t.proof_bytes(i)))
+                .collect::<String>()
+        );
+        assert_eq!(
+            std::fs::read_to_string(sidecar(dir.path(), &single_root)).unwrap(),
+            format!("0 {} -\n", hex::encode(single_root))
+        );
+
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        for i in [0u32, 3, 4] {
+            assert_eq!(
+                idx.v2_pushed_proof(&root, i),
+                Some(&PushedProof {
+                    leaf: leaves[i as usize],
+                    path: t.proof_bytes(i),
+                })
+            );
+        }
+        assert!(idx.v2_pushed_proof(&root, 1).is_none());
+        assert_eq!(
+            idx.v2_pushed_proof(&single_root, 0),
+            Some(&PushedProof {
+                leaf: single_root,
+                path: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn v2_pushed_proof_refuses_a_different_leaf_for_a_recorded_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, root, leaves) = tree(4, 0x63);
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        idx.record_v2_pushed_proof(root, 1, leaves[1], &t.proof_bytes(1))
+            .unwrap();
+        let before = std::fs::read(sidecar(dir.path(), &root)).unwrap();
+
+        for (leaf, path) in [
+            (leaves[2], t.proof_bytes(2)), // another index's valid leaf and path
+            (leaves[2], t.proof_bytes(1)),
+            ([0xEE; 32], t.proof_bytes(1)),
+        ] {
+            let err = idx
+                .record_v2_pushed_proof(root, 1, leaf, &path)
+                .expect_err("rebinding an index must be refused");
+            assert!(err.to_string().contains("refusing to rebind"), "{err}");
+        }
+        assert_eq!(
+            idx.v2_pushed_proof(&root, 1),
+            Some(&PushedProof {
+                leaf: leaves[1],
+                path: t.proof_bytes(1),
+            })
+        );
+        assert_eq!(std::fs::read(sidecar(dir.path(), &root)).unwrap(), before);
+    }
+
+    #[test]
+    fn v2_pushed_proof_refuses_a_path_that_does_not_reach_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, root, leaves) = tree(8, 0x64);
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        let mut bad_path = t.proof_bytes(2);
+        bad_path[1][0] ^= 1;
+        let short_path = t.proof_bytes(2)[..2].to_vec();
+        for (index, leaf, path) in [
+            (2u32, leaves[2], bad_path),       // a flipped sibling
+            (2, [0xAB; 32], t.proof_bytes(2)), // a leaf the tree does not have
+            (2, leaves[2], short_path),        // too short
+            (10, leaves[2], t.proof_bytes(2)), // index beyond the path's depth (10 = 0b1010)
+            (3, leaves[2], t.proof_bytes(2)),  // another index
+        ] {
+            let err = idx
+                .record_v2_pushed_proof(root, index, leaf, &path)
+                .expect_err("a proof that does not reach the root must be refused");
+            assert!(err.to_string().contains("does not lead to root"), "{err}");
+        }
+        assert!(idx.v2_pushed_proof(&root, 2).is_none());
+        assert!(!sidecar(dir.path(), &root).exists(), "nothing written");
+    }
+
+    /// An append that failed part-way leaves a line without its newline;
+    /// the next record still starts on its own line and survives a reload.
+    #[test]
+    fn v2_pushed_proof_after_a_partial_append_starts_on_a_new_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, root, leaves) = tree(4, 0x66);
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        idx.record_v2_pushed_proof(root, 0, leaves[0], &t.proof_bytes(0))
+            .unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(sidecar(dir.path(), &root))
+                .unwrap();
+            f.write_all(&line(2, &leaves[2], &t.proof_bytes(2)).as_bytes()[..30])
+                .unwrap();
+        }
+        idx.record_v2_pushed_proof(root, 1, leaves[1], &t.proof_bytes(1))
+            .unwrap();
+        drop(idx);
+
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        let got: Vec<u32> = (0..4)
+            .filter(|&i| idx.v2_pushed_proof(&root, i).is_some())
+            .collect();
+        assert_eq!(got, vec![0, 1]);
+        assert_eq!(
+            std::fs::read_to_string(sidecar(dir.path(), &root)).unwrap(),
+            format!(
+                "{}{}",
+                line(0, &leaves[0], &t.proof_bytes(0)),
+                line(1, &leaves[1], &t.proof_bytes(1))
+            ),
+            "the partial line is dropped at load"
+        );
+    }
+
+    #[test]
+    fn v2_proof_sidecar_drops_unusable_records_and_rewrites_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, root, leaves) = tree(8, 0x65);
+        let manifests = dir.path().join("manifests");
+        std::fs::create_dir_all(&manifests).unwrap();
+        let good = |i: u32| line(i, &leaves[i as usize], &t.proof_bytes(i));
+        let mut flipped = t.proof_bytes(5);
+        flipped[0][31] ^= 0x80;
+        let content = [
+            good(0),
+            "1\n".to_string(),                           // no leaf, no path
+            format!("2 {} -\n", hex::encode(leaves[2])), // empty path in an 8-leaf tree
+            line(5, &leaves[5], &flipped),               // does not reach the root
+            good(6).replace('\n', " extra\n"),           // extra field
+            good(3).replacen(&hex::encode(leaves[3])[..2], "zz", 1), // not hex
+            good(7),
+            good(7),                   // identical duplicate: harmless
+            good(4)[..40].to_string(), // torn tail (no newline)
+        ]
+        .concat();
+        std::fs::write(sidecar(dir.path(), &root), &content).unwrap();
+        // A sidecar whose stem is not a root is ignored.
+        std::fs::write(manifests.join("not-a-root.v2_proofs"), good(0)).unwrap();
+
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        let got: Vec<u32> = (0..8)
+            .filter(|&i| idx.v2_pushed_proof(&root, i).is_some())
+            .collect();
+        assert_eq!(got, vec![0, 7]);
+        // Rewritten with only the usable records.
+        assert_eq!(
+            std::fs::read_to_string(sidecar(dir.path(), &root)).unwrap(),
+            format!("{}{}", good(0), good(7))
+        );
+
+        // The dropped indices can be recorded again, and survive a reload.
+        for i in [4u32, 5] {
+            idx.record_v2_pushed_proof(root, i, leaves[i as usize], &t.proof_bytes(i))
+                .unwrap();
+        }
+        drop(idx);
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        let got: Vec<u32> = (0..8)
+            .filter(|&i| idx.v2_pushed_proof(&root, i).is_some())
+            .collect();
+        assert_eq!(got, vec![0, 4, 5, 7]);
     }
 }
