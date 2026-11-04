@@ -148,8 +148,9 @@ archive holds for the file:
   the leaf and Merkle path that arrived with the chunk's V2 Push. When
   an archive accepts a V2 Push, for either visibility, it records the
   verified leaf and path in `manifests/<hex_root>.v2_proofs` (one
-  `<chunk_index> <leaf> <path>` line per chunk, synced before the
-  PushAck; a push whose record cannot be written is refused). At
+  `<chunk_index> <leaf> <path>` line per chunk, synced, with the
+  file's directory entry, before the PushAck; a push whose record
+  cannot be made durable is refused). At
   challenge time the responder finds the chunk through its held-index
   record (`<hex_root>.v2_held`) and sends the recorded leaf and path
   only if the chunk is on disk and its BLAKE3 hash equals the recorded
