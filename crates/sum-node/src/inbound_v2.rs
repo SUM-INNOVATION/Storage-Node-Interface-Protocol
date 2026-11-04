@@ -8,7 +8,10 @@
 //!                       same code path the V1 pull uses. V2 is NOT
 //!                       exempt from chain governance.
 //!   * `Push`         → [`PushValidator::validate_push`] → on Ok,
-//!                       persist under `cid_from_blake3_hash(leaf_hash)`
+//!                       persist under `cid_from_blake3_hash(leaf_hash)`,
+//!                       record the verified leaf and Merkle path (the
+//!                       PoR responder's answer when the file has no
+//!                       Public manifest here, as for a Private file),
 //!                       and update the held-set tracker. Wire CID is
 //!                       NEVER trusted — see chain plan §3.6 receive-side.
 //!   * `ManifestPush` → reuse `sum_store::serve::validate_manifest_push`
@@ -436,6 +439,25 @@ where
         self
     }
 
+    /// Record durably the leaf and Merkle path a validated V2 Push carried
+    /// (the store's `<hex_root>.v2_proofs` sidecar), so the PoR responder
+    /// can answer a challenge on the chunk without the file's manifest, which
+    /// this archive cannot read for a Private file. Called before
+    /// [`Self::record_held`]: a chunk this version accepts is never recorded
+    /// as held, and so never attested, without its proof. The caller holds
+    /// the store write lock and refuses the ACK on `Err`.
+    fn record_pushed_proof(
+        manifest_idx: &mut ManifestIndex,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        leaf_hash: [u8; 32],
+        merkle_path: &[[u8; 32]],
+    ) -> std::result::Result<(), String> {
+        manifest_idx
+            .record_v2_pushed_proof(merkle_root, chunk_index, leaf_hash, merkle_path)
+            .map_err(|e| format!("push-proof persistence failed: {e}"))
+    }
+
     /// Record a stored, validated V2 chunk durably (the store's
     /// `<hex_root>.v2_held` sidecar), then in the held tracker. The caller
     /// holds the store write lock and refuses the ACK on `Err`: a chunk
@@ -786,6 +808,21 @@ where
                             "V2 Push (Private): cid->root mapping write FAILED — refusing ACK"
                         );
                         Some(format!("private chunk mapping persistence failed: {e}"))
+                    } else if let Err(e) = Self::record_pushed_proof(
+                        &mut stores.manifest_idx,
+                        merkle_root,
+                        chunk_index,
+                        leaf_hash,
+                        &merkle_path,
+                    ) {
+                        warn!(
+                            %peer_id,
+                            root = %hex::encode(merkle_root),
+                            chunk_index,
+                            %e,
+                            "V2 Push (Private): push-proof record FAILED — refusing ACK"
+                        );
+                        Some(e)
                     } else if let Err(e) =
                         self.record_held(&mut stores.manifest_idx, merkle_root, chunk_index, &cid)
                     {
@@ -810,7 +847,21 @@ where
                 } else {
                     let recorded = {
                         let mut stores = self.store.write().await;
-                        self.record_held(&mut stores.manifest_idx, merkle_root, chunk_index, &cid)
+                        Self::record_pushed_proof(
+                            &mut stores.manifest_idx,
+                            merkle_root,
+                            chunk_index,
+                            leaf_hash,
+                            &merkle_path,
+                        )
+                        .and_then(|()| {
+                            self.record_held(
+                                &mut stores.manifest_idx,
+                                merkle_root,
+                                chunk_index,
+                                &cid,
+                            )
+                        })
                     };
                     if let Err(e) = recorded {
                         warn!(
@@ -818,7 +869,7 @@ where
                             root = %hex::encode(merkle_root),
                             chunk_index,
                             %e,
-                            "V2 Push (Public): held-index record FAILED — refusing ACK"
+                            "V2 Push (Public): push-proof or held-index record FAILED — refusing ACK"
                         );
                         Some(e)
                     } else {
@@ -3766,5 +3817,620 @@ mod tests {
         let reopened = store_at(dir.path());
         let rebuilt = held_from_disk(&*reopened.read().await);
         assert_eq!(rebuilt.get(&root), Some(&expected));
+    }
+
+    // ── The PoR responder against what a push stored ──
+    //
+    // Each archive below is built through the production handlers an archive
+    // runs on an inbound V2 Push (`handle_push`) and ManifestPush
+    // (`handle_manifest_push`). Nothing is written to the store by hand,
+    // except where a test deletes or damages a file to stand in for an older
+    // store or a fault. The production `PorWorker` then polls a JSON-RPC
+    // stand-in that reports one active challenge targeting this archive.
+
+    /// What an archive ends up holding for one V2 file after the owner's
+    /// pushes: chunk `chunk_index` and the manifest.
+    struct PushedArchive {
+        stores: Arc<RwLock<SumStore>>,
+        manifest: DataManifest,
+        chunks: Vec<Vec<u8>>,
+        tree: MerkleTree,
+        chunk_index: u32,
+        my_addr: [u8; 20],
+    }
+
+    /// An archive assigned to one chunk of an Active, funded (`fee_pool`
+    /// 1000) 8-chunk V2 file, after the owner pushed that chunk and then
+    /// the manifest. For a Private file the chunk
+    /// bytes stand in for ciphertext — the leaves the chain commits to are
+    /// the hashes of whatever bytes were pushed (`ingest_v2.rs` builds the
+    /// Private tree over ciphertext) — and the manifest is CBOR encrypted
+    /// under a file key, exactly the opaque blob an archive receives.
+    async fn pushed_archive(private: bool, salt: u8) -> PushedArchive {
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let assignment_height = 900u64;
+        let (manifest, chunks, tree) = make_manifest(8, salt);
+        let root = manifest.merkle_root;
+
+        let rpc = AllMockRpc::new();
+        let info = if private {
+            file_info_active_private(&root, manifest.chunk_count, assignment_height)
+        } else {
+            file_info_active(&root, manifest.chunk_count, assignment_height)
+        };
+        assert!(
+            info.fee_pool > 0,
+            "a funded file: challengeable on chain once Active"
+        );
+        rpc.add_file(&format!("0x{}", hex::encode(root)), info);
+        rpc.add_snapshot(
+            assignment_height,
+            snapshot.iter().map(node_record).collect(),
+            snapshot.clone(),
+        );
+        rpc.set_nonce(&l1_address_base58(&my_addr), 1);
+
+        let stores = make_stores();
+        let dispatcher = build_dispatcher(rpc, snapshot.clone(), my_addr, stores.clone());
+
+        let r = crate::push_validator::V2Params::DEFAULTS.assignment_replication_factor;
+        let chunk_index = (0..manifest.chunk_count)
+            .find(|&i| {
+                sum_store::assignment_v2::assigned_archives(&root, &snapshot, i, r)
+                    .contains(&my_addr)
+            })
+            .expect("at least one chunk assigned to this archive");
+
+        let net = RecorderNet::new();
+        dispatcher
+            .handle_push(
+                &net,
+                fake_peer(),
+                1,
+                chunks[chunk_index as usize].clone(),
+                root,
+                chunk_index,
+                tree.proof_bytes(chunk_index),
+            )
+            .await;
+        match net.last().unwrap().1 {
+            ShardResponseV2::PushAck { error, .. } => {
+                assert!(error.is_none(), "push must be accepted: {error:?}")
+            }
+            other => panic!("expected PushAck, got {other:?}"),
+        }
+
+        let manifest_bytes = if private {
+            sum_crypto::encrypt_manifest(&[0x42u8; 32], &cbor(&manifest))
+        } else {
+            cbor(&manifest)
+        };
+        dispatcher
+            .handle_manifest_push(&net, 2, root, manifest_bytes)
+            .await;
+        assert!(
+            matches!(
+                net.last().unwrap().1,
+                ShardResponseV2::ManifestPushAck { error: None, .. }
+            ),
+            "manifest push must be accepted"
+        );
+
+        PushedArchive {
+            stores,
+            manifest,
+            chunks,
+            tree,
+            chunk_index,
+            my_addr,
+        }
+    }
+
+    const G_CHALLENGE_ID: [u8; 32] = [0xC7; 32];
+
+    /// A chain stand-in reporting one active challenge on (`root`,
+    /// `chunk_index`) targeting `target`, and the production `PorWorker`
+    /// pointed at it.
+    async fn challenged_worker(
+        root: [u8; 32],
+        chunk_index: u32,
+        target: [u8; 20],
+    ) -> (
+        crate::test_rpc_server::MockRpcServer,
+        crate::por_worker::PorWorker,
+        sum_types::rpc_types::ChallengeInfo,
+    ) {
+        use crate::test_rpc_server::{MockResponse, routes, start_mock_rpc};
+        let challenge = sum_types::rpc_types::ChallengeInfo {
+            challenge_id: format!("0x{}", hex::encode(G_CHALLENGE_ID)),
+            merkle_root: format!("0x{}", hex::encode(root)),
+            chunk_index,
+            target_node: l1_address_base58(&target),
+            created_at_height: 1_000,
+            expires_at_height: 1_050,
+        };
+        let server = start_mock_rpc(routes([
+            (
+                "storage_getActiveChallenges",
+                MockResponse::Result(serde_json::to_value(vec![challenge.clone()]).unwrap()),
+            ),
+            ("get_nonce", MockResponse::Result(serde_json::json!(5))),
+            ("chain_id", MockResponse::Result(serde_json::json!(1337))),
+            (
+                "send_raw_transaction",
+                MockResponse::Result(serde_json::json!("0xfeed")),
+            ),
+        ]))
+        .await;
+        let worker = crate::por_worker::PorWorker::new(
+            Arc::new(L1RpcClient::new(server.url())),
+            [9u8; 32],
+            l1_address_base58(&target),
+            Duration::from_secs(10),
+        );
+        (server, worker, challenge)
+    }
+
+    /// The fields of the one `SubmitStorageProof` the chain stand-in
+    /// received.
+    struct SubmittedProof {
+        challenge_id: [u8; 32],
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        chunk_hash: [u8; 32],
+        merkle_path: Vec<[u8; 32]>,
+    }
+
+    fn submitted_proof(server: &crate::test_rpc_server::MockRpcServer) -> SubmittedProof {
+        assert_eq!(
+            server.method_count("send_raw_transaction"),
+            1,
+            "one SubmitStorageProof sent"
+        );
+        let params = server.first_params("send_raw_transaction").unwrap();
+        let tx_hex = params[0].as_str().unwrap();
+        let signed = sumchain_wire::transaction::SignedTransaction::from_hex(tx_hex).unwrap();
+        let sumchain_wire::transaction::TxInner::V2(tx) = signed.inner else {
+            panic!("expected a V2 transaction")
+        };
+        match tx.payload {
+            sumchain_wire::transaction::TxPayload::StorageMetadata(data) => match data.operation {
+                sumchain_wire::storage_metadata::StorageMetadataOperation::SubmitStorageProof {
+                    challenge_id,
+                    merkle_root,
+                    chunk_index,
+                    chunk_hash,
+                    merkle_path,
+                } => SubmittedProof {
+                    challenge_id: *challenge_id.as_bytes(),
+                    merkle_root: *merkle_root.as_bytes(),
+                    chunk_index,
+                    chunk_hash: *chunk_hash.as_bytes(),
+                    merkle_path: merkle_path.iter().map(|h| *h.as_bytes()).collect(),
+                },
+                other => panic!("expected SubmitStorageProof, got {other:?}"),
+            },
+            other => panic!("expected a StorageMetadata payload, got {other:?}"),
+        }
+    }
+
+    /// Whether the chain accepts `proof` for a file of `chunk_count` chunks:
+    /// SNIP's port of the chain's `verify_merkle_proof`
+    /// (`sum_store::verify`), through the strict variant that also checks
+    /// the index and path length against the registered chunk count.
+    fn chain_accepts(proof: &SubmittedProof, chunk_count: u32) -> bool {
+        sum_store::verify::verify_merkle_proof_bytes_for_tree(
+            &proof.chunk_hash,
+            proof.chunk_index,
+            &proof.merkle_path,
+            &proof.merkle_root,
+            chunk_count,
+        )
+    }
+
+    /// Release this archive's store and open it again from disk, as a
+    /// restart does, after deleting the named `<hex_root>.<ext>` sidecars of
+    /// `root` (standing in for a store written by an older version).
+    async fn restart_store(
+        stores: Arc<RwLock<SumStore>>,
+        root: &[u8; 32],
+        delete: &[&str],
+    ) -> Arc<RwLock<SumStore>> {
+        let dir = stores.read().await.config.store_dir.clone();
+        drop(stores);
+        for ext in delete {
+            let path = dir
+                .join("manifests")
+                .join(format!("{}.{ext}", hex::encode(root)));
+            std::fs::remove_file(&path).unwrap();
+        }
+        store_at(&dir)
+    }
+
+    /// Whether any file under `dir` contains `needle`.
+    fn store_dir_contains(dir: &std::path::Path, needle: &[u8]) -> bool {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path)
+                    && bytes.windows(needle.len()).any(|w| w == needle)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// An archive that accepted a chunk of a Private V2 file by push —
+    /// chunk on disk, held index recorded, opaque manifest stored, no Public
+    /// manifest — answers a PoR challenge on that chunk with exactly the
+    /// leaf and Merkle path the push carried, and the chain's verifier
+    /// accepts the proof. (Before the fix the responder read only the Public
+    /// manifest index, failed with "no manifest for merkle root", and sent
+    /// nothing.)
+    #[tokio::test]
+    async fn por_worker_answers_private_v2_challenge_with_the_pushed_leaf_and_path() {
+        let a = pushed_archive(true, 0x5A).await;
+        let root = a.manifest.merkle_root;
+        let i = a.chunk_index;
+        let leaf = blake3::hash(&a.chunks[i as usize]);
+        let cid = cid_from_blake3_hash(&leaf);
+
+        {
+            let s = a.stores.read().await;
+            assert_eq!(
+                s.local.get(&cid).unwrap(),
+                a.chunks[i as usize],
+                "the archive holds the chunk bytes"
+            );
+            assert_eq!(
+                s.manifest_idx
+                    .v2_held_records(&root)
+                    .and_then(|m| m.get(&i)),
+                Some(&cid),
+                "the archive recorded the chunk as held"
+            );
+            assert!(
+                s.manifest_idx.get_private_bytes(&root).is_some(),
+                "opaque manifest stored"
+            );
+            assert!(
+                s.manifest_idx.get_by_merkle_root(&root).is_none(),
+                "not in the Public index: no manifest to build a proof from"
+            );
+            assert!(s.manifest_idx.chunk_cid(&root, i).is_none());
+            assert_eq!(
+                s.manifest_idx.v2_pushed_proof(&root, i),
+                Some(&sum_store::manifest_index::PushedProof {
+                    leaf: *leaf.as_bytes(),
+                    path: a.tree.proof_bytes(i),
+                }),
+                "the push's leaf and path are recorded"
+            );
+        }
+
+        let (server, mut worker, challenge) = challenged_worker(root, i, a.my_addr).await;
+        worker.poll_and_respond_for_test(&a.stores).await.unwrap();
+        assert!(
+            worker
+                .responded_for_test()
+                .contains(&challenge.challenge_id)
+        );
+        let proof = submitted_proof(&server);
+        assert_eq!(proof.challenge_id, G_CHALLENGE_ID);
+        assert_eq!(proof.merkle_root, root);
+        assert_eq!(proof.chunk_index, i);
+        assert_eq!(proof.chunk_hash, *leaf.as_bytes(), "the pushed leaf");
+        assert_eq!(proof.merkle_path, a.tree.proof_bytes(i), "the pushed path");
+        assert!(
+            chain_accepts(&proof, a.manifest.chunk_count),
+            "the chain's verifier accepts the proof"
+        );
+    }
+
+    /// Control. Same archive and challenge shape for a Public file: the
+    /// responder answers from the manifest, as before, and the proof it
+    /// sends carries the pushed chunk's leaf and the Merkle path the chain
+    /// verifies against the root.
+    #[tokio::test]
+    async fn control_por_worker_answers_public_v2_challenge_on_held_chunk() {
+        let a = pushed_archive(false, 0x5A).await;
+        let root = a.manifest.merkle_root;
+        let i = a.chunk_index;
+
+        let (server, mut worker, challenge) = challenged_worker(root, i, a.my_addr).await;
+        worker.poll_and_respond_for_test(&a.stores).await.unwrap();
+        assert!(
+            worker
+                .responded_for_test()
+                .contains(&challenge.challenge_id)
+        );
+        let proof = submitted_proof(&server);
+        assert_eq!(proof.challenge_id, G_CHALLENGE_ID);
+        assert_eq!(proof.merkle_root, root);
+        assert_eq!(proof.chunk_index, i);
+        assert_eq!(
+            proof.chunk_hash,
+            *blake3::hash(&a.chunks[i as usize]).as_bytes()
+        );
+        assert_eq!(
+            proof.merkle_path,
+            a.tree.proof_bytes(i),
+            "the path the push carried"
+        );
+        assert!(chain_accepts(&proof, a.manifest.chunk_count));
+    }
+
+    /// Control, upgrade. A Public chunk pushed before push proofs were
+    /// recorded (its store has no `.v2_proofs` sidecar) is still answered,
+    /// from the manifest, with the same proof: the Public path does not
+    /// depend on the new record.
+    #[tokio::test]
+    async fn control_public_challenge_without_a_recorded_push_proof_is_answered_from_the_manifest()
+    {
+        let a = pushed_archive(false, 0x66).await;
+        let root = a.manifest.merkle_root;
+        let i = a.chunk_index;
+        let stores = restart_store(a.stores, &root, &["v2_proofs"]).await;
+        assert!(
+            stores
+                .read()
+                .await
+                .manifest_idx
+                .v2_pushed_proof(&root, i)
+                .is_none()
+        );
+
+        let (server, mut worker, _) = challenged_worker(root, i, a.my_addr).await;
+        worker.poll_and_respond_for_test(&stores).await.unwrap();
+        let proof = submitted_proof(&server);
+        assert_eq!(
+            proof.chunk_hash,
+            *blake3::hash(&a.chunks[i as usize]).as_bytes()
+        );
+        assert_eq!(proof.merkle_path, a.tree.proof_bytes(i));
+        assert!(chain_accepts(&proof, a.manifest.chunk_count));
+    }
+
+    /// Persistence. The Merkle path that arrives with a chunk push is
+    /// recorded, for both visibilities, before the PushAck: the store holds
+    /// `<hex_root>.v2_proofs` with one `<index> <leaf> <path>` line. (Before
+    /// the fix no file in the store contained any element of the path.)
+    #[tokio::test]
+    async fn pushed_merkle_path_is_persisted_for_both_visibilities() {
+        for (private, salt) in [(true, 0x5B), (false, 0x5D)] {
+            let a = pushed_archive(private, salt).await;
+            let root = a.manifest.merkle_root;
+            let i = a.chunk_index;
+            let dir = a.stores.read().await.config.store_dir.clone();
+
+            assert!(
+                store_dir_contains(&dir, hex::encode(root).as_bytes()),
+                "scan control: root hex is on disk"
+            );
+            assert!(
+                store_dir_contains(&dir, &a.chunks[i as usize]),
+                "scan control: chunk bytes are on disk"
+            );
+
+            let path = a.tree.proof_bytes(i);
+            assert_eq!(path.len(), 3, "8 leaves ⇒ 3 siblings");
+            for (level, node) in path.iter().enumerate() {
+                assert!(
+                    store_dir_contains(&dir, hex::encode(node).as_bytes()),
+                    "path[{level}] on disk (private = {private})"
+                );
+            }
+            let sidecar = dir
+                .join("manifests")
+                .join(format!("{}.v2_proofs", hex::encode(root)));
+            assert_eq!(
+                std::fs::read_to_string(&sidecar).unwrap(),
+                format!(
+                    "{i} {} {}\n",
+                    hex::encode(blake3::hash(&a.chunks[i as usize]).as_bytes()),
+                    path.iter().map(hex::encode).collect::<Vec<_>>().join(",")
+                ),
+                "private = {private}"
+            );
+        }
+    }
+
+    /// Restart. The recorded proof survives a restart (the index is
+    /// rebuilt from disk), and a Private challenge after it is answered with
+    /// the pushed leaf and path.
+    #[tokio::test]
+    async fn pushed_proof_survives_a_restart_and_answers_after_it() {
+        let a = pushed_archive(true, 0x5E).await;
+        let root = a.manifest.merkle_root;
+        let i = a.chunk_index;
+        let leaf = *blake3::hash(&a.chunks[i as usize]).as_bytes();
+        let stores = restart_store(a.stores, &root, &[]).await;
+        assert_eq!(
+            stores.read().await.manifest_idx.v2_pushed_proof(&root, i),
+            Some(&sum_store::manifest_index::PushedProof {
+                leaf,
+                path: a.tree.proof_bytes(i),
+            }),
+            "reloaded from disk"
+        );
+
+        let (server, mut worker, _) = challenged_worker(root, i, a.my_addr).await;
+        worker.poll_and_respond_for_test(&stores).await.unwrap();
+        let proof = submitted_proof(&server);
+        assert_eq!(proof.chunk_hash, leaf);
+        assert_eq!(proof.merkle_path, a.tree.proof_bytes(i));
+        assert!(chain_accepts(&proof, a.manifest.chunk_count));
+    }
+
+    /// A push whose proof cannot be recorded is not acknowledged, and the
+    /// chunk is not recorded as held (so not attested): the proof record is
+    /// written before the held index. Both visibilities.
+    #[tokio::test]
+    async fn a_push_whose_proof_record_fails_is_refused_and_not_held() {
+        for (private, salt) in [(true, 0x67), (false, 0x68)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (rpc, manifest, chunks, tree, mine) = held_fixture(16, salt, private);
+            let root = manifest.merkle_root;
+            let stores = store_at(dir.path());
+            // A directory where the sidecar would be: appending to it fails.
+            std::fs::create_dir_all(
+                dir.path()
+                    .join("manifests")
+                    .join(format!("{}.v2_proofs", hex::encode(root))),
+            )
+            .unwrap();
+            let d = build_dispatcher(rpc, vec![], five_archives()[0], stores.clone());
+            let net = RecorderNet::new();
+            let err = push(&d, &net, root, mine[0], &chunks, &tree)
+                .await
+                .expect("refused");
+            assert!(
+                err.contains("push-proof persistence failed"),
+                "private = {private}: {err}"
+            );
+            assert!(d.held_for(&root).is_empty());
+            let s = stores.read().await;
+            assert!(s.manifest_idx.v2_held_records(&root).is_none());
+            assert!(s.manifest_idx.v2_pushed_proof(&root, mine[0]).is_none());
+        }
+    }
+
+    /// Upgrade. A Private chunk held without a recorded proof (pushed
+    /// before push proofs were recorded) gets one when the same chunk is
+    /// pushed again: the repeat push is accepted (the chunk, its CID mapping
+    /// and its held index are already there) and records the leaf and path.
+    #[tokio::test]
+    async fn a_repeat_push_records_the_proof_for_a_chunk_held_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rpc, manifest, chunks, tree, mine) = held_fixture(16, 0x69, true);
+        let root = manifest.merkle_root;
+        let i = mine[0];
+        let stores = store_at(dir.path());
+        let d = build_dispatcher(rpc, vec![], five_archives()[0], stores.clone());
+        let net = RecorderNet::new();
+        assert_eq!(push(&d, &net, root, i, &chunks, &tree).await, None);
+        drop(d);
+        let stores = restart_store(stores, &root, &["v2_proofs"]).await;
+        {
+            let s = stores.read().await;
+            assert!(s.manifest_idx.v2_pushed_proof(&root, i).is_none());
+            assert!(
+                s.manifest_idx
+                    .v2_held_records(&root)
+                    .unwrap()
+                    .contains_key(&i)
+            );
+        }
+
+        let (rpc, ..) = held_fixture(16, 0x69, true);
+        let d = build_dispatcher(rpc, vec![], five_archives()[0], stores.clone());
+        assert_eq!(push(&d, &net, root, i, &chunks, &tree).await, None);
+        assert_eq!(
+            stores.read().await.manifest_idx.v2_pushed_proof(&root, i),
+            Some(&sum_store::manifest_index::PushedProof {
+                leaf: *blake3::hash(&chunks[i as usize]).as_bytes(),
+                path: tree.proof_bytes(i),
+            })
+        );
+    }
+
+    /// Fail closed. A Private challenge is not answered when the record
+    /// that would answer it is missing: a chunk pushed before push proofs
+    /// were recorded (no `.v2_proofs` sidecar), or a recorded proof whose
+    /// chunk the held index no longer locates (no `.v2_held` sidecar). No
+    /// transaction is sent and the challenge is not marked answered.
+    #[tokio::test]
+    async fn private_challenge_without_its_records_is_not_answered() {
+        for (salt, deleted, expected) in [
+            (0x60, "v2_proofs", "no recorded push proof"),
+            (0x61, "v2_held", "no held-index record"),
+        ] {
+            let a = pushed_archive(true, salt).await;
+            let root = a.manifest.merkle_root;
+            let i = a.chunk_index;
+            let cid = cid_from_blake3_hash(&blake3::hash(&a.chunks[i as usize]));
+            let stores = restart_store(a.stores, &root, &[deleted]).await;
+            assert!(
+                stores.read().await.local.has(&cid),
+                "the chunk is still on disk"
+            );
+
+            let (server, mut worker, challenge) = challenged_worker(root, i, a.my_addr).await;
+            let err = worker
+                .respond_to_challenge_for_test(&stores, &challenge)
+                .await
+                .expect_err("no answer without the record");
+            eprintln!("responder error (Private, {deleted} missing): {err}");
+            assert!(err.to_string().contains(expected), "{err}");
+            assert!(err.to_string().starts_with("not answering"), "{err}");
+
+            worker.poll_and_respond_for_test(&stores).await.unwrap();
+            assert_eq!(
+                server.method_count("send_raw_transaction"),
+                0,
+                "no SubmitStorageProof sent"
+            );
+            assert!(
+                !worker
+                    .responded_for_test()
+                    .contains(&challenge.challenge_id)
+            );
+        }
+    }
+
+    /// Fail closed. With the proof recorded, a Private challenge is not
+    /// answered when the chunk bytes on disk no longer hash to the recorded
+    /// leaf, or are gone: the recorded leaf and path alone would verify on
+    /// chain, so they are sent only for bytes actually held.
+    #[tokio::test]
+    async fn private_challenge_is_not_answered_for_corrupted_or_missing_bytes() {
+        let a = pushed_archive(true, 0x62).await;
+        let root = a.manifest.merkle_root;
+        let i = a.chunk_index;
+        let cid = cid_from_blake3_hash(&blake3::hash(&a.chunks[i as usize]));
+        let chunk_path = a.stores.read().await.local.chunk_path(&cid).unwrap();
+        let (server, mut worker, challenge) = challenged_worker(root, i, a.my_addr).await;
+
+        let mut corrupted = a.chunks[i as usize].clone();
+        corrupted[0] ^= 1;
+        std::fs::remove_file(&chunk_path).unwrap();
+        std::fs::write(&chunk_path, &corrupted).unwrap();
+        let err = worker
+            .respond_to_challenge_for_test(&a.stores, &challenge)
+            .await
+            .expect_err("corrupted bytes: no answer");
+        eprintln!("responder error (Private, corrupted chunk): {err}");
+        assert!(
+            err.to_string()
+                .contains("does not hash to its recorded push leaf"),
+            "{err}"
+        );
+        worker.poll_and_respond_for_test(&a.stores).await.unwrap();
+
+        std::fs::remove_file(&chunk_path).unwrap();
+        let err = worker
+            .respond_to_challenge_for_test(&a.stores, &challenge)
+            .await
+            .expect_err("missing bytes: no answer");
+        eprintln!("responder error (Private, missing chunk): {err}");
+        assert!(err.to_string().contains("unreadable"), "{err}");
+        worker.poll_and_respond_for_test(&a.stores).await.unwrap();
+
+        assert_eq!(
+            server.method_count("send_raw_transaction"),
+            0,
+            "no SubmitStorageProof sent"
+        );
+        assert!(
+            !worker
+                .responded_for_test()
+                .contains(&challenge.challenge_id)
+        );
     }
 }

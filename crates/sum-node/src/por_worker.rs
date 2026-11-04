@@ -3,6 +3,19 @@
 //! Polls the L1 for active challenges targeting this node, reads the
 //! challenged chunk from disk, generates the Merkle proof, builds and
 //! signs a `SubmitStorageProof` transaction, and submits it to the L1.
+//!
+//! Where the proof comes from:
+//!
+//! * **The file's Public manifest is held here** (V1 and Public V2): the
+//!   chunk is located through the manifest and the Merkle path is rebuilt
+//!   from the manifest's chunk hashes.
+//! * **No Public manifest** (a Private V2 file, whose manifest this archive
+//!   cannot read; or a Public V2 file whose manifest never arrived): the
+//!   answer is the leaf and Merkle path recorded when the chunk's V2 Push
+//!   was accepted (`ManifestIndex::v2_pushed_proof`). The chunk is located
+//!   through the held-index record and its bytes must hash to that leaf.
+//!   With no record (a chunk never pushed here, or pushed before these
+//!   records existed), no readable chunk, or a mismatch, nothing is sent.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -165,12 +178,22 @@ impl PorWorker {
 
         // Look up manifest and chunk CID.
         let store_read = store.read().await;
-        let manifest = store_read
-            .manifest_idx
-            .get_by_merkle_root(&merkle_root)
-            .ok_or_else(|| {
-                anyhow::anyhow!("no manifest for merkle root {}", challenge.merkle_root)
-            })?;
+        let Some(manifest) = store_read.manifest_idx.get_by_merkle_root(&merkle_root) else {
+            // No Public manifest (a Private file): answer from the proof the
+            // chunk's V2 Push carried, or not at all.
+            let (chunk_hash, merkle_path) =
+                answer_from_pushed_proof(&store_read, &merkle_root, chunk_index)?;
+            drop(store_read); // Release read lock before RPC calls.
+            return self
+                .submit_proof(
+                    challenge,
+                    challenge_id,
+                    merkle_root,
+                    chunk_hash,
+                    merkle_path,
+                )
+                .await;
+        };
 
         let chunk_cid = store_read
             .manifest_idx
@@ -201,6 +224,27 @@ impl PorWorker {
 
         drop(store_read); // Release read lock before RPC calls.
 
+        self.submit_proof(
+            challenge,
+            challenge_id,
+            merkle_root,
+            chunk_hash,
+            merkle_path,
+        )
+        .await
+    }
+
+    /// Build, sign and submit the `SubmitStorageProof` for `challenge`.
+    async fn submit_proof(
+        &self,
+        challenge: &ChallengeInfo,
+        challenge_id: [u8; 32],
+        merkle_root: [u8; 32],
+        chunk_hash: [u8; 32],
+        merkle_path: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let chunk_index = challenge.chunk_index;
+
         // Fetch nonce and chain_id.
         let nonce = self.rpc.get_nonce(&self.l1_address_base58).await?;
         let chain_id = self.rpc.get_chain_id().await?;
@@ -229,5 +273,81 @@ impl PorWorker {
         );
 
         Ok(())
+    }
+}
+
+/// The chunk hash and Merkle path for a challenge on a file with no Public
+/// manifest here (a Private file), from what the chunk's V2 Push left: the
+/// recorded leaf and path, provided the chunk the held index names for
+/// `chunk_index` is on disk and hashes to that leaf.
+///
+/// Fails closed: with no recorded proof (a chunk never pushed here, or
+/// pushed before push proofs were recorded), no held-index record, an
+/// unreadable chunk, or bytes that do not hash to the recorded leaf, it
+/// returns an error and no proof is sent. The bytes check is what makes an
+/// answer honest: the chain checks only the leaf and path, which the record
+/// alone would let this archive send without holding the chunk.
+fn answer_from_pushed_proof(
+    store: &SumStore,
+    merkle_root: &[u8; 32],
+    chunk_index: u32,
+) -> Result<([u8; 32], Vec<[u8; 32]>)> {
+    let root = hex::encode(merkle_root);
+    let proof = store
+        .manifest_idx
+        .v2_pushed_proof(merkle_root, chunk_index)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "not answering: no Public manifest and no recorded push proof for chunk \
+                 {chunk_index} of root 0x{root} (chunk not pushed to this archive, or pushed \
+                 before push proofs were recorded)"
+            )
+        })?;
+    let cid = store
+        .manifest_idx
+        .v2_held_records(merkle_root)
+        .and_then(|records| records.get(&chunk_index))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "not answering: chunk {chunk_index} of root 0x{root} has a recorded push proof \
+                 but no held-index record"
+            )
+        })?;
+    let bytes = store.local.get(cid).map_err(|e| {
+        anyhow::anyhow!(
+            "not answering: chunk {chunk_index} of root 0x{root} ({cid}) unreadable: {e}"
+        )
+    })?;
+    if *blake3::hash(&bytes).as_bytes() != proof.leaf {
+        anyhow::bail!(
+            "not answering: chunk {chunk_index} of root 0x{root} ({cid}) does not hash to its \
+             recorded push leaf"
+        );
+    }
+    Ok((proof.leaf, proof.path.clone()))
+}
+
+/// Test-only entry points into the responder, for the PoR tests in
+/// `inbound_v2.rs`, which store files through the real push handlers and
+/// then challenge them.
+#[cfg(test)]
+impl PorWorker {
+    pub(crate) async fn respond_to_challenge_for_test(
+        &self,
+        store: &Arc<RwLock<SumStore>>,
+        challenge: &ChallengeInfo,
+    ) -> Result<()> {
+        self.respond_to_challenge(store, challenge).await
+    }
+
+    pub(crate) async fn poll_and_respond_for_test(
+        &mut self,
+        store: &Arc<RwLock<SumStore>>,
+    ) -> Result<()> {
+        self.poll_and_respond(store).await
+    }
+
+    pub(crate) fn responded_for_test(&self) -> &[String] {
+        &self.responded
     }
 }
