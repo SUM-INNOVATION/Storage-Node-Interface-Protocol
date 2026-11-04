@@ -4371,21 +4371,27 @@ mod tests {
     }
 
     /// Creation and repeat push. The first push of a file creates its
-    /// `.v2_proofs` and `.v2_held` sidecars, and is acknowledged only once
-    /// each new file is synced into the store's directory, since a crash
-    /// could otherwise lose the file and with it the records the ACK
-    /// promised. While the directory cannot be synced the push is refused
-    /// and nothing is held, also on a repeat; once it can, the same push is
-    /// acknowledged and held, and its records survive a restart. Both
-    /// visibilities.
+    /// sidecars (`.private_chunks` for a Private file, then `.v2_proofs`
+    /// and `.v2_held`), and is acknowledged only once each new file is
+    /// synced into the store's directory, since a crash could otherwise
+    /// lose the file and with it the records the ACK promised. While the
+    /// directory cannot be synced the push is refused, at the first record
+    /// it writes, and nothing is held or mapped, also on a repeat; once it
+    /// can, the same push is acknowledged and held, and its records
+    /// (including a Private chunk's CID → root mapping) survive a restart.
+    /// Both visibilities.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_push_is_acknowledged_only_once_its_new_records_are_synced_into_the_directory() {
-        for (private, salt) in [(true, 0x6A), (false, 0x6B)] {
+        for (private, salt, refusal) in [
+            (true, 0x6A, "private chunk mapping persistence failed"),
+            (false, 0x6B, "push-proof persistence failed"),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let (rpc, manifest, chunks, tree, mine) = held_fixture(16, salt, private);
             let root = manifest.merkle_root;
             let i = mine[0];
+            let cid = cid_from_blake3_hash(&blake3::hash(&chunks[i as usize]));
             let stores = store_at(dir.path());
             let d = build_dispatcher(rpc, vec![], five_archives()[0], stores.clone());
             let net = RecorderNet::new();
@@ -4398,13 +4404,14 @@ mod tests {
                         .await
                         .expect("refused");
                     assert!(
-                        err.contains("push-proof persistence failed"),
+                        err.contains(refusal),
                         "private = {private}, {attempt}: {err}"
                     );
                     assert!(d.held_for(&root).is_empty());
                     let s = stores.read().await;
                     assert!(s.manifest_idx.v2_pushed_proof(&root, i).is_none());
                     assert!(s.manifest_idx.v2_held_records(&root).is_none());
+                    assert!(!s.manifest_idx.is_private_chunk_cid(&cid));
                 }
             }
             assert_eq!(
@@ -4431,6 +4438,11 @@ mod tests {
                     .map(|r| r.keys().copied().collect()),
                 Some(vec![i]),
                 "private = {private}"
+            );
+            assert_eq!(
+                s.manifest_idx.is_private_chunk_cid(&cid),
+                private,
+                "the CID mapping is written for a Private chunk only"
             );
         }
     }
