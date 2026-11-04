@@ -117,8 +117,9 @@ poll interval. When a challenge fires:
 
 1. `PorWorker` receives the pending challenge from RPC (challenge
    ID, `merkle_root`, `chunk_index`, `expires_at_height`).
-2. It looks up the chunk locally, computes a BLAKE3 Merkle proof
-   from the persisted manifest, and constructs a
+2. It looks up the chunk locally, obtains its BLAKE3 Merkle proof
+   (from the file's manifest, or from the proof recorded when the
+   chunk was pushed; see below), and constructs a
    `SubmitStorageProof` transaction via
    [`tx_builder`](../../crates/sum-node/src/tx_builder.rs).
 3. The transaction is signed with the archive's Ed25519 seed and
@@ -132,12 +133,38 @@ poll interval. When a challenge fires:
    `process_expired_challenges` slashes a percentage of the
    archive's stake and flips its `NodeStatus` to `Slashed`.
 
-SNIP's responder logic is protocol-version-agnostic: the same
-`PorWorker` and `tx_builder` machinery answers challenges regardless
-of whether the file was registered via the V1 or V2 path, and
-regardless of the state of the `assignment_targeting` gate. The gate
-governs *which* archives receive challenges, not how those archives
-respond.
+The same `PorWorker` and `tx_builder` machinery handles every
+challenge, whatever the state of the `assignment_targeting` gate. The
+gate governs *which* archives receive challenges, not how those
+archives respond. Where the proof comes from depends on what the
+archive holds for the file:
+
+- **The file's Public manifest** (V1 files, and Public V2 files): the
+  responder finds the chunk through the manifest, reads it, and
+  rebuilds the Merkle path from the manifest's chunk hashes.
+- **No Public manifest** (Private V2 files, whose manifest the archive
+  stores encrypted and cannot read; also a Public V2 file whose
+  manifest has not reached the archive): the responder answers with
+  the leaf and Merkle path that arrived with the chunk's V2 Push. When
+  an archive accepts a V2 Push, for either visibility, it records the
+  verified leaf and path in `manifests/<hex_root>.v2_proofs` (one
+  `<chunk_index> <leaf> <path>` line per chunk, synced, with the
+  file's directory entry, before the PushAck; a push whose record
+  cannot be made durable is refused). At
+  challenge time the responder finds the chunk through its held-index
+  record (`<hex_root>.v2_held`) and sends the recorded leaf and path
+  only if the chunk is on disk and its BLAKE3 hash equals the recorded
+  leaf.
+
+No proof is sent for a chunk the archive does not hold. For a file
+without a Public manifest here, none is sent either when the chunk has
+no recorded leaf and path, or when its bytes do not hash to the
+recorded leaf. Chunks pushed to an archive running a version that did
+not record leaf and path have none: a challenge on such a Private
+chunk is logged (`failed to respond to challenge`, with a
+`not answering: …` reason) and not answered, until the same chunk is
+pushed to the archive again, which records them. Public files are
+answered from the manifest as before.
 
 Operational tuning surface — CLI: `--por-poll-secs` (default 10 s;
 env `SUM_POR_INTERVAL`). See [`../reference/cli.md`](../reference/cli.md).

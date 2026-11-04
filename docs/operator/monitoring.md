@@ -153,11 +153,13 @@ A file's owner can submit `ReassignChunksV2` after an archive assigned to the fi
 - `epoch watcher: assignment epoch changed; attesting again`;
 - `epoch watcher: attestation did not finish; waiting for the next epoch change or a restart` (`warn`, after 3 failed runs for one epoch).
 
-**The held-index records.**
+**The held-index and push-proof records.**
 - `<store_dir>/manifests/<root>.v2_held` records the chunk index of each chunk accepted by V2 push, one `<index> <cid>` line per push, synced before the push is acknowledged. If the write fails the push is refused.
 - At startup the archive rebuilds its held set from these records and from Public manifests, keeping only chunks still on disk.
 - **Private chunks pushed by a version without these records** cannot be indexed after a restart. They stay stored and are served, but are attested again only after the owner pushes them again.
 - A lost or damaged record file means the affected chunks are not attested until they are pushed again; it never makes the archive attest a chunk it does not hold. Unusable lines are dropped (and the file rewritten) at startup with a `warn`.
+- `<store_dir>/manifests/<root>.v2_proofs` records, for each chunk accepted by V2 push, its Merkle leaf and the path the push carried, one `<index> <leaf> <path>` line per push, synced before the held index and the acknowledgement. If the write fails the push is refused. The PoR responder answers challenges on Private files from these records (see `docs/protocol/proof-of-retrievability.md` "Responder side"). Chunks pushed by a version without them have none; lines that are damaged or do not verify against the file's root are dropped (and the file rewritten) at startup with a `warn`.
+- **These records, and a Private chunk's `<root>.private_chunks` CID record, are durable before the acknowledgement.** Each line is synced, and the first write to each file in a process run also syncs `manifests/`, so a newly created file survives a crash. If any of these syncs fails the push is refused, and the next push of the chunk tries again. A line left incomplete by a failed write is cut before the next line is written, and at startup an incomplete final line is dropped (and the file rewritten) with a `warn`.
 - **Do not edit or delete these files while the archive is running.**
 
 ## Re-fetch of newly assigned Public chunks
