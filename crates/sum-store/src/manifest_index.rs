@@ -101,8 +101,8 @@ pub struct ManifestIndex {
     /// root; the PoR responder answers from it when the file has no Public
     /// manifest here.
     v2_proofs: HashMap<[u8; 32], BTreeMap<u32, PushedProof>>,
-    /// The `.v2_held` and `.v2_proofs` files whose directory entry this
-    /// process has synced. Until a file is in this set, an append to it also
+    /// The `.private_chunks`, `.v2_held` and `.v2_proofs` files whose
+    /// directory entry this process has synced. Until a file is in this set, an append to it also
     /// syncs the directory, so a record is never acknowledged while the file
     /// holding it could vanish in a crash.
     durable_sidecars: HashSet<PathBuf>,
@@ -271,14 +271,7 @@ impl ManifestIndex {
                         continue;
                     };
                     match fs::read_to_string(&path) {
-                        Ok(content) => {
-                            for line in content.lines() {
-                                let cid = line.trim();
-                                if !cid.is_empty() {
-                                    index.private_cid_to_root.insert(cid.to_string(), root);
-                                }
-                            }
-                        }
+                        Ok(content) => index.load_private_chunk_lines(&path, root, &content),
                         Err(e) => {
                             tracing::warn!(path = %path.display(), %e, "skipping unreadable private-chunks sidecar");
                         }
@@ -425,7 +418,10 @@ impl ManifestIndex {
     /// Record a `(cid, merkle_root)` mapping for a Private (encrypted)
     /// chunk that this archive has just accepted via V2 Push. Both
     /// the in-memory map AND the on-disk sidecar are updated so
-    /// recovery from a node restart still resolves these CIDs.
+    /// recovery from a node restart still resolves these CIDs. The
+    /// sidecar line is synced, with the file's directory entry on this
+    /// process's first append to it, before `Ok`; on `Err` nothing is
+    /// kept in memory, so a repeat push writes the record again.
     ///
     /// Idempotent for `(cid, root)` pairs already mapped to the same
     /// root; an attempt to remap a CID to a *different* root returns
@@ -1013,23 +1009,74 @@ impl ManifestIndex {
         Ok(())
     }
 
-    /// Append one CID line to `<hex_root>.private_chunks`. Each line
-    /// is independently complete (`<cid>\n`), so a crash mid-write
-    /// loses at most the in-flight line — the rest reloads cleanly.
-    fn append_private_chunk_cid_to_disk(&self, root: &[u8; 32], cid: &str) -> Result<()> {
-        use std::io::Write;
-        let hex_root: String = root.iter().map(|b| format!("{b:02x}")).collect();
+    /// Append one CID line to `<hex_root>.private_chunks`, durably (see
+    /// [`Self::append_sidecar_line`]). Each line is independently complete
+    /// (`<cid>\n`), so a crash mid-write loses at most the in-flight line,
+    /// whose push is then not acknowledged — the rest reloads cleanly.
+    fn append_private_chunk_cid_to_disk(&mut self, root: &[u8; 32], cid: &str) -> Result<()> {
         let path = self
             .manifests_dir
-            .join(format!("{hex_root}.private_chunks"));
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        f.write_all(cid.as_bytes())?;
-        f.write_all(b"\n")?;
-        f.sync_data()?; // durability — Private downloads depend on this surviving restart.
-        Ok(())
+            .join(format!("{}.private_chunks", hex::encode(root)));
+        self.append_sidecar_line(&path, &format!("{cid}\n"))
+    }
+
+    /// Parse a `<hex_root>.private_chunks` sidecar. Only newline-terminated
+    /// lines count: a torn final line (a crash or failed write mid-append)
+    /// is dropped, so a CID prefix is never mapped to the root. A blank
+    /// line is skipped. A dropped record means that chunk's pulls are
+    /// denied until it is pushed again.
+    ///
+    /// When anything was dropped, the sidecar is rewritten (atomically)
+    /// with only the usable records.
+    fn load_private_chunk_lines(&mut self, path: &Path, root: [u8; 32], content: &str) {
+        let complete = match content.rfind('\n') {
+            Some(last) => &content[..=last],
+            None => "",
+        };
+        let torn = complete.len() != content.len();
+        let mut cids: Vec<&str> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut skipped = 0usize;
+        for line in complete.lines() {
+            let cid = line.trim();
+            if cid.is_empty() {
+                skipped += 1;
+            } else if seen.insert(cid) {
+                cids.push(cid);
+            }
+        }
+        if torn || skipped > 0 {
+            tracing::warn!(
+                path = %path.display(),
+                torn_tail = torn,
+                skipped,
+                "private-chunks sidecar had unusable lines; pulls of those chunks are denied until they are pushed again"
+            );
+            if let Err(e) = self.rewrite_private_chunks(&root, &cids) {
+                tracing::warn!(path = %path.display(), %e, "could not rewrite the private-chunks sidecar");
+            }
+        }
+        for cid in cids {
+            self.private_cid_to_root.insert(cid.to_string(), root);
+        }
+    }
+
+    /// Replace `<hex_root>.private_chunks` with exactly `cids` (temp file,
+    /// fsync, rename, directory fsync).
+    fn rewrite_private_chunks(&self, root: &[u8; 32], cids: &[&str]) -> Result<()> {
+        use std::io::Write;
+        let name = format!("{}.private_chunks", hex::encode(root));
+        let path = self.manifests_dir.join(&name);
+        let tmp = self.manifests_dir.join(format!("{name}.tmp"));
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            for cid in cids {
+                writeln!(f, "{cid}")?;
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        sync_dir(&self.manifests_dir)
     }
 }
 
@@ -1472,6 +1519,123 @@ mod tests {
         idx.record_private_chunk_cid(root, cid).unwrap();
         idx.record_private_chunk_cid(root, cid).unwrap(); // no error
         assert_eq!(idx.merkle_root_for_cid(cid), Some(&root));
+    }
+
+    fn private_chunks_path(dir: &Path, root: &[u8; 32]) -> PathBuf {
+        dir.join("manifests")
+            .join(format!("{}.private_chunks", hex::encode(root)))
+    }
+
+    /// Creation. The first mapping for a root creates
+    /// `<hex_root>.private_chunks`, and is refused, writes nothing and is
+    /// not kept in memory while the directory cannot be synced: a crash
+    /// could otherwise lose the new file, and authorized pulls of the chunk
+    /// would be denied after the restart. Repeat push: the same mapping is
+    /// refused again while the file's entry is not known to be durable,
+    /// then accepted once the directory can be synced. Restart: both
+    /// mappings reload.
+    #[cfg(unix)]
+    #[test]
+    fn private_chunk_record_is_refused_until_its_new_file_is_synced_into_the_directory() {
+        use super::dir_sync_fault::UnsyncableDir;
+        let dir = tempfile::tempdir().unwrap();
+        let root = [0xC4u8; 32];
+        let manifests = dir.path().join("manifests");
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        {
+            let Some(_fault) = UnsyncableDir::new(&manifests) else {
+                return;
+            };
+            for attempt in ["created", "repeat"] {
+                idx.record_private_chunk_cid(root, "bafk_p_a")
+                    .expect_err(attempt);
+                assert!(idx.merkle_root_for_cid("bafk_p_a").is_none(), "{attempt}");
+            }
+            assert!(private_chunks_path(dir.path(), &root).exists());
+        }
+        idx.record_private_chunk_cid(root, "bafk_p_a").unwrap();
+        assert_eq!(idx.merkle_root_for_cid("bafk_p_a"), Some(&root));
+        {
+            let Some(_fault) = UnsyncableDir::new(&manifests) else {
+                return;
+            };
+            idx.record_private_chunk_cid(root, "bafk_p_b").unwrap();
+        }
+        drop(idx);
+
+        assert_eq!(
+            std::fs::read_to_string(private_chunks_path(dir.path(), &root)).unwrap(),
+            "bafk_p_a\nbafk_p_b\n",
+            "a refused attempt writes nothing"
+        );
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        assert_eq!(idx.merkle_root_for_cid("bafk_p_a"), Some(&root));
+        assert_eq!(idx.merkle_root_for_cid("bafk_p_b"), Some(&root));
+    }
+
+    /// An append that failed part-way leaves a line without its newline.
+    /// The next mapping cuts it, so the mapping is not joined to it and
+    /// survives a reload.
+    #[test]
+    fn private_chunk_record_after_a_partial_append_cuts_the_partial_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = [0xC5u8; 32];
+        let path = private_chunks_path(dir.path(), &root);
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        idx.record_private_chunk_cid(root, "bafk_p_0").unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"bafk_p").unwrap();
+        }
+        idx.record_private_chunk_cid(root, "bafk_p_1").unwrap();
+        drop(idx);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "bafk_p_0\nbafk_p_1\n"
+        );
+
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        assert_eq!(idx.merkle_root_for_cid("bafk_p_0"), Some(&root));
+        assert_eq!(idx.merkle_root_for_cid("bafk_p_1"), Some(&root));
+        assert!(idx.merkle_root_for_cid("bafk_p").is_none());
+    }
+
+    /// Restart after a crash mid-append. Only newline-terminated lines
+    /// count: the torn tail (a CID prefix) is not mapped, a blank line is
+    /// skipped, and the file is rewritten with the usable records. A later
+    /// mapping then appends cleanly and everything reloads.
+    #[test]
+    fn private_chunks_sidecar_drops_a_torn_tail_at_load_and_rewrites_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = [0xC6u8; 32];
+        let path = private_chunks_path(dir.path(), &root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "bafk_p_0\n\nbafk_p_1\nbafk_p_0\nbafk_p_2_tor").unwrap();
+
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        assert_eq!(idx.merkle_root_for_cid("bafk_p_0"), Some(&root));
+        assert_eq!(idx.merkle_root_for_cid("bafk_p_1"), Some(&root));
+        assert!(idx.merkle_root_for_cid("bafk_p_2_tor").is_none());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "bafk_p_0\nbafk_p_1\n",
+            "rewritten with only the usable records"
+        );
+
+        idx.record_private_chunk_cid(root, "bafk_p_2").unwrap();
+        drop(idx);
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        for cid in ["bafk_p_0", "bafk_p_1", "bafk_p_2"] {
+            assert_eq!(idx.merkle_root_for_cid(cid), Some(&root), "{cid}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "bafk_p_0\nbafk_p_1\nbafk_p_2\n"
+        );
     }
 
     /// Defensive: refuse to rebind a CID from one Private root to
