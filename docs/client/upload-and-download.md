@@ -93,9 +93,22 @@ chain, the command aborts before any state is written.
 
 ### Recovery
 
+If `ingest-v2` prints no `lifecycle:` line, the registration did not
+finalize during the run; the warning says why. A refusal before it was
+sent (step 2 above, for example) left nothing on chain. A registration
+that was sent but not confirmed (a finality timeout, a failed status
+query, an error from the submission call) can still finalize and leave
+the file `Pending`: look the root up with `storage_getFileInfoV2` before
+ingesting again, and finish a `Pending` row with `resume` or `abandon`
+below. `--exit-status` reports these cases as codes `6`, `7` and `8`,
+and with `8` prints the root as `merkle_root:`
+([CLI reference](../reference/cli.md#sum-node-ingest-v2)).
+
 If `ingest-v2` prints `lifecycle: Pending` (chunks pushed but
 coverage or activation stalled), the file is recoverable. The exit
-status is 0 either way, so read the `lifecycle:` line:
+status is 0 either way, so read the `lifecycle:` line (or pass
+`--exit-status` for a code per outcome; see the
+[CLI reference](../reference/cli.md#sum-node-ingest-v2)):
 
 - **`sum-node resume <merkle-root-hex> <path>`** — replay only the
   residual portion of the pipeline. Re-chunks `<path>` locally,

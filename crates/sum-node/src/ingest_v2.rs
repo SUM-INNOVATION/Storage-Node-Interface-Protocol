@@ -28,11 +28,36 @@
 //!
 //! ## Outcome semantics
 //!
-//! Failures map to either [`IngestOutcome::Failed`] (only when
-//! `RegisterFilePendingV2` itself never finalizes — no chain state was
-//! created, caller can retry from scratch) or
-//! [`IngestOutcome::PendingNeedsAction`] (file is `Pending` on chain,
-//! caller must `resume` or `abandon` via W11).
+//! A run that does not activate the file ends in one of two outcomes:
+//!
+//! * [`IngestOutcome::PendingNeedsAction`] means `RegisterFilePendingV2`
+//!   finalized, so the file is `Pending` on chain. Finish it with `resume`
+//!   or `abandon` (W11); do not ingest it again.
+//! * [`IngestOutcome::Failed`] at [`IngestStage::Register`] means the
+//!   registration was not seen to finalize. What this run may have left on
+//!   chain depends on [`IngestOutcome::registration_tx`]:
+//!   * [`RegistrationTx::NotSent`] means the run stopped before submitting
+//!     it (R = 0, the V2 gate, chunking, the chunk cap, S1a discovery, the
+//!     nonce read or the transaction build). It created no chain state and
+//!     spent no fee; retry once the cause is fixed.
+//!   * [`RegistrationTx::Rejected`] means the chain reported the
+//!     transaction `Failed` or `Dropped`. It registered nothing. A `Failed`
+//!     one paid its fee and fails again unless its cause changed; a root
+//!     that is already registered is always refused.
+//!   * [`RegistrationTx::Unconfirmed`] means it was submitted, or may have
+//!     been (the submission call errored, the finality wait timed out or a
+//!     status query failed), and no terminal status was seen. It can still
+//!     finalize and leave the file `Pending`, with its fee deposit locked.
+//!     Before ingesting again, look the root
+//!     ([`IngestOutcome::merkle_root`]) up with `storage_getFileInfoV2`,
+//!     and again later if there is no row yet: a row this account owns is
+//!     finished with `resume` or `abandon`, not by a new ingest.
+//!
+//! Neither outcome says the root was free before the run. With `NotSent` or
+//! `Rejected` it may already be registered, as a V1 or a V2 file, by this
+//! account in an earlier run or by another owner, so look it up before
+//! treating the file as stored. `sum-node ingest-v2 --exit-status`
+//! reports each of these cases with its own code ([`ingest_exit`]).
 //!
 //! W10a never abandons. The pipeline never escalates to S7.
 //!
@@ -185,10 +210,13 @@ pub enum IngestOutcome {
     /// included so the caller doesn't have to re-chunk.
     ///
     /// This does not prove that nothing is on chain. If the registration
-    /// was broadcast and its finality wait timed out or a status query
-    /// failed, it can still finalize and leave the file `Pending`, with
-    /// its deposit locked. Look the root up on chain before retrying; if
-    /// it is registered, `resume` or `abandon` it.
+    /// was submitted and the submission call errored, its finality wait
+    /// timed out or a status query failed, it can still finalize and leave
+    /// the file `Pending`, with its deposit locked. Look the root up on
+    /// chain before retrying; if it is registered, `resume` or `abandon` it.
+    /// [`IngestOutcome::registration_tx`] says whether the registration
+    /// was sent and what the chain reported for it; the module docs
+    /// ("Outcome semantics") say what to do in each case.
     Failed {
         stage: IngestStage,
         manifest: Option<DataManifest>,
@@ -1482,14 +1510,18 @@ where
     /// then drives the same S1–S6 stages as [`Self::run`] with the
     /// ciphertext bytes and an encrypted manifest.
     ///
-    /// Failure shape mirrors [`Self::run`]: a pre-S1 error returns
-    /// [`IngestOutcome::Failed`] (no chain state created); post-S1
-    /// failures return [`IngestOutcome::PendingNeedsAction`] with the
-    /// stage that broke. Phase 4a does not yet implement Private
-    /// resume — the operator's options for a stuck Private `Pending`
-    /// file are (a) wait + retry the full ingest under the SAME
-    /// merkle_root (idempotent on chain), or (b) `abandon` (chain-only,
-    /// recovers fee deposit).
+    /// Outcomes are those of [`Self::run`] (module docs, "Outcome
+    /// semantics"). A registration that is not seen to finalize returns
+    /// [`IngestOutcome::Failed`], which can still leave a `Pending` file
+    /// when [`IngestOutcome::registration_tx`] is
+    /// [`RegistrationTx::Unconfirmed`]; a failure after it finalized
+    /// returns [`IngestOutcome::PendingNeedsAction`] with the stage that
+    /// broke. Finish a `Pending` Private file with [`Self::resume`], which
+    /// recovers `K_file` from the owner's bundle on chain, or with
+    /// `abandon` (chain-only, refunds most of the fee deposit). Do not
+    /// ingest the same plaintext again to recover it: a fresh `K_file`
+    /// gives a different root, so that registers a second file and locks a
+    /// second deposit.
     pub async fn run_private(&self, path: &Path, spec: PrivateIngestSpec) -> IngestOutcome {
         // ── R=0 preflight (#33) — see `run` for rationale ──────────
         if self.params.assignment_replication_factor == 0 {
@@ -2436,10 +2468,12 @@ where
             .await
         {
             Ok(Some(info)) => info,
-            // Terminal not-found: the chain has no V2 row for this root,
-            // so RegisterFilePendingV2 never took. No chain state exists —
-            // the caller can rebuild a fresh tx. Distinct from a transient
-            // RPC error below.
+            // Terminal not-found: the chain has no V2 row for this root
+            // now, so there is nothing to resume. That does not prove no
+            // registration is coming: one that was sent but not confirmed
+            // (`RegistrationTx::Unconfirmed`) can still finalize, so look
+            // again before registering the file anew. Distinct from a
+            // transient RPC error below.
             Ok(None) => {
                 return IngestOutcome::Failed {
                     stage: IngestStage::Register,
