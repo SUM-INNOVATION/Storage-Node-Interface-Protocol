@@ -4340,6 +4340,101 @@ mod tests {
         );
     }
 
+    /// Makes a directory unreadable (mode 0300) while alive: opening it to
+    /// sync it fails, while files in it can still be created and appended
+    /// to. Restores mode 0755 on drop.
+    #[cfg(unix)]
+    struct UnsyncableDir(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl UnsyncableDir {
+        /// `None`, after restoring the mode, where permissions are not
+        /// enforced (running as root): the fault cannot be injected there.
+        fn new(dir: &std::path::Path) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+            let fault = Self(dir.to_path_buf());
+            if std::fs::File::open(dir).is_ok() {
+                eprintln!("skipped: directory permissions are not enforced here");
+                return None;
+            }
+            Some(fault)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UnsyncableDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// Creation and repeat push. The first push of a file creates its
+    /// `.v2_proofs` and `.v2_held` sidecars, and is acknowledged only once
+    /// each new file is synced into the store's directory, since a crash
+    /// could otherwise lose the file and with it the records the ACK
+    /// promised. While the directory cannot be synced the push is refused
+    /// and nothing is held, also on a repeat; once it can, the same push is
+    /// acknowledged and held, and its records survive a restart. Both
+    /// visibilities.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_push_is_acknowledged_only_once_its_new_records_are_synced_into_the_directory() {
+        for (private, salt) in [(true, 0x6A), (false, 0x6B)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (rpc, manifest, chunks, tree, mine) = held_fixture(16, salt, private);
+            let root = manifest.merkle_root;
+            let i = mine[0];
+            let stores = store_at(dir.path());
+            let d = build_dispatcher(rpc, vec![], five_archives()[0], stores.clone());
+            let net = RecorderNet::new();
+            {
+                let Some(_fault) = UnsyncableDir::new(&dir.path().join("manifests")) else {
+                    return;
+                };
+                for attempt in ["first", "repeat"] {
+                    let err = push(&d, &net, root, i, &chunks, &tree)
+                        .await
+                        .expect("refused");
+                    assert!(
+                        err.contains("push-proof persistence failed"),
+                        "private = {private}, {attempt}: {err}"
+                    );
+                    assert!(d.held_for(&root).is_empty());
+                    let s = stores.read().await;
+                    assert!(s.manifest_idx.v2_pushed_proof(&root, i).is_none());
+                    assert!(s.manifest_idx.v2_held_records(&root).is_none());
+                }
+            }
+            assert_eq!(
+                push(&d, &net, root, i, &chunks, &tree).await,
+                None,
+                "private = {private}"
+            );
+            assert_eq!(d.held_for(&root), BTreeSet::from([i]));
+            drop(d);
+
+            let stores = restart_store(stores, &root, &[]).await;
+            let s = stores.read().await;
+            assert_eq!(
+                s.manifest_idx.v2_pushed_proof(&root, i),
+                Some(&sum_store::manifest_index::PushedProof {
+                    leaf: *blake3::hash(&chunks[i as usize]).as_bytes(),
+                    path: tree.proof_bytes(i),
+                }),
+                "private = {private}"
+            );
+            assert_eq!(
+                s.manifest_idx
+                    .v2_held_records(&root)
+                    .map(|r| r.keys().copied().collect()),
+                Some(vec![i]),
+                "private = {private}"
+            );
+        }
+    }
+
     /// Fail closed. A Private challenge is not answered when the record
     /// that would answer it is missing: a chunk pushed before push proofs
     /// were recorded (no `.v2_proofs` sidecar), or a recorded proof whose
