@@ -84,8 +84,9 @@ use crate::runtime_params::RuntimeChainParams;
 pub use crate::download::DownloadResult;
 pub use crate::download_route::DownloadPath;
 pub use crate::ingest_v2::{
-    IngestOutcome, IngestParams, IngestParamsDefaults, IngestPipeline, IngestStage,
-    MapPeerResolver, PrivateIngestSpec, PrivateRecipient, SuggestedAction,
+    IngestExitStatus, IngestOutcome, IngestParams, IngestParamsDefaults, IngestPipeline,
+    IngestStage, MapPeerResolver, PrivateIngestSpec, PrivateRecipient, RegistrationTx, RootOnChain,
+    SuggestedAction,
 };
 pub use crate::rpc_client::L1RpcClient;
 pub use sum_net::identity;

@@ -228,7 +228,196 @@ pub mod resume_exit {
     pub const ROOT_MISMATCH: i32 = 5;
 }
 
+/// Exit status of `sum-node ingest-v2 --exit-status`, by outcome
+/// ([`IngestOutcome::ingest_exit_code`]). Without `--exit-status`,
+/// `ingest-v2` exits 0 for every outcome.
+///
+/// The codes it shares with `resume` keep their [`resume_exit`] values and
+/// meanings. `5` ([`resume_exit::ROOT_MISMATCH`]) is not used: `ingest-v2`
+/// is given no root to mismatch. `6`, `7` and `8` split a registration
+/// that did not finalize by what the chain can hold for it.
+pub mod ingest_exit {
+    use super::resume_exit;
+
+    /// The file is `Active`: `ActivateFileV2` finalized during this run.
+    pub const ACTIVE: i32 = resume_exit::ACTIVE;
+    /// An error: before an outcome (arguments, `--key-file`, RPC, chain
+    /// parameters, network start-up), or after a registration that was not
+    /// sent or was rejected when the root lookup that tells
+    /// [`REFUSED`] from [`ALREADY_REGISTERED`] could not be done
+    /// ([`super::RootOnChain::LookupFailed`]). Nothing is claimed about
+    /// the chain.
+    pub const ERROR: i32 = resume_exit::ERROR;
+    /// The file is registered and still `Pending`: run `resume` or
+    /// `abandon`.
+    pub const PENDING: i32 = resume_exit::PENDING;
+    /// The chain shows the file `Abandoned`. `ingest-v2` does not produce
+    /// this outcome today; the code is reserved with the `resume` meaning.
+    pub const ABANDONED: i32 = resume_exit::ABANDONED;
+    /// Refused before chain registration: this run registered nothing and
+    /// nothing it sent can register later. Either the registration was
+    /// never sent ([`super::RegistrationTx::NotSent`]) or the chain
+    /// reported it failed or dropped ([`super::RegistrationTx::Rejected`]),
+    /// and the lookup found neither a V1 nor a V2 row for the root (or no
+    /// root was computed). Safe to retry once the cause is fixed.
+    ///
+    /// "Nothing registered" is not "nothing spent": a registration the
+    /// chain reported `Failed` was included in a block and paid its
+    /// transaction fee (the chain deducts it before it checks the
+    /// operation). One never sent, or `Dropped`, paid nothing.
+    pub const REFUSED: i32 = 6;
+    /// The file's merkle root is already registered on chain, as a V1 row
+    /// (`storage_getAccessList`) or a V2 row (`storage_getFileInfoV2`), and
+    /// this run did not register it. The row may belong to another owner:
+    /// read it before treating the file as stored.
+    pub const ALREADY_REGISTERED: i32 = 7;
+    /// The registration was sent, or may have been, and its outcome is
+    /// unknown ([`super::RegistrationTx::Unconfirmed`]): it can still
+    /// finalize and leave the file `Pending`, with its deposit locked. Look
+    /// the root up on chain before retrying. With `--exit-status` the CLI
+    /// prints the root as `merkle_root:`, with no `lifecycle:` line.
+    pub const REGISTRATION_UNCONFIRMED: i32 = 8;
+}
+
+/// What became of the `RegisterFilePendingV2` transaction behind an
+/// [`IngestOutcome::Failed`] at [`IngestStage::Register`]
+/// ([`IngestOutcome::registration_tx`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationTx {
+    /// Not sent: the pipeline stopped before submitting it (R = 0, the V2
+    /// gate, chunking, the chunk cap, S1a archive discovery, the nonce
+    /// read or the transaction build). Nothing from this call is on chain.
+    NotSent,
+    /// Sent, and the chain reported it `Failed` (included, then refused by
+    /// the executor, for example because the root is already registered)
+    /// or `Dropped`. Terminal for that transaction: it registered nothing.
+    Rejected,
+    /// Sent, or possibly sent, with no terminal status: the submission
+    /// call itself failed (the node can accept a transaction into its
+    /// mempool and still return an error), the finality wait timed out,
+    /// or a status query failed. It can still finalize.
+    Unconfirmed,
+}
+
+/// A registration failure from the point the transaction was submitted
+/// on. It displays, and chains its causes, exactly as the error it wraps,
+/// so logs and messages are unchanged; it only records what
+/// [`IngestOutcome::registration_tx`] reports.
+#[derive(Debug)]
+struct SentRegistrationError {
+    tx: RegistrationTx,
+    inner: anyhow::Error,
+}
+
+impl std::fmt::Display for SentRegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl std::error::Error for SentRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.inner.source()
+    }
+}
+
+fn sent_registration_error(tx: RegistrationTx, inner: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(SentRegistrationError { tx, inner })
+}
+
+/// What the chain holds for an outcome's merkle root, as far as
+/// [`IngestPipeline::ingest_exit_status`] could tell. It decides
+/// [`ingest_exit::ALREADY_REGISTERED`] versus [`ingest_exit::REFUSED`] for
+/// a registration that was not sent or was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootOnChain {
+    /// A V1 row (`storage_getAccessList`) or a V2 row
+    /// (`storage_getFileInfoV2`) exists for the root.
+    Registered,
+    /// Both lookups answered, and neither found a row.
+    NotRegistered,
+    /// A lookup failed (an RPC error or a malformed row) and no row was
+    /// found, so neither of the above can be claimed.
+    LookupFailed,
+    /// No lookup was made: the outcome has no root, or its code does not
+    /// depend on one.
+    NotLookedUp,
+}
+
+/// The result of [`IngestPipeline::ingest_exit_status`].
+#[derive(Debug)]
+pub struct IngestExitStatus {
+    /// The exit code ([`ingest_exit`]).
+    pub code: i32,
+    /// What the root lookup found.
+    pub root_on_chain: RootOnChain,
+    /// Why the lookup failed, when `root_on_chain` is
+    /// [`RootOnChain::LookupFailed`].
+    pub lookup_error: Option<anyhow::Error>,
+}
+
 impl IngestOutcome {
+    /// For a [`IngestOutcome::Failed`] at [`IngestStage::Register`]: whether
+    /// its registration transaction was sent and what the chain reported
+    /// for it. `None` for every other outcome. The pipeline sends a
+    /// registration only in S1, so a failure anywhere before it is
+    /// [`RegistrationTx::NotSent`].
+    pub fn registration_tx(&self) -> Option<RegistrationTx> {
+        match self {
+            IngestOutcome::Failed {
+                stage: IngestStage::Register,
+                source,
+                ..
+            } => Some(
+                source
+                    .downcast_ref::<SentRegistrationError>()
+                    .map_or(RegistrationTx::NotSent, |e| e.tx),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The `sum-node ingest-v2 --exit-status` status for this outcome
+    /// ([`ingest_exit`]). Exhaustive on purpose: a new outcome needs an
+    /// explicit code.
+    ///
+    /// `root` is what the chain holds for [`Self::merkle_root`]
+    /// ([`IngestPipeline::ingest_exit_status`] looks it up). It is read only
+    /// for a registration that was not sent or was rejected:
+    /// [`RootOnChain::Registered`] gives [`ingest_exit::ALREADY_REGISTERED`],
+    /// [`RootOnChain::NotRegistered`] gives [`ingest_exit::REFUSED`], and a
+    /// failed or missing lookup gives [`ingest_exit::ERROR`]: a refusal is
+    /// never reported without a lookup, except when no root was computed
+    /// (there is nothing to look up). An unconfirmed registration is
+    /// [`ingest_exit::REGISTRATION_UNCONFIRMED`] whatever the lookup says,
+    /// because a row may be its own.
+    pub fn ingest_exit_code(&self, root: RootOnChain) -> i32 {
+        match self {
+            IngestOutcome::Activated { .. }
+            | IngestOutcome::ResumedActivated { .. }
+            | IngestOutcome::ActivatedOnChain { .. } => ingest_exit::ACTIVE,
+            IngestOutcome::PendingNeedsAction { .. } => ingest_exit::PENDING,
+            IngestOutcome::AbandonedOnChain { .. } => ingest_exit::ABANDONED,
+            // Resume-only: `ingest-v2` is given no root to mismatch.
+            IngestOutcome::RootMismatch { .. } => ingest_exit::ERROR,
+            IngestOutcome::Failed { .. } => match self.registration_tx() {
+                Some(RegistrationTx::Unconfirmed) => ingest_exit::REGISTRATION_UNCONFIRMED,
+                Some(RegistrationTx::NotSent | RegistrationTx::Rejected) => match root {
+                    RootOnChain::Registered => ingest_exit::ALREADY_REGISTERED,
+                    RootOnChain::NotRegistered => ingest_exit::REFUSED,
+                    // Stopped before chunking: no root, so nothing to look up.
+                    RootOnChain::NotLookedUp if self.merkle_root().is_none() => {
+                        ingest_exit::REFUSED
+                    }
+                    RootOnChain::LookupFailed | RootOnChain::NotLookedUp => ingest_exit::ERROR,
+                },
+                // A `Failed` past registration: the pipeline never returns
+                // one, so nothing is claimed about the chain.
+                None => ingest_exit::ERROR,
+            },
+        }
+    }
+
     /// The `sum-node resume` exit status for this outcome
     /// ([`resume_exit`]). Exhaustive on purpose: a new outcome needs an
     /// explicit code.
@@ -447,6 +636,18 @@ pub trait V2IngestRpc: AttestorRpc + V2RpcClient + Send + Sync {
     ) -> Result<Option<AssignmentCoverageV2>>;
     async fn chain_get_block_height(&self) -> Result<BlockHeightInfo>;
     async fn get_nonce(&self, addr_base58: &str) -> Result<u64>;
+
+    /// Whether the chain holds a V1 (legacy) registration of this root, from
+    /// `storage_getAccessList`: `Ok(true)` a row, `Ok(false)` JSON `null`,
+    /// `Err` an RPC failure or a malformed row. The chain refuses a V2
+    /// registration of a root registered either way.
+    ///
+    /// Read only by [`IngestPipeline::ingest_exit_status`]. The provided
+    /// default fails, so an implementation that does not supply it gets a
+    /// lookup error from that call, never a false "not registered".
+    async fn v1_root_registered(&self, _merkle_root_hex: &str) -> Result<bool> {
+        anyhow::bail!("this RPC client has no V1 file lookup (storage_getAccessList)")
+    }
 }
 
 /// Outbound V2 network operations the pipeline needs. Production impl
@@ -500,6 +701,11 @@ impl V2IngestRpc for crate::rpc_client::L1RpcClient {
 
     async fn get_nonce(&self, addr_base58: &str) -> Result<u64> {
         crate::rpc_client::L1RpcClient::get_nonce(self, addr_base58).await
+    }
+
+    async fn v1_root_registered(&self, merkle_root_hex: &str) -> Result<bool> {
+        let row = crate::rpc_client::L1RpcClient::get_access_list(self, merkle_root_hex).await?;
+        Ok(row.is_some())
     }
 }
 
@@ -968,6 +1174,58 @@ where
             my_addr,
             my_addr_base58: sum_net::l1_address_base58(&my_addr),
             params,
+        }
+    }
+
+    /// The `sum-node ingest-v2 --exit-status` status for an outcome of
+    /// [`Self::run`] or [`Self::run_private`] ([`ingest_exit`]).
+    ///
+    /// For a registration that was not sent or was rejected, and only then,
+    /// it looks the outcome's root up: `storage_getFileInfoV2` (V2), then,
+    /// if that finds no row, `storage_getAccessList` (V1), because the chain
+    /// refuses a V2 registration of a root registered either way. A row in
+    /// either means [`ingest_exit::ALREADY_REGISTERED`]; no row in both,
+    /// [`ingest_exit::REFUSED`]. If a lookup fails and no row was found,
+    /// the result is [`RootOnChain::LookupFailed`] with
+    /// [`ingest_exit::ERROR`] and the error: a refusal is not reported
+    /// unless both lookups answered. The lookups are read-only; nothing is
+    /// sent.
+    pub async fn ingest_exit_status(&self, outcome: &IngestOutcome) -> IngestExitStatus {
+        let (root_on_chain, lookup_error) = match (outcome.registration_tx(), outcome.merkle_root())
+        {
+            (Some(RegistrationTx::NotSent | RegistrationTx::Rejected), Some(root)) => {
+                self.root_on_chain(&format!("0x{}", hex::encode(root)))
+                    .await
+            }
+            _ => (RootOnChain::NotLookedUp, None),
+        };
+        IngestExitStatus {
+            code: outcome.ingest_exit_code(root_on_chain),
+            root_on_chain,
+            lookup_error,
+        }
+    }
+
+    /// The V2 lookup, then the V1 lookup if the V2 one found no row. A row
+    /// in either is `Registered`, whatever the other lookup did.
+    async fn root_on_chain(&self, root_hex: &str) -> (RootOnChain, Option<anyhow::Error>) {
+        let v2 = match self.rpc.storage_get_file_info_v2(root_hex).await {
+            Ok(Some(_)) => return (RootOnChain::Registered, None),
+            Ok(None) => None,
+            Err(e) => Some(e.context(format!("storage_getFileInfoV2({root_hex})"))),
+        };
+        let v1 = match self.rpc.v1_root_registered(root_hex).await {
+            Ok(true) => return (RootOnChain::Registered, None),
+            Ok(false) => None,
+            Err(e) => Some(e.context(format!("storage_getAccessList({root_hex})"))),
+        };
+        match (v2, v1) {
+            (None, None) => (RootOnChain::NotRegistered, None),
+            (Some(e), None) | (None, Some(e)) => (RootOnChain::LookupFailed, Some(e)),
+            (Some(v2), Some(v1)) => (
+                RootOnChain::LookupFailed,
+                Some(anyhow::anyhow!("{v2:#}; {v1:#}")),
+            ),
         }
     }
 
@@ -1566,7 +1824,14 @@ where
             visibility,
             initial_access,
         )?;
-        let tx_hash = self.rpc.send_raw_transaction(&tx_hex).await?;
+        // From here on the transaction may be on its way to the chain, so
+        // every error records what became of it (`RegistrationTx`). The
+        // messages are unchanged.
+        let tx_hash = self
+            .rpc
+            .send_raw_transaction(&tx_hex)
+            .await
+            .map_err(|e| sent_registration_error(RegistrationTx::Unconfirmed, e))?;
         let height = wait_for_finalized(
             self.rpc.as_ref(),
             &tx_hash,
@@ -1575,16 +1840,19 @@ where
         )
         .await
         .map_err(|e| match e {
-            TxWaitError::Failed { reason, .. } => {
-                anyhow::anyhow!("RegisterFilePendingV2 failed: {reason}")
-            }
-            TxWaitError::Dropped => {
-                anyhow::anyhow!("RegisterFilePendingV2 dropped (resubmit with new nonce)")
-            }
-            TxWaitError::Timeout { last_status } => {
-                anyhow::anyhow!("RegisterFilePendingV2 timeout, last status: {last_status:?}")
-            }
-            TxWaitError::Rpc(e) => e,
+            TxWaitError::Failed { reason, .. } => sent_registration_error(
+                RegistrationTx::Rejected,
+                anyhow::anyhow!("RegisterFilePendingV2 failed: {reason}"),
+            ),
+            TxWaitError::Dropped => sent_registration_error(
+                RegistrationTx::Rejected,
+                anyhow::anyhow!("RegisterFilePendingV2 dropped (resubmit with new nonce)"),
+            ),
+            TxWaitError::Timeout { last_status } => sent_registration_error(
+                RegistrationTx::Unconfirmed,
+                anyhow::anyhow!("RegisterFilePendingV2 timeout, last status: {last_status:?}"),
+            ),
+            TxWaitError::Rpc(e) => sent_registration_error(RegistrationTx::Unconfirmed, e),
         })?;
         info!(
             tx_hash,
