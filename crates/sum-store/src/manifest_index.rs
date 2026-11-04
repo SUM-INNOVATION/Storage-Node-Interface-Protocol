@@ -101,6 +101,11 @@ pub struct ManifestIndex {
     /// root; the PoR responder answers from it when the file has no Public
     /// manifest here.
     v2_proofs: HashMap<[u8; 32], BTreeMap<u32, PushedProof>>,
+    /// The `.v2_held` and `.v2_proofs` files whose directory entry this
+    /// process has synced. Until a file is in this set, an append to it also
+    /// syncs the directory, so a record is never acknowledged while the file
+    /// holding it could vanish in a crash.
+    durable_sidecars: HashSet<PathBuf>,
     /// `Some(false)` when the protected list exists but could not be read:
     /// garbage collection must then delete nothing. `None` until the list
     /// has been created (first run of this version, before seeding).
@@ -222,6 +227,7 @@ impl ManifestIndex {
             gc_protected: HashSet::new(),
             v2_held: HashMap::new(),
             v2_proofs: HashMap::new(),
+            durable_sidecars: HashSet::new(),
             gc_protection_intact: None,
         };
 
@@ -511,9 +517,11 @@ impl ManifestIndex {
     }
 
     /// Record, durably, that the chunk at `chunk_index` of `merkle_root`
-    /// was accepted by a V2 Push and stored under `cid`. Call it after the
-    /// chunk is written and before the push is acknowledged; the held set
-    /// is rebuilt from these records after a restart.
+    /// was accepted by a V2 Push and stored under `cid`: one line appended
+    /// to `<hex_root>.v2_held` and synced, with the file's directory entry
+    /// on this process's first append to it. Call it after the chunk is
+    /// written and before the push is acknowledged; the held set is rebuilt
+    /// from these records after a restart.
     ///
     /// Idempotent for a pair already recorded. A different CID for an index
     /// already recorded is refused: a verified Merkle proof binds each index
@@ -559,7 +567,8 @@ impl ManifestIndex {
     /// Record, durably, the leaf and Merkle path a validated V2 Push carried
     /// for the chunk at `chunk_index` of `merkle_root`, as one
     /// `<chunk_index> <leaf hex> <path>` line appended to
-    /// `<hex_root>.v2_proofs` and synced (`<path>`: the sibling hashes in
+    /// `<hex_root>.v2_proofs` and synced, with the file's directory entry
+    /// on this process's first append to it (`<path>`: the sibling hashes in
     /// hex, bottom-up, comma-separated; `-` for a one-chunk file). Call it
     /// after the chunk is written and before its held index is recorded and
     /// the push acknowledged. The PoR responder answers a challenge on the
@@ -869,21 +878,15 @@ impl ManifestIndex {
         sync_dir(&self.manifests_dir)
     }
 
-    /// Append one `<chunk_index> <cid>` line to `<hex_root>.v2_held` and
-    /// sync it. Each line is independently complete, so a crash mid-write
-    /// loses at most the in-flight record.
-    fn append_v2_held_line(&self, root: &[u8; 32], chunk_index: u32, cid: &str) -> Result<()> {
-        use std::io::Write;
+    /// Append one `<chunk_index> <cid>` line to `<hex_root>.v2_held`,
+    /// durably (see [`Self::append_sidecar_line`]). Each line is
+    /// independently complete, so a crash mid-write loses at most the
+    /// in-flight record.
+    fn append_v2_held_line(&mut self, root: &[u8; 32], chunk_index: u32, cid: &str) -> Result<()> {
         let path = self
             .manifests_dir
             .join(format!("{}.v2_held", hex::encode(root)));
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        f.write_all(format!("{chunk_index} {cid}\n").as_bytes())?;
-        f.sync_data()?;
-        Ok(())
+        self.append_sidecar_line(&path, &format!("{chunk_index} {cid}\n"))
     }
 
     /// Parse a `<hex_root>.v2_proofs` sidecar with the `.v2_held`
@@ -968,36 +971,43 @@ impl ManifestIndex {
         sync_dir(&self.manifests_dir)
     }
 
-    /// Append one line to `<hex_root>.v2_proofs` and sync it. Each line is
-    /// independently complete, so a crash mid-write loses at most the
-    /// in-flight record, whose push is then not acknowledged. If the file
-    /// does not end in a newline (an earlier append failed part-way in this
-    /// process), the record starts on a new line, so it is not joined to the
-    /// partial one and lost at the next load.
+    /// Append one line to `<hex_root>.v2_proofs`, durably (see
+    /// [`Self::append_sidecar_line`]). Each line is independently complete,
+    /// so a crash mid-write loses at most the in-flight record, whose push
+    /// is then not acknowledged.
     fn append_v2_proof_line(
-        &self,
+        &mut self,
         root: &[u8; 32],
         chunk_index: u32,
         proof: &PushedProof,
     ) -> Result<()> {
-        use std::io::{Read, Seek, SeekFrom, Write};
         let path = self
             .manifests_dir
             .join(format!("{}.v2_proofs", hex::encode(root)));
+        self.append_sidecar_line(&path, &format_v2_proof_line(chunk_index, proof))
+    }
+
+    /// Append `line` (newline-terminated) to the sidecar at `path`, creating
+    /// it if needed, and return `Ok` only once the line would survive a
+    /// crash. The first time this process appends to the file, the
+    /// directory is synced before the line is written, so the file's own
+    /// entry is durable: a newly created file whose data alone was synced
+    /// can vanish in a crash, records and all. A failed directory sync is an
+    /// error, writes nothing, and is tried again on the next append, so a
+    /// repeat push repairs it. Then a torn final line is cut (see
+    /// [`cut_torn_tail`]), the line written, and the file's data synced.
+    fn append_sidecar_line(&mut self, path: &Path, line: &str) -> Result<()> {
+        use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
-            .open(&path)?;
-        let mut line = format_v2_proof_line(chunk_index, proof);
-        if f.metadata()?.len() > 0 {
-            let mut last = [0u8; 1];
-            f.seek(SeekFrom::End(-1))?;
-            f.read_exact(&mut last)?;
-            if last[0] != b'\n' {
-                line.insert(0, '\n');
-            }
+            .open(path)?;
+        if !self.durable_sidecars.contains(path) {
+            sync_dir(&self.manifests_dir)?;
+            self.durable_sidecars.insert(path.to_path_buf());
         }
+        cut_torn_tail(&mut f)?;
         f.write_all(line.as_bytes())?;
         f.sync_data()?;
         Ok(())
@@ -1135,6 +1145,42 @@ fn write_marker(manifests_dir: &Path) -> Result<()> {
     f.sync_all()?;
     drop(f);
     sync_dir(manifests_dir)
+}
+
+/// Cut a final line without its newline (left by an append that failed
+/// part-way) off a sidecar, so the next line is not joined to it. The
+/// loader drops such a tail anyway; cutting it, rather than ending it with
+/// a newline, keeps a fragment from becoming a line that parses: `2 ci`, a
+/// prefix of a `.v2_held` record, would read as chunk 2 held under `ci`.
+fn cut_torn_tail(f: &mut std::fs::File) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut last = [0u8; 1];
+    f.seek(SeekFrom::End(-1))?;
+    f.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    let mut buf = [0u8; 4096];
+    let mut end = len - 1;
+    let keep = loop {
+        if end == 0 {
+            break 0;
+        }
+        let start = end.saturating_sub(buf.len() as u64);
+        let n = (end - start) as usize;
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut buf[..n])?;
+        if let Some(i) = buf[..n].iter().rposition(|&b| b == b'\n') {
+            break start + i as u64 + 1;
+        }
+        end = start;
+    };
+    f.set_len(keep)?;
+    Ok(())
 }
 
 /// Make a rename or create in `dir` durable (no-op where directories
@@ -1860,6 +1906,38 @@ mod network_manifest_ingress_tests {
     }
 }
 
+/// Fault injection for the sidecar directory sync, for the tests below.
+#[cfg(all(test, unix))]
+pub(crate) mod dir_sync_fault {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    /// Makes a directory unreadable (mode 0300) while alive: opening it to
+    /// sync it fails, while files in it can still be created and appended
+    /// to. Restores mode 0755 on drop.
+    pub(crate) struct UnsyncableDir(PathBuf);
+
+    impl UnsyncableDir {
+        /// `None`, after restoring the mode, where permissions are not
+        /// enforced (running as root): the fault cannot be injected there.
+        pub(crate) fn new(dir: &Path) -> Option<Self> {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+            let fault = Self(dir.to_path_buf());
+            if std::fs::File::open(dir).is_ok() {
+                eprintln!("skipped: directory permissions are not enforced here");
+                return None;
+            }
+            Some(fault)
+        }
+    }
+
+    impl Drop for UnsyncableDir {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+}
+
 #[cfg(test)]
 mod v2_held_tests {
     use super::*;
@@ -1953,6 +2031,134 @@ mod v2_held_tests {
             .copied()
             .collect();
         assert_eq!(got, vec![0, 5, 6, 9]);
+    }
+
+    /// An append that failed part-way leaves a line without its newline.
+    /// The next record cuts it: ended with a newline, the fragment `2 ci`
+    /// would reload as chunk 2 held under a CID that does not exist.
+    #[test]
+    fn v2_held_record_after_a_partial_append_cuts_the_partial_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = [0x5D; 32];
+        let path = dir
+            .path()
+            .join("manifests")
+            .join(format!("{}.v2_held", hex::encode(root)));
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        idx.record_v2_held_index(root, 0, "cid-0").unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"2 ci").unwrap();
+        }
+        idx.record_v2_held_index(root, 1, "cid-1").unwrap();
+        drop(idx);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "0 cid-0\n1 cid-1\n"
+        );
+
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        let got: Vec<u32> = idx
+            .v2_held_records(&root)
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(got, vec![0, 1]);
+    }
+
+    /// The cut keeps exactly the newline-terminated lines, also when the
+    /// fragment is longer than one read (a `.v2_proofs` line for a deep
+    /// tree is) or the last newline sits at a read boundary.
+    #[test]
+    fn cut_torn_tail_keeps_exactly_the_complete_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sidecar");
+        let x = |n: usize| "x".repeat(n);
+        for (content, kept) in [
+            (String::new(), String::new()),
+            ("a\n".to_string(), "a\n".to_string()),
+            ("abc".to_string(), String::new()),
+            ("a\nb".to_string(), "a\n".to_string()),
+            (format!("a\n{}", x(5000)), "a\n".to_string()),
+            (format!("\n{}", x(5000)), "\n".to_string()),
+            (x(9000), String::new()),
+            (
+                format!("{}\n{}", x(4095), x(4096)),
+                format!("{}\n", x(4095)),
+            ),
+        ] {
+            std::fs::write(&path, &content).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            cut_torn_tail(&mut f).unwrap();
+            drop(f);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                kept,
+                "content of {} bytes",
+                content.len()
+            );
+        }
+    }
+
+    /// Creation. The first record for a root creates `<hex_root>.v2_held`,
+    /// and is refused, and not kept in memory, while the directory cannot
+    /// be synced: a crash could otherwise lose the new file with the record.
+    /// Repeat push: the file now exists but its entry is still not known to
+    /// be durable, so the same record is refused again, then accepted once
+    /// the directory can be synced. Later records need no directory sync.
+    #[cfg(unix)]
+    #[test]
+    fn v2_held_record_is_refused_until_its_new_file_is_synced_into_the_directory() {
+        use super::dir_sync_fault::UnsyncableDir;
+        let dir = tempfile::tempdir().unwrap();
+        let root = [0x5E; 32];
+        let manifests = dir.path().join("manifests");
+        let path = manifests.join(format!("{}.v2_held", hex::encode(root)));
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        {
+            let Some(_fault) = UnsyncableDir::new(&manifests) else {
+                return;
+            };
+            idx.record_v2_held_index(root, 3, "cid-3")
+                .expect_err("created, but not synced into the directory");
+            assert!(path.exists(), "the file was created");
+            assert!(idx.v2_held_records(&root).is_none());
+            idx.record_v2_held_index(root, 3, "cid-3")
+                .expect_err("repeat: the file's entry is still not durable");
+            assert!(idx.v2_held_records(&root).is_none());
+        }
+        idx.record_v2_held_index(root, 3, "cid-3").unwrap();
+        assert_eq!(idx.v2_held_records(&root).unwrap()[&3], "cid-3");
+        {
+            let Some(_fault) = UnsyncableDir::new(&manifests) else {
+                return;
+            };
+            idx.record_v2_held_index(root, 4, "cid-4").unwrap();
+        }
+        drop(idx);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "3 cid-3\n4 cid-4\n",
+            "a refused attempt writes nothing"
+        );
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        let got: Vec<u32> = idx
+            .v2_held_records(&root)
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(got, vec![3, 4]);
     }
 }
 
@@ -2093,9 +2299,10 @@ mod v2_proof_tests {
     }
 
     /// An append that failed part-way leaves a line without its newline;
-    /// the next record still starts on its own line and survives a reload.
+    /// the next record cuts it, so the record is not joined to it and
+    /// survives a reload.
     #[test]
-    fn v2_pushed_proof_after_a_partial_append_starts_on_a_new_line() {
+    fn v2_pushed_proof_after_a_partial_append_cuts_the_partial_line() {
         let dir = tempfile::tempdir().unwrap();
         let (t, root, leaves) = tree(4, 0x66);
         let mut idx = ManifestIndex::load(dir.path()).unwrap();
@@ -2113,20 +2320,61 @@ mod v2_proof_tests {
         idx.record_v2_pushed_proof(root, 1, leaves[1], &t.proof_bytes(1))
             .unwrap();
         drop(idx);
-
-        let idx = ManifestIndex::load(dir.path()).unwrap();
-        let got: Vec<u32> = (0..4)
-            .filter(|&i| idx.v2_pushed_proof(&root, i).is_some())
-            .collect();
-        assert_eq!(got, vec![0, 1]);
         assert_eq!(
             std::fs::read_to_string(sidecar(dir.path(), &root)).unwrap(),
             format!(
                 "{}{}",
                 line(0, &leaves[0], &t.proof_bytes(0)),
                 line(1, &leaves[1], &t.proof_bytes(1))
-            ),
-            "the partial line is dropped at load"
+            )
+        );
+
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        let got: Vec<u32> = (0..4)
+            .filter(|&i| idx.v2_pushed_proof(&root, i).is_some())
+            .collect();
+        assert_eq!(got, vec![0, 1]);
+    }
+
+    /// Creation and repeat push, as for the held index: the record that
+    /// creates `<hex_root>.v2_proofs` is refused, writes nothing and is not
+    /// kept, while the directory cannot be synced; repeated, it is refused
+    /// again, then accepted once the directory can be synced, and it
+    /// survives a reload.
+    #[cfg(unix)]
+    #[test]
+    fn v2_pushed_proof_is_refused_until_its_new_file_is_synced_into_the_directory() {
+        use super::dir_sync_fault::UnsyncableDir;
+        let dir = tempfile::tempdir().unwrap();
+        let (t, root, leaves) = tree(4, 0x67);
+        let mut idx = ManifestIndex::load(dir.path()).unwrap();
+        {
+            let Some(_fault) = UnsyncableDir::new(&dir.path().join("manifests")) else {
+                return;
+            };
+            for attempt in ["created", "repeat"] {
+                idx.record_v2_pushed_proof(root, 2, leaves[2], &t.proof_bytes(2))
+                    .expect_err(attempt);
+                assert!(idx.v2_pushed_proof(&root, 2).is_none(), "{attempt}");
+            }
+            assert!(sidecar(dir.path(), &root).exists(), "the file was created");
+        }
+        idx.record_v2_pushed_proof(root, 2, leaves[2], &t.proof_bytes(2))
+            .unwrap();
+        drop(idx);
+
+        assert_eq!(
+            std::fs::read_to_string(sidecar(dir.path(), &root)).unwrap(),
+            line(2, &leaves[2], &t.proof_bytes(2)),
+            "a refused attempt writes nothing"
+        );
+        let idx = ManifestIndex::load(dir.path()).unwrap();
+        assert_eq!(
+            idx.v2_pushed_proof(&root, 2),
+            Some(&PushedProof {
+                leaf: leaves[2],
+                path: t.proof_bytes(2),
+            })
         );
     }
 
