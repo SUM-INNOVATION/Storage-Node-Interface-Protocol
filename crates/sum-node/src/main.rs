@@ -274,6 +274,16 @@ enum Command {
         /// pool are challenged). `abandon` refunds 90% of it.
         #[arg(long, env = "SUM_FEE_DEPOSIT", default_value = "0")]
         fee_deposit: u64,
+        /// Exit with a status per outcome instead of 0 for every one:
+        /// 0 Active, 3 Pending, 6 refused before chain registration
+        /// (nothing registered), 7 root already registered on chain as V1
+        /// or V2 (not by this run), 8 registration sent but not confirmed
+        /// (prints `merkle_root:`, no `lifecycle:`; look the root up before
+        /// retrying), 1 error (including a root lookup that failed), 2
+        /// usage. stdout is otherwise as without the flag. Off by default;
+        /// no environment variable.
+        #[arg(long)]
+        exit_status: bool,
     },
 
     /// Fetch a chunk by CID from a LAN peer.
@@ -519,6 +529,7 @@ async fn main() -> Result<()> {
             visibility,
             recipients,
             fee_deposit,
+            exit_status,
         } => {
             let seed = seed.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -533,7 +544,7 @@ async fn main() -> Result<()> {
                     recipients.len()
                 );
             }
-            run_ingest_v2(
+            let code = run_ingest_v2(
                 keypair,
                 seed,
                 cli.rpc_url.clone(),
@@ -548,8 +559,18 @@ async fn main() -> Result<()> {
                 visibility,
                 recipients,
                 fee_deposit,
+                exit_status,
             )
-            .await
+            .await?;
+            if code != sum_node::ingest_v2::ingest_exit::ACTIVE {
+                // Only with --exit-status. Any `merkle_root:` / `lifecycle:`
+                // lines are already printed; make sure they reach a pipe
+                // before the process ends.
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
+            }
+            Ok(())
         }
         Command::Resume {
             merkle_root,
@@ -1164,7 +1185,8 @@ async fn run_ingest_v2(
     visibility: String,
     recipient_specs: Vec<String>,
     fee_deposit: u64,
-) -> Result<()> {
+    exit_status: bool,
+) -> Result<i32> {
     let l1_addr = identity::l1_address_from_keypair(&keypair);
     let rpc_early = Arc::new(L1RpcClient::new(rpc_url.clone()));
 
@@ -1401,8 +1423,67 @@ async fn run_ingest_v2(
             );
         }
     }
+    // Without --exit-status every outcome exits 0: OmniNode's adapter, and
+    // any caller that reads only the stdout lines above, rely on it.
+    let mut lookup_error = None;
+    let code = if exit_status {
+        let status = pipeline.ingest_exit_status(&outcome).await;
+        // An unconfirmed registration may still finalize, so the caller
+        // needs its root (a Private file's root cannot be computed by the
+        // caller). Print it, with no `lifecycle:` line: nothing is known to
+        // be registered. Only with --exit-status.
+        if status.code == sum_node::ingest_v2::ingest_exit::REGISTRATION_UNCONFIRMED
+            && let Some(root) = outcome.merkle_root()
+        {
+            println!("merkle_root: 0x{}", hex::encode(root));
+        }
+        log_ingest_exit_status(status.code, outcome.merkle_root());
+        lookup_error = status.lookup_error;
+        status.code
+    } else {
+        0
+    };
     net.shutdown().await?;
-    Ok(())
+    // The lookup that tells 6 from 7 could not be done: an error (exit 1),
+    // reported like every other error, without claiming anything about the
+    // chain.
+    if let Some(e) = lookup_error {
+        return Err(e.context(
+            "ingest-v2 --exit-status: could not look the merkle root up on chain \
+             (storage_getFileInfoV2, storage_getAccessList), so this outcome cannot be \
+             reported as refused (6) or already registered (7)",
+        ));
+    }
+    Ok(code)
+}
+
+/// With `--exit-status`, one log line for a registration that did not
+/// finalize, saying which of the three cases the exit code reports. Log
+/// output only. No `lifecycle:` line is printed for these outcomes; with
+/// the flag, code 8 also prints `merkle_root:` (above).
+fn log_ingest_exit_status(code: i32, root: Option<[u8; 32]>) {
+    use sum_node::ingest_v2::ingest_exit;
+    let root = root.map_or_else(|| "none".to_string(), |r| format!("0x{}", hex::encode(r)));
+    match code {
+        ingest_exit::REFUSED => warn!(
+            code,
+            %root,
+            "ingest-v2 --exit-status: refused before chain registration; this run registered nothing"
+        ),
+        ingest_exit::ALREADY_REGISTERED => warn!(
+            code,
+            %root,
+            "ingest-v2 --exit-status: the root is already registered on chain (V1 or V2), \
+             not by this run; read its row (owner, lifecycle) before treating the file as stored"
+        ),
+        ingest_exit::REGISTRATION_UNCONFIRMED => warn!(
+            code,
+            %root,
+            "ingest-v2 --exit-status: the registration was sent but not confirmed and can still \
+             finalize; look the root up on chain before retrying"
+        ),
+        _ => {}
+    }
 }
 
 // ── V2 Resume + Abandon (W11) ───────────────────────────────────────────────

@@ -72,14 +72,39 @@ and root from any variant:
   or would have been, registered under. It is present on a `Failed`
   outcome after chunking.
 
-**`Failed` does not always mean nothing is on chain.** A `Register`
-failure before the registration is sent leaves nothing on chain. After
-it is sent, a finality timeout or a failed status query also returns
-`Failed { stage: Register, .. }`, yet the registration can still
-finalize later and leave the file `Pending`, with its fee deposit
-locked. Before retrying such an outcome, look up `merkle_root()` on
-chain (`storage_getFileInfoV2`). If the row exists, finish it with
-`resume` or `abandon` (below) instead of ingesting again.
+**`Failed` does not always mean nothing is on chain.**
+`registration_tx()` says which case a `Failed { stage: Register, .. }`
+is, and what to do:
+
+- `NotSent`: the call stopped before submitting the registration. It
+  created no chain state and spent no fee; retry once the cause is fixed.
+- `Rejected`: the chain reported the registration failed or dropped. It
+  registered nothing, but a failed one was included in a block and paid
+  its transaction fee (a dropped one paid nothing). It fails again unless
+  its cause changed; a root that is already registered is always
+  refused.
+- `Unconfirmed`: the registration was submitted, or may have been (the
+  submission call itself errored, the finality wait timed out or a
+  status query failed). It can still finalize and leave the file
+  `Pending`, with its fee deposit locked. Before ingesting again, look up
+  `merkle_root()` on chain (`storage_getFileInfoV2`), and again later if
+  there is no row yet. Finish a row this account owns with `resume` or
+  `abandon` (below), not by ingesting again. A submission error counts
+  here because a node can accept a transaction and still return an
+  error.
+
+With `NotSent` or `Rejected` the root may already be registered, by this
+account in an earlier call or by another owner, as a V2 file or a V1
+file: look it up before treating the file as stored.
+`IngestPipeline::ingest_exit_status` makes that lookup
+(`storage_getFileInfoV2`, then `storage_getAccessList` through
+`V2IngestRpc::v1_root_registered`) and maps an outcome to the codes of
+`sum-node ingest-v2 --exit-status`. Its `root_on_chain` is `Registered`,
+`NotRegistered`, `LookupFailed` (with `lookup_error`; the code is then
+`1`, never the refusal `6`) or `NotLookedUp`. A custom `V2IngestRpc`
+that does not implement `v1_root_registered` gets `LookupFailed`. Code
+`6` (refused) covers a `Rejected` registration too, so it can follow a
+paid transaction fee.
 
 ### Fee deposit
 
