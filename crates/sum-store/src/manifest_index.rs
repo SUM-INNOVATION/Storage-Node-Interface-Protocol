@@ -106,6 +106,9 @@ pub struct ManifestIndex {
     /// syncs the directory, so a record is never acknowledged while the file
     /// holding it could vanish in a crash.
     durable_sidecars: HashSet<PathBuf>,
+    /// Opened by [`Self::load_read_only`]: nothing on disk is created,
+    /// rewritten or appended to, and every write refuses.
+    read_only: bool,
     /// `Some(false)` when the protected list exists but could not be read:
     /// garbage collection must then delete nothing. `None` until the list
     /// has been created (first run of this version, before seeding).
@@ -215,8 +218,27 @@ impl ManifestIndex {
     /// If `manifests/` is empty but a legacy `manifest.cbor` exists in
     /// `store_dir`, it will be migrated into the new directory.
     pub fn load(store_dir: &Path) -> Result<Self> {
+        Self::load_with(store_dir, false)
+    }
+
+    /// Load the index without writing anything, for a reader beside a
+    /// running node (which holds the store's lease) or an audit.
+    ///
+    /// Unlike [`Self::load`] it creates no directory, rewrites no damaged
+    /// sidecar, drops no torn line from disk, writes no marker and migrates
+    /// no legacy manifest: what is unusable is skipped in memory only. A
+    /// missing `manifests/` directory loads as an empty index. Every method
+    /// that would write refuses with an error.
+    pub fn load_read_only(store_dir: &Path) -> Result<Self> {
+        Self::load_with(store_dir, true)
+    }
+
+    fn load_with(store_dir: &Path, read_only: bool) -> Result<Self> {
         let manifests_dir = store_dir.join("manifests");
-        fs::create_dir_all(&manifests_dir)?;
+        let dir_exists = manifests_dir.is_dir();
+        if !read_only {
+            fs::create_dir_all(&manifests_dir)?;
+        }
 
         let mut index = Self {
             manifests_dir,
@@ -228,8 +250,12 @@ impl ManifestIndex {
             v2_held: HashMap::new(),
             v2_proofs: HashMap::new(),
             durable_sidecars: HashSet::new(),
+            read_only,
             gc_protection_intact: None,
         };
+        if read_only && !dir_exists {
+            return Ok(index);
+        }
 
         index.load_gc_protected();
 
@@ -314,9 +340,11 @@ impl ManifestIndex {
             && legacy_path.exists()
             && let Ok(m) = manifest::read_manifest(&legacy_path)
         {
-            tracing::info!("migrating legacy manifest.cbor into manifests/");
-            // Write to new location (ignore write errors on migration).
-            let _ = index.write_manifest(&m);
+            if !index.read_only {
+                tracing::info!("migrating legacy manifest.cbor into manifests/");
+                // Write to new location (ignore write errors on migration).
+                let _ = index.write_manifest(&m);
+            }
             index.add_to_maps(m);
         }
 
@@ -655,6 +683,7 @@ impl ManifestIndex {
     /// the rename simply repeats the seeding on next start; once the marker
     /// exists, seeding never runs again.
     pub fn seed_gc_protected_legacy(&mut self, cids_on_disk: &[String]) -> Result<()> {
+        self.ensure_writable()?;
         use std::io::Write;
         let path = self.manifests_dir.join(GC_PROTECTED_FILE);
         let tmp = self.manifests_dir.join(format!("{GC_PROTECTED_FILE}.tmp"));
@@ -701,6 +730,16 @@ impl ManifestIndex {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
+    /// Refuse a write on an index opened by [`Self::load_read_only`].
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(crate::error::StoreError::Other(
+                "manifest index opened read-only; refusing to write".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn add_to_maps(&mut self, manifest: DataManifest) {
         let root = manifest.merkle_root;
         for chunk in &manifest.chunks {
@@ -710,6 +749,7 @@ impl ManifestIndex {
     }
 
     fn write_manifest(&self, manifest: &DataManifest) -> Result<()> {
+        self.ensure_writable()?;
         let hex_root: String = manifest
             .merkle_root
             .iter()
@@ -720,6 +760,7 @@ impl ManifestIndex {
     }
 
     fn write_private_bytes(&self, root: &[u8; 32], bytes: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
         let hex_root: String = root.iter().map(|b| format!("{b:02x}")).collect();
         let path = self.manifests_dir.join(format!("{hex_root}.opaque"));
         std::fs::write(&path, bytes)?;
@@ -771,14 +812,16 @@ impl ManifestIndex {
                 }
             }
         }
-        if complete.len() != content.len()
+        if !self.read_only
+            && complete.len() != content.len()
             && let Err(e) = truncate_to(&path, complete.len() as u64)
         {
             tracing::error!(path = %path.display(), %e, "could not drop a torn GC-protected line; garbage collection disabled");
             self.gc_protection_intact = Some(false);
             return;
         }
-        if !marker.exists()
+        if !self.read_only
+            && !marker.exists()
             && let Err(e) = write_marker(&self.manifests_dir)
         {
             tracing::error!(%e, "could not write the GC-protected marker; garbage collection disabled");
@@ -793,6 +836,7 @@ impl ManifestIndex {
     /// sync it. Never creates the file: a list that has vanished is an
     /// error, not a fresh start.
     fn append_gc_protected_line(&self, line: &str) -> Result<()> {
+        self.ensure_writable()?;
         use std::io::Write;
         let path = self.manifests_dir.join(GC_PROTECTED_FILE);
         let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
@@ -847,7 +891,9 @@ impl ManifestIndex {
                 conflicting_indices = conflicted.len(),
                 "V2 held-index sidecar had unusable records; those chunks are not attested until pushed again"
             );
-            if let Err(e) = self.rewrite_v2_held(&root, &records) {
+            if !self.read_only
+                && let Err(e) = self.rewrite_v2_held(&root, &records)
+            {
                 tracing::warn!(path = %path.display(), %e, "could not rewrite the V2 held-index sidecar");
             }
         }
@@ -859,6 +905,7 @@ impl ManifestIndex {
     /// Replace `<hex_root>.v2_held` with exactly `records` (temp file,
     /// fsync, rename, directory fsync).
     fn rewrite_v2_held(&self, root: &[u8; 32], records: &BTreeMap<u32, String>) -> Result<()> {
+        self.ensure_writable()?;
         use std::io::Write;
         let name = format!("{}.v2_held", hex::encode(root));
         let path = self.manifests_dir.join(&name);
@@ -936,7 +983,9 @@ impl ManifestIndex {
                 conflicting_indices = conflicted.len(),
                 "V2 push-proof sidecar had unusable records; challenges on those chunks of files without a Public manifest are not answered until the chunks are pushed again"
             );
-            if let Err(e) = self.rewrite_v2_proofs(&root, &records) {
+            if !self.read_only
+                && let Err(e) = self.rewrite_v2_proofs(&root, &records)
+            {
                 tracing::warn!(path = %path.display(), %e, "could not rewrite the V2 push-proof sidecar");
             }
         }
@@ -952,6 +1001,7 @@ impl ManifestIndex {
         root: &[u8; 32],
         records: &BTreeMap<u32, PushedProof>,
     ) -> Result<()> {
+        self.ensure_writable()?;
         use std::io::Write;
         let name = format!("{}.v2_proofs", hex::encode(root));
         let path = self.manifests_dir.join(&name);
@@ -993,6 +1043,7 @@ impl ManifestIndex {
     /// repeat push repairs it. Then a torn final line is cut (see
     /// [`cut_torn_tail`]), the line written, and the file's data synced.
     fn append_sidecar_line(&mut self, path: &Path, line: &str) -> Result<()> {
+        self.ensure_writable()?;
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -1052,7 +1103,9 @@ impl ManifestIndex {
                 skipped,
                 "private-chunks sidecar had unusable lines; pulls of those chunks are denied until they are pushed again"
             );
-            if let Err(e) = self.rewrite_private_chunks(&root, &cids) {
+            if !self.read_only
+                && let Err(e) = self.rewrite_private_chunks(&root, &cids)
+            {
                 tracing::warn!(path = %path.display(), %e, "could not rewrite the private-chunks sidecar");
             }
         }
@@ -1064,6 +1117,7 @@ impl ManifestIndex {
     /// Replace `<hex_root>.private_chunks` with exactly `cids` (temp file,
     /// fsync, rename, directory fsync).
     fn rewrite_private_chunks(&self, root: &[u8; 32], cids: &[&str]) -> Result<()> {
+        self.ensure_writable()?;
         use std::io::Write;
         let name = format!("{}.private_chunks", hex::encode(root));
         let path = self.manifests_dir.join(&name);
@@ -2589,5 +2643,130 @@ mod v2_proof_tests {
             .filter(|&i| idx.v2_pushed_proof(&root, i).is_some())
             .collect();
         assert_eq!(got, vec![0, 4, 5, 7]);
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+    use crate::merkle::MerkleTree;
+
+    fn tree4() -> (MerkleTree, [u8; 32], Vec<[u8; 32]>) {
+        let leaves: Vec<blake3::Hash> = (0..4u32).map(|i| blake3::hash(&i.to_le_bytes())).collect();
+        let t = MerkleTree::build(&leaves);
+        let root = *t.root().as_bytes();
+        (t, root, leaves.iter().map(|h| *h.as_bytes()).collect())
+    }
+
+    /// Every file under `dir` with its bytes, sorted by path.
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push((path.clone(), std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A store written by a node, then damaged the way a crash leaves it
+    /// (torn tails in every sidecar, the GC marker gone): a read-only load
+    /// sees the usable records and leaves every byte on disk as it was,
+    /// where an ordinary load would cut, rewrite and re-mark.
+    #[test]
+    fn a_read_only_load_writes_nothing_and_sees_the_usable_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, root, leaves) = tree4();
+        let private_root = [0xD1u8; 32];
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            idx.seed_gc_protected_legacy(&[]).unwrap();
+            idx.record_v2_pushed_proof(root, 1, leaves[1], &t.proof_bytes(1))
+                .unwrap();
+            idx.record_v2_held_index(root, 1, "cid-1").unwrap();
+            idx.record_private_chunk_cid(private_root, "bafk_ro_0")
+                .unwrap();
+        }
+        let manifests = dir.path().join("manifests");
+        for (name, tail) in [
+            (format!("{}.v2_proofs", hex::encode(root)), "2 abc"),
+            (format!("{}.v2_held", hex::encode(root)), "2 ci"),
+            (
+                format!("{}.private_chunks", hex::encode(private_root)),
+                "bafk_r",
+            ),
+            (GC_PROTECTED_FILE.to_string(), "v2 00"),
+        ] {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(manifests.join(name))
+                .unwrap();
+            f.write_all(tail.as_bytes()).unwrap();
+        }
+        std::fs::remove_file(manifests.join(GC_PROTECTED_MARKER)).unwrap();
+        let before = snapshot(dir.path());
+
+        let idx = ManifestIndex::load_read_only(dir.path()).unwrap();
+        assert_eq!(
+            idx.v2_pushed_proof(&root, 1),
+            Some(&PushedProof {
+                leaf: leaves[1],
+                path: t.proof_bytes(1),
+            })
+        );
+        assert_eq!(idx.v2_held_records(&root).unwrap()[&1], "cid-1");
+        assert!(idx.v2_pushed_proof(&root, 2).is_none());
+        assert_eq!(idx.merkle_root_for_cid("bafk_ro_0"), Some(&private_root));
+        drop(idx);
+
+        assert_eq!(snapshot(dir.path()), before, "nothing on disk changed");
+    }
+
+    /// A store with no `manifests/` directory loads as an empty index and
+    /// stays without one.
+    #[test]
+    fn a_read_only_load_of_a_missing_directory_is_empty_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = ManifestIndex::load_read_only(dir.path()).unwrap();
+        assert!(idx.is_empty());
+        assert!(idx.v2_held_roots().is_empty());
+        assert!(!dir.path().join("manifests").exists());
+    }
+
+    /// Every method that would write refuses on a read-only index, and
+    /// nothing on disk changes.
+    #[test]
+    fn a_read_only_index_refuses_every_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, root, leaves) = tree4();
+        {
+            let mut idx = ManifestIndex::load(dir.path()).unwrap();
+            idx.seed_gc_protected_legacy(&[]).unwrap();
+        }
+        let before = snapshot(dir.path());
+        let mut idx = ManifestIndex::load_read_only(dir.path()).unwrap();
+        let refused = |r: Result<()>| {
+            let e = r.expect_err("a read-only index must refuse");
+            assert!(e.to_string().contains("read-only"), "{e}");
+        };
+        refused(idx.record_v2_pushed_proof(root, 0, leaves[0], &t.proof_bytes(0)));
+        refused(idx.record_v2_held_index(root, 0, "cid-0"));
+        refused(idx.record_v2_held_chunk(root, "cid-0"));
+        refused(idx.record_private_chunk_cid(root, "bafk_x"));
+        refused(idx.insert_private(root, vec![1, 2, 3]));
+        refused(idx.seed_gc_protected_legacy(&[]));
+        assert!(idx.v2_pushed_proof(&root, 0).is_none());
+        assert!(idx.v2_held_records(&root).is_none());
+        assert!(idx.get_private_bytes(&root).is_none());
+        drop(idx);
+        assert_eq!(snapshot(dir.path()), before);
     }
 }
