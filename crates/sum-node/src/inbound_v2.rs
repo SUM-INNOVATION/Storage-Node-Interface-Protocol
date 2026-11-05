@@ -4540,4 +4540,630 @@ mod tests {
                 .contains(&challenge.challenge_id)
         );
     }
+
+    // ── repush against a real archive, and repush-audit ──
+    //
+    // The owner's pipeline (`IngestPipeline::repush`) pushes through
+    // `DispatchNet` into this module's real push and manifest-push handlers,
+    // so what an archive records is exactly what the owner's command sends.
+    // The audit then reads that archive's store.
+
+    #[async_trait::async_trait]
+    impl crate::ingest_v2::V2IngestRpc for AllMockRpc {
+        async fn storage_get_assignment_coverage_v2(
+            &self,
+            merkle_root_hex: &str,
+            _missing_offset: Option<u32>,
+            _missing_limit: Option<u32>,
+        ) -> anyhow::Result<Option<AssignmentCoverageV2>> {
+            let root: [u8; 32] = hex::decode(merkle_root_hex.trim_start_matches("0x"))?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("bad root hex {merkle_root_hex}"))?;
+            AttestTriggerRpc::fetch_coverage(self, &root).await
+        }
+        async fn chain_get_block_height(
+            &self,
+        ) -> anyhow::Result<sum_types::rpc_types::BlockHeightInfo> {
+            Ok(sum_types::rpc_types::BlockHeightInfo {
+                height: 1000,
+                finality: "finalized".into(),
+            })
+        }
+        async fn get_nonce(&self, addr_base58: &str) -> anyhow::Result<u64> {
+            AttestTriggerRpc::fetch_nonce(self, addr_base58).await
+        }
+    }
+
+    /// Delivers the owner's chunk and manifest pushes for `peer` to one
+    /// real archive (`d`) and turns its answers into the acknowledgement
+    /// events the pipeline reads. A push to any other peer is dropped.
+    struct DispatchNet {
+        d: V2Dispatcher<ArcRpc, ArcRpc, ArcRpcTrigger>,
+        peer: PeerId,
+        events: StdMutex<VecDeque<sum_net::SumNetEvent>>,
+    }
+
+    impl DispatchNet {
+        fn answer(
+            &self,
+            peer_id: PeerId,
+            response: ShardResponseV2,
+            kind: sum_net::OutboundRequestKind,
+        ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push_back(sum_net::SumNetEvent::ShardReceivedV2 {
+                    peer_id,
+                    response,
+                    origin: sum_net::OutboundOrigin::new(peer_id, kind),
+                });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ingest_v2::V2IngestNet for DispatchNet {
+        async fn push_chunk_v2(
+            &self,
+            peer_id: PeerId,
+            data: Vec<u8>,
+            merkle_root: [u8; 32],
+            chunk_index: u32,
+            merkle_path: Vec<[u8; 32]>,
+        ) -> anyhow::Result<()> {
+            if peer_id != self.peer {
+                return Ok(());
+            }
+            let rec = RecorderNet::new();
+            let req = ShardRequestV2::Push {
+                data,
+                merkle_root,
+                chunk_index,
+                merkle_path,
+            };
+            self.d
+                .handle(&rec, PeerId::random(), req, u64::from(chunk_index))
+                .await;
+            let (_, response) = rec.last().expect("the archive answers a push");
+            self.answer(
+                peer_id,
+                response,
+                sum_net::OutboundRequestKind::V2Push {
+                    merkle_root,
+                    chunk_index,
+                },
+            );
+            Ok(())
+        }
+        async fn push_manifest_v2(
+            &self,
+            peer_id: PeerId,
+            merkle_root: [u8; 32],
+            manifest_bytes: Vec<u8>,
+        ) -> anyhow::Result<()> {
+            if peer_id != self.peer {
+                return Ok(());
+            }
+            let rec = RecorderNet::new();
+            self.d
+                .handle_manifest_push(&rec, 7, merkle_root, manifest_bytes)
+                .await;
+            let (_, response) = rec.last().expect("the archive answers a manifest push");
+            self.answer(
+                peer_id,
+                response,
+                sum_net::OutboundRequestKind::V2ManifestPush { merkle_root },
+            );
+            Ok(())
+        }
+        async fn next_event(&self) -> Option<sum_net::SumNetEvent> {
+            self.events.lock().unwrap().pop_front()
+        }
+    }
+
+    /// Resolves one archive to one peer.
+    struct OnePeer {
+        archive: [u8; 20],
+        peer: PeerId,
+    }
+
+    impl crate::ingest_v2::PeerResolver for OnePeer {
+        fn resolve(&self, addr: &[u8; 20]) -> Option<PeerId> {
+            (*addr == self.archive).then_some(self.peer)
+        }
+    }
+
+    /// The validator's replication factor, which every fixture here uses.
+    const R: u32 = crate::push_validator::V2Params::DEFAULTS.assignment_replication_factor;
+
+    /// Audit `inventory` for `me` against the store at `dir`, opened the
+    /// way `repush-audit` opens it: read-only, without the lease (a live
+    /// `SumStore` may hold it).
+    async fn audit_dir(
+        rpc: &AllMockRpc,
+        dir: &std::path::Path,
+        me: [u8; 20],
+        inventory: &[[u8; 32]],
+    ) -> crate::repair_audit::AuditReport {
+        let idx = sum_store::manifest_index::ManifestIndex::load_read_only(dir).unwrap();
+        let local = sum_store::store::ChunkStore::new(dir.to_path_buf()).unwrap();
+        crate::repair_audit::audit(rpc, R, me, &idx, &local, inventory).await
+    }
+
+    /// The chunk verdicts of one audited file.
+    fn verdicts(
+        report: &crate::repair_audit::AuditReport,
+    ) -> Vec<(u32, crate::repair_audit::ChunkVerdict)> {
+        match &report.files[..] {
+            [crate::repair_audit::FileAudit::Audited { chunks, .. }] => chunks
+                .iter()
+                .map(|c| (c.chunk_index, c.verdict.clone()))
+                .collect(),
+            other => panic!("expected one audited file, got {other:?}"),
+        }
+    }
+
+    /// Repair of an existing Private chunk, end to end. An archive holds a
+    /// chunk of an Active Private file, pushed before push proofs were
+    /// recorded (no `.v2_proofs` record); the audit reports it incomplete.
+    /// The owner runs `repush`: the pipeline recovers `K_file` from the
+    /// owner's access entry, re-encrypts the file, and pushes every chunk
+    /// the latest epoch assigns this archive, and the encrypted manifest,
+    /// through the real handlers, which acknowledge each and record the
+    /// leaf and path. The audit, run read-only beside the live store, then
+    /// reports every assigned chunk usable through its pushed proof; a
+    /// Private challenge on the chunk is answered with exactly that leaf
+    /// and path, and the chain's verifier accepts it. The owner sent no
+    /// transaction.
+    #[tokio::test]
+    async fn repush_repairs_a_private_chunk_held_without_its_proof_and_the_audit_shows_it() {
+        use crate::ingest_v2::{IngestPipeline, RepushOutcome, RepushResult, repush_exit};
+        use crate::repair_audit::{AuditVerdict, ChunkVerdict, audit_exit};
+        use sum_crypto::{wrap_for_recipient, x25519_keypair_from_ed25519_seed};
+
+        // The owner and a Private file, encrypted as ingest does.
+        let owner_seed = [0xC1u8; 32];
+        let owner_addr = sum_net::identity::l1_address_from_keypair(
+            &sum_net::identity::keypair_from_seed(&owner_seed).unwrap(),
+        );
+        let file_dir = tempfile::tempdir().unwrap();
+        let path = file_dir.path().join("plain.bin");
+        let plaintext_len = 9 * sum_types::storage::CHUNK_SIZE as usize + 5;
+        std::fs::write(&path, vec![0x3Cu8; plaintext_len]).unwrap();
+        let k_file_plain = [0x42u8; 32];
+        let k_file = zeroize::Zeroizing::new(k_file_plain);
+        let artifacts = crate::ingest_v2::build_private_artifacts(&path, &k_file).unwrap();
+        let root = artifacts.manifest.merkle_root;
+        let n = artifacts.manifest.chunk_count;
+        let stored = artifacts.stored_size_bytes;
+        let chunks: Vec<Vec<u8>> = artifacts
+            .manifest
+            .chunks
+            .iter()
+            .map(|c| {
+                let start = c.offset as usize;
+                artifacts.ciphertext_mmap[start..start + c.size as usize].to_vec()
+            })
+            .collect();
+        drop(artifacts);
+        let leaves: Vec<blake3::Hash> = chunks.iter().map(|c| blake3::hash(c)).collect();
+        let tree = MerkleTree::build(&leaves);
+        assert_eq!(*tree.root().as_bytes(), root);
+
+        let snapshot = five_archives();
+        let me = snapshot[0];
+        let mine: Vec<u32> = (0..n)
+            .filter(|&i| {
+                sum_store::assignment_v2::assigned_archives(&root, &snapshot, i, R).contains(&me)
+            })
+            .collect();
+        let i = *mine.first().expect("a chunk assigned to archive 0");
+        let root_hex = format!("0x{}", hex::encode(root));
+        let chain = || {
+            let (_, owner_pk) = x25519_keypair_from_ed25519_seed(&owner_seed);
+            let bundle = wrap_for_recipient(&k_file_plain, &owner_addr, &owner_pk).unwrap();
+            let owner_b58 = l1_address_base58(&owner_addr);
+            let rpc = AllMockRpc::new();
+            rpc.add_file(
+                &root_hex,
+                StorageFileInfoV2 {
+                    owner: owner_b58.clone(),
+                    plaintext_size_bytes: plaintext_len as u64,
+                    stored_size_bytes: stored,
+                    access_list: vec![sum_types::rpc_types::AccessEntryV2 {
+                        address: owner_b58,
+                        encrypted_key_bundle: Some(format!("0x{}", hex::encode(bundle))),
+                        expires_at: None,
+                    }],
+                    ..file_info_active_private(&root, n, 500)
+                },
+            );
+            rpc.add_snapshot(
+                500,
+                snapshot.iter().map(node_record).collect(),
+                snapshot.clone(),
+            );
+            rpc.set_epochs(&root_hex, n, &[500], vec![]);
+            rpc
+        };
+
+        // The archive holds chunk i from an earlier push, and has no proof
+        // record for it (as a store written before proofs were recorded).
+        let store_dir = tempfile::tempdir().unwrap();
+        let stores = store_at(store_dir.path());
+        let d = build_dispatcher(chain(), vec![], me, stores.clone());
+        assert_eq!(
+            push(&d, &RecorderNet::new(), root, i, &chunks, &tree).await,
+            None
+        );
+        drop(d);
+        let stores = restart_store(stores, &root, &["v2_proofs"]).await;
+        let audit_rpc = chain();
+        let before = audit_dir(&audit_rpc, store_dir.path(), me, &[root]).await;
+        assert_eq!(before.verdict(), AuditVerdict::Incomplete);
+        assert_eq!(before.exit_code(), audit_exit::INCOMPLETE);
+        assert_eq!(
+            verdicts(&before)
+                .iter()
+                .map(|(c, _)| *c)
+                .collect::<Vec<_>>(),
+            mine,
+            "the audit checks exactly the chunks the epoch assigns this archive"
+        );
+        assert!(
+            verdicts(&before)
+                .iter()
+                .all(|(_, v)| matches!(v, ChunkVerdict::NotUsable(_))),
+            "no chunk is answerable yet: {before:?}"
+        );
+
+        // The owner re-pushes everything.
+        let peer = PeerId::random();
+        let net = Arc::new(DispatchNet {
+            d: build_dispatcher(chain(), vec![], me, stores.clone()),
+            peer,
+            events: StdMutex::new(VecDeque::new()),
+        });
+        let owner_rpc = Arc::new(chain());
+        let params = crate::ingest_v2::IngestParams {
+            assignment_replication_factor: R,
+            max_chunk_indices_per_tx: 65_536,
+            max_chunk_count_per_file: 1_048_576,
+            chain_id: 1,
+            fee_per_tx: 0,
+            fee_deposit: 0,
+            poll_interval: Duration::from_millis(10),
+            activation_wait_secs: Duration::from_secs(1),
+            finality_timeout: Duration::from_secs(1),
+            push_retries: 0,
+            push_wait_secs: Duration::from_secs(10),
+            manifest_push_wait_secs: Duration::from_secs(5),
+            discovery_timeout: Duration::from_millis(100),
+            activation_grace_blocks: 50,
+            v2_enabled_from_height: Some(0),
+        };
+        let pipeline = IngestPipeline::new(
+            owner_rpc.clone(),
+            net,
+            Arc::new(OnePeer { archive: me, peer }),
+            owner_seed,
+            owner_addr,
+            params,
+        );
+        let outcome = pipeline.repush(root, &path).await;
+        let RepushOutcome::Done(report) = &outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        let to_me: Vec<_> = report.targets.iter().filter(|t| t.archive == me).collect();
+        assert_eq!(
+            to_me.iter().map(|t| t.chunk_index).collect::<Vec<_>>(),
+            mine,
+            "every chunk the epoch assigns this archive is pushed to it"
+        );
+        assert!(to_me.iter().all(|t| t.result == RepushResult::Acknowledged));
+        assert_eq!(
+            report.manifests.get(&me),
+            Some(&RepushResult::Acknowledged),
+            "the archive accepted the encrypted manifest"
+        );
+        assert!(
+            report
+                .targets
+                .iter()
+                .filter(|t| t.archive != me)
+                .all(|t| t.result == RepushResult::Unreachable),
+            "no other archive is reachable in this test"
+        );
+        assert_eq!(outcome.exit_code(), repush_exit::INCOMPLETE);
+        assert_eq!(owner_rpc.sent_count(), 0, "the owner sent no transaction");
+
+        // This archive's share is now complete, read beside the live store.
+        let after = audit_dir(&audit_rpc, store_dir.path(), me, &[root]).await;
+        assert_eq!(after.verdict(), AuditVerdict::Complete, "{after:?}");
+        assert_eq!(after.exit_code(), audit_exit::COMPLETE);
+        assert!(
+            verdicts(&after)
+                .iter()
+                .all(|(_, v)| *v
+                    == ChunkVerdict::Usable(crate::por_worker::AnswerSource::PushedProof))
+        );
+
+        // The proof is recorded, and a Private challenge is answered with it.
+        let leaf = *blake3::hash(&chunks[i as usize]).as_bytes();
+        assert_eq!(
+            stores.read().await.manifest_idx.v2_pushed_proof(&root, i),
+            Some(&sum_store::manifest_index::PushedProof {
+                leaf,
+                path: tree.proof_bytes(i),
+            })
+        );
+        let (server, mut worker, _) = challenged_worker(root, i, me).await;
+        worker.poll_and_respond_for_test(&stores).await.unwrap();
+        let proof = submitted_proof(&server);
+        assert_eq!(proof.chunk_hash, leaf);
+        assert_eq!(proof.merkle_path, tree.proof_bytes(i));
+        assert!(chain_accepts(&proof, n));
+    }
+
+    /// An archive holding every chunk assigned to it, for one Private and
+    /// one Public file, with their push proofs. A store dir of one archive
+    /// per file.
+    async fn audited_archive(
+        private: bool,
+        salt: u8,
+    ) -> (
+        tempfile::TempDir,
+        AllMockRpc,
+        [u8; 32],
+        Vec<Vec<u8>>,
+        Vec<u32>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (rpc, manifest, chunks, tree, mine) = held_fixture(16, salt, private);
+        let root = manifest.merkle_root;
+        rpc.set_epochs(&format!("0x{}", hex::encode(root)), 16, &[500], vec![]);
+        let stores = store_at(dir.path());
+        let (rpc2, ..) = held_fixture(16, salt, private);
+        let d = build_dispatcher(rpc2, vec![], five_archives()[0], stores.clone());
+        let net = RecorderNet::new();
+        for &i in &mine {
+            assert_eq!(push(&d, &net, root, i, &chunks, &tree).await, None);
+        }
+        if !private {
+            d.handle_manifest_push(&net, 3, root, cbor(&manifest)).await;
+            assert!(matches!(
+                net.last().unwrap().1,
+                ShardResponseV2::ManifestPushAck { error: None, .. }
+            ));
+        }
+        drop(d);
+        drop(stores);
+        (dir, rpc, root, chunks, mine)
+    }
+
+    /// Every assigned chunk answerable: complete, for both visibilities.
+    /// A Private chunk is answered from its pushed proof; a Public one from
+    /// the file's manifest, which the responder prefers when it holds one.
+    #[tokio::test]
+    async fn audit_is_complete_when_every_assigned_chunk_is_answerable() {
+        use crate::por_worker::AnswerSource;
+        use crate::repair_audit::{AuditVerdict, ChunkVerdict};
+        for (private, salt, source) in [
+            (true, 0x71, AnswerSource::PushedProof),
+            (false, 0x72, AnswerSource::PublicManifest),
+        ] {
+            let (dir, rpc, root, _, mine) = audited_archive(private, salt).await;
+            let report = audit_dir(&rpc, dir.path(), five_archives()[0], &[root]).await;
+            assert_eq!(
+                report.verdict(),
+                AuditVerdict::Complete,
+                "private = {private}"
+            );
+            assert_eq!(
+                verdicts(&report),
+                mine.iter()
+                    .map(|i| (*i, ChunkVerdict::Usable(source)))
+                    .collect::<Vec<_>>(),
+                "private = {private}"
+            );
+        }
+    }
+
+    /// A Private chunk held without its pushed proof (a store written
+    /// before proofs were recorded): not usable, so incomplete. A Public
+    /// chunk in the same state stays usable through the file's manifest.
+    #[tokio::test]
+    async fn audit_requires_a_pushed_proof_unless_a_public_manifest_answers() {
+        use crate::por_worker::AnswerSource;
+        use crate::repair_audit::{AuditVerdict, ChunkVerdict, audit_exit};
+        for (private, salt) in [(true, 0x73), (false, 0x74)] {
+            let (dir, rpc, root, _, mine) = audited_archive(private, salt).await;
+            std::fs::remove_file(
+                dir.path()
+                    .join("manifests")
+                    .join(format!("{}.v2_proofs", hex::encode(root))),
+            )
+            .unwrap();
+            let report = audit_dir(&rpc, dir.path(), five_archives()[0], &[root]).await;
+            if private {
+                assert_eq!(report.verdict(), AuditVerdict::Incomplete);
+                assert_eq!(report.exit_code(), audit_exit::INCOMPLETE);
+                for (i, v) in verdicts(&report) {
+                    match v {
+                        ChunkVerdict::NotUsable(reason) => assert!(
+                            reason.contains("no recorded push proof"),
+                            "chunk {i}: {reason}"
+                        ),
+                        other => panic!("chunk {i}: expected NotUsable, got {other:?}"),
+                    }
+                }
+            } else {
+                assert_eq!(report.verdict(), AuditVerdict::Complete);
+                assert_eq!(
+                    verdicts(&report),
+                    mine.iter()
+                        .map(|i| (*i, ChunkVerdict::Usable(AnswerSource::PublicManifest)))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// A stored chunk whose bytes no longer match: the answer built from
+    /// them does not verify (Public) or is refused (Private), so the chunk
+    /// is not usable. Both visibilities.
+    #[tokio::test]
+    async fn audit_finds_a_stored_chunk_that_does_not_match() {
+        use crate::repair_audit::{AuditVerdict, ChunkVerdict};
+        for (private, salt) in [(true, 0x75), (false, 0x76)] {
+            let (dir, rpc, root, chunks, mine) = audited_archive(private, salt).await;
+            let damaged = mine[0];
+            let cid = cid_from_blake3_hash(&blake3::hash(&chunks[damaged as usize]));
+            let chunk_path = sum_store::store::ChunkStore::new(dir.path().to_path_buf())
+                .unwrap()
+                .chunk_path(&cid)
+                .unwrap();
+            let mut perms = std::fs::metadata(&chunk_path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(&chunk_path, perms).unwrap();
+            std::fs::write(&chunk_path, b"not the chunk that was pushed").unwrap();
+
+            let report = audit_dir(&rpc, dir.path(), five_archives()[0], &[root]).await;
+            assert_eq!(
+                report.verdict(),
+                AuditVerdict::Incomplete,
+                "private = {private}"
+            );
+            for (i, v) in verdicts(&report) {
+                assert_eq!(
+                    matches!(v, ChunkVerdict::NotUsable(_)),
+                    i == damaged,
+                    "private = {private}, chunk {i}: {v:?}"
+                );
+            }
+        }
+    }
+
+    /// The inventory, not the local index, decides what is checked. An
+    /// archive whose store is empty (it never received the file) is
+    /// incomplete for an inventory naming the file, and with no inventory
+    /// the verdict is "no inventory", never "complete".
+    #[tokio::test]
+    async fn an_empty_store_never_shows_that_no_repair_is_needed() {
+        use crate::repair_audit::{AuditVerdict, ChunkVerdict, audit_exit};
+        let (rpc, manifest, _, _, mine) = held_fixture(16, 0x77, true);
+        let root = manifest.merkle_root;
+        rpc.set_epochs(&format!("0x{}", hex::encode(root)), 16, &[500], vec![]);
+        let empty = tempfile::tempdir().unwrap();
+        let me = five_archives()[0];
+
+        let report = audit_dir(&rpc, empty.path(), me, &[root]).await;
+        assert_eq!(report.verdict(), AuditVerdict::Incomplete);
+        assert_eq!(
+            verdicts(&report)
+                .iter()
+                .map(|(i, _)| *i)
+                .collect::<Vec<_>>(),
+            mine
+        );
+        assert!(
+            verdicts(&report)
+                .iter()
+                .all(|(_, v)| matches!(v, ChunkVerdict::NotUsable(_)))
+        );
+
+        let none = audit_dir(&rpc, empty.path(), me, &[]).await;
+        assert_eq!(none.verdict(), AuditVerdict::NoInventory);
+        assert_eq!(none.exit_code(), audit_exit::NO_INVENTORY);
+        assert!(
+            !empty.path().join("manifests").exists(),
+            "the audit created nothing"
+        );
+    }
+
+    /// An inventory root the chain does not register is an error; an
+    /// Abandoned file has nothing to answer and is skipped.
+    #[tokio::test]
+    async fn audit_reports_an_unregistered_root_as_an_error_and_skips_an_abandoned_file() {
+        use crate::repair_audit::{AuditVerdict, FileAudit, audit_exit};
+        let (rpc, manifest, ..) = held_fixture(16, 0x78, false);
+        let root = manifest.merkle_root;
+        let root_hex = format!("0x{}", hex::encode(root));
+        let dir = tempfile::tempdir().unwrap();
+        let me = five_archives()[0];
+
+        let unknown = [0x5Eu8; 32];
+        let report = audit_dir(&rpc, dir.path(), me, &[unknown]).await;
+        assert_eq!(
+            report.files,
+            vec![FileAudit::NotRegistered {
+                merkle_root: unknown
+            }]
+        );
+        assert_eq!(report.verdict(), AuditVerdict::Error);
+        assert_eq!(report.exit_code(), audit_exit::ERROR);
+
+        rpc.add_file(
+            &root_hex,
+            StorageFileInfoV2 {
+                lifecycle: LifecycleV2::ABANDONED,
+                abandoned_at_height: Some(900),
+                ..file_info_active(&root, 16, 500)
+            },
+        );
+        let report = audit_dir(&rpc, dir.path(), me, &[root, root]).await;
+        assert_eq!(
+            report.files,
+            vec![FileAudit::Abandoned { merkle_root: root }],
+            "listed twice, audited once"
+        );
+        assert_eq!(report.verdict(), AuditVerdict::Complete);
+    }
+
+    /// After a reassignment the audit checks the chunks the LATEST epoch
+    /// assigns this archive: a chunk it holds but no longer owns is not
+    /// checked, and a newly assigned one it never received is not usable.
+    #[tokio::test]
+    async fn audit_follows_the_latest_assignment_epoch() {
+        use crate::repair_audit::{AuditVerdict, ChunkVerdict};
+        let (dir, rpc, root, _, mine) = audited_archive(true, 0x79).await;
+        let first = five_archives();
+        let me = first[0];
+        let mut later: Vec<[u8; 20]> = first[1..].to_vec();
+        later.push([0x68; 20]);
+        later.push(me);
+        later.sort();
+        let mine_later: Vec<u32> = (0..16)
+            .filter(|&i| {
+                sum_store::assignment_v2::assigned_archives(&root, &later, i, R).contains(&me)
+            })
+            .collect();
+        assert_ne!(
+            mine_later, mine,
+            "the reassignment moves this archive's chunks"
+        );
+        rpc.add_snapshot(800, later.iter().map(node_record).collect(), later.clone());
+        rpc.set_epochs(&format!("0x{}", hex::encode(root)), 16, &[500, 800], vec![]);
+
+        let report = audit_dir(&rpc, dir.path(), me, &[root]).await;
+        let got = verdicts(&report);
+        assert_eq!(got.iter().map(|(i, _)| *i).collect::<Vec<_>>(), mine_later);
+        for (i, v) in &got {
+            assert_eq!(
+                matches!(v, ChunkVerdict::Usable(_)),
+                mine.contains(i),
+                "chunk {i}: {v:?}"
+            );
+        }
+        let newly = mine_later.iter().any(|i| !mine.contains(i));
+        assert_eq!(
+            report.verdict(),
+            if newly {
+                AuditVerdict::Incomplete
+            } else {
+                AuditVerdict::Complete
+            }
+        );
+    }
 }

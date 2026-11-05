@@ -334,6 +334,59 @@ enum Command {
         activation_wait_secs: u64,
     },
 
+    /// Re-push every chunk of a registered V2 file (`Pending` or `Active`)
+    /// to every archive the file's latest assignment epoch assigns it to,
+    /// and the file's manifest to each of those archives, so archives that
+    /// hold chunks without a recorded push proof record one. Run by the
+    /// file's owner with `--key-file`; the file must rebuild to the
+    /// registered root, chunk count and sizes (a Private file under the
+    /// `K_file` recovered from the owner's access entry). Sends no
+    /// transaction. Re-reads the assignment epoch at the end: a change
+    /// makes the run incomplete.
+    ///
+    /// Exit status: 0 every push acknowledged and the epoch unchanged
+    /// (`repush: complete`); 3 a push not acknowledged, or the epoch
+    /// changed or could not be confirmed (`repush: incomplete`); 4
+    /// Abandoned on chain; 5 root mismatch; 6 the operator or the rebuilt
+    /// file does not match the registration; 1 any error.
+    Repush {
+        /// Hex-encoded 32-byte merkle root of the registered file.
+        merkle_root: String,
+        /// Path to the original file (plaintext; a Private file is
+        /// re-encrypted under its recovered `K_file`).
+        path: PathBuf,
+        /// Wall-clock timeout for the chunk pushes' acknowledgements.
+        #[arg(long, default_value = "120")]
+        push_wait_secs: u64,
+        /// Wall-clock timeout for the manifest pushes' acknowledgements.
+        #[arg(long, default_value = "60")]
+        manifest_push_wait_secs: u64,
+    },
+
+    /// Read-only, on an archive: for each file of an explicit inventory,
+    /// check that every chunk the file's latest assignment epoch assigns
+    /// to this archive (`--key-file`) can be answered if challenged: the
+    /// stored chunk's answer, built as the PoR responder builds it (from
+    /// the Public manifest, or from the recorded push proof), verifies
+    /// against the root. Reads `--store-dir` without writing or taking its
+    /// lease, and the chain without sending anything. The inventory, not
+    /// the local index, decides what is checked: with none, the verdict is
+    /// `no_inventory`.
+    ///
+    /// Exit status: 0 every assigned chunk usable (`repush_audit:
+    /// complete`); 3 a chunk not usable (`incomplete`); 7 no inventory
+    /// given (`no_inventory`); 1 a chain read failed or an inventory root
+    /// is not registered (`error`).
+    RepushAudit {
+        /// A merkle root to audit (hex, `0x` optional). Repeatable.
+        #[arg(long = "root")]
+        roots: Vec<String>,
+        /// A file listing merkle roots to audit, one per line (`#`
+        /// comments and blank lines ignored).
+        #[arg(long)]
+        roots_file: Option<PathBuf>,
+    },
+
     /// V2 abandon: submit `AbandonFileV2` for a `Pending` file we own.
     /// Pre-checks chain state to give a clean "wait until height N"
     /// message before burning a tx fee against chain plan §3.5
@@ -566,6 +619,59 @@ async fn main() -> Result<()> {
                 // Only with --exit-status. Any `merkle_root:` / `lifecycle:`
                 // lines are already printed; make sure they reach a pipe
                 // before the process ends.
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::Repush {
+            merkle_root,
+            path,
+            push_wait_secs,
+            manifest_push_wait_secs,
+        } => {
+            let seed = seed.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "repush requires --key-file (the owner's key; it also recovers a Private \
+                     file's K_file)"
+                )
+            })?;
+            let code = run_repush_v2(
+                keypair,
+                seed,
+                cli.rpc_url.clone(),
+                cli.chain_id,
+                cli.attest_fee,
+                cli.profile,
+                net_config,
+                merkle_root,
+                path,
+                push_wait_secs,
+                manifest_push_wait_secs,
+            )
+            .await?;
+            if code != sum_node::ingest_v2::repush_exit::COMPLETE {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::RepushAudit { roots, roots_file } => {
+            if seed.is_none() {
+                anyhow::bail!("repush-audit requires --key-file (the archive's key)");
+            }
+            let code = run_repush_audit(
+                &keypair,
+                cli.store_dir.clone(),
+                cli.rpc_url.clone(),
+                cli.profile,
+                roots,
+                roots_file,
+            )
+            .await?;
+            if code != sum_node::repair_audit::audit_exit::COMPLETE {
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
                 std::process::exit(code);
@@ -1707,6 +1813,278 @@ async fn run_resume_v2(
     }
     net.shutdown().await?;
     Ok(outcome.resume_exit_code())
+}
+
+/// `repush` (see `IngestPipeline::repush`): push every chunk of a registered
+/// file to every archive its latest assignment epoch assigns it to, and the
+/// manifest to each of those archives, and report each archive's answers.
+/// Reads chain state only; sends no transaction.
+///
+/// Stdout: `merkle_root:`, `repush_epoch:`, one `repush_archive: <address>
+/// chunks_acknowledged=<n> of=<m> manifest=<result>` line per archive, a
+/// `repush_epoch_changed: <from> -> <to> not_pushed=<n>` or
+/// `repush_epoch_unconfirmed:` line when the epoch moved or could not be
+/// re-read, then `repush: complete` or `repush: incomplete`. Each push not
+/// acknowledged is logged.
+#[allow(clippy::too_many_arguments)]
+async fn run_repush_v2(
+    keypair: Keypair,
+    seed: [u8; 32],
+    rpc_url: String,
+    chain_id_arg: u64,
+    fee_per_tx: u128,
+    profile: NodeProfile,
+    net_config: NetConfig,
+    merkle_root_hex: String,
+    path: PathBuf,
+    push_wait_secs: u64,
+    manifest_push_wait_secs: u64,
+) -> Result<i32> {
+    use sum_node::ingest_v2::{EpochCheck, RepushOutcome, RepushResult};
+    let merkle_root = parse_merkle_root_hex(&merkle_root_hex)?;
+    let l1_addr = identity::l1_address_from_keypair(&keypair);
+    let rpc = Arc::new(L1RpcClient::new(rpc_url));
+    let defaults = sum_node::ingest_v2::IngestParamsDefaults {
+        poll_interval: Duration::from_secs(2),
+        activation_wait_secs: Duration::from_secs(0),
+        finality_timeout: Duration::from_secs(60),
+        push_retries: 2,
+        push_wait_secs: Duration::from_secs(push_wait_secs),
+        manifest_push_wait_secs: Duration::from_secs(manifest_push_wait_secs),
+        discovery_timeout: INGEST_DISCOVERY_TIMEOUT,
+        fee_deposit: 0,
+    };
+    let params = build_v2_ingest_params(&rpc, profile, chain_id_arg, fee_per_tx, defaults).await?;
+    let net = Arc::new(SumNet::new(net_config, keypair).await?);
+    let resolver = Arc::new(sum_node::ingest_v2::MapPeerResolver::new());
+    let pipeline =
+        sum_node::ingest_v2::IngestPipeline::new(rpc, net.clone(), resolver, seed, l1_addr, params);
+
+    let outcome = pipeline.repush(merkle_root, &path).await;
+    match &outcome {
+        RepushOutcome::Done(report) => {
+            println!("merkle_root: 0x{}", hex::encode(merkle_root));
+            println!("repush_epoch: {}", report.epoch);
+            let per_archive = report.per_archive();
+            for (archive, manifest) in &report.manifests {
+                let (acked, total) = per_archive.get(archive).copied().unwrap_or((0, 0));
+                let manifest = match manifest {
+                    RepushResult::Acknowledged => "acknowledged".to_string(),
+                    RepushResult::Refused(e) => format!("refused ({e})"),
+                    RepushResult::NoAnswer => "no_answer".to_string(),
+                    RepushResult::Unreachable => "unreachable".to_string(),
+                };
+                println!(
+                    "repush_archive: {} chunks_acknowledged={acked} of={total} manifest={manifest}",
+                    sum_net::l1_address_base58(archive)
+                );
+            }
+            for t in &report.targets {
+                if t.result != RepushResult::Acknowledged {
+                    warn!(
+                        chunk_index = t.chunk_index,
+                        archive = %sum_net::l1_address_base58(&t.archive),
+                        result = ?t.result,
+                        "REPUSH: push not acknowledged"
+                    );
+                }
+            }
+            match &report.epoch_check {
+                EpochCheck::Unchanged => {}
+                EpochCheck::Changed {
+                    from,
+                    to,
+                    not_pushed,
+                } => {
+                    println!(
+                        "repush_epoch_changed: {from} -> {to} not_pushed={}",
+                        not_pushed.len()
+                    );
+                    for (chunk_index, archive) in not_pushed {
+                        warn!(
+                            chunk_index,
+                            archive = %sum_net::l1_address_base58(archive),
+                            "REPUSH: the new assignment epoch needs this push; run repush again"
+                        );
+                    }
+                }
+                EpochCheck::Unknown(e) => {
+                    println!("repush_epoch_unconfirmed: {e}");
+                }
+            }
+            println!(
+                "repush: {}",
+                if report.complete() {
+                    "complete"
+                } else {
+                    "incomplete"
+                }
+            );
+        }
+        RepushOutcome::AbandonedOnChain { .. } => {
+            warn!("REPUSH: file is ABANDONED on chain; nothing pushed");
+        }
+        RepushOutcome::RootMismatch { expected, actual } => {
+            warn!(
+                expected = %hex::encode(expected),
+                actual = %hex::encode(actual),
+                "REPUSH: root mismatch — wrong file for the merkle_root; nothing pushed"
+            );
+        }
+        RepushOutcome::IdentityMismatch { reason } => {
+            warn!(%reason, "REPUSH: does not match the registration; nothing pushed");
+        }
+        RepushOutcome::Failed(e) => {
+            warn!(error = %format!("{e:#}"), "REPUSH: failed");
+        }
+    }
+    net.shutdown().await?;
+    Ok(outcome.exit_code())
+}
+
+/// `repush-audit` (see `sum_node::repair_audit`): read-only. Opens the store
+/// without its lease and without writing, reads the chain, and checks each
+/// inventory file's chunks assigned to this archive.
+///
+/// Stdout: `repush_audit_archive:`, `repush_audit_inventory: <n>`, one
+/// `repush_audit_file:` line per file, one `repush_audit_not_usable:` line
+/// per chunk that is not, then `repush_audit: complete|incomplete|error|
+/// no_inventory`.
+async fn run_repush_audit(
+    keypair: &Keypair,
+    store_dir: Option<PathBuf>,
+    rpc_url: String,
+    profile: NodeProfile,
+    roots: Vec<String>,
+    roots_file: Option<PathBuf>,
+) -> Result<i32> {
+    use sum_node::por_worker::AnswerSource;
+    use sum_node::repair_audit::{AuditVerdict, ChunkVerdict, FileAudit};
+
+    let archive = identity::l1_address_from_keypair(keypair);
+    let mut inventory = Vec::new();
+    for root in &roots {
+        inventory.push(
+            sum_node::repair_audit::parse_root(root)
+                .map_err(|e| anyhow::anyhow!("--root {root}: {e}"))?,
+        );
+    }
+    if let Some(path) = &roots_file {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("--roots-file {}: {e}", path.display()))?;
+        inventory.extend(
+            sum_node::repair_audit::parse_inventory(&text)
+                .map_err(|e| anyhow::anyhow!("--roots-file {}: {e}", path.display()))?,
+        );
+    }
+    println!(
+        "repush_audit_archive: {}",
+        sum_net::l1_address_base58(&archive)
+    );
+    println!("repush_audit_inventory: {}", inventory.len());
+    if inventory.is_empty() {
+        println!(
+            "repush_audit: no_inventory (give --root or --roots-file; an empty or partial local \
+             index does not show that no repair is needed)"
+        );
+        return Ok(sum_node::repair_audit::audit_exit::NO_INVENTORY);
+    }
+
+    let store_dir = StoreConfig::resolve(store_dir)?.store_dir;
+    if !store_dir.is_dir() {
+        anyhow::bail!(
+            "repush-audit: store directory {} does not exist",
+            store_dir.display()
+        );
+    }
+    let manifest_idx = sum_store::manifest_index::ManifestIndex::load_read_only(&store_dir)?;
+    let local = sum_store::store::ChunkStore::new(store_dir.clone())?;
+
+    let rpc = L1RpcClient::new(rpc_url);
+    let r = match rpc.chain_get_chain_params().await {
+        Ok(cp) => {
+            sum_node::runtime_params::RuntimeChainParams::from_chain(&cp)
+                .assignment_replication_factor
+        }
+        Err(e) if profile == NodeProfile::Production => {
+            anyhow::bail!("repush-audit: chain_getChainParams failed: {e:#}");
+        }
+        Err(e) => {
+            warn!(%e, "chain_getChainParams failed in dev profile; using the default R");
+            sum_types::storage::DEFAULT_REPLICATION_FACTOR
+        }
+    };
+    if r == 0 {
+        anyhow::bail!("repush-audit: assignment_replication_factor is 0; nothing is assigned");
+    }
+
+    let report =
+        sum_node::repair_audit::audit(&rpc, r, archive, &manifest_idx, &local, &inventory).await;
+    for file in &report.files {
+        match file {
+            FileAudit::Audited {
+                merkle_root,
+                epoch,
+                chunks,
+            } => {
+                let count = |source: AnswerSource| {
+                    chunks
+                        .iter()
+                        .filter(|c| c.verdict == ChunkVerdict::Usable(source))
+                        .count()
+                };
+                let not_usable = chunks
+                    .iter()
+                    .filter(|c| matches!(c.verdict, ChunkVerdict::NotUsable(_)))
+                    .count();
+                println!(
+                    "repush_audit_file: 0x{} epoch={epoch} assigned={} usable_public_manifest={} \
+                     usable_pushed_proof={} not_usable={not_usable}",
+                    hex::encode(merkle_root),
+                    chunks.len(),
+                    count(AnswerSource::PublicManifest),
+                    count(AnswerSource::PushedProof),
+                );
+                for c in chunks {
+                    if let ChunkVerdict::NotUsable(reason) = &c.verdict {
+                        println!(
+                            "repush_audit_not_usable: 0x{} chunk={} reason={reason}",
+                            hex::encode(merkle_root),
+                            c.chunk_index
+                        );
+                    }
+                }
+            }
+            FileAudit::Abandoned { merkle_root } => {
+                println!(
+                    "repush_audit_file: 0x{} abandoned",
+                    hex::encode(merkle_root)
+                );
+            }
+            FileAudit::NotRegistered { merkle_root } => {
+                println!(
+                    "repush_audit_file: 0x{} not_registered",
+                    hex::encode(merkle_root)
+                );
+            }
+            FileAudit::Error { merkle_root, error } => {
+                println!(
+                    "repush_audit_file: 0x{} error={error}",
+                    hex::encode(merkle_root)
+                );
+            }
+        }
+    }
+    println!(
+        "repush_audit: {}",
+        match report.verdict() {
+            AuditVerdict::Complete => "complete",
+            AuditVerdict::Incomplete => "incomplete",
+            AuditVerdict::Error => "error",
+            AuditVerdict::NoInventory => "no_inventory",
+        }
+    );
+    Ok(report.exit_code())
 }
 
 /// Owner-triggered `ReassignChunksV2` (see `sum_node::reassign_v2`).
