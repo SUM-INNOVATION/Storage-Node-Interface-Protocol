@@ -163,8 +163,11 @@ recorded leaf. Chunks pushed to an archive running a version that did
 not record leaf and path have none: a challenge on such a Private
 chunk is logged (`failed to respond to challenge`, with a
 `not answering: …` reason) and not answered, until the same chunk is
-pushed to the archive again, which records them. Public files are
-answered from the manifest as before.
+pushed to the archive again, which records them: the owner's
+`sum-node repush` does that for a whole file, and `sum-node
+repush-audit` on the archive checks the result (see
+[`../operator/repush-repair.md`](../operator/repush-repair.md)). Public
+files are answered from the manifest as before.
 
 Operational tuning surface — CLI: `--por-poll-secs` (default 10 s;
 env `SUM_POR_INTERVAL`). See [`../reference/cli.md`](../reference/cli.md).
