@@ -24,6 +24,8 @@ use anyhow::Result;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use sum_store::manifest_index::ManifestIndex;
+use sum_store::store::ChunkStore;
 use sum_store::{MerkleTree, SumStore};
 use sum_types::rpc_types::ChallengeInfo;
 
@@ -176,60 +178,22 @@ impl PorWorker {
 
         let chunk_index = challenge.chunk_index;
 
-        // Look up manifest and chunk CID.
-        let store_read = store.read().await;
-        let Some(manifest) = store_read.manifest_idx.get_by_merkle_root(&merkle_root) else {
-            // No Public manifest (a Private file): answer from the proof the
-            // chunk's V2 Push carried, or not at all.
-            let (chunk_hash, merkle_path) =
-                answer_from_pushed_proof(&store_read, &merkle_root, chunk_index)?;
-            drop(store_read); // Release read lock before RPC calls.
-            return self
-                .submit_proof(
-                    challenge,
-                    challenge_id,
-                    merkle_root,
-                    chunk_hash,
-                    merkle_path,
-                )
-                .await;
-        };
-
-        let chunk_cid = store_read
-            .manifest_idx
-            .chunk_cid(&merkle_root, chunk_index)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no chunk at index {chunk_index} for root {}",
-                    challenge.merkle_root
-                )
-            })?
-            .to_string();
-
-        // Read chunk data from disk.
-        let chunk_data = store_read.local.get(&chunk_cid)?;
-
-        // Compute chunk hash.
-        let chunk_hash = *blake3::hash(&chunk_data).as_bytes();
-
-        // Rebuild Merkle tree from manifest hashes and generate proof.
-        let leaf_hashes: Vec<blake3::Hash> = manifest
-            .chunks
-            .iter()
-            .map(|c| blake3::Hash::from(c.blake3_hash))
-            .collect();
-        let tree = MerkleTree::build(&leaf_hashes);
-        let proof = tree.generate_proof(chunk_index);
-        let merkle_path: Vec<[u8; 32]> = proof.iter().map(|h| *h.as_bytes()).collect();
-
-        drop(store_read); // Release read lock before RPC calls.
+        let answer = {
+            let store_read = store.read().await;
+            build_answer(
+                &store_read.manifest_idx,
+                &store_read.local,
+                &merkle_root,
+                chunk_index,
+            )?
+        }; // Read lock released before the RPC calls.
 
         self.submit_proof(
             challenge,
             challenge_id,
             merkle_root,
-            chunk_hash,
-            merkle_path,
+            answer.chunk_hash,
+            answer.merkle_path,
         )
         .await
     }
@@ -276,6 +240,79 @@ impl PorWorker {
     }
 }
 
+/// Where a PoR answer's Merkle path came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerSource {
+    /// Rebuilt from the file's Public manifest held here.
+    PublicManifest,
+    /// The leaf and path recorded when the chunk's V2 Push was accepted.
+    PushedProof,
+}
+
+/// The answer this archive would submit for a challenge on `chunk_index`
+/// of `merkle_root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PorAnswer {
+    pub chunk_hash: [u8; 32],
+    pub merkle_path: Vec<[u8; 32]>,
+    pub source: AnswerSource,
+}
+
+/// Build the answer the responder submits for a challenge on `chunk_index`
+/// of `merkle_root`, from the local store only, exactly as the responder
+/// does: from the file's Public manifest when it is held here, otherwise
+/// from the chunk's recorded push proof ([`answer_from_pushed_proof`]).
+/// An error means no proof would be sent. It does not check the answer
+/// against the chain's verifier; the repair audit does that.
+pub fn build_answer(
+    manifest_idx: &ManifestIndex,
+    local: &ChunkStore,
+    merkle_root: &[u8; 32],
+    chunk_index: u32,
+) -> Result<PorAnswer> {
+    let Some(manifest) = manifest_idx.get_by_merkle_root(merkle_root) else {
+        // No Public manifest (a Private file): answer from the proof the
+        // chunk's V2 Push carried, or not at all.
+        let (chunk_hash, merkle_path) =
+            answer_from_pushed_proof(manifest_idx, local, merkle_root, chunk_index)?;
+        return Ok(PorAnswer {
+            chunk_hash,
+            merkle_path,
+            source: AnswerSource::PushedProof,
+        });
+    };
+
+    let chunk_cid = manifest_idx
+        .chunk_cid(merkle_root, chunk_index)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no chunk at index {chunk_index} for root 0x{}",
+                hex::encode(merkle_root)
+            )
+        })?;
+
+    // Read chunk data from disk.
+    let chunk_data = local.get(chunk_cid)?;
+
+    // Compute chunk hash.
+    let chunk_hash = *blake3::hash(&chunk_data).as_bytes();
+
+    // Rebuild Merkle tree from manifest hashes and generate proof.
+    let leaf_hashes: Vec<blake3::Hash> = manifest
+        .chunks
+        .iter()
+        .map(|c| blake3::Hash::from(c.blake3_hash))
+        .collect();
+    let tree = MerkleTree::build(&leaf_hashes);
+    let proof = tree.generate_proof(chunk_index);
+    let merkle_path: Vec<[u8; 32]> = proof.iter().map(|h| *h.as_bytes()).collect();
+    Ok(PorAnswer {
+        chunk_hash,
+        merkle_path,
+        source: AnswerSource::PublicManifest,
+    })
+}
+
 /// The chunk hash and Merkle path for a challenge on a file with no Public
 /// manifest here (a Private file), from what the chunk's V2 Push left: the
 /// recorded leaf and path, provided the chunk the held index names for
@@ -288,13 +325,13 @@ impl PorWorker {
 /// answer honest: the chain checks only the leaf and path, which the record
 /// alone would let this archive send without holding the chunk.
 fn answer_from_pushed_proof(
-    store: &SumStore,
+    manifest_idx: &ManifestIndex,
+    local: &ChunkStore,
     merkle_root: &[u8; 32],
     chunk_index: u32,
 ) -> Result<([u8; 32], Vec<[u8; 32]>)> {
     let root = hex::encode(merkle_root);
-    let proof = store
-        .manifest_idx
+    let proof = manifest_idx
         .v2_pushed_proof(merkle_root, chunk_index)
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -303,8 +340,7 @@ fn answer_from_pushed_proof(
                  before push proofs were recorded)"
             )
         })?;
-    let cid = store
-        .manifest_idx
+    let cid = manifest_idx
         .v2_held_records(merkle_root)
         .and_then(|records| records.get(&chunk_index))
         .ok_or_else(|| {
@@ -313,7 +349,7 @@ fn answer_from_pushed_proof(
                  but no held-index record"
             )
         })?;
-    let bytes = store.local.get(cid).map_err(|e| {
+    let bytes = local.get(cid).map_err(|e| {
         anyhow::anyhow!(
             "not answering: chunk {chunk_index} of root 0x{root} ({cid}) unreadable: {e}"
         )
