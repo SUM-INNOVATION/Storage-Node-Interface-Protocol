@@ -256,6 +256,178 @@ pub mod resume_exit {
     pub const ROOT_MISMATCH: i32 = 5;
 }
 
+/// Exit status of `sum-node repush`, from [`RepushOutcome::exit_code`]. The
+/// values follow [`resume_exit`] where the meaning is shared.
+pub mod repush_exit {
+    /// Every chunk and manifest push the file's latest assignment epoch
+    /// calls for was acknowledged, and the epoch read again afterwards is
+    /// the same. Complete for that epoch only: a later reassignment needs
+    /// a new run.
+    pub const COMPLETE: i32 = 0;
+    /// An error before or during the run (arguments, RPC, rebuilding the
+    /// file), or the assignment epoch could not be read again after the
+    /// pushes, so the run cannot be confirmed.
+    pub const ERROR: i32 = 1;
+    /// A push was not acknowledged, or the assignment epoch changed during
+    /// the run: run it again.
+    pub const INCOMPLETE: i32 = 3;
+    /// The chain shows the file `Abandoned`: there is nothing to repair.
+    pub const ABANDONED: i32 = 4;
+    /// The file does not rebuild to the given merkle root.
+    pub const ROOT_MISMATCH: i32 = 5;
+    /// The rebuilt file or the operator does not match the registration
+    /// (owner, sizes, chunk count); nothing was pushed.
+    pub const IDENTITY_MISMATCH: i32 = 6;
+}
+
+/// What became of one push of `repush`, chunk or manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepushResult {
+    /// The archive acknowledged the push. For a chunk: it holds the chunk
+    /// and, on a version that records push proofs, its leaf and Merkle
+    /// path. An acknowledgement alone does not show that a proof was
+    /// recorded: `sum-node repush-audit` on the archive does.
+    Acknowledged,
+    /// The archive refused the push on every attempt; its last error.
+    Refused(String),
+    /// The push was sent (or sending failed) and no answer arrived in time.
+    NoAnswer,
+    /// No live peer is known for the archive, so nothing was sent.
+    Unreachable,
+}
+
+/// One (chunk, archive) push of `repush` and its result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepushTarget {
+    pub chunk_index: u32,
+    pub archive: [u8; 20],
+    pub result: RepushResult,
+}
+
+/// The assignment epoch as re-read when the pushes were done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpochCheck {
+    /// Still the epoch the pushes were made for.
+    Unchanged,
+    /// A reassignment moved the file to a new epoch during the run.
+    Changed {
+        from: u64,
+        to: u64,
+        /// The (chunk, archive) pairs the new epoch assigns that this run
+        /// did not get acknowledged: the work still to do.
+        not_pushed: Vec<(u32, [u8; 20])>,
+    },
+    /// The epoch could not be read again; the run cannot be confirmed
+    /// (exit [`repush_exit::ERROR`]).
+    Unknown(String),
+}
+
+/// The report of a `repush` run.
+#[derive(Debug, Clone)]
+pub struct RepushReport {
+    pub merkle_root: [u8; 32],
+    /// The assignment epoch whose snapshot gave the targets: the file's
+    /// latest, the one archives validate a push against.
+    pub epoch: u64,
+    /// Whether the chain showed the file `Active` (otherwise `Pending`).
+    pub active: bool,
+    /// Every (chunk, archive) pair the epoch assigns, in chunk order.
+    pub targets: Vec<RepushTarget>,
+    /// The manifest push to each distinct assigned archive.
+    pub manifests: std::collections::BTreeMap<[u8; 20], RepushResult>,
+    /// The epoch re-read after the pushes.
+    pub epoch_check: EpochCheck,
+}
+
+impl RepushReport {
+    /// Whether every chunk and manifest push was acknowledged and the
+    /// epoch is confirmed unchanged.
+    pub fn complete(&self) -> bool {
+        self.targets
+            .iter()
+            .all(|t| t.result == RepushResult::Acknowledged)
+            && self
+                .manifests
+                .values()
+                .all(|r| *r == RepushResult::Acknowledged)
+            && self.epoch_check == EpochCheck::Unchanged
+    }
+
+    /// Per archive: (chunk pushes acknowledged, chunk pushes assigned).
+    pub fn per_archive(&self) -> std::collections::BTreeMap<[u8; 20], (usize, usize)> {
+        let mut out = std::collections::BTreeMap::new();
+        for t in &self.targets {
+            let e = out.entry(t.archive).or_insert((0, 0));
+            e.1 += 1;
+            if t.result == RepushResult::Acknowledged {
+                e.0 += 1;
+            }
+        }
+        out
+    }
+}
+
+/// The outcome of [`IngestPipeline::repush`].
+#[derive(Debug)]
+pub enum RepushOutcome {
+    /// The pushes ran; see the report for each one.
+    Done(RepushReport),
+    /// The chain shows the file `Abandoned`; nothing was pushed.
+    AbandonedOnChain { merkle_root: [u8; 32] },
+    /// The file rebuilt to a different root; nothing was pushed.
+    RootMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+    /// The operator or the rebuilt file does not match the registration;
+    /// nothing was pushed.
+    IdentityMismatch { reason: String },
+    /// An error before the pushes (nothing was pushed) or while reading
+    /// the chain.
+    Failed(anyhow::Error),
+}
+
+impl RepushOutcome {
+    /// The process exit code ([`repush_exit`]).
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            RepushOutcome::Done(report) if report.complete() => repush_exit::COMPLETE,
+            RepushOutcome::Done(report) if matches!(report.epoch_check, EpochCheck::Unknown(_)) => {
+                repush_exit::ERROR
+            }
+            RepushOutcome::Done(_) => repush_exit::INCOMPLETE,
+            RepushOutcome::AbandonedOnChain { .. } => repush_exit::ABANDONED,
+            RepushOutcome::RootMismatch { .. } => repush_exit::ROOT_MISMATCH,
+            RepushOutcome::IdentityMismatch { .. } => repush_exit::IDENTITY_MISMATCH,
+            RepushOutcome::Failed(_) => repush_exit::ERROR,
+        }
+    }
+}
+
+/// A registered file rebuilt from its source, for [`IngestPipeline::repush`].
+/// Field order is drop order: the mmap is dropped before the temporary
+/// ciphertext file it maps.
+struct ReproducedFile {
+    manifest: DataManifest,
+    mmap: memmap2::Mmap,
+    tree: MerkleTree,
+    /// The manifest bytes an archive accepts for this file: the Public
+    /// manifest as CBOR, or the Private manifest encrypted under `K_file`.
+    manifest_bytes: Vec<u8>,
+    /// The bytes archives store: the plaintext size for a Public file, the
+    /// ciphertext size for a Private one.
+    stored_size_bytes: u64,
+    _ciphertext_temp: Option<tempfile::NamedTempFile>,
+}
+
+enum ReproduceError {
+    /// The rebuilt chunks give this root, not the registered one.
+    Mismatch {
+        actual: [u8; 32],
+    },
+    Other(anyhow::Error),
+}
+
 /// Exit status of `sum-node ingest-v2 --exit-status`, by outcome
 /// ([`IngestOutcome::ingest_exit_code`]). Without `--exit-status`,
 /// `ingest-v2` exits 0 for every outcome.
@@ -2963,6 +3135,467 @@ where
         }
     }
 
+    /// `sum-node repush`: push **every** chunk of a registered V2 file to
+    /// **every** archive its latest assignment epoch assigns the chunk to,
+    /// push the file's manifest to each of those archives, and report each
+    /// push's answer. `resume` is unchanged: it pushes only the chunks the
+    /// chain reports uncovered, and nothing for an `Active` file.
+    ///
+    /// This is how chunks pushed before archives recorded a push's leaf and
+    /// Merkle path get that record: an archive accepts a repeat push of a
+    /// chunk it holds and records the proof the push carries.
+    ///
+    /// - **Lifecycle:** the file must be `Pending` or `Active`.
+    /// - **Identity:** the operator must be the registered owner, and the
+    ///   file must rebuild to the registered root, chunk count and sizes; a
+    ///   Private file is rebuilt under the `K_file` recovered from the
+    ///   owner's own access entry. Any mismatch is refused before anything
+    ///   is pushed.
+    /// - **Targets:** the file's latest assignment epoch (the snapshot
+    ///   archives validate a push against), not `assignment_height` alone.
+    /// - **Manifest:** the bytes an archive accepts for the file's
+    ///   visibility: the Public manifest as CBOR, or the Private manifest
+    ///   encrypted under `K_file`. An archive that already holds a Private
+    ///   manifest keeps it.
+    /// - **Epoch:** re-read after the pushes; a change makes the run
+    ///   incomplete and lists the pairs the new epoch still needs.
+    /// - **Chain:** only read. No transaction is sent.
+    pub async fn repush(&self, merkle_root: [u8; 32], file_path: &Path) -> RepushOutcome {
+        let r = self.params.assignment_replication_factor;
+        if r == 0 {
+            return RepushOutcome::Failed(anyhow::anyhow!(
+                "repush: assignment_replication_factor is 0; there are no assignment targets"
+            ));
+        }
+        let root_hex = format!("0x{}", hex::encode(merkle_root));
+        let info = match self.rpc.storage_get_file_info_v2(&root_hex).await {
+            Ok(Some(info)) => info,
+            Ok(None) => {
+                return RepushOutcome::Failed(anyhow::anyhow!(
+                    "repush: file {root_hex} is not registered on chain"
+                ));
+            }
+            Err(e) => {
+                return RepushOutcome::Failed(e.context("repush: storage_getFileInfoV2 failed"));
+            }
+        };
+        if info.lifecycle.is_abandoned() {
+            return RepushOutcome::AbandonedOnChain { merkle_root };
+        }
+        if !info.lifecycle.is_active() && !info.lifecycle.is_pending() {
+            return RepushOutcome::Failed(anyhow::anyhow!(
+                "repush: unexpected lifecycle byte {} on chain",
+                info.lifecycle.0
+            ));
+        }
+        if info.owner != self.my_addr_base58 {
+            return RepushOutcome::IdentityMismatch {
+                reason: format!(
+                    "operator {} is not the registered owner {}",
+                    self.my_addr_base58, info.owner
+                ),
+            };
+        }
+
+        let file = match self
+            .reproduce_registered(&info, merkle_root, file_path)
+            .await
+        {
+            Ok(file) => file,
+            Err(ReproduceError::Mismatch { actual }) => {
+                return RepushOutcome::RootMismatch {
+                    expected: merkle_root,
+                    actual,
+                };
+            }
+            Err(ReproduceError::Other(e)) => return RepushOutcome::Failed(e),
+        };
+        let mut mismatches = Vec::new();
+        if file.manifest.chunk_count != info.chunk_count {
+            mismatches.push(format!(
+                "chunk count {} (registered {})",
+                file.manifest.chunk_count, info.chunk_count
+            ));
+        }
+        if file.manifest.total_size_bytes != info.plaintext_size_bytes {
+            mismatches.push(format!(
+                "plaintext size {} (registered {})",
+                file.manifest.total_size_bytes, info.plaintext_size_bytes
+            ));
+        }
+        if file.stored_size_bytes != info.stored_size_bytes {
+            mismatches.push(format!(
+                "stored size {} (registered {})",
+                file.stored_size_bytes, info.stored_size_bytes
+            ));
+        }
+        if !mismatches.is_empty() {
+            return RepushOutcome::IdentityMismatch {
+                reason: format!("the rebuilt file differs: {}", mismatches.join(", ")),
+            };
+        }
+
+        let (epoch, targets) = match self
+            .latest_assignment_targets(&root_hex, &info, merkle_root, r)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => return RepushOutcome::Failed(e),
+        };
+        let required: BTreeSet<[u8; 20]> = targets.iter().map(|(_, a)| *a).collect();
+        if let Err(f) = self.await_archives(&required).await {
+            warn!(
+                missing = f.missing().len(),
+                required = required.len(),
+                "repush: {f}; pushing to the reachable archives only"
+            );
+        }
+
+        let results = self.repush_chunks(&file, merkle_root, &targets).await;
+        let manifests = self
+            .repush_manifests(merkle_root, &file.manifest_bytes, &required)
+            .await;
+
+        // The epoch again: a reassignment during the run moves the targets.
+        let epoch_check = match self
+            .latest_assignment_targets(&root_hex, &info, merkle_root, r)
+            .await
+        {
+            Ok((now, _)) if now == epoch => EpochCheck::Unchanged,
+            Ok((now, new_targets)) => EpochCheck::Changed {
+                from: epoch,
+                to: now,
+                not_pushed: new_targets
+                    .into_iter()
+                    .filter(|pair| results.get(pair) != Some(&RepushResult::Acknowledged))
+                    .collect(),
+            },
+            Err(e) => EpochCheck::Unknown(format!("{e:#}")),
+        };
+
+        let report = RepushReport {
+            merkle_root,
+            epoch,
+            active: info.lifecycle.is_active(),
+            targets: targets
+                .iter()
+                .map(|(chunk_index, archive)| RepushTarget {
+                    chunk_index: *chunk_index,
+                    archive: *archive,
+                    result: results[&(*chunk_index, *archive)].clone(),
+                })
+                .collect(),
+            manifests,
+            epoch_check,
+        };
+        info!(
+            root = %root_hex,
+            epoch,
+            pushes = report.targets.len(),
+            acknowledged = report
+                .targets
+                .iter()
+                .filter(|t| t.result == RepushResult::Acknowledged)
+                .count(),
+            complete = report.complete(),
+            "repush: done"
+        );
+        RepushOutcome::Done(report)
+    }
+
+    /// The file's latest assignment epoch and every (chunk, archive) pair
+    /// its snapshot assigns, in chunk order.
+    async fn latest_assignment_targets(
+        &self,
+        root_hex: &str,
+        info: &StorageFileInfoV2,
+        merkle_root: [u8; 32],
+        r: u32,
+    ) -> Result<(u64, Vec<(u32, [u8; 20])>)> {
+        let coverage = self
+            .rpc
+            .storage_get_assignment_coverage_v2(root_hex, None, Some(0))
+            .await
+            .map_err(|e| e.context("repush: storage_getAssignmentCoverageV2 failed"))?
+            .ok_or_else(|| anyhow::anyhow!("repush: no coverage row for {root_hex}"))?;
+        let epoch = crate::inbound_v2::epoch_from_coverage(&coverage, info.assignment_height)?;
+        let mut snapshot = Vec::new();
+        for record in sum_types::rpc_types::filter_active_archives(
+            self.rpc.storage_get_active_nodes_at_height(epoch).await?,
+        ) {
+            snapshot.push(
+                sum_net::l1_address_from_base58(&record.address)
+                    .map_err(|e| e.context("snapshot address decode"))?,
+            );
+        }
+        snapshot.sort();
+        snapshot.dedup();
+        if snapshot.is_empty() {
+            anyhow::bail!(
+                "repush: the snapshot at assignment epoch {epoch} holds no eligible archive"
+            );
+        }
+        let mut targets = Vec::new();
+        for chunk_index in 0..info.chunk_count {
+            for archive in assigned_archives(&merkle_root, &snapshot, chunk_index, r) {
+                targets.push((chunk_index, archive));
+            }
+        }
+        Ok((epoch, targets))
+    }
+
+    /// Push each (chunk, archive) pair once, retry a refused one up to
+    /// `push_retries` times, and collect the answers until `push_wait_secs`.
+    async fn repush_chunks(
+        &self,
+        file: &ReproducedFile,
+        merkle_root: [u8; 32],
+        targets: &[(u32, [u8; 20])],
+    ) -> HashMap<(u32, [u8; 20]), RepushResult> {
+        let mut results: HashMap<(u32, [u8; 20]), RepushResult> = targets
+            .iter()
+            .map(|k| (*k, RepushResult::Unreachable))
+            .collect();
+        let mut by_key: HashMap<(u32, PeerId), [u8; 20]> = HashMap::new();
+        let mut attempts: HashMap<(u32, PeerId), u32> = HashMap::new();
+        let mut awaiting: HashSet<(u32, PeerId)> = HashSet::new();
+        for (chunk_index, archive) in targets {
+            let Some(peer) = self.peers.resolve(archive) else {
+                continue;
+            };
+            results.insert((*chunk_index, *archive), RepushResult::NoAnswer);
+            by_key.insert((*chunk_index, peer), *archive);
+            match self
+                .send_one_push(&file.manifest, &file.mmap, &file.tree, *chunk_index, peer)
+                .await
+            {
+                Ok(()) => {
+                    attempts.insert((*chunk_index, peer), 1);
+                    awaiting.insert((*chunk_index, peer));
+                }
+                Err(e) => warn!(chunk_index, ?peer, %e, "repush: push send failed"),
+            }
+        }
+
+        let deadline = Instant::now() + self.params.push_wait_secs;
+        while !awaiting.is_empty() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let event = tokio::select! {
+                ev = self.net.next_event() => ev,
+                _ = tokio::time::sleep(deadline - now) => break,
+            };
+            let Some(ev) = event else { break };
+            let SumNetEvent::ShardReceivedV2 {
+                peer_id,
+                response:
+                    ShardResponseV2::PushAck {
+                        merkle_root: acked_root,
+                        chunk_index,
+                        error,
+                    },
+                ..
+            } = ev
+            else {
+                continue;
+            };
+            let key = (chunk_index, peer_id);
+            if acked_root != merkle_root || !awaiting.contains(&key) {
+                continue;
+            }
+            let archive = by_key[&key];
+            match error {
+                None => {
+                    results.insert((chunk_index, archive), RepushResult::Acknowledged);
+                    awaiting.remove(&key);
+                }
+                Some(err) => {
+                    let n = attempts.entry(key).or_insert(1);
+                    if *n <= self.params.push_retries
+                        && self
+                            .send_one_push(
+                                &file.manifest,
+                                &file.mmap,
+                                &file.tree,
+                                chunk_index,
+                                peer_id,
+                            )
+                            .await
+                            .is_ok()
+                    {
+                        *n += 1;
+                    } else {
+                        results.insert((chunk_index, archive), RepushResult::Refused(err));
+                        awaiting.remove(&key);
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    /// Push `manifest_bytes` to each archive in `archives`, retry a refused
+    /// push up to `push_retries` times, and collect the answers until
+    /// `manifest_push_wait_secs`.
+    async fn repush_manifests(
+        &self,
+        merkle_root: [u8; 32],
+        manifest_bytes: &[u8],
+        archives: &BTreeSet<[u8; 20]>,
+    ) -> std::collections::BTreeMap<[u8; 20], RepushResult> {
+        let mut results: std::collections::BTreeMap<[u8; 20], RepushResult> = archives
+            .iter()
+            .map(|a| (*a, RepushResult::Unreachable))
+            .collect();
+        let mut by_peer: HashMap<PeerId, [u8; 20]> = HashMap::new();
+        let mut attempts: HashMap<PeerId, u32> = HashMap::new();
+        for archive in archives {
+            let Some(peer) = self.peers.resolve(archive) else {
+                continue;
+            };
+            results.insert(*archive, RepushResult::NoAnswer);
+            match self
+                .net
+                .push_manifest_v2(peer, merkle_root, manifest_bytes.to_vec())
+                .await
+            {
+                Ok(()) => {
+                    by_peer.insert(peer, *archive);
+                    attempts.insert(peer, 1);
+                }
+                Err(e) => warn!(?peer, %e, "repush: manifest push send failed"),
+            }
+        }
+
+        let deadline = Instant::now() + self.params.manifest_push_wait_secs;
+        while !by_peer.is_empty() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let event = tokio::select! {
+                ev = self.net.next_event() => ev,
+                _ = tokio::time::sleep(deadline - now) => break,
+            };
+            let Some(ev) = event else { break };
+            let SumNetEvent::ShardReceivedV2 {
+                peer_id,
+                response:
+                    ShardResponseV2::ManifestPushAck {
+                        merkle_root: acked_root,
+                        error,
+                    },
+                ..
+            } = ev
+            else {
+                continue;
+            };
+            if acked_root != merkle_root {
+                continue;
+            }
+            let Some(archive) = by_peer.get(&peer_id).copied() else {
+                continue;
+            };
+            match error {
+                None => {
+                    results.insert(archive, RepushResult::Acknowledged);
+                    by_peer.remove(&peer_id);
+                }
+                Some(err) => {
+                    let n = attempts.entry(peer_id).or_insert(1);
+                    if *n <= self.params.push_retries
+                        && self
+                            .net
+                            .push_manifest_v2(peer_id, merkle_root, manifest_bytes.to_vec())
+                            .await
+                            .is_ok()
+                    {
+                        *n += 1;
+                    } else {
+                        results.insert(archive, RepushResult::Refused(err));
+                        by_peer.remove(&peer_id);
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    /// Rebuild a registered file from `file_path` exactly as it was
+    /// registered: a Public file's plaintext chunks and CBOR manifest, or a
+    /// Private file's ciphertext and encrypted manifest under the `K_file`
+    /// recovered from the owner's own access entry (the operator must be
+    /// the owner). The same steps as [`Self::resume`]'s, which keeps its
+    /// own copy.
+    async fn reproduce_registered(
+        &self,
+        info: &StorageFileInfoV2,
+        merkle_root: [u8; 32],
+        file_path: &Path,
+    ) -> std::result::Result<ReproducedFile, ReproduceError> {
+        if info.visibility.is_private() {
+            let k_file = crate::access::recover_k_file_from_seed_page(
+                &self.signing_key_seed,
+                self.my_addr,
+                &self.my_addr_base58,
+                info,
+            )
+            .map_err(|e| {
+                ReproduceError::Other(anyhow::anyhow!(
+                    "repush (Private): K_file recovery from the owner's bundle failed: {e}"
+                ))
+            })?;
+            let artifacts = build_private_artifacts(file_path, &k_file).map_err(|e| {
+                ReproduceError::Other(e.context("repush (Private): re-encryption failed"))
+            })?;
+            if artifacts.manifest.merkle_root != merkle_root {
+                return Err(ReproduceError::Mismatch {
+                    actual: artifacts.manifest.merkle_root,
+                });
+            }
+            let leaves: Vec<blake3::Hash> = artifacts
+                .manifest
+                .chunks
+                .iter()
+                .map(|c| blake3::Hash::from(c.blake3_hash))
+                .collect();
+            let tree = MerkleTree::build(&leaves);
+            Ok(ReproducedFile {
+                manifest: artifacts.manifest,
+                mmap: artifacts.ciphertext_mmap,
+                tree,
+                manifest_bytes: artifacts.encrypted_manifest_bytes,
+                stored_size_bytes: artifacts.stored_size_bytes,
+                _ciphertext_temp: Some(artifacts._ciphertext_temp),
+            })
+        } else {
+            let (manifest, mmap, tree) = self
+                .s0_chunk(file_path)
+                .await
+                .map_err(ReproduceError::Other)?;
+            if manifest.merkle_root != merkle_root {
+                return Err(ReproduceError::Mismatch {
+                    actual: manifest.merkle_root,
+                });
+            }
+            let mut manifest_bytes = Vec::new();
+            ciborium::ser::into_writer(&manifest, &mut manifest_bytes).map_err(|e| {
+                ReproduceError::Other(anyhow::anyhow!("repush: manifest CBOR encode failed: {e}"))
+            })?;
+            let stored_size_bytes = manifest.total_size_bytes;
+            Ok(ReproducedFile {
+                manifest,
+                mmap,
+                tree,
+                manifest_bytes,
+                stored_size_bytes,
+                _ciphertext_temp: None,
+            })
+        }
+    }
+
     /// Walk paginated `missing_indices` until `missing_indices` is empty.
     /// Pagination cycles `missing_offset = last_returned_index + 1` per
     /// chain plan v3.2 §4 line 474.
@@ -5449,6 +6082,987 @@ mod tests {
             }
             other => panic!("expected ResumedActivated, got {other:?}"),
         }
+    }
+
+    // ── repush ─────────────────────────────────────────────────────────
+
+    /// Queue a successful PushAck for every (chunk, archive) pair the
+    /// assignment over `snapshot` gives, from each archive's peer in
+    /// `arch_to_peer` (archives without a peer get none), then a successful
+    /// ManifestPushAck from each distinct assigned archive's peer. Returns
+    /// the pairs.
+    async fn ack_every_assigned_push(
+        net: &MockNet,
+        root: [u8; 32],
+        snapshot: &[[u8; 20]],
+        chunk_count: u32,
+        r: u32,
+        arch_to_peer: &HashMap<[u8; 20], PeerId>,
+    ) -> Vec<(u32, [u8; 20])> {
+        let mut pairs = Vec::new();
+        for chunk_index in 0..chunk_count {
+            for archive in
+                sum_store::assignment_v2::assigned_archives(&root, snapshot, chunk_index, r)
+            {
+                pairs.push((chunk_index, archive));
+                if let Some(peer) = arch_to_peer.get(&archive) {
+                    net.push_event(push_ack(*peer, root, chunk_index, None))
+                        .await;
+                }
+            }
+        }
+        let distinct: BTreeSet<[u8; 20]> = pairs.iter().map(|(_, a)| *a).collect();
+        for archive in distinct {
+            if let Some(peer) = arch_to_peer.get(&archive) {
+                net.push_event(manifest_ack(*peer, root, None)).await;
+            }
+        }
+        pairs
+    }
+
+    fn push_ack(
+        peer: PeerId,
+        merkle_root: [u8; 32],
+        chunk_index: u32,
+        error: Option<String>,
+    ) -> SumNetEvent {
+        SumNetEvent::ShardReceivedV2 {
+            peer_id: peer,
+            response: ShardResponseV2::PushAck {
+                merkle_root,
+                chunk_index,
+                error,
+            },
+            origin: OutboundOrigin::new(
+                peer,
+                OutboundRequestKind::V2Push {
+                    merkle_root,
+                    chunk_index,
+                },
+            ),
+        }
+    }
+
+    fn manifest_ack(peer: PeerId, merkle_root: [u8; 32], error: Option<String>) -> SumNetEvent {
+        SumNetEvent::ShardReceivedV2 {
+            peer_id: peer,
+            response: ShardResponseV2::ManifestPushAck { merkle_root, error },
+            origin: OutboundOrigin::new(peer, OutboundRequestKind::V2ManifestPush { merkle_root }),
+        }
+    }
+
+    fn peers_for(archives: &[[u8; 20]]) -> HashMap<[u8; 20], PeerId> {
+        archives.iter().map(|a| (*a, fake_peer())).collect()
+    }
+
+    /// A Public file's chain row as `repush` checks it: owned by `owner`,
+    /// with the plaintext and stored sizes the file has.
+    fn repush_public_info(
+        root: &[u8; 32],
+        chunk_count: u32,
+        size: u64,
+        assignment_height: u64,
+        lifecycle: LifecycleV2,
+        owner: [u8; 20],
+    ) -> StorageFileInfoV2 {
+        let mut info = file_info_with_lifecycle(
+            root,
+            chunk_count,
+            assignment_height,
+            lifecycle,
+            lifecycle.is_active().then_some(assignment_height + 10),
+            None,
+        );
+        info.owner = l1_address_base58(&owner);
+        info.plaintext_size_bytes = size;
+        info.stored_size_bytes = size;
+        info
+    }
+
+    /// The same coverage row for the run's first read and its final
+    /// re-read of the assignment epoch.
+    fn enqueue_coverage_twice(rpc: &MockRpc, cov: AssignmentCoverageV2) {
+        rpc.enqueue_coverage(cov.clone());
+        rpc.enqueue_coverage(cov);
+    }
+
+    /// An Active Public file: `repush` pushes every chunk (not only
+    /// uncovered ones) to every archive the latest epoch assigns it to, the
+    /// manifest to each of those archives, sends no transaction, and
+    /// reports every push acknowledged. Plain `resume` on the same file
+    /// pushes nothing (its behaviour is unchanged).
+    #[tokio::test]
+    async fn repush_pushes_every_chunk_and_the_manifest_to_the_assignees_and_sends_nothing_on_chain()
+     {
+        let bytes = vec![0xB1; 5 * 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+        let snapshot = five_archives();
+        let my_addr = snapshot[0];
+        let arch_to_peer = peers_for(&snapshot);
+        let (_mmap, m) = BinaryChunker::chunk_file(&path).unwrap();
+        let root = m.merkle_root;
+        let root_hex = format!("0x{}", hex::encode(root));
+
+        let chain = || {
+            let rpc = Arc::new(MockRpc::default());
+            rpc.add_file(
+                &root_hex,
+                repush_public_info(
+                    &root,
+                    5,
+                    bytes.len() as u64,
+                    50,
+                    LifecycleV2::ACTIVE,
+                    my_addr,
+                ),
+            );
+            rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+            rpc
+        };
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = 3;
+
+        let rpc = chain();
+        // Every chunk covered: plain `resume` would have nothing to push.
+        enqueue_coverage_twice(&rpc, coverage_active(5, false));
+        let net = Arc::new(MockNet::new());
+        let pairs = ack_every_assigned_push(&net, root, &snapshot, 5, 3, &arch_to_peer).await;
+        assert_eq!(pairs.len(), 15, "5 chunks × R=3");
+        let distinct: BTreeSet<[u8; 20]> = pairs.iter().map(|(_, a)| *a).collect();
+        let pipeline = build_pipeline(
+            rpc.clone(),
+            net.clone(),
+            arch_to_peer.clone(),
+            my_addr,
+            params.clone(),
+        );
+        let outcome = pipeline.repush(root, &path).await;
+        let RepushOutcome::Done(report) = &outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(report.complete());
+        assert!(report.active);
+        assert_eq!(report.epoch, 50, "no reassignment: the first epoch");
+        assert_eq!(report.epoch_check, EpochCheck::Unchanged);
+        let reported: Vec<(u32, [u8; 20])> = report
+            .targets
+            .iter()
+            .map(|t| (t.chunk_index, t.archive))
+            .collect();
+        assert_eq!(reported, pairs);
+        let sent: BTreeSet<(PeerId, u32)> = net
+            .pushes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(peer, r, i)| {
+                assert_eq!(*r, root);
+                (*peer, *i)
+            })
+            .collect();
+        let expected: BTreeSet<(PeerId, u32)> =
+            pairs.iter().map(|(i, a)| (arch_to_peer[a], *i)).collect();
+        assert_eq!(sent, expected);
+        assert_eq!(net.push_count(), 15);
+        assert_eq!(
+            report.manifests.keys().copied().collect::<BTreeSet<_>>(),
+            distinct
+        );
+        assert!(
+            report
+                .manifests
+                .values()
+                .all(|r| *r == RepushResult::Acknowledged)
+        );
+        assert_eq!(
+            net.manifest_push_count(),
+            distinct.len(),
+            "one per assignee"
+        );
+        assert!(rpc.sent_txs.lock().unwrap().is_empty(), "no transaction");
+        assert_eq!(outcome.exit_code(), repush_exit::COMPLETE);
+        let per_archive = report.per_archive();
+        assert_eq!(per_archive.values().map(|(a, _)| a).sum::<usize>(), 15);
+        assert_eq!(per_archive.values().map(|(_, n)| n).sum::<usize>(), 15);
+
+        // Plain resume on the same Active file: nothing pushed.
+        let rpc = chain();
+        let net = Arc::new(MockNet::new());
+        let pipeline = build_pipeline(rpc.clone(), net.clone(), arch_to_peer, my_addr, params);
+        match pipeline.resume(root, &path).await {
+            IngestOutcome::ActivatedOnChain { .. } => {}
+            other => panic!("expected ActivatedOnChain, got {other:?}"),
+        }
+        assert_eq!(net.push_count(), 0);
+        assert_eq!(net.manifest_push_count(), 0);
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
+    }
+
+    /// After a reassignment the targets come from the snapshot at the
+    /// file's LATEST assignment epoch, the one archives validate a push
+    /// against, not from `assignment_height`.
+    #[tokio::test]
+    async fn repush_targets_the_latest_assignment_epoch() {
+        let bytes = vec![0xB2; 4 * 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+        let first = five_archives();
+        let mut latest: Vec<[u8; 20]> = first[1..].to_vec();
+        latest.push([0x66; 20]);
+        latest.sort();
+        let mut everyone = first.clone();
+        everyone.push([0x66; 20]);
+        let arch_to_peer = peers_for(&everyone);
+        let (_mmap, m) = BinaryChunker::chunk_file(&path).unwrap();
+        let root = m.merkle_root;
+
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            repush_public_info(
+                &root,
+                4,
+                bytes.len() as u64,
+                50,
+                LifecycleV2::ACTIVE,
+                first[0],
+            ),
+        );
+        rpc.add_snapshot(50, first.iter().map(node_record).collect());
+        rpc.add_snapshot(80, latest.iter().map(node_record).collect());
+        let mut cov = coverage_active(4, false);
+        cov.assignment_epochs = vec![50, 80];
+        cov.latest_assignment_epoch = 80;
+        enqueue_coverage_twice(&rpc, cov);
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = 3;
+        let net = Arc::new(MockNet::new());
+        let pairs = ack_every_assigned_push(&net, root, &latest, 4, 3, &arch_to_peer).await;
+        let pipeline = build_pipeline(rpc, net.clone(), arch_to_peer, first[0], params);
+
+        let RepushOutcome::Done(report) = pipeline.repush(root, &path).await else {
+            panic!("expected Done");
+        };
+        assert_eq!(report.epoch, 80);
+        assert_eq!(
+            report
+                .targets
+                .iter()
+                .map(|t| (t.chunk_index, t.archive))
+                .collect::<Vec<_>>(),
+            pairs
+        );
+        assert!(report.complete());
+        assert!(
+            report.targets.iter().all(|t| t.archive != first[0])
+                && !report.manifests.contains_key(&first[0]),
+            "the archive the reassignment dropped is not a target"
+        );
+    }
+
+    /// A net that answers a push only once it is sent, from a script per
+    /// (peer, chunk) and per peer for manifests, the order a live network
+    /// gives. Peer discovery, which reads events before any push, then sees
+    /// none. Records every manifest push's bytes.
+    #[derive(Default)]
+    struct ReplyNet {
+        replies: StdMutex<HashMap<(PeerId, u32), VecDeque<Option<String>>>>,
+        manifest_replies: StdMutex<HashMap<PeerId, VecDeque<Option<String>>>>,
+        events: StdMutex<VecDeque<SumNetEvent>>,
+        pushes: StdMutex<usize>,
+        manifests: StdMutex<Vec<(PeerId, [u8; 32], Vec<u8>)>>,
+    }
+
+    impl ReplyNet {
+        /// The next push of `chunk_index` to `peer` is answered with
+        /// `error` (`None`: acknowledged).
+        fn reply(&self, peer: PeerId, chunk_index: u32, error: Option<String>) {
+            self.replies
+                .lock()
+                .unwrap()
+                .entry((peer, chunk_index))
+                .or_default()
+                .push_back(error);
+        }
+        /// The next manifest push to `peer` is answered with `error`.
+        fn reply_manifest(&self, peer: PeerId, error: Option<String>) {
+            self.manifest_replies
+                .lock()
+                .unwrap()
+                .entry(peer)
+                .or_default()
+                .push_back(error);
+        }
+    }
+
+    #[async_trait]
+    impl V2IngestNet for ReplyNet {
+        async fn push_chunk_v2(
+            &self,
+            peer_id: PeerId,
+            _data: Vec<u8>,
+            merkle_root: [u8; 32],
+            chunk_index: u32,
+            _merkle_path: Vec<[u8; 32]>,
+        ) -> Result<()> {
+            *self.pushes.lock().unwrap() += 1;
+            let reply = self
+                .replies
+                .lock()
+                .unwrap()
+                .get_mut(&(peer_id, chunk_index))
+                .and_then(|q| q.pop_front());
+            if let Some(error) = reply {
+                self.events.lock().unwrap().push_back(push_ack(
+                    peer_id,
+                    merkle_root,
+                    chunk_index,
+                    error,
+                ));
+            }
+            Ok(())
+        }
+        async fn push_manifest_v2(
+            &self,
+            peer_id: PeerId,
+            merkle_root: [u8; 32],
+            manifest_bytes: Vec<u8>,
+        ) -> Result<()> {
+            self.manifests
+                .lock()
+                .unwrap()
+                .push((peer_id, merkle_root, manifest_bytes));
+            let reply = self
+                .manifest_replies
+                .lock()
+                .unwrap()
+                .get_mut(&peer_id)
+                .and_then(|q| q.pop_front());
+            if let Some(error) = reply {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push_back(manifest_ack(peer_id, merkle_root, error));
+            }
+            Ok(())
+        }
+        async fn next_event(&self) -> Option<SumNetEvent> {
+            self.events.lock().unwrap().pop_front()
+        }
+    }
+
+    /// A ReplyNet that acknowledges every chunk and manifest push to the
+    /// archives `snapshot` assigns.
+    fn acking_reply_net(
+        root: [u8; 32],
+        snapshot: &[[u8; 20]],
+        chunk_count: u32,
+        r: u32,
+        arch_to_peer: &HashMap<[u8; 20], PeerId>,
+    ) -> Arc<ReplyNet> {
+        let net = Arc::new(ReplyNet::default());
+        let mut distinct = BTreeSet::new();
+        for chunk_index in 0..chunk_count {
+            for archive in
+                sum_store::assignment_v2::assigned_archives(&root, snapshot, chunk_index, r)
+            {
+                net.reply(arch_to_peer[&archive], chunk_index, None);
+                distinct.insert(archive);
+            }
+        }
+        for archive in distinct {
+            net.reply_manifest(arch_to_peer[&archive], None);
+        }
+        net
+    }
+
+    /// A Public file's manifest is pushed as the CBOR of the rebuilt
+    /// manifest, the bytes an archive validates against the root.
+    #[tokio::test]
+    async fn repush_pushes_the_public_manifest_as_cbor() {
+        let bytes = vec![0xB8; 2 * 1_048_576 + 5];
+        let (_dir, path) = write_test_file(&bytes);
+        let snapshot = five_archives();
+        let arch_to_peer = peers_for(&snapshot);
+        let (_mmap, m) = BinaryChunker::chunk_file(&path).unwrap();
+        let root = m.merkle_root;
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            repush_public_info(
+                &root,
+                m.chunk_count,
+                bytes.len() as u64,
+                50,
+                LifecycleV2::ACTIVE,
+                snapshot[0],
+            ),
+        );
+        rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+        enqueue_coverage_twice(&rpc, coverage_active(m.chunk_count, false));
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = 3;
+        let net = acking_reply_net(root, &snapshot, m.chunk_count, 3, &arch_to_peer);
+        let pipeline = IngestPipeline::new(
+            rpc.clone(),
+            net.clone(),
+            Arc::new(StaticPeers { map: arch_to_peer }),
+            [42u8; 32],
+            snapshot[0],
+            params,
+        );
+
+        let outcome = pipeline.repush(root, &path).await;
+        let RepushOutcome::Done(report) = &outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(report.complete(), "{report:?}");
+        let assignees: BTreeSet<[u8; 20]> = report.targets.iter().map(|t| t.archive).collect();
+        assert_eq!(
+            report.manifests.keys().copied().collect::<BTreeSet<_>>(),
+            assignees
+        );
+        let manifests = net.manifests.lock().unwrap();
+        assert_eq!(
+            manifests.len(),
+            assignees.len(),
+            "one manifest push per assignee"
+        );
+        for (_, r, bytes) in manifests.iter() {
+            assert_eq!(*r, root);
+            let decoded: DataManifest = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+            assert_eq!(decoded.merkle_root, root);
+            assert_eq!(decoded.chunks, m.chunks);
+            sum_store::serve::validate_manifest_push(&hex::encode(root), bytes)
+                .expect("an archive accepts these bytes for the root");
+        }
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
+    }
+
+    /// A Private file: the owner's `K_file` is recovered from its own
+    /// access entry and the plaintext re-encrypted, so the pushes carry the
+    /// registered ciphertext chunks, and the manifest pushed is the
+    /// manifest encrypted under `K_file`, as the ingest pushed it.
+    #[tokio::test]
+    async fn repush_private_reproduces_the_ciphertext_and_pushes_the_encrypted_manifest() {
+        let owner_seed = [0xB3u8; 32];
+        let owner_addr = sum_net::identity::l1_address_from_keypair(
+            &sum_net::identity::keypair_from_seed(&owner_seed).unwrap(),
+        );
+        let plaintext = vec![0x5Au8; 3 * 1_048_576 + 17];
+        let (_dir, path) = write_test_file(&plaintext);
+        let k_file_plain = [0x77u8; 32];
+        let k_file: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new(k_file_plain);
+        let artifacts = build_private_artifacts(&path, &k_file).expect("encrypt fixture");
+        let root = artifacts.manifest.merkle_root;
+        let chunk_count = artifacts.manifest.chunk_count;
+        let stored = artifacts.stored_size_bytes;
+        let encrypted_manifest = artifacts.encrypted_manifest_bytes.clone();
+        drop(artifacts);
+
+        let snapshot = five_archives();
+        let arch_to_peer = peers_for(&snapshot);
+        let mut info = private_pending_info_with_owner_bundle(
+            root,
+            chunk_count,
+            500,
+            owner_addr,
+            &owner_seed,
+            &k_file_plain,
+        );
+        info.lifecycle = LifecycleV2::ACTIVE;
+        info.activated_at_height = Some(510);
+        info.plaintext_size_bytes = plaintext.len() as u64;
+        info.stored_size_bytes = stored;
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(&format!("0x{}", hex::encode(root)), info);
+        rpc.add_snapshot(500, snapshot.iter().map(node_record).collect());
+        enqueue_coverage_twice(&rpc, coverage_active(chunk_count, false));
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = 3;
+        let net = acking_reply_net(root, &snapshot, chunk_count, 3, &arch_to_peer);
+        let pipeline = IngestPipeline::new(
+            rpc.clone(),
+            net.clone(),
+            Arc::new(StaticPeers { map: arch_to_peer }),
+            owner_seed,
+            owner_addr,
+            params,
+        );
+
+        let outcome = pipeline.repush(root, &path).await;
+        let RepushOutcome::Done(report) = &outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(report.complete(), "{report:?}");
+        assert_eq!(*net.pushes.lock().unwrap(), report.targets.len());
+        let assignees: BTreeSet<[u8; 20]> = report.targets.iter().map(|t| t.archive).collect();
+        let manifests = net.manifests.lock().unwrap();
+        assert_eq!(
+            manifests.len(),
+            assignees.len(),
+            "one manifest push per assignee"
+        );
+        for (_, r, bytes) in manifests.iter() {
+            assert_eq!(*r, root);
+            assert_eq!(
+                *bytes, encrypted_manifest,
+                "the ingest's encrypted manifest"
+            );
+            let cbor = sum_crypto::decrypt_manifest(&k_file_plain, bytes).unwrap();
+            let decoded: DataManifest = ciborium::de::from_reader(cbor.as_slice()).unwrap();
+            assert_eq!(decoded.merkle_root, root);
+        }
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
+    }
+
+    /// A file that does not rebuild to the registered root: nothing is
+    /// pushed and the exit status is 5, as for `resume`.
+    #[tokio::test]
+    async fn repush_refuses_a_root_mismatch_and_pushes_nothing() {
+        let registered = vec![0xB4; 2 * 1_048_576];
+        let (_d1, registered_path) = write_test_file(&registered);
+        let (_m, m) = BinaryChunker::chunk_file(&registered_path).unwrap();
+        let root = m.merkle_root;
+        let other = vec![0xB5; 2 * 1_048_576];
+        let (_d2, other_path) = write_test_file(&other);
+
+        let snapshot = five_archives();
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            repush_public_info(
+                &root,
+                2,
+                registered.len() as u64,
+                50,
+                LifecycleV2::ACTIVE,
+                snapshot[0],
+            ),
+        );
+        rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+        let net = Arc::new(MockNet::new());
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = 3;
+        let pipeline = build_pipeline(
+            rpc.clone(),
+            net.clone(),
+            peers_for(&snapshot),
+            snapshot[0],
+            params,
+        );
+
+        let outcome = pipeline.repush(root, &other_path).await;
+        assert!(
+            matches!(outcome, RepushOutcome::RootMismatch { expected, .. } if expected == root),
+            "got {outcome:?}"
+        );
+        assert_eq!(outcome.exit_code(), repush_exit::ROOT_MISMATCH);
+        assert_eq!(outcome.exit_code(), resume_exit::ROOT_MISMATCH);
+        assert_eq!(net.push_count(), 0);
+        assert_eq!(net.manifest_push_count(), 0);
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
+    }
+
+    /// The operator must be the registered owner, and the file must rebuild
+    /// to the registered chunk count and sizes. Each mismatch is refused
+    /// with exit status 6 before anything is pushed.
+    #[tokio::test]
+    async fn repush_refuses_an_identity_mismatch_and_pushes_nothing() {
+        let bytes = vec![0xB9; 2 * 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+        let (_m, m) = BinaryChunker::chunk_file(&path).unwrap();
+        let root = m.merkle_root;
+        let snapshot = five_archives();
+        let size = bytes.len() as u64;
+        let mut wrong_owner =
+            repush_public_info(&root, 2, size, 50, LifecycleV2::ACTIVE, snapshot[0]);
+        wrong_owner.owner = l1_address_base58(&snapshot[1]);
+        let mut wrong_plaintext =
+            repush_public_info(&root, 2, size, 50, LifecycleV2::ACTIVE, snapshot[0]);
+        wrong_plaintext.plaintext_size_bytes = size + 1;
+        let mut wrong_stored =
+            repush_public_info(&root, 2, size, 50, LifecycleV2::ACTIVE, snapshot[0]);
+        wrong_stored.stored_size_bytes = size - 1;
+        let mut wrong_count =
+            repush_public_info(&root, 3, size, 50, LifecycleV2::ACTIVE, snapshot[0]);
+        wrong_count.chunk_count = 3;
+
+        for (info, expected) in [
+            (wrong_owner, "is not the registered owner"),
+            (wrong_plaintext, "plaintext size"),
+            (wrong_stored, "stored size"),
+            (wrong_count, "chunk count"),
+        ] {
+            let rpc = Arc::new(MockRpc::default());
+            rpc.add_file(&format!("0x{}", hex::encode(root)), info);
+            rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+            enqueue_coverage_twice(&rpc, coverage_active(2, false));
+            let net = Arc::new(MockNet::new());
+            let mut params = params_for_test(defaults_for_tests());
+            params.assignment_replication_factor = 3;
+            let pipeline = build_pipeline(
+                rpc.clone(),
+                net.clone(),
+                peers_for(&snapshot),
+                snapshot[0],
+                params,
+            );
+            let outcome = pipeline.repush(root, &path).await;
+            match &outcome {
+                RepushOutcome::IdentityMismatch { reason } => {
+                    assert!(reason.contains(expected), "{reason}")
+                }
+                other => panic!("expected IdentityMismatch ({expected}), got {other:?}"),
+            }
+            assert_eq!(outcome.exit_code(), repush_exit::IDENTITY_MISMATCH);
+            assert_eq!(net.push_count(), 0, "{expected}");
+            assert_eq!(net.manifest_push_count(), 0, "{expected}");
+            assert!(rpc.sent_txs.lock().unwrap().is_empty());
+        }
+    }
+
+    /// Each push's answer is reported: an archive with no known peer is
+    /// unreachable (nothing sent), a push refused on every attempt
+    /// (`push_retries` + 1 sends) is refused with the archive's last error,
+    /// one never answered is reported as such, and the exit status is 3.
+    #[tokio::test]
+    async fn repush_reports_each_unacknowledged_push() {
+        let bytes = vec![0xB6; 2 * 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+        let snapshot = five_archives();
+        let (_mmap, m) = BinaryChunker::chunk_file(&path).unwrap();
+        let root = m.merkle_root;
+        let r = 3u32;
+        let assigned0 = sum_store::assignment_v2::assigned_archives(&root, &snapshot, 0, r);
+        let assigned1 = sum_store::assignment_v2::assigned_archives(&root, &snapshot, 1, r);
+        let unreachable = assigned0[2];
+        let refused = (0u32, assigned0[0]);
+        let silent = (
+            1u32,
+            *assigned1
+                .iter()
+                .find(|a| **a != unreachable && **a != refused.1)
+                .expect("chunk 1 has another archive"),
+        );
+        let mut arch_to_peer = peers_for(&snapshot);
+        arch_to_peer.remove(&unreachable);
+
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            repush_public_info(
+                &root,
+                2,
+                bytes.len() as u64,
+                50,
+                LifecycleV2::PENDING,
+                snapshot[0],
+            ),
+        );
+        rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+        enqueue_coverage_twice(&rpc, coverage_active(2, false));
+        let net = Arc::new(ReplyNet::default());
+        let mut expected = Vec::new();
+        let mut distinct = BTreeSet::new();
+        for (chunk_index, assigned) in [(0u32, &assigned0), (1u32, &assigned1)] {
+            for archive in assigned.iter() {
+                distinct.insert(*archive);
+                let key = (chunk_index, *archive);
+                let result = if *archive == unreachable {
+                    RepushResult::Unreachable
+                } else if key == refused {
+                    for _ in 0..3 {
+                        net.reply(
+                            arch_to_peer[archive],
+                            chunk_index,
+                            Some("store full".into()),
+                        );
+                    }
+                    RepushResult::Refused("store full".into())
+                } else if key == silent {
+                    RepushResult::NoAnswer
+                } else {
+                    net.reply(arch_to_peer[archive], chunk_index, None);
+                    RepushResult::Acknowledged
+                };
+                expected.push(RepushTarget {
+                    chunk_index,
+                    archive: *archive,
+                    result,
+                });
+            }
+        }
+        for archive in &distinct {
+            if let Some(peer) = arch_to_peer.get(archive) {
+                net.reply_manifest(*peer, None);
+            }
+        }
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = r;
+        params.push_retries = 2;
+        let pipeline = IngestPipeline::new(
+            rpc.clone(),
+            net.clone(),
+            Arc::new(StaticPeers { map: arch_to_peer }),
+            [42u8; 32],
+            snapshot[0],
+            params,
+        );
+
+        let outcome = pipeline.repush(root, &path).await;
+        let RepushOutcome::Done(report) = &outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(!report.active);
+        assert_eq!(report.targets, expected);
+        assert_eq!(report.manifests[&unreachable], RepushResult::Unreachable);
+        assert!(!report.complete());
+        assert_eq!(outcome.exit_code(), repush_exit::INCOMPLETE);
+        let to_unreachable = expected.iter().filter(|t| t.archive == unreachable).count();
+        // One send per reachable target, plus two re-sends of the refused one.
+        assert_eq!(
+            *net.pushes.lock().unwrap(),
+            expected.len() - to_unreachable + 2
+        );
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
+    }
+
+    /// Every chunk acknowledged but one archive refusing the manifest on
+    /// every attempt: the run is incomplete, and that refusal is reported.
+    #[tokio::test]
+    async fn repush_with_a_manifest_refused_is_incomplete() {
+        let bytes = vec![0xBA; 2 * 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+        let snapshot = five_archives();
+        let arch_to_peer = peers_for(&snapshot);
+        let (_mmap, m) = BinaryChunker::chunk_file(&path).unwrap();
+        let root = m.merkle_root;
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            repush_public_info(
+                &root,
+                2,
+                bytes.len() as u64,
+                50,
+                LifecycleV2::ACTIVE,
+                snapshot[0],
+            ),
+        );
+        rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+        enqueue_coverage_twice(&rpc, coverage_active(2, false));
+        let net = Arc::new(ReplyNet::default());
+        let mut distinct = BTreeSet::new();
+        for chunk_index in 0..2 {
+            for archive in
+                sum_store::assignment_v2::assigned_archives(&root, &snapshot, chunk_index, 3)
+            {
+                net.reply(arch_to_peer[&archive], chunk_index, None);
+                distinct.insert(archive);
+            }
+        }
+        let refusing = *distinct.iter().next().unwrap();
+        for archive in &distinct {
+            if *archive == refusing {
+                for _ in 0..3 {
+                    net.reply_manifest(arch_to_peer[archive], Some("disk full".into()));
+                }
+            } else {
+                net.reply_manifest(arch_to_peer[archive], None);
+            }
+        }
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = 3;
+        params.push_retries = 2;
+        let pipeline = IngestPipeline::new(
+            rpc,
+            net.clone(),
+            Arc::new(StaticPeers { map: arch_to_peer }),
+            [42u8; 32],
+            snapshot[0],
+            params,
+        );
+        let outcome = pipeline.repush(root, &path).await;
+        let RepushOutcome::Done(report) = &outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert!(
+            report
+                .targets
+                .iter()
+                .all(|t| t.result == RepushResult::Acknowledged)
+        );
+        assert_eq!(
+            report.manifests[&refusing],
+            RepushResult::Refused("disk full".into())
+        );
+        assert!(!report.complete());
+        assert_eq!(outcome.exit_code(), repush_exit::INCOMPLETE);
+        assert_eq!(
+            net.manifests.lock().unwrap().len(),
+            distinct.len() + 2,
+            "the refusing archive got two re-sends"
+        );
+    }
+
+    /// A reassignment while the run is under way: the epoch re-read at the
+    /// end differs, so the run is incomplete and lists the (chunk, archive)
+    /// pairs the new epoch assigns that this run did not get acknowledged.
+    #[tokio::test]
+    async fn repush_reports_an_epoch_change_during_the_run_as_incomplete() {
+        let bytes = vec![0xBB; 3 * 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+        let first = five_archives();
+        let mut later: Vec<[u8; 20]> = first[1..].to_vec();
+        later.push([0x67; 20]);
+        later.sort();
+        let mut everyone = first.clone();
+        everyone.push([0x67; 20]);
+        let arch_to_peer = peers_for(&everyone);
+        let (_mmap, m) = BinaryChunker::chunk_file(&path).unwrap();
+        let root = m.merkle_root;
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            repush_public_info(
+                &root,
+                3,
+                bytes.len() as u64,
+                50,
+                LifecycleV2::ACTIVE,
+                first[0],
+            ),
+        );
+        rpc.add_snapshot(50, first.iter().map(node_record).collect());
+        rpc.add_snapshot(80, later.iter().map(node_record).collect());
+        // First read: epoch 50. Re-read at the end: a reassignment to 80.
+        rpc.enqueue_coverage(coverage_active(3, false));
+        let mut moved = coverage_active(3, false);
+        moved.assignment_epochs = vec![50, 80];
+        moved.latest_assignment_epoch = 80;
+        rpc.enqueue_coverage(moved);
+        let net = Arc::new(MockNet::new());
+        let pairs_50 = ack_every_assigned_push(&net, root, &first, 3, 3, &arch_to_peer).await;
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = 3;
+        let pipeline = build_pipeline(rpc, net.clone(), arch_to_peer, first[0], params);
+
+        let outcome = pipeline.repush(root, &path).await;
+        let RepushOutcome::Done(report) = &outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert_eq!(report.epoch, 50);
+        let mut expected_not_pushed = Vec::new();
+        for chunk_index in 0..3 {
+            for archive in
+                sum_store::assignment_v2::assigned_archives(&root, &later, chunk_index, 3)
+            {
+                if !pairs_50.contains(&(chunk_index, archive)) {
+                    expected_not_pushed.push((chunk_index, archive));
+                }
+            }
+        }
+        assert!(
+            !expected_not_pushed.is_empty(),
+            "the reassignment moves some pairs"
+        );
+        assert_eq!(
+            report.epoch_check,
+            EpochCheck::Changed {
+                from: 50,
+                to: 80,
+                not_pushed: expected_not_pushed,
+            }
+        );
+        assert!(
+            report
+                .targets
+                .iter()
+                .all(|t| t.result == RepushResult::Acknowledged),
+            "every push of the run itself was acknowledged"
+        );
+        assert!(!report.complete());
+        assert_eq!(outcome.exit_code(), repush_exit::INCOMPLETE);
+    }
+
+    /// If the epoch cannot be read again at the end, the run cannot be
+    /// confirmed: an error (exit 1), not complete and not merely
+    /// incomplete, and the report names the epoch the run targeted.
+    #[tokio::test]
+    async fn repush_with_an_unreadable_final_epoch_is_an_error() {
+        let bytes = vec![0xBC; 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+        let snapshot = five_archives();
+        let arch_to_peer = peers_for(&snapshot);
+        let (_mmap, m) = BinaryChunker::chunk_file(&path).unwrap();
+        let root = m.merkle_root;
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            repush_public_info(
+                &root,
+                1,
+                bytes.len() as u64,
+                50,
+                LifecycleV2::ACTIVE,
+                snapshot[0],
+            ),
+        );
+        rpc.add_snapshot(50, snapshot.iter().map(node_record).collect());
+        rpc.enqueue_coverage(coverage_active(1, false)); // only the first read
+        let net = Arc::new(MockNet::new());
+        ack_every_assigned_push(&net, root, &snapshot, 1, 3, &arch_to_peer).await;
+        let mut params = params_for_test(defaults_for_tests());
+        params.assignment_replication_factor = 3;
+        let pipeline = build_pipeline(rpc, net, arch_to_peer, snapshot[0], params);
+        let outcome = pipeline.repush(root, &path).await;
+        let RepushOutcome::Done(report) = &outcome else {
+            panic!("expected Done, got {outcome:?}");
+        };
+        assert_eq!(report.epoch, 50, "the epoch the run targeted");
+        assert!(matches!(report.epoch_check, EpochCheck::Unknown(_)));
+        assert!(
+            report
+                .targets
+                .iter()
+                .all(|t| t.result == RepushResult::Acknowledged),
+            "every push was acknowledged; only the final read failed"
+        );
+        assert!(!report.complete());
+        assert_eq!(outcome.exit_code(), repush_exit::ERROR);
+    }
+
+    /// An Abandoned file: nothing is pushed, exit status 4 as for `resume`.
+    #[tokio::test]
+    async fn repush_on_an_abandoned_file_pushes_nothing() {
+        let bytes = vec![0xB7; 1_048_576];
+        let (_dir, path) = write_test_file(&bytes);
+        let (_mmap, m) = BinaryChunker::chunk_file(&path).unwrap();
+        let root = m.merkle_root;
+        let snapshot = five_archives();
+        let rpc = Arc::new(MockRpc::default());
+        rpc.add_file(
+            &format!("0x{}", hex::encode(root)),
+            file_info_with_lifecycle(&root, 1, 50, LifecycleV2::ABANDONED, None, Some(90)),
+        );
+        let net = Arc::new(MockNet::new());
+        let pipeline = build_pipeline(
+            rpc.clone(),
+            net.clone(),
+            peers_for(&snapshot),
+            snapshot[0],
+            params_for_test(defaults_for_tests()),
+        );
+        let outcome = pipeline.repush(root, &path).await;
+        assert!(
+            matches!(outcome, RepushOutcome::AbandonedOnChain { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(outcome.exit_code(), repush_exit::ABANDONED);
+        assert_eq!(outcome.exit_code(), resume_exit::ABANDONED);
+        assert_eq!(net.push_count(), 0);
+        assert_eq!(net.manifest_push_count(), 0);
+        assert!(rpc.sent_txs.lock().unwrap().is_empty());
     }
 
     /// Phase 4d: operator hands resume a path whose plaintext does

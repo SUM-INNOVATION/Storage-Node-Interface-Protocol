@@ -24,6 +24,7 @@ pub mod push_validator;
 pub mod reassign_v2;
 pub mod refetch_net;
 pub mod refetch_v2;
+pub mod repair_audit;
 pub mod rpc_client;
 pub mod runtime_params;
 pub mod shard_dispatch;

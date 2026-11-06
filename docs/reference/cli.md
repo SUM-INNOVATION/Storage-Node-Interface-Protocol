@@ -170,6 +170,97 @@ Before this change `resume` exited 0 on every outcome; scripts that
 treated exit 0 as "resume ran" must now check for `0` (Active) or `3`
 (still Pending).
 
+### sum-node repush
+
+Re-push every chunk of a registered V2 file, and its manifest, to the
+archives its latest assignment epoch assigns them to. Run by the file's
+owner with `--key-file`. It repairs archives that hold a file's chunks
+without the leaf and Merkle path a V2 push carries (chunks pushed before
+archives recorded them): an archive acknowledges the repeat push of a chunk
+it holds and records the proof. `resume` is unchanged.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `<merkle_root>` | — | (positional) Hex-encoded 32-byte merkle root of the registered file. |
+| `<path>` | — | (positional) Path to the original file (plaintext). A Private file is re-encrypted under its recovered `K_file`. |
+| `--push-wait-secs` | `120` | Wall-clock timeout for the chunk pushes' acknowledgements. |
+| `--manifest-push-wait-secs` | `60` | Wall-clock timeout for the manifest pushes' acknowledgements. |
+
+What it does:
+- **Lifecycle:** it works on a `Pending` or `Active` file.
+- **Identity:** the operator must be the registered owner. The file at
+  `<path>` must rebuild to the registered root, chunk count, plaintext size
+  and stored size; a Private file is rebuilt with the `K_file` recovered
+  from the owner's own access entry. Any mismatch is refused before
+  anything is pushed.
+- **Chunks:** it pushes **every** chunk to **every** archive the file's
+  latest assignment epoch assigns it to (the epoch archives validate a push
+  against), retrying a refused push twice.
+- **Manifest:** it pushes the manifest to each of those archives, in the
+  form an archive accepts for the file: the Public manifest as CBOR, or the
+  Private manifest encrypted under `K_file`. The manifest's file name is
+  taken from `<path>`; an archive that already holds a Private manifest
+  keeps the one it has.
+- **Epoch:** it re-reads the assignment epoch after the pushes. If a
+  reassignment moved the file meanwhile, the run is incomplete and the
+  pushes the new epoch still needs are logged. If the second read fails,
+  the run is an error: it cannot be confirmed.
+- **Scope:** a complete run is complete for the epoch it reports, and only
+  that epoch. A later reassignment needs a new `repush` and a new
+  `repush-audit`.
+
+What it does not do:
+- It sends no transaction and changes no chain state.
+- An acknowledgement does not show that an archive recorded the proof (an
+  archive on a version without push-proof records acknowledges too). Use
+  `repush-audit` on the archive.
+
+| Exit | Outcome | stdout |
+|---|---|---|
+| `0` | Every chunk and manifest push was acknowledged and the epoch read again afterwards is the same | `merkle_root:`, `repush_epoch: <n>`, one `repush_archive: <address> chunks_acknowledged=<n> of=<m> manifest=<result>` line per archive, `repush: complete for epoch <n>` |
+| `3` | A push was refused, unanswered, or not sent (no known peer for the archive), or the epoch changed during the run (`repush_epoch_changed: <from> -> <to> not_pushed=<n>`). Each is logged; run it again. | as for `0`, ending `repush: incomplete (epoch <n>)` |
+| `4` | The chain shows the file `Abandoned`; nothing was pushed | none |
+| `5` | Root mismatch; nothing was pushed | none (a warning is logged) |
+| `6` | The operator is not the registered owner, or the rebuilt file's chunk count or sizes differ from the registration; nothing was pushed | none (a warning is logged) |
+| `1` | An error (arguments, RPC, rebuilding the file, missing `--key-file`), or the epoch could not be read again after the pushes | none; or, for the final read, as for `0` with `repush_epoch_unconfirmed: <error>` and `repush: error (epoch <n> could not be re-read after the pushes)` |
+
+### sum-node repush-audit
+
+Read-only, on an archive: check that every chunk the chain assigns this
+archive (`--key-file`) for each file of an explicit inventory can be
+answered if challenged. See `docs/operator/repush-repair.md`.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--root` | — | A merkle root to audit (hex, `0x` optional). Repeatable. |
+| `--roots-file` | — | A file listing merkle roots, one per line; `#` comments and blank lines are ignored. |
+
+For each file it reads the file's latest assignment epoch and that epoch's
+snapshot, takes the chunks assigned to this archive, and for each builds
+the answer the PoR responder would submit, from the local store only (the
+file's Public manifest if held here, otherwise the chunk's recorded push
+proof), then checks it with the chain's verifier. The answer is built from
+the stored chunk's bytes, so a missing or altered chunk is not usable.
+
+- **Inventory:** the roots given, never the local index. With none the
+  verdict is `no_inventory`: an empty or partial index does not show that
+  no repair is needed.
+- **Read-only:** it reads `--store-dir` without writing and without taking
+  the store's lease, so it can run beside the archive, and sends nothing to
+  the chain. A push that lands while it runs may not be seen.
+- **Epochs:** each file's latest assignment epoch is read before the file
+  is evaluated and again once every file is. An epoch that moved in
+  between makes the verdict incomplete; a second read that fails makes it
+  an error. A complete verdict is complete for the epochs it reports, and
+  only those: a later reassignment needs a new `repush` and a new audit.
+
+| Exit | Outcome | stdout |
+|---|---|---|
+| `0` | Every assigned chunk of every inventory file is usable, and every file's epoch is unchanged | `repush_audit_archive:`, `repush_audit_inventory: <n>`, one `repush_audit_file: <root> epoch=<e> epoch_recheck=unchanged assigned=<n> usable_public_manifest=<a> usable_pushed_proof=<b> not_usable=<m>` line per file (`abandoned` for an Abandoned file), `repush_audit: complete for epochs {<e>, ...}` |
+| `3` | At least one assigned chunk is not usable, or a file's epoch moved during the audit (`epoch_recheck=moved_to=<n>`) | as for `0`, with one `repush_audit_not_usable: <root> chunk=<i> reason=<...>` line per chunk, ending `repush_audit: incomplete` |
+| `7` | No inventory was given | `repush_audit: no_inventory` |
+| `1` | A chain read failed (including a file's final epoch read, `epoch_recheck=failed (...)`), or an inventory root is not registered (`repush_audit_file: <root> not_registered` / `error=...`) | as for `0`, ending `repush_audit: error` |
+
 ### sum-node abandon
 
 V2 abandon: submit `AbandonFileV2` for a `Pending` file owned by
