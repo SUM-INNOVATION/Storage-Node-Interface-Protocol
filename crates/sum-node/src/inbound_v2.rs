@@ -4679,8 +4679,8 @@ mod tests {
     /// Audit `inventory` for `me` against the store at `dir`, opened the
     /// way `repush-audit` opens it: read-only, without the lease (a live
     /// `SumStore` may hold it).
-    async fn audit_dir(
-        rpc: &AllMockRpc,
+    async fn audit_dir<C: V2RpcClient>(
+        rpc: &C,
         dir: &std::path::Path,
         me: [u8; 20],
         inventory: &[[u8; 32]],
@@ -4881,6 +4881,11 @@ mod tests {
         let after = audit_dir(&audit_rpc, store_dir.path(), me, &[root]).await;
         assert_eq!(after.verdict(), AuditVerdict::Complete, "{after:?}");
         assert_eq!(after.exit_code(), audit_exit::COMPLETE);
+        assert_eq!(
+            after.covered_epochs(),
+            std::collections::BTreeSet::from([500]),
+            "complete for the epoch it reports"
+        );
         assert!(
             verdicts(&after)
                 .iter()
@@ -5165,5 +5170,130 @@ mod tests {
                 AuditVerdict::Complete
             }
         );
+    }
+
+    /// The archive-side chain stand-in, except that the file's latest
+    /// assignment epoch is answered from a queue, one answer per read (then
+    /// as the stand-in reports it): the audit reads it before evaluating a
+    /// file and again at the end.
+    struct EpochReads {
+        inner: AllMockRpc,
+        epochs: StdMutex<VecDeque<Result<Option<u64>, String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl V2RpcClient for EpochReads {
+        async fn storage_get_file_info_v2(
+            &self,
+            merkle_root_hex: &str,
+        ) -> anyhow::Result<Option<StorageFileInfoV2>> {
+            self.inner.storage_get_file_info_v2(merkle_root_hex).await
+        }
+        async fn storage_get_active_nodes_at_height(
+            &self,
+            height: u64,
+        ) -> anyhow::Result<Vec<NodeRecordInfo>> {
+            self.inner.storage_get_active_nodes_at_height(height).await
+        }
+        async fn latest_assignment_epoch(
+            &self,
+            merkle_root_hex: &str,
+        ) -> anyhow::Result<Option<u64>> {
+            let next = self.epochs.lock().unwrap().pop_front();
+            match next {
+                Some(answer) => answer.map_err(anyhow::Error::msg),
+                None => self.inner.latest_assignment_epoch(merkle_root_hex).await,
+            }
+        }
+    }
+
+    fn epoch_reads(inner: AllMockRpc, answers: Vec<Result<Option<u64>, String>>) -> EpochReads {
+        EpochReads {
+            inner,
+            epochs: StdMutex::new(answers.into()),
+        }
+    }
+
+    /// Both reads give the same epoch: complete, and complete for that
+    /// epoch only, which the report states per file and overall.
+    #[tokio::test]
+    async fn audit_with_an_unchanged_epoch_is_complete_for_that_epoch() {
+        use crate::repair_audit::{AuditVerdict, EpochRecheck, FileAudit};
+        let (dir, rpc, root, _, _) = audited_archive(true, 0x7A).await;
+        let rpc = epoch_reads(rpc, vec![Ok(Some(500)), Ok(Some(500))]);
+        let report = audit_dir(&rpc, dir.path(), five_archives()[0], &[root]).await;
+        assert_eq!(report.verdict(), AuditVerdict::Complete);
+        assert!(matches!(
+            &report.files[..],
+            [FileAudit::Audited {
+                epoch: 500,
+                recheck: EpochRecheck::Unchanged,
+                ..
+            }]
+        ));
+        assert_eq!(
+            report.covered_epochs(),
+            std::collections::BTreeSet::from([500])
+        );
+        assert!(
+            rpc.epochs.lock().unwrap().is_empty(),
+            "both reads were made"
+        );
+    }
+
+    /// A reassignment between the audit's two reads: every chunk checked
+    /// against the first epoch is usable, but that assignment no longer
+    /// holds, so the verdict is incomplete and the file's move is reported.
+    #[tokio::test]
+    async fn audit_with_an_epoch_moved_between_the_reads_is_incomplete() {
+        use crate::repair_audit::{
+            AuditVerdict, ChunkVerdict, EpochRecheck, FileAudit, audit_exit,
+        };
+        let (dir, rpc, root, _, _) = audited_archive(true, 0x7B).await;
+        let rpc = epoch_reads(rpc, vec![Ok(Some(500)), Ok(Some(800))]);
+        let report = audit_dir(&rpc, dir.path(), five_archives()[0], &[root]).await;
+        let [
+            FileAudit::Audited {
+                epoch: 500,
+                chunks,
+                recheck,
+                ..
+            },
+        ] = &report.files[..]
+        else {
+            panic!("expected one file audited against epoch 500: {report:?}");
+        };
+        assert!(
+            chunks
+                .iter()
+                .all(|c| matches!(c.verdict, ChunkVerdict::Usable(_))),
+            "only the move makes it incomplete"
+        );
+        assert_eq!(*recheck, EpochRecheck::Moved { to: 800 });
+        assert_eq!(report.verdict(), AuditVerdict::Incomplete);
+        assert_eq!(report.exit_code(), audit_exit::INCOMPLETE);
+    }
+
+    /// The final read of a file's epoch fails: the audit cannot be
+    /// confirmed, so the verdict is an error.
+    #[tokio::test]
+    async fn audit_with_a_failed_final_epoch_read_is_an_error() {
+        use crate::repair_audit::{AuditVerdict, EpochRecheck, FileAudit, audit_exit};
+        let (dir, rpc, root, _, _) = audited_archive(false, 0x7C).await;
+        let rpc = epoch_reads(
+            rpc,
+            vec![Ok(Some(500)), Err("coverage transport failure".into())],
+        );
+        let report = audit_dir(&rpc, dir.path(), five_archives()[0], &[root]).await;
+        assert!(matches!(
+            &report.files[..],
+            [FileAudit::Audited {
+                epoch: 500,
+                recheck: EpochRecheck::Failed(_),
+                ..
+            }]
+        ));
+        assert_eq!(report.verdict(), AuditVerdict::Error);
+        assert_eq!(report.exit_code(), audit_exit::ERROR);
     }
 }

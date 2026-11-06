@@ -260,13 +260,16 @@ pub mod resume_exit {
 /// values follow [`resume_exit`] where the meaning is shared.
 pub mod repush_exit {
     /// Every chunk and manifest push the file's latest assignment epoch
-    /// calls for was acknowledged, and the epoch did not change meanwhile.
+    /// calls for was acknowledged, and the epoch read again afterwards is
+    /// the same. Complete for that epoch only: a later reassignment needs
+    /// a new run.
     pub const COMPLETE: i32 = 0;
     /// An error before or during the run (arguments, RPC, rebuilding the
-    /// file).
+    /// file), or the assignment epoch could not be read again after the
+    /// pushes, so the run cannot be confirmed.
     pub const ERROR: i32 = 1;
     /// A push was not acknowledged, or the assignment epoch changed during
-    /// the run (or could not be confirmed): run it again.
+    /// the run: run it again.
     pub const INCOMPLETE: i32 = 3;
     /// The chain shows the file `Abandoned`: there is nothing to repair.
     pub const ABANDONED: i32 = 4;
@@ -314,7 +317,8 @@ pub enum EpochCheck {
         /// did not get acknowledged: the work still to do.
         not_pushed: Vec<(u32, [u8; 20])>,
     },
-    /// The epoch could not be read again; the run cannot be confirmed.
+    /// The epoch could not be read again; the run cannot be confirmed
+    /// (exit [`repush_exit::ERROR`]).
     Unknown(String),
 }
 
@@ -388,6 +392,9 @@ impl RepushOutcome {
     pub fn exit_code(&self) -> i32 {
         match self {
             RepushOutcome::Done(report) if report.complete() => repush_exit::COMPLETE,
+            RepushOutcome::Done(report) if matches!(report.epoch_check, EpochCheck::Unknown(_)) => {
+                repush_exit::ERROR
+            }
             RepushOutcome::Done(_) => repush_exit::INCOMPLETE,
             RepushOutcome::AbandonedOnChain { .. } => repush_exit::ABANDONED,
             RepushOutcome::RootMismatch { .. } => repush_exit::ROOT_MISMATCH,
@@ -6979,9 +6986,10 @@ mod tests {
     }
 
     /// If the epoch cannot be read again at the end, the run cannot be
-    /// confirmed: incomplete.
+    /// confirmed: an error (exit 1), not complete and not merely
+    /// incomplete, and the report names the epoch the run targeted.
     #[tokio::test]
-    async fn repush_with_an_unreadable_final_epoch_is_incomplete() {
+    async fn repush_with_an_unreadable_final_epoch_is_an_error() {
         let bytes = vec![0xBC; 1_048_576];
         let (_dir, path) = write_test_file(&bytes);
         let snapshot = five_archives();
@@ -7011,9 +7019,17 @@ mod tests {
         let RepushOutcome::Done(report) = &outcome else {
             panic!("expected Done, got {outcome:?}");
         };
+        assert_eq!(report.epoch, 50, "the epoch the run targeted");
         assert!(matches!(report.epoch_check, EpochCheck::Unknown(_)));
+        assert!(
+            report
+                .targets
+                .iter()
+                .all(|t| t.result == RepushResult::Acknowledged),
+            "every push was acknowledged; only the final read failed"
+        );
         assert!(!report.complete());
-        assert_eq!(outcome.exit_code(), repush_exit::INCOMPLETE);
+        assert_eq!(outcome.exit_code(), repush_exit::ERROR);
     }
 
     /// An Abandoned file: nothing is pushed, exit status 4 as for `resume`.

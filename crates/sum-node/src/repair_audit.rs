@@ -21,6 +21,14 @@
 //! store's lease is not taken, so the audit can run beside the archive. A
 //! push that lands while it runs may not be seen; run it again.
 //!
+//! **Epochs.** Each file is audited against its latest assignment epoch,
+//! read before the file is evaluated, and every file's epoch is read again
+//! once all are evaluated. An epoch that moved in between makes the verdict
+//! incomplete (the file's chunks were checked against an assignment that no
+//! longer holds); a second read that fails makes it an error. A complete
+//! verdict covers the epochs it reports, and only those: a later
+//! reassignment needs a new repush and a new audit.
+//!
 //! What it does not show: that the chain will challenge or reward any chunk,
 //! that other archives hold their chunks, or anything about files outside
 //! the inventory.
@@ -37,9 +45,11 @@ use crate::push_validator::V2RpcClient;
 pub mod audit_exit {
     /// Every assigned chunk of every inventory file is usable.
     pub const COMPLETE: i32 = 0;
-    /// A chain read failed, or an inventory root is not registered.
+    /// A chain read failed (including the final read of an epoch), or an
+    /// inventory root is not registered.
     pub const ERROR: i32 = 1;
-    /// At least one assigned chunk is not usable.
+    /// At least one assigned chunk is not usable, or a file's assignment
+    /// epoch moved while the audit ran.
     pub const INCOMPLETE: i32 = 3;
     /// No inventory was given, so nothing can be shown complete.
     pub const NO_INVENTORY: i32 = 7;
@@ -61,15 +71,28 @@ pub struct ChunkAudit {
     pub verdict: ChunkVerdict,
 }
 
+/// A file's assignment epoch, read again after every file was evaluated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpochRecheck {
+    /// Still the epoch the file was audited against.
+    Unchanged,
+    /// A reassignment moved the file to epoch `to` meanwhile.
+    Moved { to: u64 },
+    /// The second read failed; the audit cannot be confirmed.
+    Failed(String),
+}
+
 /// The audit of one inventory file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileAudit {
     /// Audited against `epoch`. `chunks` are the chunks that epoch assigns
-    /// to this archive (none when it assigns it nothing).
+    /// to this archive (none when it assigns it nothing); `recheck` is the
+    /// epoch as read again at the end.
     Audited {
         merkle_root: [u8; 32],
         epoch: u64,
         chunks: Vec<ChunkAudit>,
+        recheck: EpochRecheck,
     },
     /// The chain shows the file `Abandoned`: nothing to answer.
     Abandoned { merkle_root: [u8; 32] },
@@ -99,30 +122,55 @@ pub struct AuditReport {
 }
 
 impl AuditReport {
-    /// No inventory, then any error, then any unusable chunk, else
-    /// complete.
+    /// No inventory; then any error (a failed read, including an epoch's
+    /// final read, or an unregistered root); then any unusable chunk or
+    /// moved epoch; else complete, for the epochs [`Self::covered_epochs`]
+    /// reports.
     pub fn verdict(&self) -> AuditVerdict {
         if self.files.is_empty() {
             return AuditVerdict::NoInventory;
         }
-        if self
-            .files
-            .iter()
-            .any(|f| matches!(f, FileAudit::Error { .. } | FileAudit::NotRegistered { .. }))
-        {
+        if self.files.iter().any(|f| {
+            matches!(
+                f,
+                FileAudit::Error { .. }
+                    | FileAudit::NotRegistered { .. }
+                    | FileAudit::Audited {
+                        recheck: EpochRecheck::Failed(_),
+                        ..
+                    }
+            )
+        }) {
             return AuditVerdict::Error;
         }
-        let unusable = self.files.iter().any(|f| match f {
-            FileAudit::Audited { chunks, .. } => chunks
-                .iter()
-                .any(|c| matches!(c.verdict, ChunkVerdict::NotUsable(_))),
+        let incomplete = self.files.iter().any(|f| match f {
+            FileAudit::Audited {
+                chunks, recheck, ..
+            } => {
+                *recheck != EpochRecheck::Unchanged
+                    || chunks
+                        .iter()
+                        .any(|c| matches!(c.verdict, ChunkVerdict::NotUsable(_)))
+            }
             _ => false,
         });
-        if unusable {
+        if incomplete {
             AuditVerdict::Incomplete
         } else {
             AuditVerdict::Complete
         }
+    }
+
+    /// The assignment epochs the audited files were checked against. A
+    /// complete verdict holds for these epochs only.
+    pub fn covered_epochs(&self) -> std::collections::BTreeSet<u64> {
+        self.files
+            .iter()
+            .filter_map(|f| match f {
+                FileAudit::Audited { epoch, .. } => Some(*epoch),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The process exit code ([`audit_exit`]).
@@ -147,13 +195,55 @@ pub async fn audit<C: V2RpcClient + ?Sized>(
     inventory: &[[u8; 32]],
 ) -> AuditReport {
     let mut files = Vec::with_capacity(inventory.len());
+    let mut assignment_heights = Vec::with_capacity(inventory.len());
     let mut seen = std::collections::HashSet::new();
     for merkle_root in inventory {
         if seen.insert(*merkle_root) {
-            files.push(audit_file(rpc, r, archive, manifest_idx, local, *merkle_root).await);
+            let (file, assignment_height) =
+                audit_file(rpc, r, archive, manifest_idx, local, *merkle_root).await;
+            files.push(file);
+            assignment_heights.push(assignment_height);
+        }
+    }
+    // Every audited file's epoch again, once all are evaluated: a
+    // reassignment during the audit moves what "assigned" means.
+    for (file, assignment_height) in files.iter_mut().zip(assignment_heights) {
+        if let FileAudit::Audited {
+            merkle_root,
+            epoch,
+            recheck,
+            ..
+        } = file
+        {
+            let root_hex = format!("0x{}", hex::encode(*merkle_root));
+            *recheck = match read_epoch(rpc, &root_hex, assignment_height).await {
+                Ok(now) if now == *epoch => EpochRecheck::Unchanged,
+                Ok(now) => EpochRecheck::Moved { to: now },
+                Err(e) => EpochRecheck::Failed(format!("{e:#}")),
+            };
         }
     }
     AuditReport { archive, files }
+}
+
+/// The epoch archives validate pushes against (the push validator's rule):
+/// the file's latest reassignment epoch, else its assignment height.
+async fn read_epoch<C: V2RpcClient + ?Sized>(
+    rpc: &C,
+    root_hex: &str,
+    assignment_height: u64,
+) -> anyhow::Result<u64> {
+    match rpc
+        .latest_assignment_epoch(root_hex)
+        .await
+        .map_err(|e| e.context("latest assignment epoch"))?
+    {
+        None => Ok(assignment_height),
+        Some(latest) if latest < assignment_height => anyhow::bail!(
+            "latest assignment epoch {latest} below assignment_height {assignment_height}"
+        ),
+        Some(latest) => Ok(latest),
+    }
 }
 
 async fn audit_file<C: V2RpcClient + ?Sized>(
@@ -163,7 +253,7 @@ async fn audit_file<C: V2RpcClient + ?Sized>(
     manifest_idx: &ManifestIndex,
     local: &ChunkStore,
     merkle_root: [u8; 32],
-) -> FileAudit {
+) -> (FileAudit, u64) {
     let root_hex = format!("0x{}", hex::encode(merkle_root));
     let error = |e: anyhow::Error| FileAudit::Error {
         merkle_root,
@@ -171,34 +261,36 @@ async fn audit_file<C: V2RpcClient + ?Sized>(
     };
     let info = match rpc.storage_get_file_info_v2(&root_hex).await {
         Ok(Some(info)) => info,
-        Ok(None) => return FileAudit::NotRegistered { merkle_root },
-        Err(e) => return error(e.context("storage_getFileInfoV2")),
+        Ok(None) => return (FileAudit::NotRegistered { merkle_root }, 0),
+        Err(e) => return (error(e.context("storage_getFileInfoV2")), 0),
     };
+    let assignment_height = info.assignment_height;
     if info.lifecycle.is_abandoned() {
-        return FileAudit::Abandoned { merkle_root };
+        return (FileAudit::Abandoned { merkle_root }, assignment_height);
     }
-    // The epoch archives validate pushes against (the push validator's
-    // rule): the latest reassignment epoch, else the assignment height.
-    let epoch = match rpc.latest_assignment_epoch(&root_hex).await {
-        Ok(None) => info.assignment_height,
-        Ok(Some(latest)) if latest < info.assignment_height => {
-            return error(anyhow::anyhow!(
-                "latest assignment epoch {latest} below assignment_height {}",
-                info.assignment_height
-            ));
-        }
-        Ok(Some(latest)) => latest,
-        Err(e) => return error(e.context("latest assignment epoch")),
+    let epoch = match read_epoch(rpc, &root_hex, assignment_height).await {
+        Ok(epoch) => epoch,
+        Err(e) => return (error(e), assignment_height),
     };
     let raw = match rpc.storage_get_active_nodes_at_height(epoch).await {
         Ok(raw) => raw,
-        Err(e) => return error(e.context("storage_getActiveNodesAtHeight")),
+        Err(e) => {
+            return (
+                error(e.context("storage_getActiveNodesAtHeight")),
+                assignment_height,
+            );
+        }
     };
     let mut snapshot = Vec::new();
     for record in sum_types::rpc_types::filter_active_archives(raw) {
         match sum_net::l1_address_from_base58(&record.address) {
             Ok(a) => snapshot.push(a),
-            Err(e) => return error(e.context("snapshot address decode")),
+            Err(e) => {
+                return (
+                    error(e.context("snapshot address decode")),
+                    assignment_height,
+                );
+            }
         }
     }
     snapshot.sort();
@@ -233,11 +325,16 @@ async fn audit_file<C: V2RpcClient + ?Sized>(
             verdict,
         });
     }
-    FileAudit::Audited {
-        merkle_root,
-        epoch,
-        chunks,
-    }
+    (
+        FileAudit::Audited {
+            merkle_root,
+            epoch,
+            chunks,
+            // Set by the second read in `audit`.
+            recheck: EpochRecheck::Unchanged,
+        },
+        assignment_height,
+    )
 }
 
 /// Parse an inventory file: one merkle root per line (64 hex characters,

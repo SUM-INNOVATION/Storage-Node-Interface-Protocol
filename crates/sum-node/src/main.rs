@@ -342,13 +342,15 @@ enum Command {
     /// registered root, chunk count and sizes (a Private file under the
     /// `K_file` recovered from the owner's access entry). Sends no
     /// transaction. Re-reads the assignment epoch at the end: a change
-    /// makes the run incomplete.
+    /// makes the run incomplete, and a failed read an error. Complete is
+    /// for the epoch reported only: a later reassignment needs a new run.
     ///
     /// Exit status: 0 every push acknowledged and the epoch unchanged
-    /// (`repush: complete`); 3 a push not acknowledged, or the epoch
-    /// changed or could not be confirmed (`repush: incomplete`); 4
-    /// Abandoned on chain; 5 root mismatch; 6 the operator or the rebuilt
-    /// file does not match the registration; 1 any error.
+    /// (`repush: complete for epoch <n>`); 3 a push not acknowledged, or
+    /// the epoch changed (`repush: incomplete`); 4 Abandoned on chain; 5
+    /// root mismatch; 6 the operator or the rebuilt file does not match the
+    /// registration; 1 any error, including an epoch that could not be read
+    /// again after the pushes (`repush: error`).
     Repush {
         /// Hex-encoded 32-byte merkle root of the registered file.
         merkle_root: String,
@@ -371,12 +373,14 @@ enum Command {
     /// against the root. Reads `--store-dir` without writing or taking its
     /// lease, and the chain without sending anything. The inventory, not
     /// the local index, decides what is checked: with none, the verdict is
-    /// `no_inventory`.
+    /// `no_inventory`. Each file's epoch is read before it is evaluated and
+    /// again at the end; complete holds for the epochs reported only.
     ///
-    /// Exit status: 0 every assigned chunk usable (`repush_audit:
-    /// complete`); 3 a chunk not usable (`incomplete`); 7 no inventory
-    /// given (`no_inventory`); 1 a chain read failed or an inventory root
-    /// is not registered (`error`).
+    /// Exit status: 0 every assigned chunk usable and every epoch unchanged
+    /// (`repush_audit: complete for epochs {...}`); 3 a chunk not usable,
+    /// or an epoch moved during the audit (`incomplete`); 7 no inventory
+    /// given (`no_inventory`); 1 a chain read failed (including an epoch's
+    /// final read) or an inventory root is not registered (`error`).
     RepushAudit {
         /// A merkle root to audit (hex, `0x` optional). Repeatable.
         #[arg(long = "root")]
@@ -1824,8 +1828,9 @@ async fn run_resume_v2(
 /// chunks_acknowledged=<n> of=<m> manifest=<result>` line per archive, a
 /// `repush_epoch_changed: <from> -> <to> not_pushed=<n>` or
 /// `repush_epoch_unconfirmed:` line when the epoch moved or could not be
-/// re-read, then `repush: complete` or `repush: incomplete`. Each push not
-/// acknowledged is logged.
+/// re-read, then `repush: complete for epoch <n>`, `repush: incomplete
+/// (epoch <n>)` or `repush: error (epoch <n> could not be re-read ...)`.
+/// Each push not acknowledged is logged.
 #[allow(clippy::too_many_arguments)]
 async fn run_repush_v2(
     keypair: Keypair,
@@ -1912,14 +1917,14 @@ async fn run_repush_v2(
                     println!("repush_epoch_unconfirmed: {e}");
                 }
             }
-            println!(
-                "repush: {}",
-                if report.complete() {
-                    "complete"
-                } else {
-                    "incomplete"
-                }
-            );
+            let epoch = report.epoch;
+            if report.complete() {
+                println!("repush: complete for epoch {epoch}");
+            } else if matches!(report.epoch_check, EpochCheck::Unknown(_)) {
+                println!("repush: error (epoch {epoch} could not be re-read after the pushes)");
+            } else {
+                println!("repush: incomplete (epoch {epoch})");
+            }
         }
         RepushOutcome::AbandonedOnChain { .. } => {
             warn!("REPUSH: file is ABANDONED on chain; nothing pushed");
@@ -1947,9 +1952,10 @@ async fn run_repush_v2(
 /// inventory file's chunks assigned to this archive.
 ///
 /// Stdout: `repush_audit_archive:`, `repush_audit_inventory: <n>`, one
-/// `repush_audit_file:` line per file, one `repush_audit_not_usable:` line
-/// per chunk that is not, then `repush_audit: complete|incomplete|error|
-/// no_inventory`.
+/// `repush_audit_file:` line per file (with the epoch it was checked against
+/// and that epoch's re-read), one `repush_audit_not_usable:` line per chunk
+/// that is not, then `repush_audit: complete for epochs {<e>, ...}`,
+/// `incomplete`, `error` or `no_inventory`.
 async fn run_repush_audit(
     keypair: &Keypair,
     store_dir: Option<PathBuf>,
@@ -1959,7 +1965,7 @@ async fn run_repush_audit(
     roots_file: Option<PathBuf>,
 ) -> Result<i32> {
     use sum_node::por_worker::AnswerSource;
-    use sum_node::repair_audit::{AuditVerdict, ChunkVerdict, FileAudit};
+    use sum_node::repair_audit::{AuditVerdict, ChunkVerdict, EpochRecheck, FileAudit};
 
     let archive = identity::l1_address_from_keypair(keypair);
     let mut inventory = Vec::new();
@@ -2026,6 +2032,7 @@ async fn run_repush_audit(
                 merkle_root,
                 epoch,
                 chunks,
+                recheck,
             } => {
                 let count = |source: AnswerSource| {
                     chunks
@@ -2037,9 +2044,14 @@ async fn run_repush_audit(
                     .iter()
                     .filter(|c| matches!(c.verdict, ChunkVerdict::NotUsable(_)))
                     .count();
+                let recheck = match recheck {
+                    EpochRecheck::Unchanged => "unchanged".to_string(),
+                    EpochRecheck::Moved { to } => format!("moved_to={to}"),
+                    EpochRecheck::Failed(e) => format!("failed ({e})"),
+                };
                 println!(
-                    "repush_audit_file: 0x{} epoch={epoch} assigned={} usable_public_manifest={} \
-                     usable_pushed_proof={} not_usable={not_usable}",
+                    "repush_audit_file: 0x{} epoch={epoch} epoch_recheck={recheck} assigned={} \
+                     usable_public_manifest={} usable_pushed_proof={} not_usable={not_usable}",
                     hex::encode(merkle_root),
                     chunks.len(),
                     count(AnswerSource::PublicManifest),
@@ -2075,15 +2087,18 @@ async fn run_repush_audit(
             }
         }
     }
-    println!(
-        "repush_audit: {}",
-        match report.verdict() {
-            AuditVerdict::Complete => "complete",
-            AuditVerdict::Incomplete => "incomplete",
-            AuditVerdict::Error => "error",
-            AuditVerdict::NoInventory => "no_inventory",
-        }
-    );
+    let epochs = report
+        .covered_epochs()
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match report.verdict() {
+        AuditVerdict::Complete => println!("repush_audit: complete for epochs {{{epochs}}}"),
+        AuditVerdict::Incomplete => println!("repush_audit: incomplete"),
+        AuditVerdict::Error => println!("repush_audit: error"),
+        AuditVerdict::NoInventory => println!("repush_audit: no_inventory"),
+    }
     Ok(report.exit_code())
 }
 
