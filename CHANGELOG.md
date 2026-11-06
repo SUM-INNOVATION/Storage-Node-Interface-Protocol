@@ -7,7 +7,20 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ## [Unreleased]
 
+## [0.4.0-rc5] - 2026-11-06
+
+Release candidate after `v0.4.0-rc4` (2026-10-20), carrying every change merged since then. Prebuilt binaries are Linux x86_64 only; every other platform builds from source ([`docs/compatibility/platform-support.md`](docs/compatibility/platform-support.md)).
+
+### Upgrade notes
+- **`sum-node resume` exit status changed** (see "Changed"): exit `0` now means the file is `Active`. Scripts that took `0` for a still-`Pending` file must check for `3`.
+- **Archives write two more per-file records** beside each manifest, both synced before a push is acknowledged: `manifests/<root>.v2_held` (the chunk indices held) and `manifests/<root>.v2_proofs` (each pushed chunk's leaf and Merkle path). A Private chunk pushed to an earlier version has neither: its archive attests it again, and can answer a challenge on it, only after the owner pushes it again with `sum-node repush`. Public chunks are recovered from their manifests.
+- **Rust 1.88 or newer** is still required to build from source.
+
 ### Fixed
+- **Proof-of-retrievability answers for Private V2 files** (#86). An archive could not answer a challenge on a Private V2 chunk it held: the responder rebuilt the Merkle path from the file's manifest, which an archive holds only encrypted for a Private file. Archives now record the leaf and path each V2 push carries, for both visibilities, and answer a Private challenge from that record, only if the stored bytes hash to the recorded leaf. Public files are answered from the manifest as before. No wire, chain or consensus change. See `docs/protocol/proof-of-retrievability.md` "Responder side".
+- **Push records durable before the acknowledgement** (#86). The push-proof record, the held index and a Private chunk's CID record (`<root>.private_chunks`) are each synced before the PushAck, and the first write to each file in a run also syncs `manifests/`. A failed sync refuses the push, so a repeat push repairs it. A final line torn by a failed write is cut before the next line is written; at startup only newline-terminated lines count, and a torn tail is dropped and the file rewritten, with a warning. See `docs/operator/monitoring.md`.
+- **Download when a chunk's top-ranked archive is down** (#81, SNIP #78). A chunk whose top-ranked assigned archive was never identified on the network waited until `--download-timeout-secs`, even when the other assigned archives held it. After a 5-second grace period from the start of the chunk phase, the chunk is now asked of its next identified assigned archive; the archive passed over stays in line behind it. Chunks are still fetched only from assigned archives and verified against the manifest, for Public and Private files alike.
+- **Dependency security updates** (#75, #76, #89), lockfile only: `rustls-webpki` 0.103.15 → 0.103.16 (RUSTSEC-2026-0382), `ctutils` 0.4.3 → 0.4.4 (RUSTSEC-2026-0385), and `async-executor` 1.14.0 → 1.14.1 (a use-after-free when a `Waker` fires during `Executor::drop`; 1.14.0 is yanked). `cargo audit` reports no vulnerabilities, with no advisory exception; the remaining warnings are for unmaintained or yanked crates.
 - **Attestation and push validation after a reassignment.** Archives validated pushes and attested against a file's original assignment snapshot (`assignment_height`), but after a `ReassignChunksV2` the chain accepts `AcceptAssignmentV2` only against the latest epoch's snapshot. A replacement archive refused its newly assigned chunks and attested nothing; a surviving archive attested indices the chain refuses. Both now use the latest assignment epoch from `storage_getAssignmentCoverageV2` (sum-chain #129).
 - **Held set after a restart.** The set of chunk indices an archive holds was in memory only. Each V2 push now records its index in `manifests/<root>.v2_held` before it is acknowledged, and the held set is rebuilt from these records and Public manifests at startup. Private chunks pushed by earlier versions are attested again only after a re-push.
 - Attestation runs are serialized per account, so two runs never start from the same nonce.
@@ -22,7 +35,16 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 - **Library interface for ingest and download (SNIP #57 item 1).** `sum_node::client`: `IngestPipeline::ingest` / `ingest_private` take a file path or an in-memory byte slice (`IngestInput`); `IngestOutcome::manifest` / `merkle_root` return the manifest and root, including on a failed registration. `download_to_path` / `download_to_bytes` fetch by root with the CLI's routing and verification and return the manifest. Byte input and output are staged through an owner-only temporary directory. Thin layer over the existing pipeline and orchestrators; the CLI, the wire format, chain transactions and the manifest are unchanged. See `docs/client/library.md`.
 
+- **`ingest-v2 --fee-deposit`** (`SUM_FEE_DEPOSIT`, **default `0`**; #82, SNIP #56). The Koppa locked in the file's fee pool by `RegisterFilePendingV2`, which was always `0` before. A file with no fee pool is never challenged and earns archives nothing; `AbandonFileV2` refunds 90% of a deposit. Library: `IngestParams::fee_deposit`. The default is unchanged; a nonzero default is a separate decision.
+
+- **`sum-node repush` and `sum-node repush-audit`** (#88). For chunks pushed before archives recorded a push's leaf and path. Neither sends a chain transaction.
+  - `repush` (the owner) re-pushes every chunk of a registered `Pending` or `Active` V2 file, and its manifest, to the archives the file's latest assignment epoch assigns them to; an archive holding a chunk without a recorded proof records one when it accepts the repeat push. It refuses, before pushing anything, unless the file rebuilds to the registered root, chunk count and sizes (a Private file under the `K_file` from the owner's own access entry). It exits `0` only when every push was acknowledged and the epoch read again afterwards is unchanged; a reassignment during the run is `incomplete` (exit `3`).
+  - `repush-audit` (an archive) checks, read-only and beside a running archive, that every chunk the latest epoch assigns it, for each file of an explicit inventory (`--root` or `--roots-file`), can be answered if challenged, using the responder's own answer builder and the chain's verifier. With no inventory the verdict is `no_inventory` (exit `7`), never complete. A complete verdict holds for the epochs it names.
+
+- **CI: an `aarch64-unknown-linux-musl` build lane** (#84, SNIP #58). A static `sum-node` and `e2e-helper` are built and smoke-tested on GitHub's arm64 runner. No aarch64 binary is published.
+
 ### Changed
+- **`sum-node reassign` submits only when a departed archive holds a chunk** (#67). It submits `ReassignChunksV2` only when the latest assignment epoch lists an archive no longer active that is assigned at least one chunk of the file (the chain's `assigned_count` up to 16,384 chunks; above that, computed locally with the chain's scorer). Otherwise it prints `no departed assignee; not submitting` and signs nothing. The coverage read is used only when it is identical twice between two identical head reads (three attempts, then refused); this is a stability check, not an atomic snapshot, and the chain re-checks its rule at execution. Who may submit is unchanged: the owner.
 - **`sum-node resume` exits non-zero unless activation completed.** Exit `0` only when the file is `Active` (`ActivateFileV2` finalized in this run, or already `Active` on chain); `3` still `Pending`; `4` `Abandoned` on chain; `5` root mismatch; `1` any error. The `lifecycle:` stdout line is unchanged. **Scripts that relied on exit 0 for a still-Pending file must adapt:** check for `0` (Active) or `3` (Pending). `ingest-v2` is unchanged.
 
 ### Documentation
@@ -31,7 +53,12 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 - **What a failed `ingest-v2` registration leaves on chain.** The pipeline docs said a `Failed` outcome means no chain state was created and the caller can retry from scratch. A registration that was submitted but not confirmed can still finalize and leave the file `Pending`, and an already-registered root exists on chain. The module docs, `run_private`, the library guide, the CLI reference and the recovery guide now say which cases created nothing (not sent; rejected by the chain), which may have left a `Pending` file (unconfirmed), and what to do for each. `run_private` also no longer suggests re-ingesting a Private file to recover it (a fresh key gives a new root): Private `resume` exists. Docs only.
 
 ### Not changed
-- Owner-side push routing (`ingest`, `resume`) and download routing still use the original assignment snapshot, so without re-fetch a reassignment alone does not restore coverage, and Private files are not re-fetched at all. No latency is promised for a newly assigned archive. No wire, chain or consensus change.
+- Owner-side push routing (`ingest`, `resume`) and download routing still use the original assignment snapshot, so without re-fetch a reassignment alone does not restore coverage, and Private files are not re-fetched at all. No latency is promised for a newly assigned archive. No wire, chain or consensus change. `repush` is the exception: it targets the latest epoch.
+
+### Chain compatibility
+- Pinned chain commit unchanged from `v0.4.0-rc4`: `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0` ([`docs/reference/chain-compat.md`](docs/reference/chain-compat.md)). It identifies a chain source state for wire format, not the validators' binary or runtime configuration.
+- Chain wire types come from `sumchain-wire`, still exact-pinned at `=0.4.0`.
+- The local mirror is still the chain's synthetic five-validator devnet at the E2E workflow's `SUMCHAIN_COMMIT` (`d8130ead3b77f38eff6eeb82b4e68bb1aca8e3b2`). A mirror run is not evidence about mainnet.
 
 ## [0.4.0-rc4] - 2026-10-20
 
