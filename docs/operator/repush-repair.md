@@ -29,11 +29,13 @@ sum-node --key-file <owner key> --rpc-url <rpc> \
 - Name the file as it was named at ingest to push identical manifest bytes
   (the manifest records the file name). An archive that already holds a
   Private manifest keeps it either way.
-- `repush: complete` (exit `0`) means every push was acknowledged and the
-  assignment epoch did not change during the run. Anything else is
-  `repush: incomplete` (exit `3`); run it again. A reassignment during the
-  run is reported as `repush_epoch_changed:`, with the pushes the new epoch
-  still needs logged.
+- `repush: complete for epoch <n>` (exit `0`) means every push was
+  acknowledged and the assignment epoch, read again after the pushes, is
+  still `<n>`. A push not acknowledged, or a reassignment during the run
+  (`repush_epoch_changed:`, with the pushes the new epoch still needs
+  logged), is `repush: incomplete` (exit `3`); run it again. If the epoch
+  cannot be read again, the run is an error (exit `1`): it cannot be
+  confirmed.
 
 **An acknowledgement is not the proof.** An archive running a version
 without push-proof records acknowledges a push too. Whether a chunk can
@@ -66,10 +68,13 @@ chain's verifier.
   Public file whose manifest this archive holds) or through the chunk's
   recorded push proof. Either way it is built from the stored chunk's
   bytes, so a missing or altered chunk is not usable.
-- `repush_audit: complete` (exit `0`): every assigned chunk of every
-  inventory file is usable. `incomplete` (exit `3`) lists each chunk that
-  is not, with the reason. `error` (exit `1`): a chain read failed, or a
-  root is not registered.
+- `repush_audit: complete for epochs {...}` (exit `0`): every assigned
+  chunk of every inventory file is usable, and every file's epoch was the
+  same when read again at the end. `incomplete` (exit `3`) lists each chunk
+  that is not usable with the reason, and marks a file whose epoch moved
+  during the audit (`epoch_recheck=moved_to=<n>`). `error` (exit `1`): a
+  chain read failed (including a file's final epoch read), or a root is not
+  registered.
 
 **The inventory decides, not the index.** A file this archive never
 received is absent from its store, so an empty or partial index cannot
@@ -80,6 +85,15 @@ the files' owners: no chain RPC lists the files an archive is assigned.
 **Read-only.** The audit opens the store without writing and without its
 lease, so it can run beside a running archive. A push that lands while it
 runs may not be seen; run it again.
+
+## Completion is scoped to the reported epochs
+
+`repush` and `repush-audit` each report the assignment epoch they worked
+against (`repush_epoch:`, and `epoch=` on each audited file), and read it
+again before reporting. Complete means complete **for those epochs**. A
+reassignment after the run moves chunks to other archives: run `repush`
+again for the file, and `repush-audit` on its archives, against the new
+epoch.
 
 ## What a complete audit does not show
 
