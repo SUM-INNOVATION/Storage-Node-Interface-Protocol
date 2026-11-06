@@ -80,7 +80,7 @@ source "$HOME/.cargo/env"
 # Clone + build at the current release-candidate tag.
 git clone https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol.git
 cd Storage-Node-Interface-Protocol
-git checkout v0.4.0-rc4            # or <latest-release-candidate-tag>
+git checkout v0.4.0-rc5            # or <latest-release-candidate-tag>
 make release-check
 ```
 
@@ -166,7 +166,7 @@ source "$HOME/.cargo/env"
 
 git clone https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol.git
 cd Storage-Node-Interface-Protocol
-git checkout v0.4.0-rc4            # or <latest-release-candidate-tag>
+git checkout v0.4.0-rc5            # or <latest-release-candidate-tag>
                                    # Replace with `v0.4.0` once the final tag exists.
 make release-check
 
@@ -208,7 +208,7 @@ source "$HOME/.cargo/env"
 
 git clone https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol.git
 cd Storage-Node-Interface-Protocol
-git checkout v0.4.0-rc4            # or <latest-release-candidate-tag>
+git checkout v0.4.0-rc5            # or <latest-release-candidate-tag>
                                    # Replace with `v0.4.0` once the final tag exists.
 make release-check
 

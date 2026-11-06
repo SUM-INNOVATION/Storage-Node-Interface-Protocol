@@ -25,8 +25,8 @@ passes.**
 ## 2. Install
 
 ```bash
-curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/v0.4.0-rc4/install.sh \
-    | sh -s -- --version v0.4.0-rc4
+curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/v0.4.0-rc5/install.sh \
+    | sh -s -- --version v0.4.0-rc5
 sum-node --version
 ```
 
