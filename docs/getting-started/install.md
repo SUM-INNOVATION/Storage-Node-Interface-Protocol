@@ -8,9 +8,12 @@ manual-verify path first** — the curl-pipe-sh one-liner is a
 convenience that does the same steps, but you should understand
 what it does before piping arbitrary scripts into your shell.
 
-> Prebuilt binaries are published only for **Linux x86_64** in the
-> `v0.4.x` line. Every other supported platform cell builds from
-> source. See [`PLATFORM-SUPPORT.md`](../compatibility/platform-support.md).
+> Prebuilt binaries are published for **Linux x86_64** and, in
+> releases tagged after `v0.4.0-rc5`, for **Linux aarch64** (a static
+> `aarch64-unknown-linux-musl` build that needs no libc on the host).
+> `v0.4.0-rc5` and earlier carry Linux x86_64 only. Every other
+> supported platform cell builds from source. See
+> [`PLATFORM-SUPPORT.md`](../compatibility/platform-support.md).
 
 ## Manual-verify path (recommended for first install)
 
@@ -20,7 +23,7 @@ the final `v0.4.0` has not been released yet):
 
 ```bash
 VERSION=v0.4.0-rc5
-PLATFORM=linux-x86_64
+PLATFORM=linux-x86_64      # or linux-aarch64, for releases after v0.4.0-rc5
 BASE=https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/releases/download/${VERSION}
 
 # 1. Download the tarball and checksums.
@@ -60,8 +63,10 @@ sudo mv "snip-${VERSION}-${PLATFORM}/bin/e2e-helper" /usr/local/bin/
 
 The install script attached to each release performs the same
 steps. It requires you to pass `--version` explicitly — there is
-no implicit "latest." The script refuses to run on anything other
-than Linux x86_64 and does not invoke `sudo` itself.
+no implicit "latest." The script picks the Linux x86_64 or Linux
+aarch64 tarball from `uname -m`, refuses every other platform, and
+does not invoke `sudo` itself. (The `v0.4.0-rc5` installer accepts
+Linux x86_64 only.)
 
 User-local install (default `$HOME/.local/bin`):
 
@@ -82,11 +87,17 @@ What the script does, in order:
 
 1. Refuses to run unless `--version vX.Y.Z` (or `vX.Y.Z-rcN`) is
    passed. There is no `--latest`.
-2. Refuses to run on anything other than `Linux x86_64`.
-3. Downloads `snip-${VERSION}-linux-x86_64.tar.gz` and `SHA256SUMS`
-   from the release page into a `mktemp -d` directory.
-4. Verifies the tarball against `SHA256SUMS` with
-   `sha256sum --check --ignore-missing`.
+2. Picks the tarball from `uname -s` and `uname -m`: Linux `x86_64`
+   or `amd64` → `linux-x86_64`; Linux `aarch64` or `arm64` →
+   `linux-aarch64`. Anything else (another OS, or e.g. `armv7l`,
+   `riscv64`, `i686`) is refused with exit code 2, before any
+   download.
+3. Downloads `SHA256SUMS` from the release page into a `mktemp -d`
+   directory and finds the one line that names
+   `snip-${VERSION}-${PLATFORM}.tar.gz`. A release that does not list
+   that tarball is refused before the tarball is fetched.
+4. Downloads the tarball and compares its SHA256 with that line. On a
+   mismatch it exits 1 and installs nothing.
 5. Extracts and moves `sum-node` and `e2e-helper` into
    `${PREFIX}/bin` (default `$HOME/.local/bin`).
 6. Warns if the install dir is not on `$PATH`.
@@ -124,7 +135,7 @@ The built binaries land at `target/release/sum-node` and
 ## Tarball layout
 
 ```
-snip-vX.Y.Z-linux-x86_64/
+snip-vX.Y.Z-<platform>/        <platform> is linux-x86_64 or linux-aarch64
   bin/
     sum-node
     e2e-helper
@@ -134,10 +145,10 @@ snip-vX.Y.Z-linux-x86_64/
   LICENSE-APACHE
 ```
 
-`SHA256SUMS` is a sibling asset on the release page (not inside
-the tarball). The tarball itself is single-flat-root: it expands
-into one top-level directory matching its basename without
-extension.
+Both tarballs have the same layout. `SHA256SUMS` is a sibling asset
+on the release page (not inside a tarball), with one line per
+tarball. Each tarball is single-flat-root: it expands into one
+top-level directory matching its basename without extension.
 
 ## Security notes
 

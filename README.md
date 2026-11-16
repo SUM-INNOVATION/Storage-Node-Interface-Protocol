@@ -40,8 +40,10 @@ planned for `v0.4.x`, see
 
 ## Install
 
-Prebuilt binaries are published for **Linux x86_64**. Every other
-supported platform builds from source — see
+Prebuilt binaries are published for **Linux x86_64**. Releases tagged
+after `v0.4.0-rc5` also carry a **Linux aarch64** tarball (a static
+`aarch64-unknown-linux-musl` build). Every other supported platform
+builds from source — see
 [`docs/getting-started/install.md`](docs/getting-started/install.md)
 for both paths.
 
@@ -60,8 +62,10 @@ curl -fsSL https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/rel
 ```
 
 The script installs `sum-node` and `e2e-helper` into
-`$HOME/.local/bin` by default. It refuses to run on anything
-other than Linux x86_64 and does not invoke `sudo` itself.
+`$HOME/.local/bin` by default. It picks the tarball for the host's
+architecture, checks it against `SHA256SUMS` before installing,
+refuses platforms without a prebuilt tarball, and does not invoke
+`sudo` itself. The `v0.4.0-rc5` installer accepts Linux x86_64 only.
 
 ---
 

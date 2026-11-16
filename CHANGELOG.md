@@ -7,6 +7,13 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ## [Unreleased]
 
+### Added
+- **Linux aarch64 release tarball** (SNIP #58). `release.yml` now also attaches `snip-<tag>-linux-aarch64.tar.gz`: a static `aarch64-unknown-linux-musl` `sum-node` and `e2e-helper`, built by the existing `aarch64-musl.yml` lane (native arm64 runner, no cross toolchain), which `release.yml` calls on the tag. Same layout as the x86_64 tarball; `SHA256SUMS` has one line for each. The draft's assets are verified on `ubuntu-22.04`, `ubuntu-24.04` and `ubuntu-24.04-arm`, each running its own platform's `sum-node --version`. Not yet run on the target aarch64 hardware.
+
+### Changed
+- **`install.sh` picks the tarball from `uname -m`**: `x86_64`/`amd64` → `linux-x86_64`, `aarch64`/`arm64` → `linux-aarch64`; any other OS or architecture is refused with exit code 2 before any download. It now downloads `SHA256SUMS` first, refuses a release that does not list its tarball, and compares the tarball's SHA256 with that one line before extracting or installing anything. `make release-check` runs a new installer self-test (`scripts/test-install.sh`, stubbed `uname` and `curl`, no network).
+- The post-publish install smoke (`release-install-smoke.yml`, manual dispatch) also runs on `ubuntu-24.04-arm`.
+
 ## [0.4.0-rc5] - 2026-11-06
 
 Release candidate after `v0.4.0-rc4` (2026-10-20), carrying every change merged since then. Prebuilt binaries are Linux x86_64 only; every other platform builds from source ([`docs/compatibility/platform-support.md`](docs/compatibility/platform-support.md)).

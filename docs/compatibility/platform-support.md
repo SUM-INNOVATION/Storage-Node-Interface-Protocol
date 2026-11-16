@@ -62,8 +62,9 @@ are WSL2 and Crostini respectively.
 Validated on mainnet (`v0.4.0-rc3` bring-up: three archive nodes
 on Hetzner CX21 VPSs, first Public V2 round-trip byte-identical).
 
-**Linux x86_64 has a prebuilt tarball.** This is the only cell
-in the matrix with prebuilts in the `v0.4.x` line. See
+**Linux x86_64 has a prebuilt tarball**, and so does **Linux
+aarch64** in releases tagged after `v0.4.0-rc5`. These are the only
+cells in the matrix with prebuilts. See
 [`INSTALL.md`](../getting-started/install.md) for both the manual-verify path
 (download, check SHA256, extract, move binaries) and the
 curl-pipe convenience script. The build-from-source path below
@@ -84,21 +85,29 @@ git checkout v0.4.0-rc5            # or <latest-release-candidate-tag>
 make release-check
 ```
 
-aarch64 is the same toolchain but has **no prebuilt tarball** in
-`v0.4.x` — build from source. Promotion of archive mode on
+aarch64 builds from source with the same toolchain. `v0.4.0-rc5`
+and earlier have no aarch64 tarball. Promotion of archive mode on
 aarch64 from "with caveats" to "supported" requires one operator
 to run a long-lived archive against mainnet for the documented
-validation window. A prebuilt aarch64 tarball is a candidate for
-`v0.4.1+` once that validation lands.
+validation window; a prebuilt tarball does not change that.
 
 A static `aarch64-unknown-linux-musl` build of `sum-node` runs in
 CI ([`aarch64-musl.yml`](../../.github/workflows/aarch64-musl.yml),
 [#58](https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/issues/58))
 on pull requests that change the code. It checks that the binaries
 link statically, runs `sum-node --version`, and runs the
-`e2e-helper` tests for that target. It is a build check only: no
-aarch64 binary is published, and the install script still accepts
-only x86_64.
+`e2e-helper` tests for that target. On pull requests it publishes
+nothing.
+
+On a version tag, [`release.yml`](../../.github/workflows/release.yml)
+calls that same lane and packages its binaries as
+`snip-<tag>-linux-aarch64.tar.gz`, beside
+`snip-<tag>-linux-x86_64.tar.gz`, with one `SHA256SUMS` over both.
+`scripts/install.sh` picks the tarball from `uname -m` (`aarch64` or
+`arm64` → `linux-aarch64`). The binaries need no libc on the host.
+The draft's assets are checked on a GitHub-hosted arm64 runner before
+publication; a run on the target aarch64 hardware is a separate
+acceptance step (#58).
 
 For the full mainnet archive bring-up flow see
 [`MAINNET-BRINGUP.md`](../operator/mainnet-bringup.md).
@@ -296,17 +305,17 @@ These items are deliberately deferred. Re-evaluate at the
 - **macOS launchd plist templates.** Will land alongside the
   macOS archive promotion when its validation window closes.
 - **Code signing, notarization, signed checksums.** `v0.4.x`
-  ships a Linux x86_64 tarball and a SHA256SUMS file but does
+  ships Linux tarballs and a SHA256SUMS file but does
   NOT sign binaries, notarize for macOS Gatekeeper, sign
   `SHA256SUMS` with PGP, or publish Sigstore attestations.
   Operators with threat models that require any of these should
   build from source at the matching tag. The full signing
   workstream is deferred to `v0.5.x`.
-- **Prebuilt distribution beyond Linux x86_64.** `v0.4.x` ships
-  a Linux x86_64 tarball only. Linux aarch64 and macOS arm64
-  prebuilts are candidates for `v0.4.1+` once their per-cell
-  promotion criteria clear. Homebrew, winget, scoop, deb/rpm
-  packaging is a `v0.5.x+` workstream.
+- **Prebuilt distribution beyond Linux.** `v0.4.x` ships Linux
+  x86_64 and (after `v0.4.0-rc5`) Linux aarch64 tarballs only. A
+  macOS arm64 prebuilt is a candidate for `v0.4.1+` once its
+  per-cell promotion criteria clear. Homebrew, winget, scoop,
+  deb/rpm packaging is a `v0.5.x+` workstream.
 - **`cargo xtask release-check` cross-platform dev-loop wrapper.**
   `make release-check` via Git Bash / WSL2 / Crostini is enough.
 

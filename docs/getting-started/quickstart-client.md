@@ -1,8 +1,9 @@
 # Quickstart: client
 
 Fastest path to upload a small file, then download it, using
-prebuilt binaries on Linux x86_64. For every other platform build
-from source per [`install.md`](install.md) and skip step 1.
+prebuilt binaries on Linux x86_64 (Linux aarch64 too, for releases
+tagged after `v0.4.0-rc5`). For every other platform build from
+source per [`install.md`](install.md) and skip step 1.
 
 You will need:
 
@@ -21,7 +22,7 @@ sum-node --version
 ```
 
 See [`install.md`](install.md) for the manual-verify path and for
-non-Linux-x86_64 environments.
+environments without a prebuilt tarball.
 
 ## 2. Configure
 

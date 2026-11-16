@@ -48,8 +48,14 @@ When a maintainer creates the tracking issue, link it here.
 
 ### Linux aarch64 prebuilt tarball
 
-Cross-compile lane in the release workflow. Requires one operator's
-long-run validation before promoting; see
+Wired, not yet released
+([#58](https://github.com/SUM-INNOVATION/Storage-Node-Interface-Protocol/issues/58)):
+`release.yml` packages `snip-<tag>-linux-aarch64.tar.gz` from the
+native `aarch64-musl.yml` lane (no cross toolchain) and
+`scripts/install.sh` selects it. Remaining: the first tagged release
+that carries it, and an install and run on the target aarch64
+hardware. Promoting aarch64 archive mode still needs one operator's
+long-run validation; see
 [`../compatibility/platform-support.md`](../compatibility/platform-support.md)
 "Promotion criteria."
 

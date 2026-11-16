@@ -71,7 +71,7 @@ wins.
 | Feature | Status | Location | Notes |
 |---|---|---|---|
 | Linux x86_64 prebuilt tarball + install script | Shipped | [`../getting-started/install.md`](../getting-started/install.md) | v0.4.x. |
-| Linux aarch64 prebuilt | **Planned** | [`../compatibility/platform-support.md`](../compatibility/platform-support.md) | v0.4.1+ pending operator validation. |
+| Linux aarch64 prebuilt (static musl) + install script selection (SNIP #58) | Unreleased | [`../compatibility/platform-support.md`](../compatibility/platform-support.md); [`../../.github/workflows/release.yml`](../../.github/workflows/release.yml); [`../../scripts/install.sh`](../../scripts/install.sh) | Packaged by the next tagged release from the `aarch64-musl.yml` lane. A run on the target aarch64 hardware is pending. |
 | macOS arm64 prebuilt | **Planned** | [`../compatibility/platform-support.md`](../compatibility/platform-support.md) | v0.4.1+. |
 | Signed release artifacts (code signing, notarization, PGP-signed SHA256SUMS, Sigstore) | **Planned** | [`../compatibility/platform-support.md`](../compatibility/platform-support.md) "Not planned for v0.4.x" | v0.5.x workstream. |
 | Homebrew / winget / scoop / deb / rpm | **Planned** | [`../compatibility/platform-support.md`](../compatibility/platform-support.md) | v0.5.x+ workstream. |
