@@ -1,9 +1,16 @@
 # aarch64 musl build lane (SNIP #58): builds a static
 # aarch64-unknown-linux-musl `sum-node` from the locked sources and smoke-
-# tests it. It is a build check only. It publishes nothing: no release, no
-# workflow artifact, no change to release.yml or scripts/install.sh. Adding
-# the target to the release is a separate step that needs release
-# authorization.
+# tests it.
+#
+# On pull requests, pushes to main and manual dispatch it is a build check
+# only and publishes nothing: no release, no workflow artifact.
+#
+# release.yml also calls it (workflow_call) on a version tag, with
+# upload-binaries: true, so the release's linux-aarch64 tarball is built
+# by this same lane. Only then, and only for a tag ref, does the job also
+# upload the two checked binaries as a workflow artifact of that release
+# run, for release.yml's draft job to package. This workflow never creates,
+# edits or uploads to a release itself.
 #
 # Not a merge gate: "release-check (linux)" in ci.yml is.
 #
@@ -37,12 +44,22 @@
 # live RPC smoke (§ 2.3) is not run: it needs a public endpoint, and the
 # other pull-request lanes avoid that dependency as well.
 #
-# Third-party actions are pinned to the same full commit SHAs as ci.yml.
+# Third-party actions are pinned to the same full commit SHAs as ci.yml;
+# actions/upload-artifact, used only on the release path, is pinned to a
+# full commit SHA as well.
 
 name: aarch64-musl
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      upload-binaries:
+        description: >-
+          Upload bin/sum-node and bin/e2e-helper as the workflow artifact
+          bin-linux-aarch64 (release.yml on a version tag only)
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -72,7 +89,7 @@ env:
 
 jobs:
   build:
-    name: sum-node aarch64-unknown-linux-musl (static build + smoke, not published)
+    name: sum-node aarch64-unknown-linux-musl (static build + smoke, ${{ inputs.upload-binaries && 'for the release' || 'not published' }})
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -144,3 +161,18 @@ jobs:
           check "empty rootfs" "$(docker run --rm --network none -v "$OUT:/x:ro" snip-empty-rootfs /x/sum-node --version)"
           docker run --rm --network none -v "$OUT:/x:ro" snip-empty-rootfs /x/e2e-helper --help >/dev/null
           echo "empty rootfs: e2e-helper --help exits 0"
+
+      # Only when release.yml calls this on a version tag. The artifact
+      # belongs to that release run; the draft job there packages it into
+      # snip-<tag>-linux-aarch64.tar.gz. Artifacts do not keep the
+      # executable bit; the draft job sets it.
+      - name: Hand the binaries to release.yml
+        if: inputs.upload-binaries && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: bin-linux-aarch64
+          path: |
+            target/${{ env.TARGET }}/release/sum-node
+            target/${{ env.TARGET }}/release/e2e-helper
+          if-no-files-found: error
+          retention-days: 7

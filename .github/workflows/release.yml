@@ -1,21 +1,35 @@
 # Release workflow — triggered on version tags (v*). Builds release
-# binaries from the tag checkout, packages them as a Linux x86_64
-# tarball, computes SHA256SUMS, and uploads the artifacts together
-# with `scripts/install.sh` to a DRAFT GitHub Release.
+# binaries from the tag checkout for two platforms, packages each as a
+# tarball with the same layout, computes one SHA256SUMS over both, and
+# uploads them together with `scripts/install.sh` to a DRAFT GitHub
+# Release:
+#
+#   snip-<tag>-linux-x86_64.tar.gz   job linux-x86_64: `make release-check`,
+#                                    then `cargo build --workspace --release`
+#                                    on ubuntu-22.04 (glibc)
+#   snip-<tag>-linux-aarch64.tar.gz  job linux-aarch64: the aarch64-musl.yml
+#                                    lane (static aarch64-unknown-linux-musl,
+#                                    native arm64 runner, no cross toolchain),
+#                                    called with upload-binaries: true
+#   SHA256SUMS                       one line per tarball
+#   install.sh                       scripts/install.sh at the tag
+#
+# The build jobs only hand their binaries to the `draft` job as workflow
+# artifacts; `draft` is the one job that can write to the release.
 #
 # The release is never auto-published. After upload, the
 # `verify-draft` job downloads the draft's assets on fresh GitHub-hosted
 # runners and checks them with scripts/verify-release-assets.sh (asset
-# set, SHA256SUMS, tarball layout, `sum-node --version`). A human
-# reviews that result, replaces the draft body and publishes. The
-# post-publish curl-pipe smoke is the manual-dispatch workflow
-# release-install-smoke.yml.
+# set, SHA256SUMS, tarball layouts, `sum-node --version` of the runner's
+# platform tarball, on x86_64 and on arm64). A human reviews that result,
+# replaces the draft body and publishes. The post-publish curl-pipe smoke
+# is the manual-dispatch workflow release-install-smoke.yml.
 # Both rc and final tags create a draft (rc tags additionally carry
 # the GitHub "pre-release" flag once published).
 #
-# Scope: Linux x86_64 only for v0.4.x. macOS / aarch64 are deferred
-# to v0.4.1+. Build-from-source remains the contract for every other
-# platform cell — see docs/PLATFORM-SUPPORT.md.
+# Scope: Linux x86_64 and Linux aarch64. macOS is deferred.
+# Build-from-source remains the contract for every other platform
+# cell — see docs/PLATFORM-SUPPORT.md.
 #
 # All third-party actions are pinned to a full commit SHA, not a
 # floating tag. The human tag is included as a comment so the SHA
@@ -34,11 +48,9 @@ permissions:
 
 jobs:
   linux-x86_64:
-    name: package linux-x86_64
+    name: build linux-x86_64
     runs-on: ubuntu-22.04
     timeout-minutes: 30
-    permissions:
-      contents: write  # required to create / upload to the draft release
     steps:
       - name: Checkout (tag)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -73,36 +85,110 @@ jobs:
       - name: Build workspace (release)
         run: cargo build --workspace --release --locked
 
-      - name: Stage tarball and checksums
-        id: stage
+      # Artifacts do not keep the executable bit; the draft job sets it.
+      - name: Hand the binaries to the draft job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: bin-linux-x86_64
+          path: |
+            target/release/sum-node
+            target/release/e2e-helper
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-aarch64:
+    name: build linux-aarch64
+    # The existing aarch64 lane, not a second build: static
+    # aarch64-unknown-linux-musl, statically-linked check, `--version` on
+    # Alpine, glibc Ubuntu and an empty root filesystem, and the
+    # e2e-helper tests, then the artifact bin-linux-aarch64.
+    uses: ./.github/workflows/aarch64-musl.yml
+    with:
+      upload-binaries: true
+    permissions:
+      contents: read
+
+  draft:
+    name: package and upload the draft release
+    needs: [linux-x86_64, linux-aarch64]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write  # required to create / upload to the draft release
+    steps:
+      - name: Checkout (tag)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Validate tag format
         run: |
           set -eu
           TAG="${GITHUB_REF_NAME}"
-          PLATFORM="linux-x86_64"
-          ROOT="snip-${TAG}-${PLATFORM}"
-
-          mkdir -p "dist/${ROOT}/bin"
-          cp target/release/sum-node    "dist/${ROOT}/bin/sum-node"
-          cp target/release/e2e-helper  "dist/${ROOT}/bin/e2e-helper"
-          cp README.md                  "dist/${ROOT}/README.md"
-          cp CHANGELOG.md               "dist/${ROOT}/CHANGELOG.md"
-          cp LICENSE-MIT                "dist/${ROOT}/LICENSE-MIT"
-          cp LICENSE-APACHE             "dist/${ROOT}/LICENSE-APACHE"
-
-          # Belt + suspenders against tag/tarball drift if this
-          # workflow is ever edited. The interpolation above already
-          # pins this, but assert anyway.
-          test "${ROOT}" = "snip-${TAG}-${PLATFORM}" || {
-              echo "error: staged dir '${ROOT}' disagrees with tag '${TAG}'" >&2
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*) ;;
+            *)
+              echo "error: tag '$TAG' does not match vX.Y.Z or vX.Y.Z-rcN" >&2
               exit 1
-          }
+              ;;
+          esac
 
-          ( cd dist && tar czf "${ROOT}.tar.gz" "${ROOT}" )
-          ( cd dist && sha256sum "${ROOT}.tar.gz" > SHA256SUMS )
+      - name: Download the linux-x86_64 binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: bin-linux-x86_64
+          path: ${{ runner.temp }}/bin/linux-x86_64
 
-          echo "tag=${TAG}"                   >> "$GITHUB_OUTPUT"
-          echo "tarball=dist/${ROOT}.tar.gz"  >> "$GITHUB_OUTPUT"
-          echo "checksums=dist/SHA256SUMS"    >> "$GITHUB_OUTPUT"
+      - name: Download the linux-aarch64 binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: bin-linux-aarch64
+          path: ${{ runner.temp }}/bin/linux-aarch64
+
+      - name: Stage tarballs and checksums
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          mkdir dist
+
+          for PLATFORM in linux-x86_64 linux-aarch64; do
+              case "$PLATFORM" in
+                linux-x86_64)  MACHINE='Advanced Micro Devices X86-64' ;;
+                linux-aarch64) MACHINE='AArch64' ;;
+              esac
+              ROOT="snip-${TAG}-${PLATFORM}"
+              BIN="${RUNNER_TEMP}/bin/${PLATFORM}"
+
+              mkdir -p "dist/${ROOT}/bin"
+              for b in sum-node e2e-helper; do
+                  # Each binary is an ELF for its tarball's architecture.
+                  readelf -hW "${BIN}/${b}" | grep -E '^ *(Class|Machine):'
+                  readelf -hW "${BIN}/${b}" | grep -qE "^ *Machine: +${MACHINE}\$" || {
+                      echo "error: ${PLATFORM}/${b} is not a ${MACHINE} ELF binary" >&2
+                      exit 1
+                  }
+                  install -m 0755 "${BIN}/${b}" "dist/${ROOT}/bin/${b}"
+              done
+              cp README.md                  "dist/${ROOT}/README.md"
+              cp CHANGELOG.md               "dist/${ROOT}/CHANGELOG.md"
+              cp LICENSE-MIT                "dist/${ROOT}/LICENSE-MIT"
+              cp LICENSE-APACHE             "dist/${ROOT}/LICENSE-APACHE"
+
+              # Belt + suspenders against tag/tarball drift if this
+              # workflow is ever edited. The interpolation above already
+              # pins this, but assert anyway.
+              test "${ROOT}" = "snip-${TAG}-${PLATFORM}" || {
+                  echo "error: staged dir '${ROOT}' disagrees with tag '${TAG}'" >&2
+                  exit 1
+              }
+
+              ( cd dist && tar czf "${ROOT}.tar.gz" "${ROOT}" )
+          done
+
+          ( cd dist && sha256sum "snip-${TAG}-linux-x86_64.tar.gz" \
+                                 "snip-${TAG}-linux-aarch64.tar.gz" > SHA256SUMS )
 
       - name: Show staged assets
         run: |
@@ -114,7 +200,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          TAG="${{ steps.stage.outputs.tag }}"
+          TAG="${GITHUB_REF_NAME}"
+          set -- "dist/snip-${TAG}-linux-x86_64.tar.gz" \
+                 "dist/snip-${TAG}-linux-aarch64.tar.gz" \
+                 dist/SHA256SUMS \
+                 scripts/install.sh
 
           case "$TAG" in
             *-rc*) PRERELEASE_FLAG="--prerelease" ;;
@@ -125,34 +215,31 @@ jobs:
           # verify assets + install line before publishing in the
           # GitHub UI. NEVER add `--latest` here; we do not promise
           # an implicit-latest contract for v0.4.x.
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release $TAG already exists — re-uploading assets (clobber)"
-            gh release upload "$TAG" \
-                "${{ steps.stage.outputs.tarball }}" \
-                "${{ steps.stage.outputs.checksums }}" \
-                scripts/install.sh \
-                --clobber
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$@" --clobber
           else
-            gh release create "$TAG" \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
                 --draft $PRERELEASE_FLAG \
                 --title "$TAG" \
                 --notes "Draft release. Replace this body with the matching CHANGELOG.md section before publishing." \
-                "${{ steps.stage.outputs.tarball }}" \
-                "${{ steps.stage.outputs.checksums }}" \
-                scripts/install.sh
+                "$@"
           fi
 
   verify-draft:
     # Each job runs on a fresh GitHub-hosted VM, so this checks the assets
     # as uploaded, on machines that did not build them: ubuntu-22.04 (the
-    # build image, the checklist's reference host) and ubuntu-24.04 (a
-    # newer userland). It only reads; nothing is published or re-uploaded.
+    # x86_64 build image, the checklist's reference host), ubuntu-24.04 (a
+    # newer userland) and ubuntu-24.04-arm (arm64, for the linux-aarch64
+    # tarball). It only reads; nothing is published or re-uploaded.
     name: verify draft assets (${{ matrix.os }})
-    needs: linux-x86_64
+    needs: draft
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
+        # x86_64 runners run the linux-x86_64 tarball's binary, the arm64
+        # runner the linux-aarch64 one (verify-release-assets.sh check 6).
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     permissions:
@@ -182,6 +269,7 @@ jobs:
           esac
           jq -r '.assets[].name' release.json | LC_ALL=C sort > names.txt
           printf '%s\n' SHA256SUMS install.sh "snip-${TAG}-linux-x86_64.tar.gz" \
+              "snip-${TAG}-linux-aarch64.tar.gz" \
               | LC_ALL=C sort > want.txt
           diff -u want.txt names.txt
 
