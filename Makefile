@@ -3,7 +3,7 @@
 # Run `make` (no args) to print this help.
 
 .DEFAULT_GOAL := help
-.PHONY: help fmt lint lint-strict test build release-check smoke audit-logs check-docs-links check-cli-doc check-release-verifier e2e-mirror
+.PHONY: help fmt lint lint-strict test build release-check smoke audit-logs check-docs-links check-cli-doc check-release-verifier check-installer e2e-mirror
 
 help:
 	@printf "Targets:\n"
@@ -16,7 +16,8 @@ help:
 	@printf "  check-docs-links         scripts/check-docs-links.sh (Markdown link resolver)\n"
 	@printf "  check-cli-doc            scripts/check-cli-doc.sh (clap flags vs docs/reference/cli.md)\n"
 	@printf "  check-release-verifier   scripts/test-verify-release-assets.sh (release asset verifier self-test)\n"
-	@printf "  release-check            fmt + lint-strict + test + build + audit-logs + docs checks + verifier self-test\n"
+	@printf "  check-installer          scripts/test-install.sh (install.sh architecture selection + checksum self-test)\n"
+	@printf "  release-check            fmt + lint-strict + test + build + audit-logs + docs checks + verifier and installer self-tests\n"
 	@printf "  smoke RPC=URL            read-only chain smoke (extra args via SMOKE_ARGS=...)\n"
 	@printf "                           e.g. make smoke RPC=http://localhost:8545 SMOKE_ARGS=--require-v2\n"
 	@printf "  e2e-mirror               manual local-mirror E2E suite (assumes mirror running)\n"
@@ -49,7 +50,10 @@ check-cli-doc: build
 check-release-verifier:
 	scripts/test-verify-release-assets.sh
 
-release-check: fmt lint-strict test build audit-logs check-docs-links check-cli-doc check-release-verifier
+check-installer:
+	scripts/test-install.sh
+
+release-check: fmt lint-strict test build audit-logs check-docs-links check-cli-doc check-release-verifier check-installer
 	@printf "release-check: ok\n"
 
 smoke:
