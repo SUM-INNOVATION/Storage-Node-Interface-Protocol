@@ -7,7 +7,13 @@
 #
 # Contract for v0.4.x:
 #   - --version is REQUIRED. No implicit "latest".
-#   - Linux x86_64 ONLY. Every other platform builds from source.
+#   - Linux only. The tarball is chosen from `uname -m`:
+#       x86_64, amd64   -> snip-<version>-linux-x86_64.tar.gz
+#       aarch64, arm64  -> snip-<version>-linux-aarch64.tar.gz
+#     Any other OS or architecture is refused; build from source there.
+#   - The tarball is checked against its own SHA256SUMS line before
+#     anything is extracted or installed. A release whose SHA256SUMS
+#     does not list the tarball is refused.
 #   - This script does NOT run sudo for you. To install to a system
 #     path, run the curl-pipe under your own sudo.
 #
@@ -38,8 +44,8 @@ Usage: install.sh --version vX.Y.Z [--prefix DIR]
 
 Notes:
   - No 'latest'. The version must be passed explicitly.
-  - Linux x86_64 only for v0.4.x. Other platforms: build from source
-    (see docs/PLATFORM-SUPPORT.md).
+  - Linux x86_64 (amd64) and Linux aarch64 (arm64) only. Other
+    platforms: build from source (see docs/PLATFORM-SUPPORT.md).
   - This installer does NOT run sudo. To install to a system path,
     run the curl-pipe under sudo, e.g.:
       curl -fsSL <url>/install.sh \
@@ -104,16 +110,21 @@ esac
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
-if [ "$OS" != "Linux" ] || [ "$ARCH" != "x86_64" ]; then
+case "$ARCH" in
+    x86_64|amd64)  PLATFORM="linux-x86_64" ;;
+    aarch64|arm64) PLATFORM="linux-aarch64" ;;
+    *)             PLATFORM="" ;;
+esac
+if [ "$OS" != "Linux" ] || [ -z "$PLATFORM" ]; then
     cat >&2 <<EOF
-error: prebuilt binaries are only published for Linux x86_64 in $VERSION.
+error: prebuilt binaries are only published for Linux x86_64 (amd64) and
+       Linux aarch64 (arm64).
        detected: $OS $ARCH
        Build from source on this platform — see docs/PLATFORM-SUPPORT.md.
 EOF
     exit 2
 fi
 
-PLATFORM="linux-x86_64"
 TARBALL="snip-${VERSION}-${PLATFORM}.tar.gz"
 CHECKSUMS="SHA256SUMS"
 BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
@@ -151,21 +162,53 @@ printf 'snip-install: target     %s\n' "$VERSION"
 printf 'snip-install: platform   %s\n' "$PLATFORM"
 printf 'snip-install: install to %s\n' "$INSTALL_DIR"
 
-printf 'snip-install: downloading %s\n' "${BASE_URL}/${TARBALL}"
-curl -fsSL --proto '=https' --tlsv1.2 -o "${TMP}/${TARBALL}" "${BASE_URL}/${TARBALL}"
-
 printf 'snip-install: downloading %s\n' "${BASE_URL}/${CHECKSUMS}"
 curl -fsSL --proto '=https' --tlsv1.2 -o "${TMP}/${CHECKSUMS}" "${BASE_URL}/${CHECKSUMS}"
 
-printf 'snip-install: verifying SHA256\n'
-if ! ( cd "$TMP" && sha256sum --check --ignore-missing "$CHECKSUMS" ); then
-    printf 'error: SHA256 verification failed for %s\n' "$TARBALL" >&2
-    printf '       expected (from %s):\n' "$CHECKSUMS" >&2
-    grep -F "$TARBALL" "${TMP}/${CHECKSUMS}" >&2 || true
-    printf '       observed:\n' >&2
-    sha256sum "${TMP}/${TARBALL}" >&2 || true
+# The one SHA256SUMS line that names this tarball: "<sha256>  <file>".
+# SHA256SUMS lists every platform's tarball; only this one is checked.
+EXPECTED=""
+MATCHES=0
+while IFS= read -r line || [ -n "$line" ]; do
+    if [ "${line#*  }" = "$TARBALL" ]; then
+        EXPECTED="${line%%  *}"
+        MATCHES=$((MATCHES + 1))
+    fi
+done < "${TMP}/${CHECKSUMS}"
+if [ "$MATCHES" -eq 0 ]; then
+    printf 'error: %s does not list %s; this release has no %s tarball.\n' \
+        "$CHECKSUMS" "$TARBALL" "$PLATFORM" >&2
+    printf '       Build from source — see docs/PLATFORM-SUPPORT.md.\n' >&2
     exit 1
 fi
+if [ "$MATCHES" -ne 1 ]; then
+    printf 'error: %s lists %s %s times\n' "$CHECKSUMS" "$TARBALL" "$MATCHES" >&2
+    exit 1
+fi
+case "$EXPECTED" in
+    *[!0-9a-f]* | "")
+        printf 'error: %s entry for %s is not a SHA256 digest\n' "$CHECKSUMS" "$TARBALL" >&2
+        exit 1
+        ;;
+esac
+if [ "${#EXPECTED}" -ne 64 ]; then
+    printf 'error: %s entry for %s is not a SHA256 digest\n' "$CHECKSUMS" "$TARBALL" >&2
+    exit 1
+fi
+
+printf 'snip-install: downloading %s\n' "${BASE_URL}/${TARBALL}"
+curl -fsSL --proto '=https' --tlsv1.2 -o "${TMP}/${TARBALL}" "${BASE_URL}/${TARBALL}"
+
+printf 'snip-install: verifying SHA256\n'
+OBSERVED="$(sha256sum < "${TMP}/${TARBALL}")"
+OBSERVED="${OBSERVED%% *}"
+if [ "$OBSERVED" != "$EXPECTED" ]; then
+    printf 'error: SHA256 verification failed for %s\n' "$TARBALL" >&2
+    printf '       expected (from %s): %s\n' "$CHECKSUMS" "$EXPECTED" >&2
+    printf '       observed:           %s\n' "$OBSERVED" >&2
+    exit 1
+fi
+printf 'snip-install: %s: OK\n' "$TARBALL"
 
 EXTRACT_DIR="${TMP}/extract"
 mkdir -p "$EXTRACT_DIR"

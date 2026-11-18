@@ -1,13 +1,8 @@
 use std::time::Duration;
 
-use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, mdns, relay,
-    request_response::{self, ProtocolSupport},
-    swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
-};
+use libp2p::request_response::{self, ProtocolSupport};
 
 use crate::codec::{SHARD_XFER_PROTOCOL_V1, SHARD_XFER_PROTOCOL_V2, VersionedShardCodec};
-use crate::gate::{Gated, PolicyBehaviour};
 
 /// Request timeout applied to both shard-transfer behaviours.
 ///
@@ -56,71 +51,97 @@ pub fn build_shard_xfer_v2() -> request_response::Behaviour<VersionedShardCodec>
         shard_xfer_config(),
     )
 }
+pub use mesh::{LocalMeshBehaviour, LocalMeshBehaviourEvent};
 
-/// Composed [`NetworkBehaviour`] for the SUM Storage Node mesh.
-///
-/// The `#[derive(NetworkBehaviour)]` macro generates `LocalMeshBehaviourEvent`
-/// with variants matching each field name in PascalCase:
-/// - `NetPolicy(Infallible)` — never constructed; the policy behaviour emits
-///   no events
-/// - `Mdns(mdns::Event)`
-/// - `Gossipsub(gossipsub::Event)`
-/// - `Identify(identify::Event)`
-/// - `ShardXferV1(request_response::Event<ShardRequestVersioned, ShardResponseVersioned>)`
-/// - `ShardXferV2(request_response::Event<ShardRequestVersioned, ShardResponseVersioned>)`
-/// - `Kademlia(kad::Event)`
-/// - `Autonat(autonat::Event)`
-/// - `Relay(relay::Event)`
-/// - `RelayClient(relay::client::Event)`
-/// - `Dcutr(dcutr::Event)`
-///
-/// ## Why shard transfer is two behaviours and not one
-///
-/// One behaviour registering both protocols is what this node used to do, and
-/// it makes per-request protocol selection impossible: `send_request` attaches
-/// the behaviour's whole protocol list to every request and lets multistream
-/// pick the first mutually-supported entry. A V1-shaped request sent to a
-/// dual-protocol peer therefore negotiated `/sum/storage/v2` and the codec had
-/// to refuse to write it — a V1 pull to a peer that speaks V2 could not be
-/// expressed at all.
-///
-/// Two behaviours, each with exactly one protocol, make the version a routing
-/// decision at the call site: [`crate::swarm::SwarmCommand::RequestShard`]
-/// goes to `shard_xfer_v1`, every V2 command goes to `shard_xfer_v2`, and
-/// negotiation has one candidate either way.
-///
-/// The cost is that `OutboundRequestId` is unique only per behaviour, so both
-/// counters start at zero and collide immediately. That is why every outbound
-/// record is keyed by [`crate::correlation::OutboundKey`] — the id paired with
-/// the [`crate::correlation::RequestDomain`] naming which of these two fields
-/// minted it — and never by the raw id.
-///
-/// ## Network policy (SNIP #79)
-///
-/// `net_policy` is first on purpose: the derived behaviour consults fields in
-/// declaration order, so a connection the policy refuses is refused before
-/// any other behaviour sets up state for it (see [`crate::gate`]). The
-/// address-supplying behaviours are wrapped in [`Gated`], which dereferences
-/// to the inner behaviour and keeps its event type, so the event variants
-/// below are unchanged. `mdns` is a [`Toggle`]: disabled, it is absent rather
-/// than idle — no socket, no announcement, no discovery.
-#[derive(NetworkBehaviour)]
-pub struct LocalMeshBehaviour {
-    pub net_policy: PolicyBehaviour,
-    pub mdns: Gated<Toggle<mdns::tokio::Behaviour>>,
-    pub gossipsub: gossipsub::Behaviour,
-    pub identify: Gated<identify::Behaviour>,
-    /// `/sum/storage/v1` only. Inbound V1 pulls are served; inbound V1 pushes
-    /// are refused by `sum-node`'s inbound dispatcher. No outbound V1 push
-    /// command exists any more.
-    pub shard_xfer_v1: request_response::Behaviour<VersionedShardCodec>,
-    /// `/sum/storage/v2` only. Every V2 operation is routed here explicitly.
-    pub shard_xfer_v2: request_response::Behaviour<VersionedShardCodec>,
-    pub kademlia: Gated<kad::Behaviour<kad::store::MemoryStore>>,
-    pub autonat: Gated<autonat::Behaviour>,
-    pub relay: relay::Behaviour,
-    pub relay_client: Gated<relay::client::Behaviour>,
-    pub dcutr: Gated<dcutr::Behaviour>,
+// `LocalMeshBehaviour` sits in this private module only to scope one lint
+// allowance; the re-export above keeps `behaviour::LocalMeshBehaviour` and
+// `behaviour::LocalMeshBehaviourEvent` (and the crate-root re-export) as they
+// were.
+//
+// `#[derive(NetworkBehaviour)]` wraps each field's events in
+// `LocalMeshBehaviourEvent`. `net_policy`'s event type is `Infallible`, and
+// rustc 1.100 reports the generated `LocalMeshBehaviourEvent::NetPolicy(..)`
+// call as an unreachable call; `-D warnings` makes that an error. The call is
+// unreachable by design: the policy behaviour emits no events. An `#[allow]`
+// on the struct does not reach the impl the derive generates beside it, so
+// the allowance is on this module, which holds only the struct and the
+// derive's output. The rest of this file stays under `-D warnings`.
+mod mesh {
+    #![allow(unreachable_code)]
+
+    use libp2p::{
+        autonat, dcutr, gossipsub, identify, kad, mdns, relay, request_response,
+        swarm::{NetworkBehaviour, behaviour::toggle::Toggle},
+    };
+
+    use crate::codec::VersionedShardCodec;
+    use crate::gate::{Gated, PolicyBehaviour};
+
+    /// Composed [`NetworkBehaviour`] for the SUM Storage Node mesh.
+    ///
+    /// The `#[derive(NetworkBehaviour)]` macro generates `LocalMeshBehaviourEvent`
+    /// with variants matching each field name in PascalCase:
+    /// - `NetPolicy(Infallible)` — never constructed; the policy behaviour emits
+    ///   no events
+    /// - `Mdns(mdns::Event)`
+    /// - `Gossipsub(gossipsub::Event)`
+    /// - `Identify(identify::Event)`
+    /// - `ShardXferV1(request_response::Event<ShardRequestVersioned, ShardResponseVersioned>)`
+    /// - `ShardXferV2(request_response::Event<ShardRequestVersioned, ShardResponseVersioned>)`
+    /// - `Kademlia(kad::Event)`
+    /// - `Autonat(autonat::Event)`
+    /// - `Relay(relay::Event)`
+    /// - `RelayClient(relay::client::Event)`
+    /// - `Dcutr(dcutr::Event)`
+    ///
+    /// ## Why shard transfer is two behaviours and not one
+    ///
+    /// One behaviour registering both protocols is what this node used to do, and
+    /// it makes per-request protocol selection impossible: `send_request` attaches
+    /// the behaviour's whole protocol list to every request and lets multistream
+    /// pick the first mutually-supported entry. A V1-shaped request sent to a
+    /// dual-protocol peer therefore negotiated `/sum/storage/v2` and the codec had
+    /// to refuse to write it — a V1 pull to a peer that speaks V2 could not be
+    /// expressed at all.
+    ///
+    /// Two behaviours, each with exactly one protocol, make the version a routing
+    /// decision at the call site: [`crate::swarm::SwarmCommand::RequestShard`]
+    /// goes to `shard_xfer_v1`, every V2 command goes to `shard_xfer_v2`, and
+    /// negotiation has one candidate either way.
+    ///
+    /// The cost is that `OutboundRequestId` is unique only per behaviour, so both
+    /// counters start at zero and collide immediately. That is why every outbound
+    /// record is keyed by [`crate::correlation::OutboundKey`] — the id paired with
+    /// the [`crate::correlation::RequestDomain`] naming which of these two fields
+    /// minted it — and never by the raw id.
+    ///
+    /// ## Network policy (SNIP #79)
+    ///
+    /// `net_policy` is first on purpose: the derived behaviour consults fields in
+    /// declaration order, so a connection the policy refuses is refused before
+    /// any other behaviour sets up state for it (see [`crate::gate`]). The
+    /// address-supplying behaviours are wrapped in [`Gated`], which dereferences
+    /// to the inner behaviour and keeps its event type, so the event variants
+    /// below are unchanged. `mdns` is a [`Toggle`]: disabled, it is absent rather
+    /// than idle — no socket, no announcement, no discovery.
+    #[derive(NetworkBehaviour)]
+    pub struct LocalMeshBehaviour {
+        pub net_policy: PolicyBehaviour,
+        pub mdns: Gated<Toggle<mdns::tokio::Behaviour>>,
+        pub gossipsub: gossipsub::Behaviour,
+        pub identify: Gated<identify::Behaviour>,
+        /// `/sum/storage/v1` only. Inbound V1 pulls are served; inbound V1 pushes
+        /// are refused by `sum-node`'s inbound dispatcher. No outbound V1 push
+        /// command exists any more.
+        pub shard_xfer_v1: request_response::Behaviour<VersionedShardCodec>,
+        /// `/sum/storage/v2` only. Every V2 operation is routed here explicitly.
+        pub shard_xfer_v2: request_response::Behaviour<VersionedShardCodec>,
+        pub kademlia: Gated<kad::Behaviour<kad::store::MemoryStore>>,
+        pub autonat: Gated<autonat::Behaviour>,
+        pub relay: relay::Behaviour,
+        pub relay_client: Gated<relay::client::Behaviour>,
+        pub dcutr: Gated<dcutr::Behaviour>,
+    }
 }
 
 #[cfg(test)]

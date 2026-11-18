@@ -7,6 +7,9 @@
 # release URLs: no checkout, no secrets, read-only token. It never runs
 # on push, pull request or tag, and it never creates, edits or
 # publishes a release.
+# The ubuntu-24.04-arm cell installs the linux-aarch64 tarball, so it
+# passes only for releases that carry one (the first tag cut after
+# SNIP #58's release wiring, and later); earlier releases are x86_64-only.
 # It uses no third-party actions.
 
 name: release install smoke
@@ -28,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     env:

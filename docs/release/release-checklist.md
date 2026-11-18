@@ -349,48 +349,67 @@ final `vX.Y.Z` tag.
 
 Pushing the tag triggers
 [`.github/workflows/release.yml`](../../.github/workflows/release.yml),
-which builds the Linux x86_64 release binaries, packages them as
-`snip-vX.Y.Z-linux-x86_64.tar.gz`, computes `SHA256SUMS`, and
-uploads those plus `scripts/install.sh` to a **draft** GitHub
-Release. The workflow never auto-publishes.
+which builds the release binaries for two platforms:
+
+- Linux x86_64 on `ubuntu-22.04`, after `make release-check`;
+- Linux aarch64 by calling the
+  [`aarch64-musl.yml`](../../.github/workflows/aarch64-musl.yml) lane
+  (static `aarch64-unknown-linux-musl`, native arm64 runner, no cross
+  toolchain), with its static-link, `--version` and `e2e-helper` test
+  checks.
+
+Its `draft` job checks that each binary is an ELF for its platform,
+packages them as `snip-vX.Y.Z-linux-x86_64.tar.gz` and
+`snip-vX.Y.Z-linux-aarch64.tar.gz` (same layout), computes one
+`SHA256SUMS` over both, and uploads those plus `scripts/install.sh`
+to a **draft** GitHub Release. The workflow never auto-publishes.
 
 **First path: GitHub-hosted verification.** The same workflow's
-`verify-draft` job then runs on two fresh GitHub-hosted runners that
-did not build the assets, `ubuntu-22.04` and `ubuntu-24.04`. Each
-one:
+`verify-draft` job then runs on three fresh GitHub-hosted runners that
+did not build the assets, `ubuntu-22.04`, `ubuntu-24.04` and
+`ubuntu-24.04-arm`. Each one:
 
 - confirms the release is a draft for this tag, flagged pre-release
-  exactly when the tag is an rc, with exactly three assets:
-  `snip-vX.Y.Z-linux-x86_64.tar.gz`, `SHA256SUMS`, `install.sh`;
+  exactly when the tag is an rc, with exactly four assets:
+  `snip-vX.Y.Z-linux-x86_64.tar.gz`, `snip-vX.Y.Z-linux-aarch64.tar.gz`,
+  `SHA256SUMS`, `install.sh`;
 - downloads them with `gh release download` and runs
   [`scripts/verify-release-assets.sh`](../../scripts/verify-release-assets.sh),
   which checks:
-  - the asset set is exactly those three regular files;
-  - `SHA256SUMS` has one entry, for the tarball, and it matches;
-  - every tarball entry is confined to `snip-vX.Y.Z-linux-x86_64/`,
-    with no `..` component and no link or special file;
-  - the layout is exactly `bin/sum-node`, `bin/e2e-helper`,
-    `README.md`, `CHANGELOG.md`, `LICENSE-MIT` and `LICENSE-APACHE`,
-    with both binaries executable;
-  - the bundled `CHANGELOG.md` has a `## [X.Y.Z]` section;
-  - `bin/sum-node --version` prints exactly `sum-node X.Y.Z` on that
-    runner;
+  - the asset set is exactly those four regular files;
+  - `SHA256SUMS` has two entries, one for each tarball, and both
+    match;
+  - for each tarball, every entry is confined to
+    `snip-vX.Y.Z-<platform>/`, with no `..` component and no link or
+    special file;
+  - for each tarball, the layout is exactly `bin/sum-node`,
+    `bin/e2e-helper`, `README.md`, `CHANGELOG.md`, `LICENSE-MIT` and
+    `LICENSE-APACHE`, with both binaries executable, and the bundled
+    `CHANGELOG.md` has a `## [X.Y.Z]` section;
+  - `bin/sum-node --version` from the runner's own platform tarball
+    (`linux-x86_64` on the x86_64 runners, `linux-aarch64` on the arm64
+    runner) prints exactly `sum-node X.Y.Z`;
   - the `install.sh` asset is byte-identical to the tag's
     `scripts/install.sh`.
 
 `make release-check` self-tests the verifier against a synthetic good
-release and 16 broken ones
-([`scripts/test-verify-release-assets.sh`](../../scripts/test-verify-release-assets.sh)).
+release and 21 broken ones
+([`scripts/test-verify-release-assets.sh`](../../scripts/test-verify-release-assets.sh)),
+and the installer's architecture selection and checksum refusal with
+stubbed `uname` and `curl`
+([`scripts/test-install.sh`](../../scripts/test-install.sh)).
 
 - [ ] Wait for the `release` workflow on the tag to finish green,
-      including both `verify draft assets` jobs. Keep the run URL as
-      evidence.
+      including all three `verify draft assets` jobs. Keep the run URL
+      as evidence.
 - [ ] Open the draft release in the GitHub UI and confirm the asset
       list is the one the job checked.
 
 **Fallback: a clean host.** If the GitHub-hosted job cannot run, or
-as an additional check, verify by hand on a clean Linux x86_64 host
-(or an Ubuntu 22.04 VM / container). From a checkout of the tag:
+as an additional check, verify by hand on a clean Linux x86_64 or
+Linux aarch64 host (or an Ubuntu 22.04 VM / container); the script
+runs the `--version` of the host's own platform tarball. From a
+checkout of the tag:
 
 ```bash
 # Authenticated download from the draft release.
@@ -404,17 +423,19 @@ gh release download vX.Y.Z \
 scripts/verify-release-assets.sh assets vX.Y.Z scripts/install.sh
 ```
 
-Without a checkout, the minimal manual steps are:
+Without a checkout, the minimal manual steps are (`PLATFORM` is
+`linux-x86_64` or `linux-aarch64`, matching the host):
 
 ```bash
+PLATFORM=linux-x86_64
 gh release download vX.Y.Z \
     --repo SUM-INNOVATION/Storage-Node-Interface-Protocol \
-    --pattern 'snip-*-linux-x86_64.tar.gz' \
+    --pattern "snip-*-${PLATFORM}.tar.gz" \
     --pattern 'SHA256SUMS'
 
 sha256sum --check --ignore-missing SHA256SUMS
-tar xzf snip-vX.Y.Z-linux-x86_64.tar.gz
-./snip-vX.Y.Z-linux-x86_64/bin/sum-node --version
+tar xzf "snip-vX.Y.Z-${PLATFORM}.tar.gz"
+"./snip-vX.Y.Z-${PLATFORM}/bin/sum-node" --version
 ```
 
 Either way this confirms tarball integrity, layout, and that the
@@ -429,8 +450,9 @@ that is the next gate.
 - [ ] After publishing, run the post-publish install smoke.
       **First path:** dispatch
       [`.github/workflows/release-install-smoke.yml`](../../.github/workflows/release-install-smoke.yml)
-      with the tag. It runs the line below on fresh `ubuntu-22.04`
-      and `ubuntu-24.04` runners and checks `sum-node --version`.
+      with the tag. It runs the line below on fresh `ubuntu-22.04`,
+      `ubuntu-24.04` and `ubuntu-24.04-arm` runners and checks
+      `sum-node --version`.
       It runs only on manual dispatch and reads only the public
       release URLs. **Fallback:** run the line on a clean host:
 

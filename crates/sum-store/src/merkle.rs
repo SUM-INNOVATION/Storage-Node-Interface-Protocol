@@ -99,17 +99,18 @@ impl MerkleTree {
         let mut idx = chunk_index as usize;
 
         // Walk from leaf level (0) up to one below the root
-        for level in 0..self.levels.len() - 1 {
+        // (`self.levels.len() >= 2` here, so the slice is never empty).
+        for level in &self.levels[..self.levels.len() - 1] {
             let sibling_idx = if idx.is_multiple_of(2) {
                 idx + 1
             } else {
                 idx - 1
             };
-            let sibling = if sibling_idx < self.levels[level].len() {
-                self.levels[level][sibling_idx]
+            let sibling = if sibling_idx < level.len() {
+                level[sibling_idx]
             } else {
                 // Out of bounds means the node was duplicated (odd level)
-                self.levels[level][idx]
+                level[idx]
             };
             proof.push(sibling);
             idx /= 2;
