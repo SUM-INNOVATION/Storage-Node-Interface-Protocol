@@ -7,12 +7,30 @@ in [`docs/reference/chain-compat.md`](docs/reference/chain-compat.md).
 
 ## [Unreleased]
 
+## [0.4.0-rc6] - 2026-11-24
+
+Release candidate after `v0.4.0-rc5` (2026-11-06), carrying every change merged since then. Prebuilt binaries are Linux x86_64 and, new in this release, Linux aarch64 (static `aarch64-unknown-linux-musl`); every other platform builds from source ([`docs/compatibility/platform-support.md`](docs/compatibility/platform-support.md)).
+
+### Upgrade notes
+- **`install.sh` refuses unknown platforms and verifies against one `SHA256SUMS` line** (see "Changed"). Run on aarch64 against `v0.4.0-rc5` or earlier, which list no aarch64 tarball, the new installer stops after downloading `SHA256SUMS`.
+- **Rust 1.88 or newer** is still required to build from source.
+
 ### Added
 - **Linux aarch64 release tarball** (SNIP #58). `release.yml` now also attaches `snip-<tag>-linux-aarch64.tar.gz`: a static `aarch64-unknown-linux-musl` `sum-node` and `e2e-helper`, built by the existing `aarch64-musl.yml` lane (native arm64 runner, no cross toolchain), which `release.yml` calls on the tag. Same layout as the x86_64 tarball; `SHA256SUMS` has one line for each. The draft's assets are verified on `ubuntu-22.04`, `ubuntu-24.04` and `ubuntu-24.04-arm`, each running its own platform's `sum-node --version`. Not yet run on the target aarch64 hardware.
 
 ### Changed
 - **`install.sh` picks the tarball from `uname -m`**: `x86_64`/`amd64` → `linux-x86_64`, `aarch64`/`arm64` → `linux-aarch64`; any other OS or architecture is refused with exit code 2 before any download. It now downloads `SHA256SUMS` first, refuses a release that does not list its tarball, and compares the tarball's SHA256 with that one line before extracting or installing anything. `make release-check` runs a new installer self-test (`scripts/test-install.sh`, stubbed `uname` and `curl`, no network).
 - The post-publish install smoke (`release-install-smoke.yml`, manual dispatch) also runs on `ubuntu-24.04-arm`.
+- **Builds with Rust 1.100** (#92): `sum-net` scopes an `unreachable_code` allow to the derived mesh behaviour, and `sum-store` iterates Merkle levels directly in `generate_proof`. No behaviour change.
+
+### Fixed
+- **Dependency security updates** (#92, #93), lockfile only: `openssl` 0.10.76 → 0.10.82 and `openssl-sys` 0.9.112 → 0.9.118 (RUSTSEC-2026-0463 and RUSTSEC-2026-0473 to RUSTSEC-2026-0479); `quinn-proto` 0.11.18 → 0.11.19 (RUSTSEC-2026-0523, RUSTSEC-2026-0524) and `quinn-udp` 0.5.14 → 0.5.16 (RUSTSEC-2026-0538); `libp2p-gossipsub` 0.50.0 → 0.50.1 (RUSTSEC-2026-0534); `url` 2.5.8 → 2.5.9 and `form_urlencoded` 1.2.2 → 1.2.3 (RUSTSEC-2026-0592).
+- **`rustix` 1.1.4 → 1.1.6** (RUSTSEC-2026-0486: `xattr` functions could mark unwritten bytes as initialized when given a zero-length buffer). `sum-store`'s requirement moves from the exact pin `=1.1.4` to a compatible requirement with 1.1.6 as the minimum.
+
+### Chain compatibility
+- Pinned chain commit unchanged from `v0.4.0-rc5`: `5ff6c7485bdfa1eb9143b8712cfb9c50ed6659e0` ([`docs/reference/chain-compat.md`](docs/reference/chain-compat.md)). It identifies a chain source state for wire format, not the validators' binary or runtime configuration.
+- Chain wire types come from `sumchain-wire`, still exact-pinned at `=0.4.0`.
+- The local mirror is still the chain's synthetic five-validator devnet at the E2E workflow's `SUMCHAIN_COMMIT` (`d8130ead3b77f38eff6eeb82b4e68bb1aca8e3b2`). A mirror run is not evidence about mainnet.
 
 ## [0.4.0-rc5] - 2026-11-06
 
